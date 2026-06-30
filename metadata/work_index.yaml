@@ -1,0 +1,44 @@
+generated_at: null
+works:
+  oss-fuzz-gen:
+    repo: "https://github.com/google/oss-fuzz-gen.git"
+    path: "external/oss-fuzz-gen"
+    commit: null
+    date: null
+    reference_type: "engineering_artifact"
+    optional: false
+  ckgfuzzer:
+    repo: "https://github.com/security-pride/CKGFuzzer.git"
+    path: "external/CKGFuzzer"
+    commit: null
+    date: null
+    reference_type: "paper_artifact"
+    optional: false
+  promefuzz:
+    repo: "https://github.com/pvz122/PromeFuzz.git"
+    path: "external/PromeFuzz"
+    commit: null
+    date: null
+    reference_type: "paper_artifact"
+    optional: false
+  elfuzz:
+    repo: "https://github.com/OSUSecLab/elfuzz.git"
+    path: "external/elfuzz"
+    commit: null
+    date: null
+    reference_type: "paper_artifact"
+    optional: false
+  g2fuzz:
+    repo: "https://github.com/G2FUZZ/G2FUZZ.git"
+    path: "external/G2FUZZ"
+    commit: null
+    date: null
+    reference_type: "paper_artifact"
+    optional: false
+  g2fuzz-data:
+    repo: "https://github.com/G2FUZZ/G2FUZZ-DATA.git"
+    path: "external/G2FUZZ-DATA"
+    commit: null
+    date: null
+    reference_type: "dataset"
+    optional: true

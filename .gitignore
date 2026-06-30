@@ -1,3 +1,64 @@
+# Harness Gen Bench ignore files & dirs
+plans/
+
+
+
+# HarnessGenBench scaffold
+
+# Secrets
+.env
+*.env
+openai_key.txt
+*api_key*
+*secret*
+*token*
+*.pem
+*.key
+*.json.credentials
+
+# External projects and generated data
+/external/
+/results/**
+!/results/.gitkeep
+/artifacts/**
+!/artifacts/.gitkeep
+/workspace/
+/tmp/
+
+# Fuzzing outputs
+crashes/
+hangs/
+queue/
+default/
+corpus/
+coverage/
+*.profraw
+*.profdata
+*.sancov
+*.db
+*.sqlite
+
+# Build outputs
+build/
+dist/
+out/
+__pycache__/
+*.pyc
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.class
+node_modules/
+.venv/
+venv/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -216,3 +277,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Keep scaffold helper library tracked despite the generic Python lib/ ignore.
+!scripts/lib/
+!scripts/lib/common.sh
