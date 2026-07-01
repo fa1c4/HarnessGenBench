@@ -67,6 +67,102 @@ metadata() {
     printf '}\n'
   } >"$workspace/metadata.json"
 }
+
+if [[ "$mode" == "generate-target" ]]; then
+  # shellcheck source=/opt/hgb/bin/target_contract.sh
+  source /opt/hgb/bin/target_contract.sh
+  export HGB_GENERATOR="${HGB_GENERATOR:-promefuzz}"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/promefuzz_out" /run/hgb/promefuzz
+  hgb_require_target_package
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
+  language="c++"
+  if find /target/source_input -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null | grep -q . && ! find /target/source_input -type f \( -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.hpp' \) 2>/dev/null | grep -q .; then
+    language="c"
+  fi
+  config=/run/hgb/promefuzz/config.toml
+  libraries=/run/hgb/promefuzz/libraries.toml
+  cat >"$config" <<EOF_PROMEFUZZ_CONFIG
+[llm.hgb_cloud]
+llm_type = "openai"
+base_url = "${OPENAI_BASE_URL:-https://api.openai.com/v1}"
+api_key = "${OPENAI_API_KEY:-}"
+model = "${OPENAI_MODEL:-}"
+EOF_PROMEFUZZ_CONFIG
+  compile_db="$workspace/promefuzz_build/compile_commands.json"
+  mkdir -p "$workspace/promefuzz_build"
+  cmake_src="$(find /target/source_input -name CMakeLists.txt -type f -printf '%h\n' 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$cmake_src" ]]; then
+    cmake -S "$cmake_src" -B "$workspace/promefuzz_build" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >"$workspace/logs/cmake.log" 2>&1 || true
+  elif [[ "${HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD:-0}" == "1" ]] && command -v bear >/dev/null 2>&1; then
+    (cd "$workspace/promefuzz_build" && bear -- bash /target/fuzzbench_benchmark/build.sh) >"$workspace/logs/bear.log" 2>&1 || true
+  fi
+  cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
+[$safe_target]
+language = "$language"
+header_paths = ["/target/source_input"]
+compile_commands_path = "$compile_db"
+document_paths = ["/target/docs"]
+document_has_api_usage = true
+output_path = "$workspace/promefuzz_out/$safe_target"
+compile_args = ""
+EOF_PROMEFUZZ_LIBS
+  printf 'PromeFuzz config: %s\nPromeFuzz libraries: %s\n' "$config" "$libraries" >"$workspace/command.txt"
+  if [[ ! -f "$compile_db" ]]; then
+    cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
+    hgb_soft_skip needs_compile_commands 'PromeFuzz requires compile_commands.json; no CMake database was created and FuzzBench build replay is disabled by default' harness_generator
+  fi
+  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
+    cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
+    hgb_write_common_metadata dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' 0 harness_generator
+    hgb_write_common_summary dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' harness_generator
+    exit 0
+  fi
+  if ! hgb_api_key_present; then
+    printf 'OPENAI_API_KEY is not set; PromeFuzz target generation skipped.\n' >"$workspace/logs/run.log"
+    hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 harness_generator
+    hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
+    exit 2
+  fi
+  cfg_flag=-c
+  if ! (cd "$artifact" && "$python" PromeFuzz.py --help 2>/dev/null | grep -q -- ' -c'); then
+    cfg_flag=--config
+  fi
+  stages=(preprocess comprehend generate stats)
+  : >"$workspace/command.txt"
+  code=0
+  for stage in "${stages[@]}"; do
+    printf '%q ' "$python" PromeFuzz.py "$cfg_flag" "$config" -F "$libraries" "$stage" >>"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
+    stage_code=0
+    (cd "$artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "$python" PromeFuzz.py "$cfg_flag" "$config" -F "$libraries" "$stage") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
+    if [[ "$stage" == "stats" ]]; then
+      continue
+    fi
+    if [[ "$stage_code" -ne 0 ]]; then
+      code="$stage_code"
+      break
+    fi
+  done
+  n=0
+  while IFS= read -r generated; do
+    n=$((n + 1))
+    cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
+  done < <(find "$workspace/promefuzz_out" "$artifact" -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'fuzz_driver_*' \) 2>/dev/null | sort)
+  status=completed
+  reason=none
+  if [[ "$code" -ne 0 ]]; then
+    status=failed
+    reason="PromeFuzz stage exited $code"
+  fi
+  extra=$(printf '  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db")" "$(hgb_json_escape "$workspace/command.txt")")
+  hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
+  hgb_write_common_summary "$status" "$reason" harness_generator
+  exit "$code"
+fi
 [[ "$mode" == "smoke-pugixml" || "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }
 export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"

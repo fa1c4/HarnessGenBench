@@ -3,7 +3,8 @@
   docker-build-ckgfuzzer smoke-ckgfuzzer \
   docker-build-promefuzz smoke-promefuzz \
   docker-build-elfuzz smoke-elfuzz \
-  docker-build-g2fuzz smoke-g2fuzz
+  docker-build-g2fuzz smoke-g2fuzz \
+  targets target-smoke generate generate-dry-run generate-matrix
 
 check:
 	bash scripts/env_check.sh
@@ -45,3 +46,18 @@ docker-build-g2fuzz:
 smoke-g2fuzz:
 	bash scripts/g2fuzz_generate_seeds.sh || true
 	bash scripts/g2fuzz_smoke_afl.sh || true
+
+targets:
+	bash scripts/hgb_targets.sh list
+
+target-smoke:
+	bash scripts/hgb_target_smoke.sh $(TARGET)
+
+generate:
+	bash scripts/hgb_generate_harness.sh --generator $(GENERATOR) --target $(TARGET)
+
+generate-dry-run:
+	bash scripts/hgb_generate_harness.sh --generator $(GENERATOR) --target $(TARGET) --dry-run
+
+generate-matrix:
+	bash scripts/hgb_generate_matrix.sh --generators $(GENERATORS) --targets $(TARGETS)

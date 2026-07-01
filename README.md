@@ -56,3 +56,42 @@ bash scripts/g2fuzz_smoke_afl.sh || true
 LLM-backed smoke runs may fail because credentials, quota, model access, Docker-in-Docker, or upstream CLIs are unavailable. They should still leave `metadata.json`, logs, and `HGB_SUMMARY.md` in `workspace/`.
 
 G2FUZZ target `.afl` and `.cmp` binaries are not bundled by the upstream artifact. Missing target binaries soft-skip by default and produce `TARGET_BUILD_MISSING.md`; set `G2FUZZ_REQUIRE_TARGET_BINARIES=1` to make that condition fail.
+
+## FuzzBench Target Integration
+
+List targets:
+
+```bash
+make artifacts
+make targets
+```
+
+Prepare a target package:
+
+```bash
+make target-smoke TARGET=jsoncpp_jsoncpp_fuzzer
+```
+
+Generate a harness with one generator:
+
+```bash
+source configs/set_api_key.sh
+make generate GENERATOR=promefuzz TARGET=jsoncpp_jsoncpp_fuzzer
+```
+
+Dry-run without calling an LLM:
+
+```bash
+make generate-dry-run GENERATOR=ckgfuzzer TARGET=jsoncpp_jsoncpp_fuzzer
+```
+
+Run a small matrix:
+
+```bash
+bash scripts/hgb_generate_matrix.sh \
+  --generators oss-fuzz-gen,ckgfuzzer,promefuzz \
+  --targets jsoncpp_jsoncpp_fuzzer,zlib_zlib_uncompress_fuzzer \
+  --dry-run
+```
+
+ELFuzz and G2FUZZ are input-generation baselines, not source-level harness generators. Their target-aware runs soft-skip by default with `not_harness_generator`; pass `--allow-input-generator` to run them as input-generation baselines.

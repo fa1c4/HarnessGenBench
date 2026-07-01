@@ -74,6 +74,7 @@ main() {
   ensure_dir "$metadata_dir"
 
   local repos=(
+    "fuzzbench|https://github.com/google/fuzzbench.git|fuzzbench|target_benchmark_suite|false"
     "oss-fuzz-gen|https://github.com/google/oss-fuzz-gen.git|oss-fuzz-gen|engineering_artifact|false"
     "ckgfuzzer|https://github.com/security-pride/CKGFuzzer.git|ckgfuzzer|paper_artifact|false"
     "promefuzz|https://github.com/pvz122/PromeFuzz.git|promefuzz|paper_artifact|false"

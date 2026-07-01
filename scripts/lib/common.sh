@@ -70,6 +70,33 @@ workspace_run_dir() {
   printf '%s/%s/%s\n' "$(hgb_workspace_dir "$root")" "$fuzzer" "$timestamp"
 }
 
+
+valid_hgb_generator() {
+  case "${1:-}" in
+    oss-fuzz-gen|ckgfuzzer|promefuzz|elfuzz|g2fuzz) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+generator_artifact_name() {
+  case "${1:-}" in
+    oss-fuzz-gen) printf 'oss-fuzz-gen\n' ;;
+    ckgfuzzer) printf 'ckgfuzzer\n' ;;
+    promefuzz) printf 'promefuzz\n' ;;
+    elfuzz) printf 'elfuzz\n' ;;
+    g2fuzz) printf 'g2fuzz\n' ;;
+    *) die "unknown generator: ${1:-}" ;;
+  esac
+}
+
+workspace_generator_target_run_dir() {
+  local generator="$1"
+  local target="$2"
+  local timestamp="${3:-$(make_timestamp)}"
+  local root="${4:-$(repo_root)}"
+  printf '%s/%s/%s/%s\n' "$(hgb_workspace_dir "$root")" "$generator" "$target" "$timestamp"
+}
+
 latest_workspace_run() {
   local fuzzer="$1"
   local root="${2:-$(repo_root)}"
@@ -250,4 +277,51 @@ run_hgb_container() {
     -v "$workspace:/workspace" \
     "$@" \
     "$image" "$mode"
+}
+
+run_hgb_target_container() {
+  local image="$1"
+  local workspace="$2"
+  local generator="$3"
+  local target="$4"
+  local target_package="$5"
+  local project="$6"
+  local fuzz_target="$7"
+  local root artifact_name generator_commit
+  shift 7
+  root="$(repo_root)"
+  artifact_name="$(generator_artifact_name "$generator")"
+  generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
+  ensure_dir "$workspace"
+  docker run --rm --init \
+    --entrypoint /opt/hgb/entrypoint.sh \
+    -e API_KEY \
+    -e BASE_URL \
+    -e MODEL \
+    -e OPENAI_API_KEY \
+    -e OPENAI_BASE_URL \
+    -e OPENAI_MODEL \
+    -e HGB_RUN_ID="$(basename "$workspace")" \
+    -e HGB_GENERATOR="$generator" \
+    -e HGB_GENERATOR_COMMIT="$generator_commit" \
+    -e HGB_TARGET="$target" \
+    -e HGB_TARGET_PACKAGE=/target \
+    -e HGB_TARGET_MANIFEST=/target/target_manifest.json \
+    -e HGB_TARGET_SOURCE_DIR=/target/source_input \
+    -e HGB_TARGET_REFERENCE_DIR=/target/reference_harnesses \
+    -e HGB_TARGET_PROJECT="$project" \
+    -e HGB_TARGET_FUZZ_TARGET="$fuzz_target" \
+    -e HGB_DRY_RUN="${HGB_DRY_RUN:-0}" \
+    -e HGB_GENERATION_TIMEOUT_SECONDS="${HGB_GENERATION_TIMEOUT_SECONDS:-900}" \
+    -e HGB_ALLOW_INPUT_GENERATOR_TO_RUN="${HGB_ALLOW_INPUT_GENERATOR_TO_RUN:-0}" \
+    -e HGB_HOST_UID="$(id -u)" \
+    -e HGB_HOST_GID="$(id -g)" \
+    -v "$workspace:/workspace" \
+    -v "$target_package:/target:ro" \
+    -v "$root/artifacts:/opt/hgb/artifacts:ro" \
+    -v "$root/docker/$generator/entrypoint.sh:/opt/hgb/entrypoint.sh:ro" \
+    -v "$root/docker/common:/opt/hgb/bin:ro" \
+    -v "$root/metadata:/opt/hgb/metadata:ro" \
+    "$@" \
+    "$image" generate-target
 }

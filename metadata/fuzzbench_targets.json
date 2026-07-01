@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "source": {
+    "kind": "fuzzbench",
+    "artifact_key": "fuzzbench",
+    "repo": "https://github.com/google/fuzzbench",
+    "benchmark_root": "benchmarks"
+  },
+  "expected_target_count": 29,
+  "targets": [
+    {"name": "bloaty_fuzz_target", "enabled": true},
+    {"name": "bloaty_fuzz_target_52948c", "enabled": true},
+    {"name": "curl_curl_fuzzer_http", "enabled": true},
+    {"name": "freetype2_ftfuzzer", "enabled": true},
+    {"name": "harfbuzz_hb-shape-fuzzer", "enabled": true},
+    {"name": "harfbuzz_hb-shape-fuzzer_17863b", "enabled": true},
+    {"name": "jsoncpp_jsoncpp_fuzzer", "enabled": true},
+    {"name": "lcms_cms_transform_fuzzer", "enabled": true},
+    {"name": "libjpeg-turbo_libjpeg_turbo_fuzzer", "enabled": true},
+    {"name": "libpcap_fuzz_both", "enabled": true},
+    {"name": "libpng_libpng_read_fuzzer", "enabled": true},
+    {"name": "libxml2_xml", "enabled": true},
+    {"name": "libxml2_xml_e85b9b", "enabled": true},
+    {"name": "libxslt_xpath", "enabled": true},
+    {"name": "mbedtls_fuzz_dtlsclient", "enabled": true},
+    {"name": "mbedtls_fuzz_dtlsclient_7c6b0e", "enabled": true},
+    {"name": "mruby_mruby_fuzzer_8c8bbd", "enabled": true},
+    {"name": "openh264_decoder_fuzzer", "enabled": true},
+    {"name": "openssl_x509", "enabled": true},
+    {"name": "openthread_ot-ip6-send-fuzzer", "enabled": true},
+    {"name": "php_php-fuzz-parser_0dbedb", "enabled": true},
+    {"name": "proj4_proj_crs_to_crs_fuzzer", "enabled": true},
+    {"name": "re2_fuzzer", "enabled": true},
+    {"name": "sqlite3_ossfuzz", "enabled": true},
+    {"name": "stb_stbi_read_fuzzer", "enabled": true},
+    {"name": "systemd_fuzz-link-parser", "enabled": true},
+    {"name": "vorbis_decode_fuzzer", "enabled": true},
+    {"name": "woff2_convert_woff2ttf_fuzzer", "enabled": true},
+    {"name": "zlib_zlib_uncompress_fuzzer", "enabled": true}
+  ]
+}

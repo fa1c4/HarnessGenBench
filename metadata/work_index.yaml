@@ -1,6 +1,13 @@
-generated_at: "2026-07-01T02:14:09Z"
+generated_at: "2026-07-01T03:31:31Z"
 artifact_root: "artifacts"
 works:
+  fuzzbench:
+    repo: "https://github.com/google/fuzzbench.git"
+    path: "artifacts/fuzzbench"
+    commit: "3234e151d70f6093272a9b4155e68ee57faf986c"
+    checkout_mode: "detached-pinned-current-upstream-head"
+    reference_type: "target_benchmark_suite"
+    optional: false
   oss-fuzz-gen:
     repo: "https://github.com/google/oss-fuzz-gen.git"
     path: "artifacts/oss-fuzz-gen"

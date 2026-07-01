@@ -105,6 +105,104 @@ metadata() {
     printf '}\n'
   } >"$workspace/metadata.json"
 }
+
+if [[ "$mode" == "generate-target" ]]; then
+  # shellcheck source=/opt/hgb/bin/target_contract.sh
+  source /opt/hgb/bin/target_contract.sh
+  export HGB_GENERATOR="${HGB_GENERATOR:-ckgfuzzer}"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
+  hgb_require_target_package
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
+  ckg_project="hgb_${safe_target}"
+  ckg_root=/fuzzing_llm_engine
+  ckg_db="$ckg_root/external_database/$ckg_project"
+  ckg_proj="$ckg_root/projects/$ckg_project"
+  rm -rf "$ckg_db" "$ckg_proj"
+  mkdir -p "$ckg_db/test" "$ckg_proj" /docker_shared
+  if [[ -d /target/source_input ]]; then
+    cp -a /target/source_input/. "$ckg_proj/" 2>/dev/null || true
+  fi
+  if [[ "$(hgb_count_files "$ckg_proj" -type f)" == "0" ]]; then
+    hgb_soft_skip source_input_missing 'target package does not contain source files for CKGFuzzer API extraction' harness_generator
+  fi
+  if [[ "${HGB_ALLOW_REFERENCE_USAGE:-0}" == "1" && -d /target/reference_harnesses ]]; then
+    cp -a /target/reference_harnesses/. "$ckg_db/test/" 2>/dev/null || true
+  else
+    cat >"$ckg_db/test/hgb_neutral_usage.c" <<'EOF_CKG_USAGE'
+#include <stdint.h>
+int main(void) { const uint8_t data[] = {0}; return (int)data[0]; }
+EOF_CKG_USAGE
+  fi
+
+  api_count="$(python3 /opt/hgb/bin/extract_api_list.py --source /target/source_input --out "$ckg_db/api_list.json" --max 200 2>"$workspace/logs/api_extract.log" || printf '0')"
+  api_count="${api_count##*$'\n'}"
+  cat >"$ckg_db/config.yaml" <<EOF_CKG_CONFIG
+project_name: "$ckg_project"
+api_key: "${OPENAI_API_KEY:-}"
+base_url: "${OPENAI_BASE_URL:-}"
+model: "${OPENAI_MODEL:-}"
+source_dir: "$ckg_proj"
+output_dir: "$workspace/generated_harnesses"
+build_command: "bash /target/fuzzbench_benchmark/build.sh"
+EOF_CKG_CONFIG
+  printf 'CKGFuzzer project: %s\napi_list: %s\nconfig: %s\n' "$ckg_project" "$ckg_db/api_list.json" "$ckg_db/config.yaml" >"$workspace/command.txt"
+  if [[ "${api_count:-0}" == "0" ]]; then
+    hgb_soft_skip no_api_candidates 'no C/C++ API candidates were extracted from target source_input' harness_generator
+  fi
+  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
+    hgb_write_common_metadata dry_run_ok 'dry run prepared CKGFuzzer project config and API list' 0 harness_generator
+    hgb_write_common_summary dry_run_ok 'dry run prepared CKGFuzzer project config and API list' harness_generator
+    exit 0
+  fi
+  if ! hgb_api_key_present; then
+    printf 'OPENAI_API_KEY is not set; CKGFuzzer target generation skipped.\n' >"$workspace/logs/generation.log"
+    hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 harness_generator
+    hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
+    exit 2
+  fi
+  if [[ "${CKGFUZZER_SKIP_CODEQL:-0}" != "1" ]] && ! command -v codeql >/dev/null 2>&1; then
+    hgb_soft_skip missing_codeql 'CodeQL CLI is not available in the CKGFuzzer image; set CKGFUZZER_SKIP_CODEQL=1 to bypass this check' harness_generator
+  fi
+  repo_py="$(find "$artifact" -name repo.py -type f 2>/dev/null | head -n 1 || true)"
+  preproc_py="$(find "$artifact" -name preproc.py -type f 2>/dev/null | head -n 1 || true)"
+  fuzzing_py="$(find "$artifact" -name fuzzing.py -type f 2>/dev/null | head -n 1 || true)"
+  if [[ -z "$repo_py" || -z "$preproc_py" || -z "$fuzzing_py" ]]; then
+    hgb_soft_skip upstream_cli_not_found 'could not find repo.py, preproc.py, and fuzzing.py in the CKGFuzzer artifact' harness_generator
+  fi
+  {
+    printf 'cd %q && python %q --project_name %q --shared_llm_dir /docker_shared --saved_dir %q --src_api --call_graph\n' "$(dirname "$repo_py")" "$repo_py" "$ckg_project" "$ckg_db/codebase"
+    printf 'python %q --project_name %q --src_api_file_path %q\n' "$preproc_py" "$ckg_project" "$ckg_db"
+    printf 'python %q --yaml %q --gen_driver --summary_api --check_compilation --gen_input\n' "$fuzzing_py" "$ckg_db/config.yaml"
+  } >"$workspace/command.txt"
+  code=0
+  (cd "$(dirname "$repo_py")" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" python "$repo_py" --project_name "$ckg_project" --shared_llm_dir /docker_shared --saved_dir "$ckg_db/codebase" --src_api --call_graph) >"$workspace/logs/repo.log" 2>&1 || code=$?
+  if [[ "$code" == "0" ]]; then
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" python "$preproc_py" --project_name "$ckg_project" --src_api_file_path "$ckg_db" >"$workspace/logs/preproc.log" 2>&1 || code=$?
+  fi
+  if [[ "$code" == "0" ]]; then
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --check_compilation --gen_input >"$workspace/logs/fuzzing.log" 2>&1 || code=$?
+  fi
+  n=0
+  while IFS= read -r generated; do
+    n=$((n + 1))
+    cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
+  done < <(find "$ckg_root" "$artifact" -type f \( -name 'driver_*.c' -o -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' \) 2>/dev/null | sort)
+  status=completed
+  reason=none
+  if [[ "$code" -ne 0 ]]; then
+    status=failed
+    reason="CKGFuzzer upstream command exited $code"
+  fi
+  extra=$(printf '  "ckgfuzzer_project": "%s",\n  "api_candidate_count": %s,\n  "command_file": "%s"' "$(hgb_json_escape "$ckg_project")" "${api_count:-0}" "$(hgb_json_escape "$workspace/command.txt")")
+  hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
+  hgb_write_common_summary "$status" "$reason" harness_generator
+  exit "$code"
+fi
 [[ "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }
 export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"

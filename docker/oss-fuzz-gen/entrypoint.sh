@@ -52,6 +52,75 @@ metadata() {
   } >"$workspace/metadata.json"
 }
 
+
+if [[ "$mode" == "generate-target" ]]; then
+  # shellcheck source=/opt/hgb/bin/target_contract.sh
+  source /opt/hgb/bin/target_contract.sh
+  export HGB_GENERATOR="${HGB_GENERATOR:-oss-fuzz-gen}"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
+  hgb_require_target_package
+  project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+
+  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
+    printf 'oss-fuzz-gen generate-target dry-run for %s\n' "$target_name" >"$workspace/command.txt"
+    hgb_write_common_metadata dry_run_ok 'dry run validated target package' 0 harness_generator
+    hgb_write_common_summary dry_run_ok 'dry run validated target package' harness_generator
+    exit 0
+  fi
+
+  if ! hgb_api_key_present; then
+    printf 'OPENAI_API_KEY is not set; OSS-Fuzz-Gen target generation skipped.\n' >"$workspace/logs/run.log"
+    hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 harness_generator
+    hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
+    exit 2
+  fi
+
+  benchmark_yaml="${OFG_BENCHMARK_YAML:-}"
+  if [[ -n "$benchmark_yaml" && ! -f "$benchmark_yaml" ]]; then
+    printf 'Provided OFG_BENCHMARK_YAML does not exist: %s\n' "$benchmark_yaml" >"$workspace/logs/benchmark_yaml.log"
+    benchmark_yaml=""
+  fi
+  if [[ -z "$benchmark_yaml" && -d "$artifact/benchmark-sets" ]]; then
+    while IFS= read -r candidate; do
+      if grep -Fq "$target_name" "$candidate" || grep -Fq "$fuzz_target" "$candidate" || grep -Eq "project:[[:space:]]*['\"]?$project['\"]?[[:space:]]*$" "$candidate"; then
+        benchmark_yaml="$candidate"
+        break
+      fi
+    done < <(find "$artifact/benchmark-sets" -type f \( -name '*.yaml' -o -name '*.yml' \) 2>/dev/null | sort)
+  fi
+  if [[ -z "$benchmark_yaml" ]]; then
+    printf 'No compatible OSS-Fuzz-Gen benchmark YAML found for project=%s target=%s\n' "$project" "$target_name" >"$workspace/logs/benchmark_yaml.log"
+    hgb_soft_skip needs_ofg_benchmark_yaml 'OSS-Fuzz-Gen requires a function/test benchmark YAML; FuzzBench benchmark only provides project/fuzz_target' harness_generator
+  fi
+
+  cmd=("$python" run_all_experiments.py --model "$OPENAI_MODEL" -y "$benchmark_yaml" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --work-dir "$workspace/ofg-work")
+  printf '%q ' "${cmd[@]}" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
+  code=0
+  (cd "$artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
+  if [[ -d "$workspace/ofg-work" ]]; then
+    n=0
+    while IFS= read -r generated; do
+      n=$((n + 1))
+      cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
+    done < <(find "$workspace/ofg-work" -type f \( -path '*/fixed_targets/*' -o -path '*/raw_targets/*' \) \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) 2>/dev/null | sort)
+  fi
+  status=completed
+  reason=none
+  if [[ "$code" -ne 0 ]]; then
+    status=failed
+    reason="run_all_experiments exited $code"
+  fi
+  extra=$(printf '  "benchmark_yaml": "%s",\n  "command_file": "%s",\n  "log_file": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")")
+  hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
+  hgb_write_common_summary "$status" "$reason" harness_generator
+  exit "$code"
+fi
 [[ "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }
 export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"

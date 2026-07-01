@@ -54,6 +54,59 @@ metadata() {
     printf '}\n'
   } >"$workspace/metadata.json"
 }
+
+if [[ "$mode" == "generate-target" ]]; then
+  # shellcheck source=/opt/hgb/bin/target_contract.sh
+  source /opt/hgb/bin/target_contract.sh
+  export HGB_GENERATOR="${HGB_GENERATOR:-elfuzz}"
+  export HGB_GENERATOR_ARTIFACT_DIR="/opt/hgb/artifacts/elfuzz"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  export HGB_CAPABILITY=input_generator
+  mkdir -p "$workspace/logs" "$workspace/generated_inputs"
+  hgb_require_target_package
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  if [[ "${HGB_ALLOW_INPUT_GENERATOR_TO_RUN:-0}" != "1" ]]; then
+    hgb_soft_skip not_harness_generator 'ELFuzz synthesizes input generators/fuzzer-space workflows, not source-level harnesses; set HGB_ALLOW_INPUT_GENERATOR_TO_RUN=1 to run it as an input generator baseline' input_generator
+  fi
+  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
+    printf 'elfuzz generate-target dry-run target=%s\n' "$target_name" >"$workspace/command.txt"
+    hgb_write_common_metadata dry_run_ok 'dry run validated ELFuzz input-generator target package' 0 input_generator
+    hgb_write_common_summary dry_run_ok 'dry run validated ELFuzz input-generator target package' input_generator
+    exit 0
+  fi
+  if ! command -v elfuzz >/dev/null 2>&1; then
+    hgb_soft_skip upstream_cli_not_found 'elfuzz CLI not found in image' input_generator
+  fi
+  recognized=0
+  if [[ "${ELFUZZ_TRUST_FUZZBENCH_TARGET:-0}" == "1" ]]; then
+    recognized=1
+  elif [[ ",${ELFUZZ_SUPPORTED_TARGETS:-}," == *",$target_name,"* ]]; then
+    recognized=1
+  elif elfuzz list >"$workspace/logs/elfuzz_list.log" 2>&1 && grep -Fq "$target_name" "$workspace/logs/elfuzz_list.log"; then
+    recognized=1
+  fi
+  if [[ "$recognized" != "1" ]]; then
+    hgb_soft_skip target_not_supported_by_elfuzz 'ELFuzz CLI did not report support for this FuzzBench target name' input_generator
+  fi
+  printf 'elfuzz synth/produce for %s\n' "$target_name" >"$workspace/command.txt"
+  code=0
+  timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" bash -lc "elfuzz synth -T fuzzer.elfuzz --use-small-model '$target_name'" >"$workspace/logs/synth.log" 2>&1 || code=$?
+  if [[ "$code" == "0" ]]; then
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" bash -lc "elfuzz produce -T elfuzz --time '${ELFUZZ_PRODUCE_SECONDS:-60}' '$target_name'" >"$workspace/logs/produce.log" 2>&1 || code=$?
+  fi
+  find "$workspace" -type f \( -path '*/seeds/*' -o -path '*/inputs/*' -o -name '*.seed' \) -exec cp {} "$workspace/generated_inputs/" \; 2>/dev/null || true
+  status=completed
+  reason=none
+  if [[ "$code" -ne 0 ]]; then
+    status=failed
+    reason="ELFuzz input generation exited $code"
+  fi
+  hgb_write_common_metadata "$status" "$reason" "$code" input_generator
+  hgb_write_common_summary "$status" "$reason" input_generator
+  exit "$code"
+fi
 [[ "$mode" == "smoke-jsoncpp" || "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }
 target="${ELFUZZ_TARGET:-jsoncpp}"
 printf 'elfuzz smoke-jsoncpp target=%s\n' "$target" >"$workspace/command.txt"

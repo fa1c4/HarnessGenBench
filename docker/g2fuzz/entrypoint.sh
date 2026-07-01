@@ -125,6 +125,80 @@ write_afl_metadata() {
   } >"$workspace/metadata.json"
 }
 
+
+if [[ "$mode" == "generate-target" ]]; then
+  # shellcheck source=/opt/hgb/bin/target_contract.sh
+  source /opt/hgb/bin/target_contract.sh
+  export HGB_GENERATOR="${HGB_GENERATOR:-g2fuzz}"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  export HGB_CAPABILITY=input_generator
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  mkdir -p "$workspace/logs" "$workspace/generated_inputs" "$workspace/config"
+  hgb_require_target_package
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  if [[ "${HGB_ALLOW_INPUT_GENERATOR_TO_RUN:-0}" != "1" ]]; then
+    hgb_soft_skip not_harness_generator 'G2FUZZ generates inputs and AFL++ workflows, not source-level harnesses; set HGB_ALLOW_INPUT_GENERATOR_TO_RUN=1 to run it as an input generator baseline' input_generator
+  fi
+  safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
+  runtime=/run/hgb/g2fuzz-target
+  mkdir -p "$runtime"
+  formats="$(python3 - "$target_name" "$safe_target" /opt/hgb/metadata/fuzzbench_target_formats.json "$runtime/program_to_format.json" <<'PY_G2_FORMATS'
+import json, sys
+name, safe, mapping_path, out_path = sys.argv[1:]
+try:
+    mapping = json.load(open(mapping_path, encoding='utf-8'))
+except OSError:
+    mapping = {}
+formats = mapping.get(name) or ['custom']
+with open(out_path, 'w', encoding='utf-8') as f:
+    json.dump({safe: formats}, f, indent=2)
+    f.write('\n')
+print(','.join(formats))
+PY_G2_FORMATS
+)"
+  cp "$runtime/program_to_format.json" "$workspace/config/program_to_format.json"
+  model="${G2FUZZ_MODEL:-${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}}"
+  python3 - "$runtime/model_setting.json" "$model" <<'PY_G2_MODEL'
+import json, sys
+with open(sys.argv[1], 'w', encoding='utf-8') as f:
+    json.dump({'model': [sys.argv[2]]}, f, indent=2)
+    f.write('\n')
+PY_G2_MODEL
+  cp "$runtime/model_setting.json" "$workspace/config/model_setting.json"
+  output_dir="$workspace/g2fuzz_output"
+  printf '%q ' "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
+  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
+    hgb_write_common_metadata dry_run_ok 'dry run prepared G2FUZZ target format mapping' 0 input_generator
+    hgb_write_common_summary dry_run_ok 'dry run prepared G2FUZZ target format mapping' input_generator
+    exit 0
+  fi
+  if ! hgb_api_key_present; then
+    printf 'OPENAI_API_KEY is not set. No credential file was created.\n' >"$workspace/logs/program_gen.log"
+    hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 input_generator
+    hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' input_generator
+    exit 2
+  fi
+  printf '%s\n' "$OPENAI_API_KEY" >"$runtime/openai_key.txt"
+  chmod 600 "$runtime/openai_key.txt"
+  code=0
+  (cd "$runtime" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
+  rm -f "$runtime/openai_key.txt"
+  if [[ -d "$output_dir" ]]; then
+    cp -a "$output_dir/." "$workspace/generated_inputs/" 2>/dev/null || true
+  fi
+  status=completed
+  reason=none
+  if [[ "$code" -ne 0 ]]; then
+    status=failed
+    reason="program_gen exited $code"
+  fi
+  extra=$(printf '  "program": "%s",\n  "formats": "%s",\n  "output_dir": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$safe_target")" "$(hgb_json_escape "$formats")" "$(hgb_json_escape "$output_dir")" "$(hgb_json_escape "$workspace/command.txt")")
+  hgb_write_common_metadata "$status" "$reason" "$code" input_generator "$extra"
+  hgb_write_common_summary "$status" "$reason" input_generator
+  exit "$code"
+fi
 case "$mode" in
   generate-seeds|smoke)
     mapfile -t selected < <(select_program)
