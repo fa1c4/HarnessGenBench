@@ -94,12 +94,24 @@ api_key = "${OPENAI_API_KEY:-}"
 model = "${OPENAI_MODEL:-}"
 EOF_PROMEFUZZ_CONFIG
   compile_db="$workspace/promefuzz_build/compile_commands.json"
+  preserved_compile_db="$workspace/compile_commands.json"
+  compile_db_for_metadata="$compile_db"
   mkdir -p "$workspace/promefuzz_build"
   cmake_src="$(find /target/source_input -name CMakeLists.txt -type f -printf '%h\n' 2>/dev/null | head -n 1 || true)"
   if [[ -n "$cmake_src" ]]; then
     cmake -S "$cmake_src" -B "$workspace/promefuzz_build" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >"$workspace/logs/cmake.log" 2>&1 || true
-  elif [[ "${HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD:-0}" == "1" ]] && command -v bear >/dev/null 2>&1; then
-    (cd "$workspace/promefuzz_build" && bear -- bash /target/fuzzbench_benchmark/build.sh) >"$workspace/logs/bear.log" 2>&1 || true
+  fi
+  if [[ ! -f "$compile_db" && "${HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD:-1}" == "1" ]] && command -v bear >/dev/null 2>&1; then
+    mkdir -p "$workspace/promefuzz_build/src" "$workspace/promefuzz_build/out" "$workspace/promefuzz_build/work"
+    cp -a /target/source_input/. "$workspace/promefuzz_build/src/" 2>/dev/null || true
+    (cd "$workspace/promefuzz_build" && SRC="$workspace/promefuzz_build/src" OUT="$workspace/promefuzz_build/out" WORK="$workspace/promefuzz_build/work" bear -- bash /target/fuzzbench_benchmark/build.sh) >"$workspace/logs/bear.log" 2>&1 || true
+    if [[ -f "$workspace/promefuzz_build/compile_commands.json" && ! -f "$compile_db" ]]; then
+      cp "$workspace/promefuzz_build/compile_commands.json" "$compile_db" 2>/dev/null || true
+    fi
+  fi
+  if [[ -f "$compile_db" ]]; then
+    cp "$compile_db" "$preserved_compile_db" 2>/dev/null || true
+    compile_db_for_metadata="$preserved_compile_db"
   fi
   cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
 [$safe_target]
@@ -114,10 +126,16 @@ EOF_PROMEFUZZ_LIBS
   printf 'PromeFuzz config: %s\nPromeFuzz libraries: %s\n' "$config" "$libraries" >"$workspace/command.txt"
   if [[ ! -f "$compile_db" ]]; then
     cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
+    if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
+    fi
     hgb_soft_skip needs_compile_commands 'PromeFuzz requires compile_commands.json; no CMake database was created and FuzzBench build replay is disabled by default' harness_generator
   fi
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
+    if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
+    fi
     hgb_write_common_metadata dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' 0 harness_generator
     hgb_write_common_summary dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' harness_generator
     exit 0
@@ -128,8 +146,12 @@ EOF_PROMEFUZZ_LIBS
     hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
     exit 2
   fi
+  runtime_artifact=/run/hgb/promefuzz/artifact
+  rm -rf "$runtime_artifact"
+  mkdir -p "$runtime_artifact"
+  cp -a "$artifact/." "$runtime_artifact/"
   cfg_flag=-c
-  if ! (cd "$artifact" && "$python" PromeFuzz.py --help 2>/dev/null | grep -q -- ' -c'); then
+  if ! (cd "$runtime_artifact" && "$python" PromeFuzz.py --help 2>/dev/null | grep -q -- ' -c'); then
     cfg_flag=--config
   fi
   stages=(preprocess comprehend generate stats)
@@ -138,7 +160,7 @@ EOF_PROMEFUZZ_LIBS
   for stage in "${stages[@]}"; do
     printf '%q ' "$python" PromeFuzz.py "$cfg_flag" "$config" -F "$libraries" "$stage" >>"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
     stage_code=0
-    (cd "$artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "$python" PromeFuzz.py "$cfg_flag" "$config" -F "$libraries" "$stage") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
+    (cd "$runtime_artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "$python" PromeFuzz.py "$cfg_flag" "$config" -F "$libraries" "$stage") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
     if [[ "$stage" == "stats" ]]; then
       continue
     fi
@@ -151,14 +173,17 @@ EOF_PROMEFUZZ_LIBS
   while IFS= read -r generated; do
     n=$((n + 1))
     cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-  done < <(find "$workspace/promefuzz_out" "$artifact" -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'fuzz_driver_*' \) 2>/dev/null | sort)
+  done < <(find "$workspace/promefuzz_out" "$runtime_artifact" -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'fuzz_driver_*' \) 2>/dev/null | sort)
   status=completed
   reason=none
   if [[ "$code" -ne 0 ]]; then
     status=failed
     reason="PromeFuzz stage exited $code"
   fi
-  extra=$(printf '  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db")" "$(hgb_json_escape "$workspace/command.txt")")
+  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+    rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
+  fi
+  extra=$(printf '  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "$(hgb_json_escape "$workspace/command.txt")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

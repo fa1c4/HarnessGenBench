@@ -188,13 +188,26 @@ PY_G2_MODEL
   if [[ -d "$output_dir" ]]; then
     cp -a "$output_dir/." "$workspace/generated_inputs/" 2>/dev/null || true
   fi
+  generated_inputs="$(hgb_count_files "$workspace/generated_inputs" -type f)"
+  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+    rm -rf "$output_dir"
+  fi
+  program_gen_code="$code"
   status=completed
   reason=none
-  if [[ "$code" -ne 0 ]]; then
+  if [[ "$program_gen_code" -eq 124 && "$generated_inputs" -gt 0 ]]; then
+    status=partial_completed
+    reason="program_gen timed out after generating $generated_inputs inputs"
+    code=0
+  elif [[ "$program_gen_code" -ne 0 ]]; then
     status=failed
-    reason="program_gen exited $code"
+    reason="program_gen exited $program_gen_code"
   fi
-  extra=$(printf '  "program": "%s",\n  "formats": "%s",\n  "output_dir": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$safe_target")" "$(hgb_json_escape "$formats")" "$(hgb_json_escape "$output_dir")" "$(hgb_json_escape "$workspace/command.txt")")
+  extra=$(printf '  "program": "%s",
+  "formats": "%s",
+  "output_dir": "%s",
+  "program_gen_exit_code": %s,
+  "command_file": "%s"' "$(hgb_json_escape "$safe_target")" "$(hgb_json_escape "$formats")" "$(hgb_json_escape "$output_dir")" "$program_gen_code" "$(hgb_json_escape "$workspace/command.txt")")
   hgb_write_common_metadata "$status" "$reason" "$code" input_generator "$extra"
   hgb_write_common_summary "$status" "$reason" input_generator
   exit "$code"
@@ -234,9 +247,17 @@ PYMODEL
     seeds="$(count_files "$output_dir/default/gen_seeds" -type f)"
     generators="$(count_files "$output_dir/default/generators" -type f)"
     status=completed; reason=none
-    [[ "$code" -eq 0 ]] || { status=failed; reason="program_gen exited $code"; }
-    write_seed_metadata "$status" "$code" "$reason" "$program" "$formats" "$seeds" "$generators" "$output_dir"
-    write_seed_summary "$status" "$code" "$reason" "$program" "$formats" "$seeds" "$generators"
+    program_gen_code="$code"
+    if [[ "$program_gen_code" -eq 124 && "$seeds" -gt 0 ]]; then
+      status=partial_completed
+      reason="program_gen timed out after generating $seeds seeds"
+      code=0
+    elif [[ "$program_gen_code" -ne 0 ]]; then
+      status=failed
+      reason="program_gen exited $program_gen_code"
+    fi
+    write_seed_metadata "$status" "$program_gen_code" "$reason" "$program" "$formats" "$seeds" "$generators" "$output_dir"
+    write_seed_summary "$status" "$program_gen_code" "$reason" "$program" "$formats" "$seeds" "$generators"
     exit "$code"
     ;;
   smoke-afl)

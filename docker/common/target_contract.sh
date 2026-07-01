@@ -82,6 +82,7 @@ hgb_write_common_metadata() {
     printf '  "generator": "%s",\n' "$(hgb_json_escape "${HGB_GENERATOR:-unknown}")"
     printf '  "target": "%s",\n' "$(hgb_json_escape "${HGB_TARGET:-$(hgb_target_manifest_value target)}")"
     printf '  "run_type": "generate-target",\n'
+    printf '  "save_mode": "%s",\n' "$(hgb_json_escape "${HGB_SAVE_MODE:-compact}")"
     printf '  "capability": "%s",\n' "$(hgb_json_escape "$capability")"
     printf '  "status": "%s",\n' "$(hgb_json_escape "$status")"
     printf '  "reason": "%s",\n' "$(hgb_json_escape "$reason")"

@@ -9,18 +9,38 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any
 
 
-CLONE_RE = re.compile(
-    r"git\s+clone(?:\s+--[^\s]+)*\s+"
-    r"(https://[^\s'\"\\]+|git://[^\s'\"\\]+|ssh://[^\s'\"\\]+|git@[^\s'\"\\]+)"
-    r"(?:\s+([^\s'\"\\]+))?"
-)
+SOURCE_URL_RE = re.compile(r"^(?:https?|git|ssh)://|^git@")
+SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+SHELL_OPS = {"&&", ";", "||", "|"}
+GIT_CLONE_OPTIONS_WITH_ARG = {
+    "-b",
+    "--branch",
+    "--depth",
+    "--origin",
+    "-o",
+    "--config",
+    "-c",
+    "--reference",
+    "--reference-if-able",
+    "--separate-git-dir",
+    "--template",
+    "--upload-pack",
+    "-u",
+    "--jobs",
+    "-j",
+}
 
 
 def now_iso() -> str:
@@ -196,18 +216,167 @@ def normalize_repo_name(url: str, dest: str | None, used: set[str]) -> str:
     return candidate
 
 
-def parse_clone_repos(dockerfile: Path) -> list[dict[str, str]]:
+def is_source_url(value: str) -> bool:
+    return bool(SOURCE_URL_RE.search(value.rstrip(".,")))
+
+
+def logical_dockerfile_lines(dockerfile: Path) -> list[str]:
     if not dockerfile.exists():
         return []
-    text = dockerfile.read_text(encoding="utf-8", errors="replace")
+    logical: list[str] = []
+    current = ""
+    for raw in dockerfile.read_text(encoding="utf-8", errors="replace").splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped.endswith("\\"):
+            current += stripped[:-1] + " "
+            continue
+        current += stripped
+        logical.append(current)
+        current = ""
+    if current:
+        logical.append(current)
+    return logical
+
+
+def shell_words(command: str) -> list[str]:
+    if command.startswith("RUN "):
+        command = command[4:].strip()
+    command = command.replace("&&", " && ").replace("||", " || ").replace(";", " ; ")
+    try:
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def parse_git_clone_sources(tokens: list[str], used: set[str]) -> list[dict[str, str]]:
     repos: list[dict[str, str]] = []
-    used: set[str] = set()
-    for match in CLONE_RE.finditer(text):
-        url = match.group(1).rstrip(".,")
-        raw_dest = match.group(2)
-        dest = normalize_repo_name(url, raw_dest, used)
-        repos.append({"url": url, "dest": dest, "source": "Dockerfile"})
+    i = 0
+    while i < len(tokens):
+        if tokens[i] != "git" or i + 1 >= len(tokens) or tokens[i + 1] != "clone":
+            i += 1
+            continue
+        j = i + 2
+        url = ""
+        raw_dest: str | None = None
+        while j < len(tokens):
+            token = tokens[j]
+            if token in SHELL_OPS:
+                break
+            if token.startswith("-"):
+                opt = token.split("=", 1)[0]
+                if "=" not in token and opt in GIT_CLONE_OPTIONS_WITH_ARG and j + 1 < len(tokens):
+                    j += 2
+                else:
+                    j += 1
+                continue
+            if not url:
+                url = token.rstrip(".,")
+                j += 1
+                continue
+            raw_dest = token
+            break
+        if url and is_source_url(url):
+            dest = normalize_repo_name(url, raw_dest, used)
+            repos.append({"kind": "git", "url": url, "dest": dest, "source": "Dockerfile"})
+        i = max(j + 1, i + 1)
     return repos
+
+
+def docker_path_basename(value: str) -> str:
+    value = value.strip().strip("'\"").rstrip("/")
+    for prefix in ("${SRC}/", "$SRC/", "/src/", "${WORK}/", "$WORK/"):
+        if value.startswith(prefix):
+            value = value[len(prefix):]
+            break
+    if value in {"", "${SRC}", "$SRC", "/src", "."}:
+        return "source"
+    return value.split("/")[-1] or "source"
+
+
+def archive_url(value: str) -> bool:
+    lower = value.lower().rstrip(".,")
+    return (
+        lower.startswith(("http://", "https://"))
+        and not lower.endswith((".dict", ".options"))
+        and (".tar" in lower or lower.endswith((".tgz", ".zip")) or "tarball" in lower or "/archive/" in lower)
+    )
+
+
+def parse_archive_sources(tokens: list[str], used: set[str]) -> list[dict[str, str]]:
+    repos: list[dict[str, str]] = []
+    current_dir = ""
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "cd" and i + 1 < len(tokens):
+            current_dir = tokens[i + 1]
+            i += 2
+            continue
+        if token in {"curl", "wget"}:
+            url = ""
+            j = i + 1
+            while j < len(tokens) and tokens[j] not in SHELL_OPS:
+                candidate = tokens[j].rstrip(".,")
+                if archive_url(candidate):
+                    url = candidate
+                j += 1
+            if url:
+                dest_hint = docker_path_basename(current_dir) if current_dir else None
+                dest = normalize_repo_name(url, dest_hint, used)
+                repos.append({"kind": "archive", "url": url, "dest": dest, "source": "Dockerfile"})
+            i = max(j, i + 1)
+            continue
+        i += 1
+    return repos
+
+
+def load_source_overrides(root: Path, target: str) -> list[dict[str, str]]:
+    path = root / "metadata" / "fuzzbench_source_overrides.json"
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    overrides = data.get(target, [])
+    if not isinstance(overrides, list):
+        return []
+    normalized: list[dict[str, str]] = []
+    used: set[str] = set()
+    for entry in overrides:
+        if not isinstance(entry, dict) or not entry.get("url"):
+            continue
+        url = str(entry["url"]).rstrip(".,")
+        kind = str(entry.get("kind") or ("archive" if archive_url(url) else "git"))
+        dest = normalize_repo_name(url, str(entry.get("dest") or "") or None, used)
+        normalized.append({"kind": kind, "url": url, "dest": dest, "source": "metadata/fuzzbench_source_overrides.json"})
+    return normalized
+
+
+def dedupe_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[tuple[str, str, str]] = set()
+    deduped: list[dict[str, str]] = []
+    for source in sources:
+        key = (source.get("kind", "git"), source.get("url", ""), source.get("dest", ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(source)
+    return deduped
+
+
+def parse_clone_repos(dockerfile: Path, root: Path | None = None, target: str | None = None) -> list[dict[str, str]]:
+    used: set[str] = set()
+    sources: list[dict[str, str]] = []
+    for line in logical_dockerfile_lines(dockerfile):
+        tokens = shell_words(line)
+        sources.extend(parse_git_clone_sources(tokens, used))
+        sources.extend(parse_archive_sources(tokens, used))
+    if root is not None and target is not None:
+        sources.extend(load_source_overrides(root, target))
+    return dedupe_sources(sources)
 
 
 def copy_tree(src: Path, dst: Path) -> None:
@@ -221,19 +390,23 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
     artifacts_root.mkdir(parents=True, exist_ok=True)
     local = artifacts_root / repo["dest"]
     result: dict[str, Any] = dict(repo)
+    result.setdefault("kind", "git")
     result["artifact_path"] = str(local)
     if local.exists() and not (local / ".git").exists():
         result["clone_status"] = "path_exists_not_git"
+        result["materialize_status"] = "path_exists_not_git"
         return result
     if (local / ".git").exists():
         proc = run(["git", "-C", str(local), "fetch", "--all", "--tags", "--prune"])
         result["clone_status"] = "fetched" if proc.returncode == 0 else "fetch_failed"
+        result["materialize_status"] = result["clone_status"]
         if proc.returncode != 0:
             result["error"] = (proc.stderr or proc.stdout).strip()[-1000:]
             return result
     else:
         proc = run(["git", "clone", repo["url"], str(local)])
         result["clone_status"] = "cloned" if proc.returncode == 0 else "clone_failed"
+        result["materialize_status"] = result["clone_status"]
         if proc.returncode != 0:
             result["error"] = (proc.stderr or proc.stdout).strip()[-1000:]
             return result
@@ -248,6 +421,54 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
         result["checkout_status"] = "kept_head_no_commit"
     result["checked_out_commit"] = git_head(local)
     return result
+
+
+def copy_extracted_archive(extract_root: Path, local: Path) -> None:
+    entries = [p for p in extract_root.iterdir() if p.name not in {"__MACOSX"}]
+    source = entries[0] if len(entries) == 1 and entries[0].is_dir() else extract_root
+    if local.exists():
+        shutil.rmtree(local)
+    shutil.copytree(source, local, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"), dirs_exist_ok=False)
+
+
+def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[str, Any]:
+    artifacts_root = root / "artifacts" / "fuzzbench-target-sources" / target
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+    local = artifacts_root / repo["dest"]
+    result: dict[str, Any] = dict(repo)
+    result["kind"] = "archive"
+    result["artifact_path"] = str(local)
+    if local.is_dir() and any(local.rglob("*")):
+        result["materialize_status"] = "cached"
+        return result
+    try:
+        with tempfile.TemporaryDirectory(prefix="hgb-source-", dir=str(artifacts_root)) as tmp_s:
+            tmp = Path(tmp_s)
+            archive_path = tmp / "source.archive"
+            urllib.request.urlretrieve(repo["url"], archive_path)
+            extract_root = tmp / "extract"
+            extract_root.mkdir()
+            if zipfile.is_zipfile(archive_path):
+                with zipfile.ZipFile(archive_path) as zf:
+                    zf.extractall(extract_root)
+            else:
+                with tarfile.open(archive_path) as tf:
+                    try:
+                        tf.extractall(extract_root, filter="data")
+                    except TypeError:
+                        tf.extractall(extract_root)
+            copy_extracted_archive(extract_root, local)
+        result["materialize_status"] = "extracted"
+    except Exception as exc:  # noqa: BLE001 - record best-effort source acquisition errors.
+        result["materialize_status"] = "archive_failed"
+        result["error"] = str(exc)[-1000:]
+    return result
+
+
+def materialize_source(repo: dict[str, str], target: str, commit: str, root: Path) -> dict[str, Any]:
+    if repo.get("kind") == "archive":
+        return materialize_archive(repo, target, root)
+    return materialize_repo(repo, target, commit, root)
 
 
 def likely_reference_harness(path: Path, root: Path) -> bool:
@@ -271,7 +492,7 @@ def likely_reference_harness(path: Path, root: Path) -> bool:
     return header_name_hint and path_hint
 
 
-def strip_reference_harnesses(source_full: Path, source_input: Path, reference_dir: Path, strip: bool) -> list[str]:
+def strip_reference_harnesses(source_full: Path, source_input: Path, reference_dir: Path, strip: bool, source_label: str = "source_full") -> list[str]:
     removed: list[str] = []
     if not source_full.exists():
         return removed
@@ -282,7 +503,7 @@ def strip_reference_harnesses(source_full: Path, source_input: Path, reference_d
         ref_target = reference_dir / rel
         ref_target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, ref_target)
-        removed.append(f"source_full/{rel.as_posix()}")
+        removed.append(f"{source_label}/{rel.as_posix()}")
         if strip:
             input_path = source_input / rel
             if input_path.exists():
@@ -359,6 +580,18 @@ def ensure_package_build_script(benchmark_copy: Path) -> str:
     build_sh.chmod(0o755)
     return "missing_stubbed_soft_skip"
 
+def count_source_files(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for p in path.rglob("*") if p.is_file() and p.suffix.lower() in SOURCE_EXTS)
+
+
+def count_named_files(path: Path, name: str) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for p in path.rglob(name) if p.is_file())
+
+
 def write_summary(output: Path, manifest: dict[str, Any]) -> None:
     lines = [
         "# HarnessGenBench Target Package",
@@ -368,7 +601,11 @@ def write_summary(output: Path, manifest: dict[str, Any]) -> None:
         f"- Fuzz target: `{manifest.get('fuzz_target', '')}`",
         f"- FuzzBench commit: `{manifest.get('fuzzbench_commit', 'unknown')}`",
         f"- Source status: `{manifest.get('source_status', 'unknown')}`",
+        f"- Source layout: `{manifest.get('source_layout', 'full')}`",
         f"- Source repositories: `{len(manifest.get('source_repos', []))}`",
+        f"- Source files: `{manifest.get('source_file_count', 0)}`",
+        f"- CMake files: `{manifest.get('cmake_file_count', 0)}`",
+        f"- Compile databases: `{manifest.get('compile_commands_count', 0)}`",
         f"- Reference harness files stripped/copied: `{len(manifest.get('reference_harness_files', []))}`",
         f"- Seed files: `{manifest.get('seed_count', 0)}`",
         f"- Dictionary/options files: `{manifest.get('dictionary_count', 0)}`",
@@ -376,49 +613,72 @@ def write_summary(output: Path, manifest: dict[str, Any]) -> None:
         "",
     ]
     if manifest.get("source_status") == "benchmark_only":
-        lines.append("No `git clone` commands were parsed from the FuzzBench Dockerfile, so the package contains the benchmark files only.")
+        lines.append("No source fetch commands were parsed from the FuzzBench Dockerfile, so the package contains benchmark files only.")
     elif manifest.get("source_status") == "partial":
-        lines.append("At least one source repository could not be cloned or copied. Downstream generators should soft-skip if source input is insufficient.")
+        lines.append("At least one source repository could not be materialized or copied. Downstream generators should soft-skip if source input is insufficient.")
+    elif manifest.get("source_layout") == "compact":
+        lines.append("Source repositories were materialized in the artifact cache and copied only to `source_input/`; `source_full/` is omitted to keep the workspace compact.")
     else:
         lines.append("Source repositories were materialized under `source_full/` and copied to `source_input/` for generator input.")
     (output / "HGB_TARGET_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def package_target(root: Path, target: str, output: Path) -> Path:
+def package_target(root: Path, target: str, output: Path, layout: str = "compact") -> Path:
+    if layout not in {"compact", "full"}:
+        raise SystemExit(f"unknown target package layout: {layout}")
     resolved = resolve_target(root, target)
     benchmark_dir = Path(resolved["benchmark_dir"])
     if not benchmark_dir.is_dir():
         raise SystemExit(f"missing FuzzBench benchmark directory: {benchmark_dir}")
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    for dirname in ("logs", "source_full", "source_input", "reference_harnesses", "docs", "seeds", "dictionary"):
-        (output / dirname).mkdir(parents=True, exist_ok=True)
+    (output / "logs").mkdir(parents=True, exist_ok=True)
+    for dirname in ("source_input", "reference_harnesses", "docs", "seeds", "dictionary"):
+        path = output / dirname
+        if path.exists():
+            shutil.rmtree(path)
+        path.mkdir(parents=True, exist_ok=True)
+    source_full = output / "source_full"
+    if layout == "full":
+        if source_full.exists():
+            shutil.rmtree(source_full)
+        source_full.mkdir(parents=True, exist_ok=True)
+    elif source_full.exists():
+        shutil.rmtree(source_full)
     benchmark_copy = output / "fuzzbench_benchmark"
     copy_tree(benchmark_dir, benchmark_copy)
     build_script_status = ensure_package_build_script(benchmark_copy)
-    repos = parse_clone_repos(benchmark_copy / "Dockerfile")
+    repos = parse_clone_repos(benchmark_copy / "Dockerfile", root, target)
     materialized: list[dict[str, Any]] = []
+    source_root = output / ("source_full" if layout == "full" else "source_input")
     for repo in repos:
-        record = materialize_repo(repo, target, resolved.get("commit", ""), root)
+        record = materialize_source(repo, target, resolved.get("commit", ""), root)
         materialized.append(record)
         local = Path(record.get("artifact_path", ""))
-        if record.get("clone_status") in {"cloned", "fetched"} and local.is_dir():
+        if record.get("materialize_status") in {"cloned", "fetched", "cached", "extracted"} and local.is_dir():
+            package_dst = source_root / repo["dest"]
             try:
-                copy_tree(local, output / "source_full" / repo["dest"])
-                record["copy_status"] = "copied_to_package"
+                copy_tree(local, package_dst)
+                record["copy_status"] = "copied_to_package" if layout == "full" else "copied_to_source_input"
+                record["package_path"] = package_dst.relative_to(output).as_posix()
             except OSError as exc:
                 record["copy_status"] = "copy_failed"
                 record["copy_error"] = str(exc)
     (output / "source_repos.json").write_text(json.dumps(materialized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    if any((output / "source_full").rglob("*")):
+    if layout == "full" and any((output / "source_full").rglob("*")):
         copy_tree(output / "source_full", output / "source_input")
     strip = os.environ.get("HGB_TARGET_STRIP_REFERENCE_HARNESS", "1") != "0"
-    reference_files = strip_reference_harnesses(output / "source_full", output / "source_input", output / "reference_harnesses", strip)
-    copy_selected_docs(output / "source_full", output / "docs")
+    source_label = "source_full" if layout == "full" else "source_input"
+    reference_files = strip_reference_harnesses(source_root, output / "source_input", output / "reference_harnesses", strip, source_label=source_label)
+    copy_selected_docs(source_root, output / "docs")
     seed_count, dictionary_count = copy_seeds_and_dicts(benchmark_copy, output / "seeds", output / "dictionary")
+    source_file_count = count_source_files(output / "source_input")
+    cmake_file_count = count_named_files(output / "source_input", "CMakeLists.txt")
+    compile_commands_count = count_named_files(output / "source_input", "compile_commands.json")
+    copied_statuses = {"copied_to_package", "copied_to_source_input"}
     if not repos:
         source_status = "benchmark_only"
-    elif all(r.get("copy_status") == "copied_to_package" for r in materialized):
+    elif all(r.get("copy_status") in copied_statuses for r in materialized):
         source_status = "materialized"
     else:
         source_status = "partial"
@@ -432,10 +692,15 @@ def package_target(root: Path, target: str, output: Path) -> Path:
         "fuzz_target": resolved.get("fuzz_target", ""),
         "commit": resolved.get("commit", ""),
         "commit_date": resolved.get("commit_date", ""),
+        "source_layout": layout,
         "source_status": source_status,
         "source_repos": materialized,
+        "source_artifact_paths": sorted({str(r.get("artifact_path", "")) for r in materialized if r.get("artifact_path")}),
+        "source_file_count": source_file_count,
+        "cmake_file_count": cmake_file_count,
+        "compile_commands_count": compile_commands_count,
         "source_input_dir": "source_input",
-        "source_full_dir": "source_full",
+        "source_full_dir": "source_full" if layout == "full" else "",
         "reference_harness_dir": "reference_harnesses",
         "reference_harness_files": reference_files,
         "seed_count": seed_count,
@@ -461,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
     package_parser = sub.add_parser("package")
     package_parser.add_argument("target")
     package_parser.add_argument("--output", required=True)
+    package_parser.add_argument("--layout", choices=("compact", "full"), default=os.environ.get("HGB_TARGET_PACKAGE_LAYOUT", "compact"))
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -478,7 +744,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{key}: {resolved.get(key, '')}")
         return 0
     if args.command == "package":
-        output = package_target(root, args.target, Path(args.output))
+        output = package_target(root, args.target, Path(args.output), layout=args.layout)
         print(output)
         return 0
     raise SystemExit(f"unknown command: {args.command}")

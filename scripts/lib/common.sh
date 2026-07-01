@@ -230,6 +230,7 @@ hgb_build_image() {
   local artifact_name="$2"
   local root="${3:-$(repo_root)}"
   local image latest dockerfile log_file out_dir code image_id
+  local build_args=()
   image="$(hgb_image_name "$fuzzer" "$artifact_name" "$root")"
   latest="hgb-$fuzzer:latest"
   dockerfile="$root/docker/$fuzzer/Dockerfile"
@@ -238,8 +239,14 @@ hgb_build_image() {
   log_file="$out_dir/logs/docker_build.log"
   require_docker
   [[ -f "$dockerfile" ]] || die "Missing Dockerfile: $dockerfile"
+  if [[ "$fuzzer" == "ckgfuzzer" ]]; then
+    build_args+=(--build-arg "HGB_INSTALL_CODEQL=${HGB_INSTALL_CODEQL:-0}")
+    if [[ -n "${CODEQL_CLI_URL:-}" ]]; then
+      build_args+=(--build-arg "CODEQL_CLI_URL=${CODEQL_CLI_URL}")
+    fi
+  fi
   code=0
-  docker build -f "$dockerfile" -t "$image" -t "$latest" "$root" >"$log_file" 2>&1 || code=$?
+  docker build "${build_args[@]}" -f "$dockerfile" -t "$image" -t "$latest" "$root" >"$log_file" 2>&1 || code=$?
   image_id="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
   {
     printf '{\n'
@@ -288,11 +295,15 @@ run_hgb_target_container() {
   local project="$6"
   local fuzz_target="$7"
   local root artifact_name generator_commit
+  local extra_docker_args=()
   shift 7
   root="$(repo_root)"
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
   ensure_dir "$workspace"
+  if [[ -n "${HGB_CODEQL_DIR:-}" ]]; then
+    extra_docker_args+=(-v "${HGB_CODEQL_DIR}:/opt/hgb/codeql-host:ro" -e HGB_CODEQL_DIR=/opt/hgb/codeql-host)
+  fi
   docker run --rm --init \
     --entrypoint /opt/hgb/entrypoint.sh \
     -e API_KEY \
@@ -314,6 +325,7 @@ run_hgb_target_container() {
     -e HGB_DRY_RUN="${HGB_DRY_RUN:-0}" \
     -e HGB_GENERATION_TIMEOUT_SECONDS="${HGB_GENERATION_TIMEOUT_SECONDS:-900}" \
     -e HGB_ALLOW_INPUT_GENERATOR_TO_RUN="${HGB_ALLOW_INPUT_GENERATOR_TO_RUN:-0}" \
+    -e HGB_SAVE_MODE="${HGB_SAVE_MODE:-compact}" \
     -e HGB_HOST_UID="$(id -u)" \
     -e HGB_HOST_GID="$(id -g)" \
     -v "$workspace:/workspace" \
@@ -322,6 +334,7 @@ run_hgb_target_container() {
     -v "$root/docker/$generator/entrypoint.sh:/opt/hgb/entrypoint.sh:ro" \
     -v "$root/docker/common:/opt/hgb/bin:ro" \
     -v "$root/metadata:/opt/hgb/metadata:ro" \
+    "${extra_docker_args[@]}" \
     "$@" \
     "$image" generate-target
 }

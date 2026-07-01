@@ -9,13 +9,14 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   bash scripts/hgb_prepare_target.sh TARGET
-  bash scripts/hgb_prepare_target.sh --target TARGET [--run-id ID] [--output PATH]
+  bash scripts/hgb_prepare_target.sh --target TARGET [--run-id ID] [--output PATH] [--layout compact|full]
 EOF
 }
 
 target=""
 run_id=""
 output=""
+layout="compact"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -29,6 +30,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --output)
       output="${2:-}"
+      shift 2
+      ;;
+    --layout)
+      layout="${2:-}"
       shift 2
       ;;
     -h|--help)
@@ -50,6 +55,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$target" ]] || { usage; exit 64; }
+[[ "$layout" == "compact" || "$layout" == "full" ]] || die "--layout must be compact or full"
 
 root="$(repo_root)"
 load_hgb_config
@@ -63,4 +69,4 @@ if [[ -z "$output" ]]; then
   output="$(hgb_workspace_dir "$root")/targets/$target/$run_id"
 fi
 
-python3 "$SCRIPT_DIR/hgb_targets.py" package "$target" --output "$output"
+python3 "$SCRIPT_DIR/hgb_targets.py" package "$target" --output "$output" --layout "$layout"

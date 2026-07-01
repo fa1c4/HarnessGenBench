@@ -115,6 +115,18 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
+  if [[ -n "${HGB_CODEQL_DIR:-}" ]]; then
+    if [[ -x "$HGB_CODEQL_DIR/codeql" ]]; then
+      export PATH="$HGB_CODEQL_DIR:$PATH"
+    elif [[ -x "$HGB_CODEQL_DIR/codeql/codeql" ]]; then
+      export PATH="$HGB_CODEQL_DIR/codeql:$PATH"
+    fi
+  fi
+  if [[ -x /opt/codeql/codeql/codeql ]]; then
+    export PATH="/opt/codeql/codeql:$PATH"
+  elif [[ -x /opt/codeql/codeql ]]; then
+    export PATH="/opt/codeql:$PATH"
+  fi
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
   safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"

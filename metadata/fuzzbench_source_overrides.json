@@ -1,0 +1,9 @@
+{
+  "sqlite3_ossfuzz": [
+    {
+      "dest": "sqlite3",
+      "kind": "archive",
+      "url": "https://sqlite.org/src/tarball/sqlite.tar.gz?r=c78cbf2e86850cc6"
+    }
+  ]
+}

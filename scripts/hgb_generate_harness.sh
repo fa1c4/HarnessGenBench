@@ -16,6 +16,9 @@ Options:
       --target-package PATH  reuse an existing prepared target package
       --run-id ID            explicit run id
       --dry-run              validate and write metadata without expensive generation
+      --layout compact|full  target package layout when preparing a package (default: compact)
+      --save-mode compact|debug
+                             compact removes duplicate transient outputs; debug preserves them
       --timeout SECONDS      generation timeout passed into the container
       --allow-input-generator
                              allow ELFuzz/G2FUZZ input-generation baselines to run
@@ -29,6 +32,8 @@ run_id=""
 timeout_seconds="${HGB_GENERATION_TIMEOUT_SECONDS:-900}"
 dry_run=0
 allow_input_generator=0
+target_layout="compact"
+save_mode="compact"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -52,6 +57,14 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --layout|--target-layout)
+      target_layout="${2:-}"
+      shift 2
+      ;;
+    --save-mode)
+      save_mode="${2:-}"
+      shift 2
+      ;;
     --timeout)
       timeout_seconds="${2:-}"
       shift 2
@@ -73,6 +86,8 @@ done
 [[ -n "$generator" && -n "$target" ]] || { usage; exit 64; }
 valid_hgb_generator "$generator" || die "unknown generator: $generator"
 [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
+[[ "$target_layout" == "compact" || "$target_layout" == "full" ]] || die "--layout must be compact or full"
+[[ "$save_mode" == "compact" || "$save_mode" == "debug" ]] || die "--save-mode must be compact or debug"
 
 root="$(repo_root)"
 load_hgb_config
@@ -86,7 +101,7 @@ ensure_artifacts_present "$root" "${artifacts[@]}"
 
 run_id="${run_id:-$(make_timestamp)}"
 if [[ -z "$target_package" ]]; then
-  target_package="$(bash "$SCRIPT_DIR/hgb_prepare_target.sh" --target "$target" --run-id "$run_id")"
+  target_package="$(bash "$SCRIPT_DIR/hgb_prepare_target.sh" --target "$target" --run-id "$run_id" --layout "$target_layout")"
 fi
 target_package="$(cd "$target_package" && pwd)"
 manifest="$target_package/target_manifest.json"
@@ -115,11 +130,14 @@ fi
   printf 'target_package=%s\n' "$target_package"
   printf 'workspace=%s\n' "$workspace"
   printf 'image=%s\n' "$image"
+  printf 'target_layout=%s\n' "$target_layout"
+  printf 'save_mode=%s\n' "$save_mode"
 } >"$workspace/host_command.txt"
 
 export HGB_DRY_RUN="$dry_run"
 export HGB_GENERATION_TIMEOUT_SECONDS="$timeout_seconds"
 export HGB_ALLOW_INPUT_GENERATOR_TO_RUN="$allow_input_generator"
+export HGB_SAVE_MODE="$save_mode"
 
 code=0
 run_hgb_target_container "$image" "$workspace" "$generator" "$target" "$target_package" "$project" "$fuzz_target" || code=$?
@@ -131,7 +149,7 @@ if [[ "$code" -eq 64 && ! -f "$workspace/metadata.json" ]]; then
 fi
 status="$(extract_json_string status "$workspace/metadata.json")"
 case "$status" in
-  not_harness_generator|needs_ofg_benchmark_yaml|no_api_candidates|missing_codeql|upstream_cli_not_found|needs_compile_commands|target_not_supported_by_elfuzz|soft_skip|dry_run_ok)
+  not_harness_generator|needs_ofg_benchmark_yaml|no_api_candidates|missing_codeql|upstream_cli_not_found|needs_compile_commands|target_not_supported_by_elfuzz|not_applicable|partial_completed|soft_skip|dry_run_ok)
     code=0
     ;;
 esac

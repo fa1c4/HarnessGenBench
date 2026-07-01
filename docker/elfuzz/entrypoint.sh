@@ -88,7 +88,7 @@ if [[ "$mode" == "generate-target" ]]; then
     recognized=1
   fi
   if [[ "$recognized" != "1" ]]; then
-    hgb_soft_skip target_not_supported_by_elfuzz 'ELFuzz CLI did not report support for this FuzzBench target name' input_generator
+    hgb_soft_skip not_applicable 'ELFuzz CLI did not report support for this FuzzBench target name' input_generator
   fi
   printf 'elfuzz synth/produce for %s\n' "$target_name" >"$workspace/command.txt"
   code=0
