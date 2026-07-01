@@ -1,127 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
-extract_json_string() {
-  local key="$1"
-  local file="$2"
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
-}
-
-extract_json_number() {
-  local key="$1"
-  local file="$2"
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" | head -n 1
-}
-
-extract_command_value() {
-  local flag="$1"
-  local file="$2"
-  sed -n "s/.*$flag[[:space:]]\([^[:space:]]*\).*/\1/p" "$file" | head -n 1
-}
-
-count_matches() {
-  local dir="$1"
-  shift
-  find "$dir" "$@" 2>/dev/null | wc -l | tr -d ' '
-}
-
-print_paths() {
-  local dir="$1"
-  shift
-  find "$dir" "$@" 2>/dev/null | sort | sed "s#^$dir/##" | head -n 40
-}
-
 main() {
-  local run_dir metadata_file summary_file root model benchmark_yaml upstream_commit exit_code
-  local log_count harness_count report_count coverage_count introspector_count crash_count
-  local build_status runtime_status
-
+  local root run_dir metadata summary fuzzer title status reason commit code model target api_key_present
+  local log_count generated_count crash_count hang_count queue_count
   root="$(repo_root)"
+  fuzzer="oss-fuzz-gen"
+  title="OSS-Fuzz-Gen"
   run_dir="${1:-}"
-  [[ -n "$run_dir" ]] || die "Usage: bash scripts/oss_fuzz_gen_collect_report.sh results/oss-fuzz-gen/<run-dir>"
+  if [[ -z "$run_dir" ]]; then
+    run_dir="$(latest_workspace_run "$fuzzer" "$root")"
+  fi
+  [[ -n "$run_dir" ]] || die "No workspace run found for $fuzzer"
   [[ "$run_dir" = /* ]] || run_dir="$root/$run_dir"
   [[ -d "$run_dir" ]] || die "Run directory not found: $run_dir"
+  metadata="$run_dir/metadata.json"
+  summary="$run_dir/HGB_SUMMARY.md"
 
-  metadata_file="$run_dir/metadata.json"
-  summary_file="$run_dir/HGB_SUMMARY.md"
-
-  model="unknown"
-  benchmark_yaml="unknown"
-  upstream_commit="unknown"
-  exit_code="unknown"
-  if [[ -f "$metadata_file" ]]; then
-    model="$(extract_json_string model "$metadata_file")"
-    benchmark_yaml="$(extract_json_string benchmark_yaml "$metadata_file")"
-    upstream_commit="$(extract_json_string upstream_commit "$metadata_file")"
-    exit_code="$(extract_json_number exit_code "$metadata_file")"
-    [[ -n "$model" ]] || model="unknown"
-    [[ -n "$benchmark_yaml" ]] || benchmark_yaml="unknown"
-    [[ -n "$upstream_commit" ]] || upstream_commit="unknown"
-    [[ -n "$exit_code" ]] || exit_code="unknown"
-  else
-    if [[ -f "$run_dir/command.txt" ]]; then
-      benchmark_yaml="$(extract_command_value '--benchmark-yaml' "$run_dir/command.txt")"
-      [[ -n "$benchmark_yaml" ]] || benchmark_yaml="$(extract_command_value '-y' "$run_dir/command.txt")"
-      model="$(extract_command_value '--model' "$run_dir/command.txt")"
-      [[ -n "$model" ]] || model="$(extract_command_value '-l' "$run_dir/command.txt")"
-    fi
-    if [[ -d "$root/external/oss-fuzz-gen/.git" ]]; then
-      upstream_commit="$(git -C "$root/external/oss-fuzz-gen" rev-parse HEAD 2>/dev/null || true)"
-    fi
-    [[ -n "$model" ]] || model="unknown"
-    [[ -n "$benchmark_yaml" ]] || benchmark_yaml="unknown"
-    [[ -n "$upstream_commit" ]] || upstream_commit="unknown"
+  status="unknown"; reason="none"; commit="unknown"; code="unknown"; model="unknown"; target="unknown"; api_key_present="unknown"
+  if [[ -f "$metadata" ]]; then
+    status="$(extract_json_string status "$metadata")"; [[ -n "$status" ]] || status="unknown"
+    reason="$(extract_json_string reason "$metadata")"; [[ -n "$reason" ]] || reason="none"
+    commit="$(extract_json_string upstream_commit "$metadata")"; [[ -n "$commit" ]] || commit="unknown"
+    code="$(extract_json_number exit_code "$metadata")"; [[ -n "$code" ]] || code="$(extract_json_number afl_exit_code "$metadata")"; [[ -n "$code" ]] || code="unknown"
+    model="$(extract_json_string model "$metadata")"; [[ -n "$model" ]] || model="unknown"
+    target="$(extract_json_string target "$metadata")"; [[ -n "$target" ]] || target="$(extract_json_string program "$metadata")"; [[ -n "$target" ]] || target="unknown"
+    api_key_present="$(sed -n 's/.*"api_key_present"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$metadata" | head -n 1)"; [[ -n "$api_key_present" ]] || api_key_present="unknown"
   fi
 
-  log_count="$(count_matches "$run_dir" -type f -name '*.log')"
-  harness_count="$(count_matches "$run_dir" -type f \( -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name '*fuzz*.c' \))"
-  report_count="$(count_matches "$run_dir" -type f \( -name '*.html' -o -name '*.md' -o -name '*.json' \))"
-  coverage_count="$(count_matches "$run_dir" -type f \( -iname '*coverage*' -o -name '*.profdata' -o -name '*.profraw' -o -name '*.sancov' \))"
-  introspector_count="$(count_matches "$run_dir" -type f \( -iname '*introspector*' -o -path '*/fuzz-introspector/*' \))"
-  crash_count="$(count_matches "$run_dir" -type f \( -path '*/crashes/*' -o -iname '*crash*' \))"
+  log_count="$(count_files "$run_dir/logs" -type f)"
+  generated_count="$(count_files "$run_dir" -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'driver_*.c' \))"
+  queue_count="$(count_files "$run_dir" -type f -path '*/queue/*')"
+  crash_count="$(count_files "$run_dir" -type f -path '*/crashes/*' ! -name README.txt)"
+  hang_count="$(count_files "$run_dir" -type f -path '*/hangs/*' ! -name README.txt)"
 
-  build_status="unknown"
-  runtime_status="unknown"
-  if grep -RqiE 'build succeeded|build success|successfully built' "$run_dir" 2>/dev/null; then
-    build_status="success observed"
-  elif grep -RqiE 'build failed|failed to build|compile error|compilation failed' "$run_dir" 2>/dev/null; then
-    build_status="failure observed"
-  fi
-
-  if grep -RqiE 'crash|runtime error|timeout|oom' "$run_dir" 2>/dev/null; then
-    runtime_status="runtime issue mentioned in logs"
-  elif grep -RqiE 'run succeeded|finished fuzzing|execution finished' "$run_dir" 2>/dev/null; then
-    runtime_status="success observed"
+  if [[ "$reason" == "none" && -d "$run_dir/logs" ]] && grep -RqiE 'OPENAI_API_KEY|api key|unauthorized|authentication|quota|model|docker|permission|not found|error|failed|traceback|target binaries' "$run_dir/logs" 2>/dev/null; then
+    reason="$(grep -RihE 'OPENAI_API_KEY|api key|unauthorized|authentication|quota|model|docker|permission|not found|error|failed|traceback|target binaries' "$run_dir/logs" 2>/dev/null | head -n 1)"
   fi
 
   {
-    printf '# HarnessGenBench OSS-Fuzz-Gen Summary\n\n'
+    printf '# HarnessGenBench %s Summary\n\n' "$title"
     printf -- '- Run directory: `%s`\n' "$run_dir"
-    printf -- '- Upstream commit: `%s`\n' "$upstream_commit"
-    printf -- '- Benchmark YAML: `%s`\n' "$benchmark_yaml"
+    printf -- '- Upstream commit: `%s`\n' "$commit"
+    printf -- '- Status: `%s`\n' "$status"
+    printf -- '- Exit code: `%s`\n' "$code"
+    printf -- '- Target/program: `%s`\n' "$target"
     printf -- '- Model: `%s`\n' "$model"
-    printf -- '- Exit code: `%s`\n' "$exit_code"
-    printf -- '- Build status: %s\n' "$build_status"
-    printf -- '- Runtime status: %s\n' "$runtime_status"
-    printf -- '- Runtime crash artifact count: %s\n' "$crash_count"
+    printf -- '- API key present: `%s`\n' "$api_key_present"
     printf -- '- Log files: %s\n' "$log_count"
-    printf -- '- Generated harness candidates: %s\n' "$harness_count"
-    printf -- '- Report artifact candidates: %s\n' "$report_count"
-    printf -- '- Coverage artifact candidates: %s\n' "$coverage_count"
-    printf -- '- Fuzz Introspector artifact candidates: %s\n' "$introspector_count"
+    printf -- '- Generated harness candidates: %s\n' "$generated_count"
+    printf -- '- Queue/crash/hang counts: queue=%s, crashes=%s, hangs=%s\n' "$queue_count" "$crash_count" "$hang_count"
+    printf -- '- Top failure reason: %s\n' "$reason"
     printf '\n## Logs\n\n'
-    print_paths "$run_dir" -type f -name '*.log' | sed 's/^/- `/' | sed 's/$/`/'
-    printf '\n## Generated Harness Candidates\n\n'
-    print_paths "$run_dir" -type f \( -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name '*fuzz*.c' \) | sed 's/^/- `/' | sed 's/$/`/'
-    printf '\n## Coverage And Introspector Candidates\n\n'
-    print_paths "$run_dir" -type f \( -iname '*coverage*' -o -iname '*introspector*' -o -path '*/fuzz-introspector/*' -o -name '*.profdata' -o -name '*.sancov' \) | sed 's/^/- `/' | sed 's/$/`/'
-  } >"$summary_file"
-
-  log "Wrote $summary_file"
+    list_files "$run_dir/logs" -type f | sort | sed "s#^$run_dir/##" | sed 's/^/- `/' | sed 's/$/`/'
+    printf '\n## Generated Artifacts\n\n'
+    list_files "$run_dir" -maxdepth 4 -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'driver_*.c' -o -name 'TARGET_BUILD_MISSING.md' \) | sort | sed "s#^$run_dir/##" | head -100 | sed 's/^/- `/' | sed 's/$/`/'
+  } >"$summary"
+  log "Wrote $summary"
 }
-
 main "$@"

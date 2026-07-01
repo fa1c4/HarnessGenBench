@@ -1,98 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
-
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
-extract_json_string() {
-  local key="$1"
-  local file="$2"
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
-}
-
-extract_stage_code() {
-  local key="$1"
-  local file="$2"
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" | head -n 1
-}
-
-count_files() {
-  local dir="$1"
-  shift
-  find "$dir" "$@" 2>/dev/null | wc -l | tr -d ' '
-}
-
 main() {
-  local root run_dir metadata_file summary_file project model repo_code preproc_code fuzzing_code
-  local api_count driver_count compile_pass_count compile_fail_count input_status failed_stages
-
+  local root run_dir metadata summary fuzzer title status reason commit code model target api_key_present
+  local log_count generated_count crash_count hang_count queue_count
   root="$(repo_root)"
+  fuzzer="ckgfuzzer"
+  title="CKGFuzzer"
   run_dir="${1:-}"
-  [[ -n "$run_dir" ]] || die "Usage: bash scripts/ckgfuzzer_collect_report.sh results/ckgfuzzer/<run-dir>"
+  if [[ -z "$run_dir" ]]; then
+    run_dir="$(latest_workspace_run "$fuzzer" "$root")"
+  fi
+  [[ -n "$run_dir" ]] || die "No workspace run found for $fuzzer"
   [[ "$run_dir" = /* ]] || run_dir="$root/$run_dir"
   [[ -d "$run_dir" ]] || die "Run directory not found: $run_dir"
+  metadata="$run_dir/metadata.json"
+  summary="$run_dir/HGB_SUMMARY.md"
 
-  metadata_file="$run_dir/metadata.json"
-  summary_file="$run_dir/HGB_SUMMARY.md"
-  project="unknown"
-  model="unknown"
-  repo_code="unknown"
-  preproc_code="unknown"
-  fuzzing_code="unknown"
-  if [[ -f "$metadata_file" ]]; then
-    project="$(extract_json_string project "$metadata_file")"
-    model="$(extract_json_string model "$metadata_file")"
-    repo_code="$(extract_stage_code repo "$metadata_file")"
-    preproc_code="$(extract_stage_code preproc "$metadata_file")"
-    fuzzing_code="$(extract_stage_code fuzzing "$metadata_file")"
-    [[ -n "$project" ]] || project="unknown"
-    [[ -n "$model" ]] || model="unknown"
-    [[ -n "$repo_code" ]] || repo_code="unknown"
-    [[ -n "$preproc_code" ]] || preproc_code="unknown"
-    [[ -n "$fuzzing_code" ]] || fuzzing_code="unknown"
+  status="unknown"; reason="none"; commit="unknown"; code="unknown"; model="unknown"; target="unknown"; api_key_present="unknown"
+  if [[ -f "$metadata" ]]; then
+    status="$(extract_json_string status "$metadata")"; [[ -n "$status" ]] || status="unknown"
+    reason="$(extract_json_string reason "$metadata")"; [[ -n "$reason" ]] || reason="none"
+    commit="$(extract_json_string upstream_commit "$metadata")"; [[ -n "$commit" ]] || commit="unknown"
+    code="$(extract_json_number exit_code "$metadata")"; [[ -n "$code" ]] || code="$(extract_json_number afl_exit_code "$metadata")"; [[ -n "$code" ]] || code="unknown"
+    model="$(extract_json_string model "$metadata")"; [[ -n "$model" ]] || model="unknown"
+    target="$(extract_json_string target "$metadata")"; [[ -n "$target" ]] || target="$(extract_json_string program "$metadata")"; [[ -n "$target" ]] || target="unknown"
+    api_key_present="$(sed -n 's/.*"api_key_present"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p' "$metadata" | head -n 1)"; [[ -n "$api_key_present" ]] || api_key_present="unknown"
   fi
 
-  api_count=0
-  if [[ -f "$run_dir/generated/api_list.json" ]]; then
-    api_count="$(grep -E '"[^"]+"' "$run_dir/generated/api_list.json" | wc -l | tr -d ' ')"
-  fi
-  driver_count="$(count_files "$run_dir" -type f \( -name 'driver_*.c' -o -name 'driver_*.cc' -o -name '*fuzz*.c' -o -name '*fuzz*.cc' \))"
-  compile_pass_count="$(count_files "$run_dir/generated" -type d -name '*compilation_pass*')"
-  compile_fail_count="$(grep -RciE 'compilation failed|compile error|error:' "$run_dir/logs" 2>/dev/null | awk -F: '{s += $2} END {print s + 0}')"
-  input_status="unknown"
-  if grep -Rqi 'Generate Input' "$run_dir/logs" 2>/dev/null; then
-    input_status="attempted"
-  fi
-  if grep -RqiE 'skip generate input|Skip Generate Input' "$run_dir/logs" 2>/dev/null; then
-    input_status="skipped"
-  fi
+  log_count="$(count_files "$run_dir/logs" -type f)"
+  generated_count="$(count_files "$run_dir" -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'driver_*.c' \))"
+  queue_count="$(count_files "$run_dir" -type f -path '*/queue/*')"
+  crash_count="$(count_files "$run_dir" -type f -path '*/crashes/*' ! -name README.txt)"
+  hang_count="$(count_files "$run_dir" -type f -path '*/hangs/*' ! -name README.txt)"
 
-  failed_stages=""
-  [[ "$repo_code" =~ ^[0-9]+$ && "$repo_code" -ne 0 ]] && failed_stages="${failed_stages} repo"
-  [[ "$preproc_code" =~ ^[0-9]+$ && "$preproc_code" -ne 0 ]] && failed_stages="${failed_stages} preproc"
-  [[ "$fuzzing_code" =~ ^[0-9]+$ && "$fuzzing_code" -ne 0 ]] && failed_stages="${failed_stages} fuzzing"
-  [[ -n "$failed_stages" ]] || failed_stages=" none"
+  if [[ "$reason" == "none" && -d "$run_dir/logs" ]] && grep -RqiE 'OPENAI_API_KEY|api key|unauthorized|authentication|quota|model|docker|permission|not found|error|failed|traceback|target binaries' "$run_dir/logs" 2>/dev/null; then
+    reason="$(grep -RihE 'OPENAI_API_KEY|api key|unauthorized|authentication|quota|model|docker|permission|not found|error|failed|traceback|target binaries' "$run_dir/logs" 2>/dev/null | head -n 1)"
+  fi
 
   {
-    printf '# HarnessGenBench CKGFuzzer Summary\n\n'
+    printf '# HarnessGenBench %s Summary\n\n' "$title"
     printf -- '- Run directory: `%s`\n' "$run_dir"
-    printf -- '- Project: `%s`\n' "$project"
+    printf -- '- Upstream commit: `%s`\n' "$commit"
+    printf -- '- Status: `%s`\n' "$status"
+    printf -- '- Exit code: `%s`\n' "$code"
+    printf -- '- Target/program: `%s`\n' "$target"
     printf -- '- Model: `%s`\n' "$model"
-    printf -- '- APIs analyzed: %s\n' "$api_count"
-    printf -- '- Generated driver candidates: %s\n' "$driver_count"
-    printf -- '- Compile pass directory count: %s\n' "$compile_pass_count"
-    printf -- '- Compile failure mentions: %s\n' "$compile_fail_count"
-    printf -- '- Input generation status: %s\n' "$input_status"
-    printf -- '- Stage exit codes: repo=`%s`, preproc=`%s`, fuzzing=`%s`\n' "$repo_code" "$preproc_code" "$fuzzing_code"
-    printf -- '- Failed stages:%s\n' "$failed_stages"
+    printf -- '- API key present: `%s`\n' "$api_key_present"
+    printf -- '- Log files: %s\n' "$log_count"
+    printf -- '- Generated harness candidates: %s\n' "$generated_count"
+    printf -- '- Queue/crash/hang counts: queue=%s, crashes=%s, hangs=%s\n' "$queue_count" "$crash_count" "$hang_count"
+    printf -- '- Top failure reason: %s\n' "$reason"
     printf '\n## Logs\n\n'
-    find "$run_dir/logs" -type f -name '*.log' 2>/dev/null | sort | sed "s#^$run_dir/##" | sed 's/^/- `/' | sed 's/$/`/'
+    list_files "$run_dir/logs" -type f | sort | sed "s#^$run_dir/##" | sed 's/^/- `/' | sed 's/$/`/'
     printf '\n## Generated Artifacts\n\n'
-    find "$run_dir/generated" -maxdepth 3 -type f 2>/dev/null | sort | sed "s#^$run_dir/##" | head -80 | sed 's/^/- `/' | sed 's/$/`/'
-  } >"$summary_file"
-
-  log "Wrote $summary_file"
+    list_files "$run_dir" -maxdepth 4 -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'driver_*.c' -o -name 'TARGET_BUILD_MISSING.md' \) | sort | sed "s#^$run_dir/##" | head -100 | sed 's/^/- `/' | sed 's/$/`/'
+  } >"$summary"
+  log "Wrote $summary"
 }
-
 main "$@"

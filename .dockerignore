@@ -1,0 +1,25 @@
+# Local secrets and legacy host state
+.env
+*.env
+configs/set_api_key.sh
+external/
+results/
+workspace/
+plans/
+tmp/
+
+# VCS/editor/build noise
+**/__pycache__/
+**/*.pyc
+.vscode/
+.idea/
+.DS_Store
+
+# Large fuzzing outputs that should never enter image build context
+**/queue/
+**/crashes/
+**/hangs/
+**/corpus/
+**/*.profraw
+**/*.profdata
+**/*.sancov

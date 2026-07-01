@@ -1,37 +1,11 @@
 # PromeFuzz Config Notes
 
-Generated configs are copied from `external/PromeFuzz/config.template.toml` into `results/promefuzz/config_*/config.toml` and patched non-interactively.
+The Docker reproduction no longer writes persistent TOML files containing LLM settings under `results/` or `workspace/`.
 
-No API key is written to the TOML file. `api_key = ""` is preserved so PromeFuzz reads `OPENAI_API_KEY` from the environment at runtime.
+At container runtime, `docker/promefuzz/entrypoint.sh` derives a temporary config at `/run/hgb/promefuzz_config.toml` from Docker environment variables:
 
-```diff
-[comprehender]
--embedding_llm = "embedding_llm"
--comprehension_llm = ""
-+embedding_llm = "hgb_embedding"
-+comprehension_llm = "hgb_cloud"
+- `API_KEY` / `OPENAI_API_KEY`
+- `BASE_URL` / `OPENAI_BASE_URL`
+- `MODEL` / `OPENAI_MODEL`
 
-[generator]
--generation_llm = ""
-+generation_llm = "hgb_cloud"
-
-[analyzer]
--analysis_llm = ""
-+analysis_llm = "hgb_cloud"
-
-[llm]
--default_llm = "cloud_llm"
-+default_llm = "hgb_cloud"
-
-+[llm.hgb_cloud]
-+llm_type = "openai"
-+base_url = "https://api.openai.com/v1/"
-+api_key = ""
-+model = "gpt-4o-mini"
-
-+[llm.hgb_embedding]
-+llm_type = "openai"
-+base_url = "https://api.openai.com/v1/"
-+api_key = ""
-+model = "text-embedding-3-small"
-```
+Metadata records only `api_key_present`, never the key value.

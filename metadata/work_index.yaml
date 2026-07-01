@@ -1,44 +1,45 @@
-generated_at: "2026-06-30T08:34:57Z"
+generated_at: "2026-07-01T02:14:09Z"
+artifact_root: "artifacts"
 works:
   oss-fuzz-gen:
     repo: "https://github.com/google/oss-fuzz-gen.git"
-    path: "external/oss-fuzz-gen"
+    path: "artifacts/oss-fuzz-gen"
     commit: "c0982c5d40a7e93ce70fd319705804b9a29954d0"
-    date: "2026-06-30T08:35:15Z"
+    checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "engineering_artifact"
     optional: false
   ckgfuzzer:
     repo: "https://github.com/security-pride/CKGFuzzer.git"
-    path: "external/CKGFuzzer"
+    path: "artifacts/ckgfuzzer"
     commit: "bb50d2fd81c19b82cdbf6f96832097705decd57e"
-    date: "2026-06-30T08:35:40Z"
+    checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "paper_artifact"
     optional: false
   promefuzz:
     repo: "https://github.com/pvz122/PromeFuzz.git"
-    path: "external/PromeFuzz"
+    path: "artifacts/promefuzz"
     commit: "427337fe7e220417ad8a93f42f3fc73edba19110"
-    date: "2026-06-30T08:35:53Z"
+    checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "paper_artifact"
     optional: false
   elfuzz:
     repo: "https://github.com/OSUSecLab/elfuzz.git"
-    path: "external/elfuzz"
+    path: "artifacts/elfuzz"
     commit: "fc6841bb12bb21e1f1144303ccf31d4120de0067"
-    date: "2026-06-30T08:36:07Z"
+    checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "paper_artifact"
     optional: false
   g2fuzz:
     repo: "https://github.com/G2FUZZ/G2FUZZ.git"
-    path: "external/G2FUZZ"
+    path: "artifacts/g2fuzz"
     commit: "f62cc550c0cdc715bc960937d3017fcb1e5c11bc"
-    date: "2026-06-30T08:36:21Z"
+    checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "paper_artifact"
     optional: false
   g2fuzz-data:
     repo: "https://github.com/G2FUZZ/G2FUZZ-DATA.git"
-    path: "external/G2FUZZ-DATA"
+    path: "artifacts/g2fuzz-data"
     commit: "e2aa979c0fd81dd75a47905c3996412219f6cc2f"
-    date: "2026-06-30T08:39:01Z"
+    checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "dataset"
     optional: true

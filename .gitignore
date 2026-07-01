@@ -1,6 +1,6 @@
 # Harness Gen Bench ignore files & dirs
 plans/
-
+workspace/
 
 
 # HarnessGenBench scaffold
@@ -16,14 +16,22 @@ openai_key.txt
 *.key
 *.json.credentials
 
+
+# HarnessGenBench tracked placeholders and local config policy
+!configs/
+!configs/.gitkeep
+!configs/set_api_key.example.sh
+configs/set_api_key.sh
+
 # External projects and generated data
 /external/
 /results/**
-!/results/.gitkeep
 /artifacts/**
-!/artifacts/.gitkeep
-/workspace/
+/workspace/**
 /tmp/
+!/artifacts/.gitkeep
+!/workspace/.gitkeep
+!/results/.gitkeep
 
 # Fuzzing outputs
 crashes/
