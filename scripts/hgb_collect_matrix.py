@@ -16,11 +16,17 @@ SOFT_STATUSES = {
     "needs_ofg_benchmark_yaml",
     "no_api_candidates",
     "missing_codeql",
+    "missing_processor_binaries",
     "upstream_cli_not_found",
     "needs_compile_commands",
     "source_input_missing",
     "soft_skip",
     "soft_skip_target_binaries_missing",
+    "elfuzz_missing_hf_token_or_model_access",
+    "promefuzz_no_usable_docs",
+    "promefuzz_no_api_candidates",
+    "ckg_no_compilable_sources",
+    "missing_oss_fuzz_checkout",
 }
 PARTIAL_STATUSES = {"partial_completed"}
 NOT_APPLICABLE_STATUSES = {"not_applicable", "target_not_supported_by_elfuzz"}
@@ -35,7 +41,19 @@ TRANSIENT_DIR_NAMES = {
 }
 
 REMEDIATIONS = (
+    ('program_gen timed out after preserving', 'G2Fuzz produced preseeded or generated inputs before timeout; accept partial_completed or increase HGB_GENERATION_TIMEOUT_SECONDS.'),
+    ('ELFuzz TGI startup timed out', 'Set HF_TOKEN/model access, verify Docker can start TGI, or lower ELFUZZ_TGI_WAITING_SECONDS for cached models.'),
+    ('elfuzz_missing_hf_token_or_model_access', 'Set HF_TOKEN, configure elfuzz tgi.huggingface_token, or set ELFUZZ_LOCAL_MODEL_CACHE_READY=1 only when the model is already cached and accessible.'),
+    ('PromeFuzz NLTK data is unavailable', 'Rebuild the PromeFuzz image so NLTK data is downloaded into /opt/hgb/nltk_data during docker build.'),
+    ('PromeFuzz PDF document parsing failed', 'Rebuild the PromeFuzz image with pdfminer.six or remove unsupported PDFs from /target/docs.'),
+    ('promefuzz_no_usable_docs', 'Filter or replace empty/invalid target docs; PROME_FUZZ_SKIP_BAD_DOCS=1 skips bad docs but at least one usable document is needed for comprehension.'),
+    ('promefuzz_no_api_candidates', 'Improve PromeFuzz API extraction/compile_commands for this target; generation is skipped when preprocess finds zero APIs.'),
+    ('CKGFuzzer fuzzing stage exited 124', 'Reduce CKGFUZZER_MAX_SUMMARY_APIS/CKGFUZZER_MAX_PLANNER_APIS or keep deterministic local summaries enabled.'),
+    ('CKGFuzzer repo stage exited', 'Inspect CKGFuzzer repo.log; common fixes are Docker socket access, CodeQL wrapper build replay, and target package source layout.'),
+    ('ckg_no_compilable_sources', 'Fix target build replay for CKGFuzzer or inspect the CodeQL wrapper fallback compile log; CodeQL needs at least one compiled C/C++ translation unit.'),
+    ('missing_oss_fuzz_checkout', 'Rebuild OSS-Fuzz-Gen with OFG_INSTALL_OSS_FUZZ=1, set OFG_OSS_FUZZ_DIR to a valid checkout, or set OFG_ALLOW_RUNTIME_CLONE=1 when network is available.'),
     ("missing_codeql", "Mount or install CodeQL: set HGB_CODEQL_DIR=/path/to/codeql or build CKGFuzzer with HGB_INSTALL_CODEQL=1; use CKGFUZZER_SKIP_CODEQL=1 only as a fallback."),
+    ("missing_processor_binaries", "Rebuild the PromeFuzz image so setup.sh builds preprocessor and cgprocessor during docker build."),
     ("needs_compile_commands", "Improve target package build replay or enable Bear/CMake compile_commands generation for PromeFuzz."),
     ("needs_ofg_benchmark_yaml", "Generate or provide an OSS-Fuzz-Gen function-level benchmark YAML for this target."),
     ("no_api_candidates", "Improve source packaging/API extraction for this target before running function-level harness generators."),
@@ -44,6 +62,7 @@ REMEDIATIONS = (
     ("target_not_supported_by_elfuzz", "Treat this pair as unsupported by ELFuzz unless a target adapter or supported-target mapping is added."),
     ("program_gen timed out", "Increase HGB_GENERATION_TIMEOUT_SECONDS or accept partial_completed G2FUZZ inputs."),
     ("program_gen exited 124", "Increase HGB_GENERATION_TIMEOUT_SECONDS or classify generated seeds as partial_completed."),
+    ("oss-fuzz Python requirements install failed", "Rebuild OSS-Fuzz-Gen with native Python build dependencies; inspect run.log for the failing pip package."),
     ("run_all_experiments exited", "Inspect OSS-Fuzz-Gen run.log; common fixes are writable --oss-fuzz-dir and generated benchmark YAML."),
     ("PromeFuzz stage exited", "Inspect the failing PromeFuzz stage log; ensure runtime artifact is writable and compile_commands.json is valid."),
 )

@@ -17,6 +17,49 @@ mkdir -p "$workspace/logs"
 json_escape() { local v="${1:-}"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//$'\n'/\\n}"; printf '%s' "$v"; }
 count_files() { local d="$1"; shift || true; [[ -d "$d" ]] || { printf '0'; return 0; }; find "$d" "$@" 2>/dev/null | wc -l | tr -d ' '; }
 commit() { git -C "$artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
+oss_fuzz_checkout_ready() {
+  local dir="$1"
+  [[ -d "$dir/.git" && -f "$dir/infra/helper.py" ]]
+}
+materialize_oss_fuzz_checkout() {
+  local source_dir="${OFG_OSS_FUZZ_DIR:-/opt/hgb/oss-fuzz}"
+  local run_dir="${OFG_OSS_FUZZ_RUN_DIR:-$workspace/oss-fuzz}"
+  rm -rf "$run_dir"
+  mkdir -p "$(dirname "$run_dir")"
+  if oss_fuzz_checkout_ready "$source_dir"; then
+    rsync -a --delete "$source_dir/" "$run_dir/"
+  elif [[ "${OFG_ALLOW_RUNTIME_CLONE:-0}" == "1" ]]; then
+    git clone --depth 1 "${OFG_OSS_FUZZ_REPO:-https://github.com/google/oss-fuzz.git}" "$run_dir" >"$workspace/logs/oss_fuzz_checkout.log" 2>&1 || true
+  fi
+  oss_fuzz_checkout_ready "$run_dir" || return 1
+  printf '%s' "$run_dir"
+}
+classify_ofg_failure() {
+  local code="$1" log_file="$2"
+  if [[ "$code" == "124" ]]; then
+    printf 'OSS-Fuzz-Gen timed out'
+    return 0
+  fi
+  if [[ -f "$log_file" ]]; then
+    if grep -Eiq 'pip install|requirements\.txt|subprocess\.CalledProcessError.*pip|No matching distribution|Failed building wheel|error: subprocess-exited-with-error' "$log_file"; then
+      printf 'OSS-Fuzz-Gen oss-fuzz Python requirements install failed'
+      return 0
+    fi
+    if grep -Eiq 'permission denied|read-only file system|cannot create' "$log_file"; then
+      printf 'OSS-Fuzz-Gen workspace write/setup failed'
+      return 0
+    fi
+    if grep -Eiq 'docker.*not found|Cannot connect to the Docker daemon' "$log_file"; then
+      printf 'OSS-Fuzz-Gen could not access Docker while preparing oss-fuzz'
+      return 0
+    fi
+    if grep -Eiq '/workspace/oss-fuzz|No such file or directory.*oss-fuzz|FileNotFoundError.*oss-fuzz|missing_oss_fuzz_checkout' "$log_file"; then
+      printf 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
+      return 0
+    fi
+  fi
+  printf 'run_all_experiments exited %s' "$code"
+}
 summary() {
   local status="$1" exit_code="$2" reason="$3"
   {
@@ -157,7 +200,14 @@ PY_OFG_YAML
     fi
   fi
 
-  oss_fuzz_dir="${OFG_OSS_FUZZ_DIR:-$workspace/oss-fuzz}"
+  oss_fuzz_dir=""
+  if ! oss_fuzz_dir="$(materialize_oss_fuzz_checkout)"; then
+    printf 'missing_oss_fuzz_checkout: no valid OSS-Fuzz checkout at OFG_OSS_FUZZ_DIR=%s and runtime clone is disabled or failed.
+' "${OFG_OSS_FUZZ_DIR:-/opt/hgb/oss-fuzz}" >"$workspace/logs/oss_fuzz_checkout.log"
+    hgb_write_common_metadata missing_oss_fuzz_checkout 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' 2 harness_generator
+    hgb_write_common_summary missing_oss_fuzz_checkout 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' harness_generator
+    exit 2
+  fi
   mkdir -p "$workspace/pip-cache"
   cmd=("$python" run_all_experiments.py --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --work-dir "$workspace/ofg-work")
   printf '%q ' "${cmd[@]}" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
@@ -177,9 +227,9 @@ PY_OFG_YAML
   reason=none
   if [[ "$code" -ne 0 ]]; then
     status=failed
-    reason="run_all_experiments exited $code"
+    reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
   fi
-  extra=$(printf '  "benchmark_yaml": "%s",\n  "command_file": "%s",\n  "log_file": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")")
+  extra=$(printf '  "benchmark_yaml": "%s",\n  "command_file": "%s",\n  "log_file": "%s",\n  "oss_fuzz_dir": "%s",\n  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
@@ -211,12 +261,22 @@ if [[ -z "$OPENAI_API_KEY" ]]; then
   summary missing_api_key 2 'OPENAI_API_KEY is not set'
   exit 2
 fi
-cmd=("$python" run_all_experiments.py -y "$benchmark_yaml" --model "$OPENAI_MODEL" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --work-dir "$workspace/ofg-work")
+oss_fuzz_dir=""
+if ! oss_fuzz_dir="$(materialize_oss_fuzz_checkout)"; then
+  printf 'missing_oss_fuzz_checkout: no valid OSS-Fuzz checkout at OFG_OSS_FUZZ_DIR=%s and runtime clone is disabled or failed.
+' "${OFG_OSS_FUZZ_DIR:-/opt/hgb/oss-fuzz}" >"$run_log"
+  printf 'prepare oss-fuzz checkout
+' >"$command_file"
+  metadata missing_oss_fuzz_checkout 2 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' "$command_file" "$run_log" "$benchmark_yaml"
+  summary missing_oss_fuzz_checkout 2 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
+  exit 2
+fi
+cmd=("$python" run_all_experiments.py -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --work-dir "$workspace/ofg-work")
 printf '%q ' "${cmd[@]}" >"$command_file"; printf '\n' >>"$command_file"
 code=0
 (cd "$artifact" && timeout "${OFG_TOTAL_TIMEOUT_SECONDS:-600}" "${cmd[@]}") >"$run_log" 2>&1 || code=$?
 status=completed; reason=none
-[[ "$code" -eq 0 ]] || { status=failed; reason="run_all_experiments exited $code"; }
+[[ "$code" -eq 0 ]] || { status=failed; reason="$(classify_ofg_failure "$code" "$run_log")"; }
 metadata "$status" "$code" "$reason" "$command_file" "$run_log" "$benchmark_yaml"
 summary "$status" "$code" "$reason"
 exit "$code"

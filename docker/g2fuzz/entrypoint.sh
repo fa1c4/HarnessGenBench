@@ -19,6 +19,51 @@ count_files() { local d="$1"; shift || true; [[ -d "$d" ]] || { printf '0'; retu
 extract_json_string() { local key="$1" file="$2"; [[ -f "$file" ]] || return 0; sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1; }
 commit() { git -C "$artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
 data_commit() { git -C "$data_artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
+write_g2fuzz_preseeds() {
+  local target="$1" formats="$2" seed_dir="$3"
+  mkdir -p "$seed_dir"
+  if [[ "$target" == *harfbuzz* || ",$formats," == *TTF* || ",$formats," == *OTF* || ",$formats," == *TTC* ]]; then
+    python3 - "$seed_dir" <<'PY_G2_PRESEED'
+from pathlib import Path
+import sys
+seed_dir = Path(sys.argv[1])
+seed_dir.mkdir(parents=True, exist_ok=True)
+seeds = {
+    "hgb_minimal.ttf": bytes.fromhex("000100000000000000000000"),
+    "hgb_minimal.otf": b"OTTO" + b"\x00" * 8,
+    "hgb_minimal.ttc": b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00",
+}
+for name, data in seeds.items():
+    path = seed_dir / name
+    if not path.exists():
+        path.write_bytes(data)
+PY_G2_PRESEED
+  fi
+  local copied=0
+  while IFS= read -r corpus_file && [[ "$copied" -lt "${G2FUZZ_MAX_PRESEEDED_CORPUS_FILES:-32}" ]]; do
+    cp "$corpus_file" "$seed_dir/hgb_corpus_${copied}_$(basename "$corpus_file")" 2>/dev/null || true
+    copied=$((copied + 1))
+  done < <(find /target -type f \( -path '*/corpus/*' -o -path '*/seeds/*' -o -path '*/seed_corpus/*' \) -size -1048576c 2>/dev/null | sort)
+}
+patch_g2fuzz_program_gen() {
+  local py="$artifact/program_gen.py"
+  [[ -f "$py" ]] || return 0
+  python3 - "$py" <<'PY_G2_PROGRAM_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+text = text.replace(
+    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, 3)',
+    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "1") or "1"))',
+)
+text = text.replace(
+    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, 1)',
+    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "1") or "1"))',
+)
+path.write_text(text)
+PY_G2_PROGRAM_PATCH
+}
 select_program() {
   "$python" - "$artifact/program_to_format.json" "${G2FUZZ_PROGRAM:-auto}" <<'PYSEL'
 import json, sys
@@ -145,13 +190,22 @@ if [[ "$mode" == "generate-target" ]]; then
   runtime=/run/hgb/g2fuzz-target
   mkdir -p "$runtime"
   formats="$(python3 - "$target_name" "$safe_target" /opt/hgb/metadata/fuzzbench_target_formats.json "$runtime/program_to_format.json" <<'PY_G2_FORMATS'
-import json, sys
+import json, os, sys
 name, safe, mapping_path, out_path = sys.argv[1:]
 try:
     mapping = json.load(open(mapping_path, encoding='utf-8'))
 except OSError:
     mapping = {}
 formats = mapping.get(name) or ['custom']
+if 'harfbuzz' in name:
+    preferred = ['TTF', 'ttf', 'OTF', 'otf', 'TTC', 'ttc']
+    formats = sorted(formats, key=lambda item: preferred.index(item) if item in preferred else len(preferred))
+try:
+    max_formats = int(os.environ.get('G2FUZZ_MAX_FORMATS', '1') or '0')
+except ValueError:
+    max_formats = 1
+if max_formats > 0:
+    formats = formats[:max_formats]
 with open(out_path, 'w', encoding='utf-8') as f:
     json.dump({safe: formats}, f, indent=2)
     f.write('\n')
@@ -168,6 +222,8 @@ with open(sys.argv[1], 'w', encoding='utf-8') as f:
 PY_G2_MODEL
   cp "$runtime/model_setting.json" "$workspace/config/model_setting.json"
   output_dir="$workspace/g2fuzz_output"
+  write_g2fuzz_preseeds "$target_name" "$formats" "$output_dir/default/gen_seeds"
+  patch_g2fuzz_program_gen
   printf '%q ' "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     hgb_write_common_metadata dry_run_ok 'dry run prepared G2FUZZ target format mapping' 0 input_generator
@@ -183,7 +239,7 @@ PY_G2_MODEL
   printf '%s\n' "$OPENAI_API_KEY" >"$runtime/openai_key.txt"
   chmod 600 "$runtime/openai_key.txt"
   code=0
-  (cd "$runtime" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
+  (cd "$runtime" && timeout "${G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS:-${HGB_GENERATION_TIMEOUT_SECONDS:-900}}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
   rm -f "$runtime/openai_key.txt"
   if [[ -d "$output_dir" ]]; then
     cp -a "$output_dir/." "$workspace/generated_inputs/" 2>/dev/null || true
@@ -197,7 +253,7 @@ PY_G2_MODEL
   reason=none
   if [[ "$program_gen_code" -eq 124 && "$generated_inputs" -gt 0 ]]; then
     status=partial_completed
-    reason="program_gen timed out after generating $generated_inputs inputs"
+    reason="program_gen timed out after preserving $generated_inputs generated/preseeded inputs"
     code=0
   elif [[ "$program_gen_code" -ne 0 ]]; then
     status=failed
@@ -219,6 +275,8 @@ case "$mode" in
     formats="${selected[1]}"
     model="${G2FUZZ_MODEL:-${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}}"
     output_dir="$workspace/${program}_output"
+    write_g2fuzz_preseeds "$program" "$formats" "$output_dir/default/gen_seeds"
+    patch_g2fuzz_program_gen
     runtime=/run/hgb/g2fuzz-runtime
     mkdir -p "$runtime" "$workspace/config"
     cp "$artifact/program_to_format.json" "$runtime/program_to_format.json"
@@ -242,7 +300,7 @@ PYMODEL
     printf '%s\n' "$OPENAI_API_KEY" >"$runtime/openai_key.txt"
     chmod 600 "$runtime/openai_key.txt"
     code=0
-    (cd "$runtime" && timeout "${G2FUZZ_TIMEOUT_SECONDS:-300}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$program") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
+    (cd "$runtime" && timeout "${G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS:-${G2FUZZ_TIMEOUT_SECONDS:-300}}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$program") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
     rm -f "$runtime/openai_key.txt"
     seeds="$(count_files "$output_dir/default/gen_seeds" -type f)"
     generators="$(count_files "$output_dir/default/generators" -type f)"

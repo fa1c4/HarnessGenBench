@@ -239,10 +239,19 @@ hgb_build_image() {
   log_file="$out_dir/logs/docker_build.log"
   require_docker
   [[ -f "$dockerfile" ]] || die "Missing Dockerfile: $dockerfile"
+  if [[ "$fuzzer" == "oss-fuzz-gen" ]]; then
+    build_args+=(--build-arg "OFG_INSTALL_OSS_FUZZ=${OFG_INSTALL_OSS_FUZZ:-1}")
+    if [[ -n "${OFG_OSS_FUZZ_REPO:-}" ]]; then
+      build_args+=(--build-arg "OFG_OSS_FUZZ_REPO=${OFG_OSS_FUZZ_REPO}")
+    fi
+    if [[ -n "${OFG_OSS_FUZZ_REF:-}" ]]; then
+      build_args+=(--build-arg "OFG_OSS_FUZZ_REF=${OFG_OSS_FUZZ_REF}")
+    fi
+  fi
   if [[ "$fuzzer" == "ckgfuzzer" ]]; then
-    build_args+=(--build-arg "HGB_INSTALL_CODEQL=${HGB_INSTALL_CODEQL:-0}")
-    if [[ -n "${CODEQL_CLI_URL:-}" ]]; then
-      build_args+=(--build-arg "CODEQL_CLI_URL=${CODEQL_CLI_URL}")
+    build_args+=(--build-arg "HGB_INSTALL_CODEQL=${HGB_INSTALL_CODEQL:-1}")
+    if [[ -n "${CODEQL_BUNDLE_URL:-}" ]]; then
+      build_args+=(--build-arg "CODEQL_BUNDLE_URL=${CODEQL_BUNDLE_URL}")
     fi
   fi
   code=0
@@ -278,6 +287,49 @@ run_hgb_container() {
     -e OPENAI_API_KEY \
     -e OPENAI_BASE_URL \
     -e OPENAI_MODEL \
+    -e OFG_OSS_FUZZ_DIR \
+    -e OFG_ALLOW_RUNTIME_CLONE \
+    -e OFG_OSS_FUZZ_REPO \
+    -e HF_TOKEN \
+    -e ELFUZZ_TARGET_OVERRIDE \
+    -e ELFUZZ_TRUST_FUZZBENCH_TARGET \
+    -e ELFUZZ_SUPPORTED_TARGETS \
+    -e ELFUZZ_TGI_WAITING_SECONDS \
+    -e ELFUZZ_EVOLUTION_ITERATIONS \
+    -e ELFUZZ_PRODUCE_SECONDS \
+    -e ELFUZZ_AFL_SECONDS \
+    -e ELFUZZ_STAGE_TIMEOUT_SECONDS \
+    -e ELFUZZ_HELP_ONLY \
+    -e ELFUZZ_SKIP_DOWNLOAD \
+    -e ELFUZZ_REQUIRE_HF_TOKEN \
+    -e ELFUZZ_LOCAL_MODEL_CACHE_READY \
+    -e CKGFUZZER_EMBEDDING_MODEL \
+    -e CKGFUZZER_EMBEDDING_BASE_URL \
+    -e CKGFUZZER_EMBEDDING_API_KEY \
+    -e CKGFUZZER_LOCAL_API_COMBINATION \
+    -e CKGFUZZER_MAX_COMBINATION_SIZE \
+    -e CKGFUZZER_MAX_PLANNER_APIS \
+    -e CKGFUZZER_MAX_SUMMARY_APIS \
+    -e CKGFUZZER_MAX_CALL_GRAPH_APIS \
+    -e CKGFUZZER_LOCAL_API_SUMMARY \
+    -e CKGFUZZER_GEN_INPUT \
+    -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
+    -e PROME_FUZZ_EMBEDDING_HOST \
+    -e PROME_FUZZ_EMBEDDING_PORT \
+    -e PROME_FUZZ_EMBEDDING_BASE_URL \
+    -e PROME_FUZZ_EMBEDDING_API_KEY \
+    -e PROME_FUZZ_EMBEDDING_MODEL \
+    -e PROME_FUZZ_EMBEDDING_MAX_TOKENS \
+    -e PROME_FUZZ_EMBEDDING_TIMEOUT \
+    -e PROME_FUZZ_EMBEDDING_RETRY_TIMES \
+    -e PROME_FUZZ_MAX_APIS \
+    -e PROME_FUZZ_COMPREHEND_TASK \
+    -e G2FUZZ_MAX_FORMATS \
+    -e G2FUZZ_TRY_NUM \
+    -e G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS \
+    -e G2FUZZ_MAX_PRESEEDED_CORPUS_FILES \
+    -e PROME_FUZZ_SKIP_BAD_DOCS \
+    -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
     -e HGB_HOST_UID="$(id -u)" \
     -e HGB_HOST_GID="$(id -g)" \
@@ -301,8 +353,21 @@ run_hgb_target_container() {
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
   ensure_dir "$workspace"
+  if [[ "$generator" != "promefuzz" && "$generator" != "ckgfuzzer" ]]; then
+    extra_docker_args+=(-v "$root/artifacts:/opt/hgb/artifacts:ro")
+  fi
   if [[ -n "${HGB_CODEQL_DIR:-}" ]]; then
     extra_docker_args+=(-v "${HGB_CODEQL_DIR}:/opt/hgb/codeql-host:ro" -e HGB_CODEQL_DIR=/opt/hgb/codeql-host)
+  fi
+  if [[ "$generator" == "ckgfuzzer" ]]; then
+    ensure_dir "$workspace/docker_shared"
+    extra_docker_args+=(-v "$workspace/docker_shared:$workspace/docker_shared" -e "HGB_CKG_DOCKER_SHARED=$workspace/docker_shared" -e "CKGFUZZER_MAX_CALL_GRAPH_APIS=${CKGFUZZER_MAX_CALL_GRAPH_APIS:-8}")
+    if [[ -S /var/run/docker.sock ]]; then
+      extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
+    fi
+  fi
+  if [[ "$generator" == "elfuzz" && -S /var/run/docker.sock ]]; then
+    extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
   docker run --rm --init \
     --entrypoint /opt/hgb/entrypoint.sh \
@@ -312,11 +377,55 @@ run_hgb_target_container() {
     -e OPENAI_API_KEY \
     -e OPENAI_BASE_URL \
     -e OPENAI_MODEL \
+    -e OFG_OSS_FUZZ_DIR \
+    -e OFG_ALLOW_RUNTIME_CLONE \
+    -e OFG_OSS_FUZZ_REPO \
+    -e HF_TOKEN \
+    -e ELFUZZ_TARGET_OVERRIDE \
+    -e ELFUZZ_TRUST_FUZZBENCH_TARGET \
+    -e ELFUZZ_SUPPORTED_TARGETS \
+    -e ELFUZZ_TGI_WAITING_SECONDS \
+    -e ELFUZZ_EVOLUTION_ITERATIONS \
+    -e ELFUZZ_PRODUCE_SECONDS \
+    -e ELFUZZ_AFL_SECONDS \
+    -e ELFUZZ_STAGE_TIMEOUT_SECONDS \
+    -e ELFUZZ_HELP_ONLY \
+    -e ELFUZZ_SKIP_DOWNLOAD \
+    -e ELFUZZ_REQUIRE_HF_TOKEN \
+    -e ELFUZZ_LOCAL_MODEL_CACHE_READY \
+    -e CKGFUZZER_EMBEDDING_MODEL \
+    -e CKGFUZZER_EMBEDDING_BASE_URL \
+    -e CKGFUZZER_EMBEDDING_API_KEY \
+    -e CKGFUZZER_LOCAL_API_COMBINATION \
+    -e CKGFUZZER_MAX_COMBINATION_SIZE \
+    -e CKGFUZZER_MAX_PLANNER_APIS \
+    -e CKGFUZZER_MAX_SUMMARY_APIS \
+    -e CKGFUZZER_MAX_CALL_GRAPH_APIS \
+    -e CKGFUZZER_LOCAL_API_SUMMARY \
+    -e CKGFUZZER_GEN_INPUT \
+    -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
+    -e PROME_FUZZ_EMBEDDING_HOST \
+    -e PROME_FUZZ_EMBEDDING_PORT \
+    -e PROME_FUZZ_EMBEDDING_BASE_URL \
+    -e PROME_FUZZ_EMBEDDING_API_KEY \
+    -e PROME_FUZZ_EMBEDDING_MODEL \
+    -e PROME_FUZZ_EMBEDDING_MAX_TOKENS \
+    -e PROME_FUZZ_EMBEDDING_TIMEOUT \
+    -e PROME_FUZZ_EMBEDDING_RETRY_TIMES \
+    -e PROME_FUZZ_MAX_APIS \
+    -e PROME_FUZZ_COMPREHEND_TASK \
+    -e G2FUZZ_MAX_FORMATS \
+    -e G2FUZZ_TRY_NUM \
+    -e G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS \
+    -e G2FUZZ_MAX_PRESEEDED_CORPUS_FILES \
+    -e PROME_FUZZ_SKIP_BAD_DOCS \
+    -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
     -e HGB_GENERATOR="$generator" \
     -e HGB_GENERATOR_COMMIT="$generator_commit" \
     -e HGB_TARGET="$target" \
     -e HGB_TARGET_PACKAGE=/target \
+    -e HGB_TARGET_PACKAGE_HOST="$target_package" \
     -e HGB_TARGET_MANIFEST=/target/target_manifest.json \
     -e HGB_TARGET_SOURCE_DIR=/target/source_input \
     -e HGB_TARGET_REFERENCE_DIR=/target/reference_harnesses \
@@ -330,7 +439,6 @@ run_hgb_target_container() {
     -e HGB_HOST_GID="$(id -g)" \
     -v "$workspace:/workspace" \
     -v "$target_package:/target:ro" \
-    -v "$root/artifacts:/opt/hgb/artifacts:ro" \
     -v "$root/docker/$generator/entrypoint.sh:/opt/hgb/entrypoint.sh:ro" \
     -v "$root/docker/common:/opt/hgb/bin:ro" \
     -v "$root/metadata:/opt/hgb/metadata:ro" \

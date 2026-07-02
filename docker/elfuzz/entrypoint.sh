@@ -12,6 +12,18 @@ trap fix_workspace_permissions EXIT
 mode="${1:-smoke-jsoncpp}"
 mkdir -p "$workspace/logs" "$workspace/artifacts"
 json_escape() { local v="${1:-}"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//$'\n'/\\n}"; printf '%s' "$v"; }
+count_files() { local d="$1"; shift || true; [[ -d "$d" ]] || { printf '0'; return 0; }; find "$d" "$@" 2>/dev/null | wc -l | tr -d ' '; }
+elfuzz_target_for_hgb_target() {
+  case "$1" in
+    jsoncpp|jsoncpp_jsoncpp_fuzzer) printf 'jsoncpp' ;;
+    libxml2|libxml2_xml|libxml2_xml_e85b9b) printf 'libxml2' ;;
+    re2|re2_fuzzer) printf 're2' ;;
+    sqlite3|sqlite3_ossfuzz) printf 'sqlite3' ;;
+    cpython3|cpython3_*) printf 'cpython3' ;;
+    librsvg|librsvg_*) printf 'librsvg' ;;
+    *) printf '' ;;
+  esac
+}
 stage_exit() { [[ -f "$workspace/logs/$1.exit" ]] && cat "$workspace/logs/$1.exit" || printf not_run; }
 run_stage() {
   local stage="$1"; shift
@@ -55,6 +67,24 @@ metadata() {
   } >"$workspace/metadata.json"
 }
 
+patch_elfuzz_cleanup() {
+  local py=/opt/hgb/artifacts/elfuzz/cli/pre_experiments.py
+  [[ -f "$py" ]] || return 0
+  python3 - "$py" <<'PY_ELFUZZ_CLEANUP_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '        subprocess.run(["sudo", "docker", "stop", "tgi-server"], check=True, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'
+new = '        try:\n            subprocess.run(["sudo", "docker", "stop", "tgi-server"], check=False, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n        except Exception as exc:\n            print(f"[HGB] ignoring tgi-server cleanup failure: {exc}")'
+if old in text and "ignoring tgi-server cleanup failure" not in text:
+    text = text.replace(old, new, 1)
+path.write_text(text)
+PY_ELFUZZ_CLEANUP_PATCH
+}
+elfuzz_configured_hf_token() {
+  elfuzz config --get tgi.huggingface_token 2>/dev/null | sed -n '1p' || true
+}
 if [[ "$mode" == "generate-target" ]]; then
   # shellcheck source=/opt/hgb/bin/target_contract.sh
   source /opt/hgb/bin/target_contract.sh
@@ -79,31 +109,76 @@ if [[ "$mode" == "generate-target" ]]; then
   if ! command -v elfuzz >/dev/null 2>&1; then
     hgb_soft_skip upstream_cli_not_found 'elfuzz CLI not found in image' input_generator
   fi
+  elfuzz_target="${ELFUZZ_TARGET_OVERRIDE:-$(elfuzz_target_for_hgb_target "$target_name")}"
   recognized=0
+  elfuzz list >"$workspace/logs/elfuzz_list.log" 2>&1 || true
   if [[ "${ELFUZZ_TRUST_FUZZBENCH_TARGET:-0}" == "1" ]]; then
+    recognized=1
+    elfuzz_target="${elfuzz_target:-$target_name}"
+  elif [[ -n "$elfuzz_target" ]]; then
     recognized=1
   elif [[ ",${ELFUZZ_SUPPORTED_TARGETS:-}," == *",$target_name,"* ]]; then
     recognized=1
-  elif elfuzz list >"$workspace/logs/elfuzz_list.log" 2>&1 && grep -Fq "$target_name" "$workspace/logs/elfuzz_list.log"; then
+    elfuzz_target="$target_name"
+  elif grep -Fq "$target_name" "$workspace/logs/elfuzz_list.log"; then
     recognized=1
+    elfuzz_target="$target_name"
   fi
-  if [[ "$recognized" != "1" ]]; then
-    hgb_soft_skip not_applicable 'ELFuzz CLI did not report support for this FuzzBench target name' input_generator
+  if [[ "$recognized" != "1" || -z "$elfuzz_target" ]]; then
+    hgb_soft_skip target_not_supported_by_elfuzz 'ELFuzz supports a small fixed target set; no mapping exists for this HGB/FuzzBench target name' input_generator
   fi
-  printf 'elfuzz synth/produce for %s\n' "$target_name" >"$workspace/command.txt"
+  patch_elfuzz_cleanup
+  configured_hf_token="$(elfuzz_configured_hf_token)"
+  if [[ "${ELFUZZ_REQUIRE_HF_TOKEN:-1}" == "1" && -z "${HF_TOKEN:-}" && -z "$configured_hf_token" && "${ELFUZZ_LOCAL_MODEL_CACHE_READY:-0}" != "1" ]]; then
+    hgb_soft_skip elfuzz_missing_hf_token_or_model_access 'ELFuzz TGI synthesis requires HF_TOKEN, a configured Hugging Face token, or ELFUZZ_LOCAL_MODEL_CACHE_READY=1 for an already-cached model' input_generator
+  fi
+  synth_args=(elfuzz synth -T fuzzer.elfuzz --use-small-model --tgi-waiting "${ELFUZZ_TGI_WAITING_SECONDS:-120}" --evolution-iterations "${ELFUZZ_EVOLUTION_ITERATIONS:-1}" "$elfuzz_target")
+  produce_args=(elfuzz produce -T elfuzz --time "${ELFUZZ_PRODUCE_SECONDS:-60}" "$elfuzz_target")
+  {
+    printf 'elfuzz synth/produce for HGB target %s as ELFuzz target %s\n' "$target_name" "$elfuzz_target"
+    printf 'synth command: '
+    printf '%q ' "${synth_args[@]}"
+    printf '\nproduce command: '
+    printf '%q ' "${produce_args[@]}"
+    printf '\n'
+  } >"$workspace/command.txt"
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    elfuzz config --set tgi.huggingface_token "$HF_TOKEN" >/dev/null 2>"$workspace/logs/hf_config.log" || true
+  else
+    printf 'HF_TOKEN is not set; TGI model startup may fail if no Hugging Face token file exists.\n' >"$workspace/logs/hf_config.log"
+  fi
   code=0
-  timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" bash -lc "elfuzz synth -T fuzzer.elfuzz --use-small-model '$target_name'" >"$workspace/logs/synth.log" 2>&1 || code=$?
+  failed_stage=synth
+  (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${synth_args[@]}") >"$workspace/logs/synth.log" 2>&1 || code=$?
   if [[ "$code" == "0" ]]; then
-    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" bash -lc "elfuzz produce -T elfuzz --time '${ELFUZZ_PRODUCE_SECONDS:-60}' '$target_name'" >"$workspace/logs/produce.log" 2>&1 || code=$?
+    failed_stage=produce
+    (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${produce_args[@]}") >"$workspace/logs/produce.log" 2>&1 || code=$?
   fi
-  find "$workspace" -type f \( -path '*/seeds/*' -o -path '*/inputs/*' -o -name '*.seed' \) -exec cp {} "$workspace/generated_inputs/" \; 2>/dev/null || true
+  find "$workspace" -type f \( -path '*/seeds/*' -o -path '*/inputs/*' -o -name '*.seed' -o -name '*.bin' \) -exec cp {} "$workspace/generated_inputs/" \; 2>/dev/null || true
   status=completed
   reason=none
+  generated_input_count="$(count_files "$workspace/generated_inputs" -type f)"
   if [[ "$code" -ne 0 ]]; then
     status=failed
-    reason="ELFuzz input generation exited $code"
+    reason="ELFuzz $failed_stage stage exited $code"
+    if [[ -f "$workspace/logs/synth.log" ]]; then
+      if grep -qi 'huggingface/token\|HF_TOKEN\|Hugging Face token\|401\|403\|gated repo\|access token' "$workspace/logs/synth.log"; then
+        reason='elfuzz_missing_hf_token_or_model_access: ELFuzz TGI startup is missing a valid Hugging Face token or model access; set HF_TOKEN or use an already-cached accessible model'
+      elif grep -qi 'Cannot connect to the Docker daemon' "$workspace/logs/synth.log"; then
+        reason='ELFuzz TGI startup cannot access Docker daemon; mount /var/run/docker.sock or run with Docker available'
+      elif [[ "$code" == "124" ]] && grep -qi 'TGI server started' "$workspace/logs/synth.log"; then
+        reason='ELFuzz synthesis timed out after TGI started; lower ELFUZZ_EVOLUTION_ITERATIONS, lower ELFUZZ_TGI_WAITING_SECONDS when the model is cached, or increase HGB_GENERATION_TIMEOUT_SECONDS'
+      elif [[ "$code" == "124" ]] && grep -qi 'text-gneration-inference\|TGI' "$workspace/logs/synth.log"; then
+        reason='ELFuzz TGI startup timed out; set HF_TOKEN if model access requires it, ensure Docker/TGI can download the model, lower ELFUZZ_TGI_WAITING_SECONDS when cached, or increase HGB_GENERATION_TIMEOUT_SECONDS'
+      fi
+    fi
+    if [[ "${generated_input_count:-0}" -gt 0 ]]; then
+      status=partial_completed
+      reason="ELFuzz $failed_stage stage exited $code after producing $generated_input_count input candidates"
+    fi
   fi
-  hgb_write_common_metadata "$status" "$reason" "$code" input_generator
+  extra=$(printf '  "elfuzz_target": "%s",\n  "failed_stage": "%s",\n  "tgi_waiting_seconds": "%s",\n  "evolution_iterations": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$elfuzz_target")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "${ELFUZZ_TGI_WAITING_SECONDS:-120}")" "$(hgb_json_escape "${ELFUZZ_EVOLUTION_ITERATIONS:-1}")" "$(hgb_json_escape "$workspace/command.txt")")
+  hgb_write_common_metadata "$status" "$reason" "$code" input_generator "$extra"
   hgb_write_common_summary "$status" "$reason" input_generator
   exit "$code"
 fi

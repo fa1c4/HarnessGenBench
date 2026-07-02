@@ -55,6 +55,8 @@ bash scripts/g2fuzz_smoke_afl.sh || true
 
 LLM-backed smoke runs may fail because credentials, quota, model access, Docker-in-Docker, or upstream CLIs are unavailable. They should still leave `metadata.json`, logs, and `HGB_SUMMARY.md` in `workspace/`.
 
+CKGFuzzer requires the CodeQL CLI for target-aware generation. The CKGFuzzer Docker image installs the CodeQL bundle during `bash scripts/ckgfuzzer_setup.sh` by default. Set `HGB_INSTALL_CODEQL=0` only when rebuilding a smaller image for dry runs or when mounting an external CodeQL checkout with `HGB_CODEQL_DIR`.
+
 G2FUZZ target `.afl` and `.cmp` binaries are not bundled by the upstream artifact. Missing target binaries soft-skip by default and produce `TARGET_BUILD_MISSING.md`; set `G2FUZZ_REQUIRE_TARGET_BINARIES=1` to make that condition fail.
 
 ## FuzzBench Target Integration
