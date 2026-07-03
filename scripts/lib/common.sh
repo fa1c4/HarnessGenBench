@@ -290,6 +290,12 @@ run_hgb_container() {
     -e OFG_OSS_FUZZ_DIR \
     -e OFG_ALLOW_RUNTIME_CLONE \
     -e OFG_OSS_FUZZ_REPO \
+    -e OFG_BENCHMARK_YAML \
+    -e OFG_ALLOW_PROJECT_YAML_FALLBACK \
+    -e OFG_SKIP_COVERAGE_GAINS \
+    -e OFG_SYNTH_MAX_APIS \
+    -e OFG_RUN_TIMEOUT \
+    -e OFG_MAX_BENCHMARK_FUNCTIONS \
     -e HF_TOKEN \
     -e ELFUZZ_TARGET_OVERRIDE \
     -e ELFUZZ_TRUST_FUZZBENCH_TARGET \
@@ -353,7 +359,7 @@ run_hgb_target_container() {
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
   ensure_dir "$workspace"
-  if [[ "$generator" != "promefuzz" && "$generator" != "ckgfuzzer" ]]; then
+  if [[ "$generator" != "promefuzz" && "$generator" != "ckgfuzzer" && "$generator" != "oss-fuzz-gen" ]]; then
     extra_docker_args+=(-v "$root/artifacts:/opt/hgb/artifacts:ro")
   fi
   if [[ -n "${HGB_CODEQL_DIR:-}" ]]; then
@@ -365,6 +371,9 @@ run_hgb_target_container() {
     if [[ -S /var/run/docker.sock ]]; then
       extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     fi
+  fi
+  if [[ "$generator" == "oss-fuzz-gen" && -S /var/run/docker.sock ]]; then
+    extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
   if [[ "$generator" == "elfuzz" && -S /var/run/docker.sock ]]; then
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
@@ -380,6 +389,12 @@ run_hgb_target_container() {
     -e OFG_OSS_FUZZ_DIR \
     -e OFG_ALLOW_RUNTIME_CLONE \
     -e OFG_OSS_FUZZ_REPO \
+    -e OFG_BENCHMARK_YAML \
+    -e OFG_ALLOW_PROJECT_YAML_FALLBACK \
+    -e OFG_SKIP_COVERAGE_GAINS \
+    -e OFG_SYNTH_MAX_APIS \
+    -e OFG_RUN_TIMEOUT \
+    -e OFG_MAX_BENCHMARK_FUNCTIONS \
     -e HF_TOKEN \
     -e ELFUZZ_TARGET_OVERRIDE \
     -e ELFUZZ_TRUST_FUZZBENCH_TARGET \

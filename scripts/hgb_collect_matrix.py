@@ -41,6 +41,11 @@ TRANSIENT_DIR_NAMES = {
 }
 
 REMEDIATIONS = (
+    ('deepseek_invalid_n', 'Rebuild OSS-Fuzz-Gen with the DeepSeek/OpenAI-compatible adapter that omits n for single-sample requests.'),
+    ('ofg_nonretryable_llm_request', 'Inspect the OpenAI-compatible request parameters; 400 invalid_request_error is non-retryable and should fail fast.'),
+    ('ofg_docker_unavailable', 'Use the HGB target source fallback or mount /var/run/docker.sock for OSS-Fuzz-Gen when local OSS-Fuzz image fallback is required.'),
+    ('ofg_bad_benchmark_fallback', 'Disable project-level benchmark fallback or provide a target-specific OSS-Fuzz-Gen YAML for this target.'),
+    ('ofg_introspector_timeout', 'Keep OFG_SKIP_COVERAGE_GAINS=1 and verify ofg_run_wrapper disables coverage aggregation/background reporting.'),
     ('program_gen timed out after preserving', 'G2Fuzz produced preseeded or generated inputs before timeout; accept partial_completed or increase HGB_GENERATION_TIMEOUT_SECONDS.'),
     ('ELFuzz TGI startup timed out', 'Set HF_TOKEN/model access, verify Docker can start TGI, or lower ELFUZZ_TGI_WAITING_SECONDS for cached models.'),
     ('elfuzz_missing_hf_token_or_model_access', 'Set HF_TOKEN, configure elfuzz tgi.huggingface_token, or set ELFUZZ_LOCAL_MODEL_CACHE_READY=1 only when the model is already cached and accessible.'),

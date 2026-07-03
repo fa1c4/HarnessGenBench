@@ -122,6 +122,9 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   else
     image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
   fi
+elif [[ "$dry_run" != "1" && "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && grep -Fq "_chat_completion_kwargs" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "_copy_hgb_target_source" /opt/hgb/artifacts/oss-fuzz-gen/data_prep/project_src.py' >/dev/null 2>&1; then
+  log "rebuilding stale OSS-Fuzz-Gen image without /opt/hgb/oss-fuzz or current OSS-Fuzz-Gen fixes: $image"
+  image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
 fi
 
 {

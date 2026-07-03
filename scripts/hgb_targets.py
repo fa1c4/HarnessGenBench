@@ -402,7 +402,11 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
         result["materialize_status"] = result["clone_status"]
         if proc.returncode != 0:
             result["error"] = (proc.stderr or proc.stdout).strip()[-1000:]
-            return result
+            if any(p for p in local.rglob("*") if p.is_file() and ".git" not in p.parts):
+                result["materialize_status"] = "fetch_failed_using_cached_checkout"
+                result["cache_fallback"] = True
+            else:
+                return result
     else:
         proc = run(["git", "clone", repo["url"], str(local)])
         result["clone_status"] = "cloned" if proc.returncode == 0 else "clone_failed"
@@ -655,7 +659,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         record = materialize_source(repo, target, resolved.get("commit", ""), root)
         materialized.append(record)
         local = Path(record.get("artifact_path", ""))
-        if record.get("materialize_status") in {"cloned", "fetched", "cached", "extracted"} and local.is_dir():
+        if record.get("materialize_status") in {"cloned", "fetched", "cached", "extracted", "fetch_failed_using_cached_checkout"} and local.is_dir():
             package_dst = source_root / repo["dest"]
             try:
                 copy_tree(local, package_dst)
@@ -676,6 +680,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     cmake_file_count = count_named_files(output / "source_input", "CMakeLists.txt")
     compile_commands_count = count_named_files(output / "source_input", "compile_commands.json")
     copied_statuses = {"copied_to_package", "copied_to_source_input"}
+    source_fallback_statuses = sorted({str(r.get("materialize_status", "")) for r in materialized if r.get("cache_fallback")})
     if not repos:
         source_status = "benchmark_only"
     elif all(r.get("copy_status") in copied_statuses for r in materialized):
@@ -694,6 +699,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         "commit_date": resolved.get("commit_date", ""),
         "source_layout": layout,
         "source_status": source_status,
+        "source_fallback_statuses": source_fallback_statuses,
         "source_repos": materialized,
         "source_artifact_paths": sorted({str(r.get("artifact_path", "")) for r in materialized if r.get("artifact_path")}),
         "source_file_count": source_file_count,
