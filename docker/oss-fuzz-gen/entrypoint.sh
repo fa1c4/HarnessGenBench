@@ -18,7 +18,7 @@ json_escape() { local v="${1:-}"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//
 count_files() { local d="$1"; shift || true; [[ -d "$d" ]] || { printf '0'; return 0; }; find "$d" "$@" 2>/dev/null | wc -l | tr -d ' '; }
 json_file_value() {
   local file="$1" key="$2"
-  python3 - "$file" "$key" <<'PY_JSON_VALUE'
+  "$python" - "$file" "$key" <<'PY_JSON_VALUE'
 import json
 import sys
 try:
@@ -50,9 +50,87 @@ materialize_oss_fuzz_checkout() {
   oss_fuzz_checkout_ready "$run_dir" || return 1
   printf '%s' "$run_dir"
 }
+prepare_oss_fuzz_venv() {
+  local oss_fuzz_dir="$1"
+  local venv_target="${OFG_OSS_FUZZ_VENV:-/opt/hgb/venv}"
+  if [[ -x "$venv_target/bin/python3" || -x "$venv_target/bin/python" ]]; then
+    rm -rf "$oss_fuzz_dir/venv"
+    ln -s "$venv_target" "$oss_fuzz_dir/venv"
+    return 0
+  fi
+  printf 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv at %s
+' "$venv_target" >&2
+  return 1
+}
+ofg_llm_preflight() {
+  local log_file="$1"
+  [[ "${OFG_LLM_PREFLIGHT:-1}" == "1" ]] || return 0
+  "$python" - >"$log_file" 2>&1 <<'PY_OFG_PREFLIGHT'
+import os
+import sys
+import openai
+
+api_key = os.getenv('OPENAI_API_KEY') or os.getenv('API_KEY') or os.getenv('DEEPSEEK_API_KEY')
+model = os.getenv('OPENAI_MODEL') or os.getenv('MODEL') or 'gpt-4o-mini'
+kwargs = {'api_key': api_key, 'timeout': float(os.getenv('OFG_LLM_REQUEST_TIMEOUT_SECONDS', '600'))}
+base_url = os.getenv('OPENAI_BASE_URL') or os.getenv('BASE_URL')
+if base_url:
+    kwargs['base_url'] = base_url
+max_retries = os.getenv('OFG_LLM_MAX_RETRIES', '0')
+try:
+    kwargs['max_retries'] = int(max_retries)
+except ValueError:
+    print(f'Invalid OFG_LLM_MAX_RETRIES: {max_retries}')
+    sys.exit(1)
+try:
+    client = openai.OpenAI(**kwargs)
+    client.chat.completions.create(
+        model=model,
+        messages=[{'role': 'user', 'content': 'Return OK.'}],
+        max_tokens=1,
+        temperature=0,
+    )
+except Exception as exc:
+    print(f'{type(exc).__name__}: {exc}')
+    sys.exit(1)
+print('llm_preflight_ok')
+PY_OFG_PREFLIGHT
+}
 classify_ofg_failure() {
   local code="$1" log_file="$2"
   if [[ -f "$log_file" ]]; then
+    if grep -Eiq 'ModuleNotFoundError: No module named .pkg_resources.|No module named .pkg_resources.|pkg_resources' "$log_file"; then
+      printf 'ofg_oss_fuzz_dependency_setup_failed: OSS-Fuzz-Gen Python environment is missing pkg_resources'
+      return 0
+    fi
+    if grep -Eiq 'ofg_benchmark_trim_failed|ModuleNotFoundError: No module named .yaml.|benchmark trim failed' "$log_file"; then
+      printf 'ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed'
+      return 0
+    fi
+    if grep -Eiq 'AuthenticationError|Authentication Fails|401 Authorization Required|HTTP/1\.1 401|Error code: 401|PermissionDeniedError|Error code: 403|invalid api key' "$log_file"; then
+      printf 'ofg_invalid_api_key: OpenAI-compatible API key was rejected'
+      return 0
+    fi
+    if grep -Eiq 'ofg_empty_llm_response|LLM returned empty response|NoneType.*split|expected non-empty LLM response' "$log_file"; then
+      printf 'ofg_empty_llm_response: OpenAI-compatible endpoint returned empty response content'
+      return 0
+    fi
+    if grep -Eiq 'TLS handshake timeout|net/http: TLS handshake timeout|docker pull.*timed out|Client\.Timeout exceeded|context deadline exceeded' "$log_file"; then
+      printf 'ofg_docker_pull_timeout: Docker image pull timed out while preparing the OSS-Fuzz project image'
+      return 0
+    fi
+    if grep -Eiq 'ofg_project_image_build_failed|Failed to build image for|Failed to build project image' "$log_file"; then
+      printf 'ofg_project_image_build_failed: OSS-Fuzz project image build failed during harness validation'
+      return 0
+    fi
+    if [[ "$code" == "124" ]] && grep -Eiq '===== ROUND .* Recompile|Recompile|fixing build' "$log_file"; then
+      printf 'ofg_recompile_timeout: OSS-Fuzz-Gen timed out while recompiling or repairing the generated harness'
+      return 0
+    fi
+    if grep -Eiq 'APITimeoutError|ReadTimeout|The read operation timed out|Request timed out|timed out while requesting|LLM request timeout' "$log_file"; then
+      printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out'
+      return 0
+    fi
     if grep -Eiq 'Invalid n value' "$log_file"; then
       printf 'deepseek_invalid_n: DeepSeek rejected the OpenAI n parameter'
       return 0
@@ -73,20 +151,24 @@ classify_ofg_failure() {
       printf 'OSS-Fuzz-Gen workspace write/setup failed'
       return 0
     fi
-    if grep -Eiq 'pip install|requirements\.txt|subprocess\.CalledProcessError.*pip|No matching distribution|Failed building wheel|error: subprocess-exited-with-error' "$log_file"; then
-      printf 'OSS-Fuzz-Gen oss-fuzz Python requirements install failed'
+    if grep -Eiq 'ofg_oss_fuzz_dependency_setup_failed|pip install|requirements\.txt|subprocess\.CalledProcessError.*pip|No matching distribution|Failed building wheel|error: subprocess-exited-with-error' "$log_file"; then
+      printf 'ofg_oss_fuzz_dependency_setup_failed: OSS-Fuzz helper dependency setup failed'
       return 0
     fi
     if grep -Eiq 'docker.*not found' "$log_file"; then
       printf 'ofg_docker_unavailable: Docker command is unavailable and source fallback did not satisfy OSS-Fuzz-Gen'
       return 0
     fi
-    if grep -Eiq '/workspace/oss-fuzz|No such file or directory.*oss-fuzz|FileNotFoundError.*oss-fuzz|missing_oss_fuzz_checkout' "$log_file"; then
+    if grep -Eiq 'missing_oss_fuzz_checkout|OSS-Fuzz checkout is unavailable|no valid OSS-Fuzz checkout|No such file or directory.*infra/helper\.py|FileNotFoundError.*infra/helper\.py' "$log_file"; then
       printf 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
       return 0
     fi
     if grep -Eiq 'Querying FuzzIntrospector API' "$log_file" && [[ "$code" == "124" ]]; then
       printf 'ofg_introspector_timeout: OSS-Fuzz-Gen timed out while querying Fuzz Introspector'
+      return 0
+    fi
+    if grep -Eiq 'one_prompt_prototyper|chat.completions|LLM API Error' "$log_file" && [[ "$code" == "124" ]]; then
+      printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out or exceeded row budget'
       return 0
     fi
     if grep -Eiq 'Exception while running experiment|Traceback' "$log_file"; then
@@ -145,6 +227,16 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
+  export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
+  export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+  export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+  export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
+  export OFG_REQUIRE_BENCHMARK_TRIM="${OFG_REQUIRE_BENCHMARK_TRIM:-1}"
+  export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
+  export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
+  export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
+  export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
+  export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
   hgb_require_target_package
   project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
@@ -222,6 +314,10 @@ PY_OFG_YAML
   fi
 
   benchmark_yaml="${OFG_BENCHMARK_YAML:-}"
+  benchmark_original_function_count=0
+  benchmark_trimmed_function_count=0
+  benchmark_original_test_file_count=0
+  benchmark_trimmed_test_file_count=0
   benchmark_match_kind="none"
   selected_yaml_project=""
   selected_yaml_target_name=""
@@ -268,8 +364,22 @@ PY_OFG_YAML
 
   if [[ -n "$benchmark_yaml" && "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" != "0" ]]; then
     trimmed_yaml="$workspace/ofg_benchmark.trimmed.yaml"
-    if python3 /opt/hgb/bin/ofg_trim_benchmark.py --in "$benchmark_yaml" --out "$trimmed_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" >>"$workspace/logs/benchmark_yaml.log" 2>&1; then
+    trim_metadata="$workspace/ofg_benchmark_trim.json"
+    if "$python" /opt/hgb/bin/ofg_trim_benchmark.py --in "$benchmark_yaml" --out "$trimmed_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$trim_metadata" >>"$workspace/logs/benchmark_yaml.log" 2>&1; then
       benchmark_yaml="$trimmed_yaml"
+      benchmark_original_function_count="$(json_file_value "$trim_metadata" original_function_count)"
+      benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
+      benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
+      benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
+    elif [[ "${OFG_REQUIRE_BENCHMARK_TRIM:-1}" == "1" ]]; then
+      printf 'ofg_benchmark_trim_failed: failed to trim %s
+' "$benchmark_yaml" >>"$workspace/logs/benchmark_yaml.log"
+      extra=$(printf '  "benchmark_yaml": "%s",
+  "benchmark_match_kind": "%s",
+  "benchmark_trim_log": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$workspace/logs/benchmark_yaml.log")")
+      hgb_write_common_metadata failed 'ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed' 65 harness_generator "$extra"
+      hgb_write_common_summary failed 'ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed' harness_generator
+      exit 65
     fi
   fi
 
@@ -281,11 +391,22 @@ PY_OFG_YAML
     hgb_write_common_summary missing_oss_fuzz_checkout 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' harness_generator
     exit 2
   fi
+  if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 2>&1; then
+    hgb_write_common_metadata failed 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv' 65 harness_generator
+    hgb_write_common_summary failed 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv' harness_generator
+    exit 65
+  fi
+  if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
+    reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
   mkdir -p "$workspace/pip-cache"
-  cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --work-dir "$workspace/ofg-work")
+  cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --work-dir "$workspace/ofg-work")
   printf '%q ' "${cmd[@]}" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
   code=0
-  (cd "$artifact" && PIP_CACHE_DIR="$workspace/pip-cache" timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
+  (cd "$artifact" && PIP_CACHE_DIR="$workspace/pip-cache" timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
   if [[ -d "$workspace/ofg-work" ]]; then
     n=0
     while IFS= read -r generated; do
@@ -318,7 +439,27 @@ PY_OFG_YAML
   target_source_file_count="${target_source_file_count:-0}"
   target_source_fallback_statuses="$(hgb_target_manifest_value source_fallback_statuses)"
   target_source_fallback_statuses="${target_source_fallback_statuses:-[]}"
-  extra=$(printf '  "benchmark_yaml": "%s",\n  "benchmark_match_kind": "%s",\n  "selected_yaml_project": "%s",\n  "selected_yaml_target_name": "%s",\n  "benchmark_candidate_count": %s,\n  "offline_coverage_mode": "%s",\n  "target_source_status": "%s",\n  "target_source_file_count": %s,\n  "target_source_fallback_statuses": %s,\n  "command_file": "%s",\n  "log_file": "%s",\n  "oss_fuzz_dir": "%s",\n  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
+  extra=$(printf '  "benchmark_yaml": "%s",
+  "benchmark_match_kind": "%s",
+  "selected_yaml_project": "%s",
+  "selected_yaml_target_name": "%s",
+  "benchmark_candidate_count": %s,
+  "benchmark_original_function_count": %s,
+  "benchmark_trimmed_function_count": %s,
+  "benchmark_original_test_file_count": %s,
+  "benchmark_trimmed_test_file_count": %s,
+  "offline_coverage_mode": "%s",
+  "introspector_mode": "%s",
+  "ofg_num_samples": %s,
+  "ofg_num_exp": %s,
+  "ofg_num_eva": %s,
+  "target_source_status": "%s",
+  "target_source_file_count": %s,
+  "target_source_fallback_statuses": %s,
+  "command_file": "%s",
+  "log_file": "%s",
+  "oss_fuzz_dir": "%s",
+  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
@@ -328,6 +469,16 @@ export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
 export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
 export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
+export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
+export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
+export OFG_REQUIRE_BENCHMARK_TRIM="${OFG_REQUIRE_BENCHMARK_TRIM:-1}"
+export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
+export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
+export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
+export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
+export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
 benchmark="${OFG_BENCHMARK:-tinyxml2}"
 benchmark_yaml=""
 if [[ -d "$artifact/benchmark-sets" ]]; then
@@ -361,7 +512,22 @@ if ! oss_fuzz_dir="$(materialize_oss_fuzz_checkout)"; then
   summary missing_oss_fuzz_checkout 2 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
   exit 2
 fi
-cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --work-dir "$workspace/ofg-work")
+if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 2>&1; then
+  printf 'prepare oss-fuzz venv
+' >"$command_file"
+  metadata failed 65 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv' "$command_file" "$workspace/logs/oss_fuzz_venv.log" "$benchmark_yaml"
+  summary failed 65 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv'
+  exit 65
+fi
+if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
+  reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
+  printf 'llm preflight
+' >"$command_file"
+  metadata failed 65 "$reason" "$command_file" "$workspace/logs/llm_preflight.log" "$benchmark_yaml"
+  summary failed 65 "$reason"
+  exit 65
+fi
+cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --work-dir "$workspace/ofg-work")
 printf '%q ' "${cmd[@]}" >"$command_file"; printf '\n' >>"$command_file"
 code=0
 (cd "$artifact" && timeout "${OFG_TOTAL_TIMEOUT_SECONDS:-600}" "${cmd[@]}") >"$run_log" 2>&1 || code=$?

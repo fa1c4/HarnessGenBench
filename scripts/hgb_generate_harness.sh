@@ -29,7 +29,7 @@ generator=""
 target=""
 target_package=""
 run_id=""
-timeout_seconds="${HGB_GENERATION_TIMEOUT_SECONDS:-900}"
+timeout_seconds="${HGB_GENERATION_TIMEOUT_SECONDS:-10800}"
 dry_run=0
 allow_input_generator=0
 target_layout="compact"
@@ -122,8 +122,8 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
   else
     image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
   fi
-elif [[ "$dry_run" != "1" && "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && grep -Fq "_chat_completion_kwargs" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "_copy_hgb_target_source" /opt/hgb/artifacts/oss-fuzz-gen/data_prep/project_src.py' >/dev/null 2>&1; then
-  log "rebuilding stale OSS-Fuzz-Gen image without /opt/hgb/oss-fuzz or current OSS-Fuzz-Gen fixes: $image"
+elif [[ "$dry_run" != "1" && "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && test -x /opt/hgb/oss-fuzz-venv/bin/python && /opt/hgb/venv/bin/python -c "import pkg_resources; import google.cloud.logging" && /opt/hgb/oss-fuzz-venv/bin/python -c "import pkg_resources; import yaml" && grep -Fq "_chat_completion_kwargs" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "_copy_hgb_target_source" /opt/hgb/artifacts/oss-fuzz-gen/data_prep/project_src.py && grep -Fq "OFG_LOCAL_INTROSPECTOR_SHIM" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "ofg_benchmark_trim_failed" /opt/hgb/entrypoint.sh && grep -Fq "OFG_OSS_FUZZ_VENV" /opt/hgb/entrypoint.sh && grep -Fq "OFG_LLM_MAX_RETRIES" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "ofg_empty_llm_response" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/output_parser.py && grep -Fq "ofg_docker_pull_timeout" /opt/hgb/entrypoint.sh' >/dev/null 2>&1; then
+  log "rebuilding stale OSS-Fuzz-Gen image without /opt/hgb/oss-fuzz, split helper venv, or current OSS-Fuzz-Gen fixes: $image"
   image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
 fi
 
@@ -139,6 +139,8 @@ fi
 
 export HGB_DRY_RUN="$dry_run"
 export HGB_GENERATION_TIMEOUT_SECONDS="$timeout_seconds"
+export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
+export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
 export HGB_ALLOW_INPUT_GENERATOR_TO_RUN="$allow_input_generator"
 export HGB_SAVE_MODE="$save_mode"
 

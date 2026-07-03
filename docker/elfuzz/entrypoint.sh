@@ -149,10 +149,10 @@ if [[ "$mode" == "generate-target" ]]; then
   fi
   code=0
   failed_stage=synth
-  (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${synth_args[@]}") >"$workspace/logs/synth.log" 2>&1 || code=$?
+  (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${synth_args[@]}") >"$workspace/logs/synth.log" 2>&1 || code=$?
   if [[ "$code" == "0" ]]; then
     failed_stage=produce
-    (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${produce_args[@]}") >"$workspace/logs/produce.log" 2>&1 || code=$?
+    (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${produce_args[@]}") >"$workspace/logs/produce.log" 2>&1 || code=$?
   fi
   find "$workspace" -type f \( -path '*/seeds/*' -o -path '*/inputs/*' -o -name '*.seed' -o -name '*.bin' \) -exec cp {} "$workspace/generated_inputs/" \; 2>/dev/null || true
   status=completed

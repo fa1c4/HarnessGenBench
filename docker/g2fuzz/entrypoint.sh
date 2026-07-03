@@ -239,7 +239,7 @@ PY_G2_MODEL
   printf '%s\n' "$OPENAI_API_KEY" >"$runtime/openai_key.txt"
   chmod 600 "$runtime/openai_key.txt"
   code=0
-  (cd "$runtime" && timeout "${G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS:-${HGB_GENERATION_TIMEOUT_SECONDS:-900}}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
+  (cd "$runtime" && timeout "${G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS:-${HGB_GENERATION_TIMEOUT_SECONDS:-10800}}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
   rm -f "$runtime/openai_key.txt"
   if [[ -d "$output_dir" ]]; then
     cp -a "$output_dir/." "$workspace/generated_inputs/" 2>/dev/null || true
@@ -258,6 +258,13 @@ PY_G2_MODEL
   elif [[ "$program_gen_code" -ne 0 ]]; then
     status=failed
     reason="program_gen exited $program_gen_code"
+    if grep -qi 'AuthenticationError\|PermissionDeniedError\|Error code: 401\|Error code: 403\|invalid api key' "$workspace/logs/program_gen.log"; then
+      reason='G2Fuzz LLM API credentials were rejected; verify base URL, model, and API key before rerunning'
+    elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/program_gen.log"; then
+      reason='G2Fuzz LLM API returned empty response content before saving generated inputs'
+    elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/program_gen.log"; then
+      reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase provider request timeout'
+    fi
   fi
   extra=$(printf '  "program": "%s",
   "formats": "%s",
@@ -313,6 +320,13 @@ PYMODEL
     elif [[ "$program_gen_code" -ne 0 ]]; then
       status=failed
       reason="program_gen exited $program_gen_code"
+      if grep -qi 'AuthenticationError\|PermissionDeniedError\|Error code: 401\|Error code: 403\|invalid api key' "$workspace/logs/program_gen.log"; then
+        reason='G2Fuzz LLM API credentials were rejected; verify base URL, model, and API key before rerunning'
+      elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/program_gen.log"; then
+        reason='G2Fuzz LLM API returned empty response content before saving generated inputs'
+      elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/program_gen.log"; then
+        reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase provider request timeout'
+      fi
     fi
     write_seed_metadata "$status" "$program_gen_code" "$reason" "$program" "$formats" "$seeds" "$generators" "$output_dir"
     write_seed_summary "$status" "$program_gen_code" "$reason" "$program" "$formats" "$seeds" "$generators"

@@ -397,7 +397,7 @@ PY_PROMEFUZZ_LOCAL_RAG_PATCH
     fi
     printf '%q ' "${stage_args[@]}" >>"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
     stage_code=0
-    (cd "$runtime_artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" "${stage_args[@]}") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
+    (cd "$runtime_artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${stage_args[@]}") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
     if [[ "$stage" == "stats" ]]; then
       continue
     fi
@@ -448,6 +448,12 @@ PY_PROME_API_COUNT
         reason='PromeFuzz embedding service is unavailable at localhost:11434; start Ollama or set PROME_FUZZ_EMBEDDING_LLM_TYPE/base/model/API key'
       elif grep -q 'openai.NotFoundError: Error code: 404\|Error code: 404' "$stage_log"; then
         reason='PromeFuzz embedding API returned 404; set PROME_FUZZ_EMBEDDING_MODEL and embedding base/API key to a compatible embeddings endpoint'
+      elif grep -qi 'AuthenticationError\|PermissionDeniedError\|Error code: 401\|Error code: 403\|invalid api key' "$stage_log"; then
+        reason='PromeFuzz LLM or embedding API credentials were rejected; verify base URL, model, and API key before rerunning'
+      elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$stage_log"; then
+        reason='PromeFuzz LLM API returned empty response content before harness generation'
+      elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$stage_log"; then
+        reason='PromeFuzz LLM or embedding request timed out before harness generation; reduce API/doc caps or increase provider request timeout'
       elif grep -qi 'Expected Embeddings to be non-empty\|no non-empty chunks\|Skipping document' "$stage_log"; then
         reason='promefuzz_no_usable_docs: PromeFuzz comprehension had no usable non-empty documentation chunks after filtering bad docs'
       elif grep -qi 'pdfminer\|partition_pdf\|Failed to load document.*pdf' "$stage_log"; then

@@ -676,7 +676,7 @@ PY_CKG_HF_IMPORT_PATCH
   repo_code=0
   preproc_code=not_run
   fuzzing_code=not_run
-  (cd "$(dirname "$repo_py")" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" python "$repo_py" --project_name "$ckg_project" --shared_llm_dir "$ckg_shared" --saved_dir "$ckg_db/codebase" --src_api --call_graph) >"$workspace/logs/repo.log" 2>&1 || repo_code=$?
+  (cd "$(dirname "$repo_py")" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$repo_py" --project_name "$ckg_project" --shared_llm_dir "$ckg_shared" --saved_dir "$ckg_db/codebase" --src_api --call_graph) >"$workspace/logs/repo.log" 2>&1 || repo_code=$?
   if [[ "$repo_code" != "0" ]]; then
     code="$repo_code"
     failed_stage=repo
@@ -689,7 +689,7 @@ PY_CKG_HF_IMPORT_PATCH
   fi
   if [[ "$code" == "0" ]]; then
     preproc_code=0
-    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" python "$preproc_py" --project_name "$ckg_project" --src_api_file_path "$ckg_db" >"$workspace/logs/preproc.log" 2>&1 || preproc_code=$?
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$preproc_py" --project_name "$ckg_project" --src_api_file_path "$ckg_db" >"$workspace/logs/preproc.log" 2>&1 || preproc_code=$?
     if [[ "$preproc_code" != "0" ]]; then
       code="$preproc_code"
       failed_stage=preproc
@@ -703,7 +703,7 @@ PY_CKG_HF_IMPORT_PATCH
   fi
   if [[ "$code" == "0" ]]; then
     fuzzing_code=0
-    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-900}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --check_compilation "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --check_compilation "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
     if [[ "$fuzzing_code" != "0" ]]; then
       code="$fuzzing_code"
       failed_stage=fuzzing
@@ -727,6 +727,12 @@ PY_CKG_HF_IMPORT_PATCH
     if [[ "$failed_stage" == "fuzzing" && -f "$workspace/logs/fuzzing.log" ]]; then
       if grep -q 'openai.NotFoundError: Error code: 404' "$workspace/logs/fuzzing.log"; then
         reason='CKGFuzzer embedding API returned 404; set CKGFUZZER_EMBEDDING_MODEL and embedding base/API key to a compatible embeddings endpoint'
+      elif grep -qi 'AuthenticationError\|PermissionDeniedError\|Error code: 401\|Error code: 403\|invalid api key' "$workspace/logs/fuzzing.log"; then
+        reason='CKGFuzzer LLM API key or embedding credentials were rejected; verify base URL, model, and API key before rerunning'
+      elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/fuzzing.log"; then
+        reason='CKGFuzzer LLM API returned empty response content before harness generation'
+      elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/fuzzing.log"; then
+        reason='CKGFuzzer LLM API request timed out before harness generation; reduce API caps or increase provider request timeout'
       elif grep -qi 'Connection refused.*11434\|Failed to establish.*11434' "$workspace/logs/fuzzing.log"; then
         reason='CKGFuzzer embedding service is unavailable at localhost:11434; start Ollama or configure CKGFUZZER_EMBEDDING_MODEL/base URL'
       elif grep -q "ModuleNotFoundError: No module named" "$workspace/logs/fuzzing.log"; then
