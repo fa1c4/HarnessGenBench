@@ -45,6 +45,56 @@ STOP_TOKENS = {
 }
 
 
+
+REFERENCE_SOURCE_EXTS = {'.c', '.cc', '.cpp', '.cxx', '.h', '.hh', '.hpp', '.hxx'}
+REFERENCE_CALL_SKIP = GENERIC_NAMES | BANNED_API_NAMES | {
+    'alignas', 'alignof', 'asm', 'auto', 'bool', 'break', 'case', 'catch',
+    'char', 'class', 'const', 'const_cast', 'continue', 'decltype', 'default',
+    'delete', 'do', 'double', 'dynamic_cast', 'else', 'enum', 'explicit',
+    'extern', 'false', 'float', 'for', 'friend', 'goto', 'if', 'inline', 'int',
+    'long', 'namespace', 'new', 'noexcept', 'nullptr', 'operator', 'private',
+    'protected', 'public', 'register', 'reinterpret_cast', 'return', 'short',
+    'signed', 'sizeof', 'static', 'static_cast', 'struct', 'switch', 'template',
+    'this', 'throw', 'true', 'try', 'typedef', 'typeid', 'typename', 'union',
+    'unsigned', 'using', 'virtual', 'void', 'volatile', 'while',
+    'LLVMFuzzerTestOneInput', 'LLVMFuzzerInitialize',
+}
+
+
+def strip_reference_noise(text: str) -> str:
+    text = re.sub(r'/\*.*?\*/', ' ', text, flags=re.S)
+    text = re.sub(r'//.*', ' ', text)
+    text = re.sub(r'"(?:\\.|[^"\\])*"', ' ', text)
+    text = re.sub(r"'(?:\\.|[^'\\])*'", ' ', text)
+    return text
+
+
+def load_reference_calls(reference_dir: str | Path | None, max_bytes: int = 1_000_000) -> set[str]:
+    if not reference_dir:
+        return set()
+    root = Path(reference_dir)
+    if not root.exists():
+        return set()
+    calls: set[str] = set()
+    remaining = max_bytes
+    for path in sorted(root.rglob('*')):
+        if not path.is_file() or path.suffix.lower() not in REFERENCE_SOURCE_EXTS:
+            continue
+        if remaining <= 0:
+            break
+        try:
+            text = path.read_text(encoding='utf-8', errors='replace')[:remaining]
+        except OSError:
+            continue
+        remaining -= len(text)
+        for match in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_:]*)\s*\(', strip_reference_noise(text)):
+            name = match.group(1).split('::')[-1]
+            if not name or name in REFERENCE_CALL_SKIP or name.startswith('__'):
+                continue
+            calls.add(name.lower())
+    return calls
+
+
 def split_hint_tokens(*values: str) -> list[str]:
     tokens: list[str] = []
     for value in values:

@@ -26,7 +26,7 @@ RUN cd /opt/hgb/artifacts/promefuzz \
   && test -x build/bin/cgprocessor
 ENV PATH="/opt/hgb/venv/bin:${PATH}"
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py /opt/hgb/bin/
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py /opt/hgb/bin/
 RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/extract_api_list.py
 COPY docker/promefuzz/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh

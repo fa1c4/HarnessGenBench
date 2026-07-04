@@ -354,7 +354,10 @@ if [[ "$mode" == "generate-target" ]]; then
   export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
   export OFG_BUILD_IMAGE_PULL="${OFG_BUILD_IMAGE_PULL:-1}"
   export OFG_PROJECT_IMAGE_BUILD_PARALLELISM="${OFG_PROJECT_IMAGE_BUILD_PARALLELISM:-2}"
-  export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-500}"
+  export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
+  export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
+  export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
+  export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-$HGB_SELECTED_API_MAX}"
   export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
   export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
   export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
@@ -370,12 +373,25 @@ if [[ "$mode" == "generate-target" ]]; then
   project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
   fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  selected_reference_dir="/target/reference_harnesses/selected"
+  api_selection_metadata="$workspace/ofg_api_selection.json"
 
   synthesize_benchmark_yaml() {
     local out_yaml="$1"
     local api_json="$workspace/ofg_api_candidates.json"
     local api_count
-    api_count="$(python3 /opt/hgb/bin/extract_api_list.py --details --source /target/source_input --out "$api_json" --max "${OFG_SYNTH_CANDIDATE_POOL:-500}" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir /target/reference_harnesses 2>"$workspace/logs/ofg_api_extract.log" || printf '0')"
+    api_count="$(python3 /opt/hgb/bin/extract_api_list.py --details \
+      --source /target/source_input \
+      --out "$api_json" \
+      --max "${OFG_SYNTH_CANDIDATE_POOL:-${HGB_SELECTED_API_MAX:-8}}" \
+      --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}" \
+      --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" \
+      --project "$project" \
+      --target-name "$target_name" \
+      --fuzz-target "$fuzz_target" \
+      --reference-dir "$selected_reference_dir" \
+      --selection-metadata "$api_selection_metadata" \
+      2>"$workspace/logs/ofg_api_extract.log" || printf '0')"
     api_count="${api_count##*$'\n'}"
     if [[ "${api_count:-0}" == "0" ]]; then
       return 1
@@ -394,12 +410,13 @@ cpp_count = sum(1 for p in source.rglob('*') if p.suffix.lower() in cpp_exts)
 c_count = sum(1 for p in source.rglob('*') if p.suffix.lower() in c_exts)
 language = 'c++' if cpp_count >= c_count else 'c'
 ref = None
-ref_root = Path('/target/reference_harnesses')
-if ref_root.exists():
-    for candidate in sorted(ref_root.rglob('*')):
-        if candidate.is_file() and candidate.suffix.lower() in {'.c', '.cc', '.cpp', '.cxx'}:
-            ref = candidate
-            break
+if __import__('os').environ.get('HGB_ALLOW_REFERENCE_USAGE', '0') == '1':
+    ref_root = Path('/target/reference_harnesses/selected')
+    if ref_root.exists():
+        for candidate in sorted(ref_root.rglob('*')):
+            if candidate.is_file() and candidate.suffix.lower() in {'.c', '.cc', '.cpp', '.cxx'}:
+                ref = candidate
+                break
 target_path = str(ref) if ref else f'/src/{project}/{fuzz_target or target_name}.cc'
 functions = []
 for record in records:
@@ -500,7 +517,7 @@ PY_OFG_YAML
     trim_benchmark_once() {
       local source_yaml="$1" out_yaml="$2" metadata_json="$3"
       local trim_args
-      trim_args=(/opt/hgb/bin/ofg_trim_benchmark.py --in "$source_yaml" --out "$out_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$metadata_json" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir /target/reference_harnesses --min-score "${OFG_MIN_BENCHMARK_SCORE:-1}")
+      trim_args=(/opt/hgb/bin/ofg_trim_benchmark.py --in "$source_yaml" --out "$out_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$metadata_json" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir "$selected_reference_dir" --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" --min-score "${OFG_MIN_BENCHMARK_SCORE:-1}")
       if [[ "${OFG_ALLOW_TEST_BENCHMARKS:-0}" == "1" ]]; then
         trim_args+=(--allow-test-files)
       fi
@@ -649,6 +666,7 @@ PY_OFG_LOG_HARNESS
   "selected_yaml_project": "%s",
   "selected_yaml_target_name": "%s",
   "benchmark_candidate_count": %s,
+  "api_selection_metadata": "%s",
   "benchmark_original_function_count": %s,
   "benchmark_trimmed_function_count": %s,
   "benchmark_original_test_file_count": %s,
@@ -665,7 +683,7 @@ PY_OFG_LOG_HARNESS
   "command_file": "%s",
   "log_file": "%s",
   "oss_fuzz_dir": "%s",
-  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "${OFG_MAX_ROUND:-5}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
+  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "$(hgb_json_escape "$api_selection_metadata")" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "${OFG_MAX_ROUND:-5}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

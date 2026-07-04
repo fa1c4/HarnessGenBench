@@ -23,6 +23,26 @@ from typing import Any
 
 SOURCE_URL_RE = re.compile(r"^(?:https?|git|ssh)://|^git@")
 SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+HARNESS_SOURCE_EXTS = {".c", ".cc", ".cpp", ".cxx"}
+SELECTED_REFERENCE_SUBDIR = "selected"
+HARNESS_STOP_TOKENS = {
+    "fuzz",
+    "fuzzer",
+    "fuzzing",
+    "target",
+    "oss",
+    "ossfuzz",
+    "read",
+    "decode",
+    "parser",
+    "parse",
+    "http",
+    "both",
+    "send",
+    "convert",
+    "shape",
+    "link",
+}
 SHELL_OPS = {"&&", ";", "||", "|"}
 GIT_CLONE_OPTIONS_WITH_ARG = {
     "-b",
@@ -515,6 +535,213 @@ def strip_reference_harnesses(source_full: Path, source_input: Path, reference_d
     return sorted(removed)
 
 
+
+def _norm_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def harness_hint_tokens(*values: str) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        for token in re.split(r"[^A-Za-z0-9]+", value or ""):
+            token = token.lower()
+            if len(token) < 2 or token in HARNESS_STOP_TOKENS:
+                continue
+            if token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def _for_loop_values(build_text: str) -> dict[str, list[str]]:
+    values: dict[str, list[str]] = {}
+    for match in re.finditer(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)", build_text):
+        var = match.group(1)
+        raw_values = [unquote(part.strip()) for part in match.group(2).split() if part.strip()]
+        values[var] = [value for value in raw_values if value and not value.startswith("$")]
+    return values
+
+
+def _clean_build_source_ref(ref: str) -> str:
+    ref = unquote(ref.strip().strip("\\"))
+    for prefix in ("${SRC}/", "$SRC/", "${WORK}/", "$WORK/", "./"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+    while ref.startswith("../"):
+        ref = ref[3:]
+    return ref.strip("/")
+
+
+def _source_ref_matches_target(ref: str, target_tokens: list[str], target_norms: set[str]) -> bool:
+    rel = _clean_build_source_ref(ref).lower()
+    name = Path(rel).name.lower()
+    stem = Path(name).stem
+    norm_stem = _norm_token(stem)
+    norm_rel = _norm_token(rel)
+    if not rel or Path(rel).suffix.lower() not in HARNESS_SOURCE_EXTS:
+        return False
+    if "fuzz" in rel or "fuzzer" in rel:
+        return True
+    if stem in {"target", "ossfuzz"}:
+        return True
+    if norm_stem in target_norms:
+        return True
+    return any(token and token in norm_rel for token in target_tokens)
+
+
+def selected_build_hints(build_sh: Path, target: str, fuzz_target: str) -> tuple[set[str], set[str]]:
+    if not build_sh.is_file():
+        return set(), set()
+    text = build_sh.read_text(encoding="utf-8", errors="replace")
+    tokens = harness_hint_tokens(target, fuzz_target)
+    target_norms = {_norm_token(value) for value in (target, fuzz_target, *tokens) if value}
+    refs: set[str] = set()
+    stems: set[str] = set()
+
+    source_ref_re = re.compile(r"(?:\$\{?[A-Za-z_][A-Za-z0-9_]*\}?/|\.\.?/|[A-Za-z0-9_.-]+/)?[A-Za-z0-9_./{}$-]+\.(?:c|cc|cpp|cxx)\b")
+    for match in source_ref_re.finditer(text):
+        ref = _clean_build_source_ref(match.group(0))
+        if "$" not in ref and _source_ref_matches_target(ref, tokens, target_norms):
+            refs.add(ref.lower())
+            stems.add(Path(ref).stem.lower())
+
+    loop_values = _for_loop_values(text)
+    for var, values in loop_values.items():
+        var_pattern = re.compile(rf"[A-Za-z0-9_./{{}}$-]*\$(?:\{{{re.escape(var)}\}}|{re.escape(var)})[A-Za-z0-9_./{{}}$-]*\.(?:c|cc|cpp|cxx)\b")
+        for match in var_pattern.finditer(text):
+            template = _clean_build_source_ref(match.group(0))
+            for value in values:
+                value_norm = _norm_token(value)
+                if value_norm not in target_norms and value not in {"fuzz", "fuzzer"}:
+                    continue
+                expanded = template.replace(f"${{{var}}}", value).replace(f"${var}", value)
+                if _source_ref_matches_target(expanded, tokens, target_norms):
+                    refs.add(expanded.lower())
+                    stems.add(Path(expanded).stem.lower())
+
+    for match in re.finditer(r"\b[A-Za-z0-9_./-]*(?:fuzz|fuzzer)[A-Za-z0-9_./-]*\b", text, re.I):
+        hint = match.group(0).strip("./")
+        if not hint or hint.lower() in {"fuzzers", "fuzzer", "fuzz"}:
+            continue
+        stems.add(Path(hint).name.lower())
+    return refs, stems
+
+
+def _candidate_score(
+    path: Path,
+    rel: Path,
+    root: Path,
+    target: str,
+    fuzz_target: str,
+    build_refs: set[str],
+    build_stems: set[str],
+    benchmark_local: bool,
+) -> int:
+    rel_s = rel.as_posix()
+    rel_l = rel_s.lower()
+    name_l = path.name.lower()
+    stem_l = path.stem.lower()
+    norm_stem = _norm_token(stem_l)
+    norm_rel = _norm_token(rel_s)
+    tokens = harness_hint_tokens(target, fuzz_target)
+    target_norms = {_norm_token(value) for value in (target, fuzz_target, *tokens) if value}
+    score = 0
+    if rel_l in build_refs or any(rel_l.endswith(ref) for ref in build_refs):
+        score += 420
+    if stem_l in build_stems or name_l in build_stems:
+        score += 240
+    if norm_stem in target_norms:
+        score += 180
+    for norm in target_norms:
+        if norm and norm in norm_stem:
+            score += 120
+        elif norm and norm in norm_rel:
+            score += 70
+    for token in tokens:
+        if token == stem_l:
+            score += 140
+        elif token in stem_l:
+            score += 90
+        elif token in rel_l:
+            score += 35
+    if stem_l in {"target", "ossfuzz"} and benchmark_local:
+        score += 120
+    if benchmark_local:
+        score += 30
+    try:
+        if likely_reference_harness(path, root):
+            score += 45
+    except ValueError:
+        pass
+    if any(part.lower() in {"seed", "seeds", "testcases", "corpus"} for part in rel.parts):
+        score -= 200
+    return score
+
+
+def _copy_selected_reference_file(path: Path, root: Path, label: str, selected_dir: Path) -> str | None:
+    try:
+        rel = path.relative_to(root)
+    except ValueError:
+        return None
+    dst = selected_dir / label / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, dst)
+    return f"{label}/{rel.as_posix()}"
+
+
+def copy_selected_reference_harnesses(
+    benchmark_dir: Path,
+    source_root: Path,
+    reference_dir: Path,
+    target: str,
+    fuzz_target: str,
+    source_label: str,
+) -> list[str]:
+    selected_dir = reference_dir / SELECTED_REFERENCE_SUBDIR
+    selected_dir.mkdir(parents=True, exist_ok=True)
+    build_refs, build_stems = selected_build_hints(benchmark_dir / "build.sh", target, fuzz_target)
+    candidates: list[tuple[int, Path, Path, str, bool]] = []
+
+    roots: list[tuple[Path, str, bool]] = []
+    if benchmark_dir.is_dir():
+        roots.append((benchmark_dir, "fuzzbench_benchmark", True))
+    if source_root.is_dir():
+        roots.append((source_root, source_label, False))
+
+    for root, label, benchmark_local in roots:
+        for candidate in sorted(root.rglob("*")):
+            if not candidate.is_file() or candidate.suffix.lower() not in HARNESS_SOURCE_EXTS:
+                continue
+            try:
+                rel = candidate.relative_to(root)
+            except ValueError:
+                continue
+            if benchmark_local and any(part in {"seeds", "testcases", "corpus"} for part in rel.parts):
+                continue
+            score = _candidate_score(candidate, rel, root, target, fuzz_target, build_refs, build_stems, benchmark_local)
+            if benchmark_local:
+                source_count = sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() in HARNESS_SOURCE_EXTS)
+                if source_count == 1:
+                    score += 120
+            if score >= 80:
+                candidates.append((score, candidate, root, label, benchmark_local))
+
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: (-item[0], item[3], item[1].as_posix()))
+    top_score = candidates[0][0]
+    threshold = max(80, top_score - 40)
+    copied: list[str] = []
+    seen: set[str] = set()
+    for score, candidate, root, label, _benchmark_local in candidates:
+        if score < threshold or len(copied) >= 8:
+            break
+        rel_label = _copy_selected_reference_file(candidate, root, label, selected_dir)
+        if rel_label and rel_label not in seen:
+            seen.add(rel_label)
+            copied.append(rel_label)
+    return copied
+
+
 def copy_selected_docs(source_full: Path, docs_dir: Path) -> int:
     if not source_full.exists():
         return 0
@@ -611,6 +838,7 @@ def write_summary(output: Path, manifest: dict[str, Any]) -> None:
         f"- CMake files: `{manifest.get('cmake_file_count', 0)}`",
         f"- Compile databases: `{manifest.get('compile_commands_count', 0)}`",
         f"- Reference harness files stripped/copied: `{len(manifest.get('reference_harness_files', []))}`",
+        f"- Selected reference harness files: `{manifest.get('selected_reference_harness_count', 0)}`",
         f"- Seed files: `{manifest.get('seed_count', 0)}`",
         f"- Dictionary/options files: `{manifest.get('dictionary_count', 0)}`",
         f"- Build script status: `{manifest.get('build_script_status', 'unknown')}`",
@@ -673,6 +901,14 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         copy_tree(output / "source_full", output / "source_input")
     strip = os.environ.get("HGB_TARGET_STRIP_REFERENCE_HARNESS", "1") != "0"
     source_label = "source_full" if layout == "full" else "source_input"
+    selected_reference_files = copy_selected_reference_harnesses(
+        benchmark_copy,
+        source_root,
+        output / "reference_harnesses",
+        target,
+        resolved.get("fuzz_target", ""),
+        source_label,
+    )
     reference_files = strip_reference_harnesses(source_root, output / "source_input", output / "reference_harnesses", strip, source_label=source_label)
     copy_selected_docs(source_root, output / "docs")
     seed_count, dictionary_count = copy_seeds_and_dicts(benchmark_copy, output / "seeds", output / "dictionary")
@@ -709,6 +945,9 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         "source_full_dir": "source_full" if layout == "full" else "",
         "reference_harness_dir": "reference_harnesses",
         "reference_harness_files": reference_files,
+        "selected_reference_harness_dir": f"reference_harnesses/{SELECTED_REFERENCE_SUBDIR}",
+        "selected_reference_harness_files": selected_reference_files,
+        "selected_reference_harness_count": len(selected_reference_files),
         "seed_count": seed_count,
         "dictionary_count": dictionary_count,
         "build_script_status": build_script_status,

@@ -138,6 +138,8 @@ if [[ "$mode" == "generate-target" ]]; then
   add_codeql_to_path /opt/codeql
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
   safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
   ckg_project="hgb_${safe_target}"
   ckg_root=/fuzzing_llm_engine
@@ -366,7 +368,20 @@ int main(void) { const uint8_t data[] = {0}; return (int)data[0]; }
 EOF_CKG_USAGE
   fi
 
-  api_count="$(python3 /opt/hgb/bin/extract_api_list.py --source /target/source_input --out "$ckg_db/api_list.json" --max 200 2>"$workspace/logs/api_extract.log" || printf '0')"
+  api_selection_metadata="$workspace/api_selection.json"
+  selected_reference_dir="/target/reference_harnesses/selected"
+  api_count="$(python3 /opt/hgb/bin/extract_api_list.py \
+    --source /target/source_input \
+    --out "$ckg_db/api_list.json" \
+    --max "${CKGFUZZER_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}" \
+    --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}" \
+    --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" \
+    --project "$project" \
+    --target-name "$target_name" \
+    --fuzz-target "$fuzz_target" \
+    --reference-dir "$selected_reference_dir" \
+    --selection-metadata "$api_selection_metadata" \
+    2>"$workspace/logs/api_extract.log" || printf '0')"
   api_count="${api_count##*$'\n'}"
   cat >"$ckg_db/config.yaml" <<EOF_CKG_CONFIG
 config:
@@ -746,7 +761,7 @@ PY_CKG_HF_IMPORT_PATCH
     status=partial_completed
     reason="CKGFuzzer $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
   fi
-  extra=$(printf '  "ckgfuzzer_project": "%s",\n  "ckgfuzzer_shared_dir": "%s",\n  "api_candidate_count": %s,\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "repo_exit_code": "%s",\n  "preproc_exit_code": "%s",\n  "fuzzing_exit_code": "%s",\n  "codeql_version": "%s"' "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")")
+  extra=$(printf '  "ckgfuzzer_project": "%s",\n  "ckgfuzzer_shared_dir": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "repo_exit_code": "%s",\n  "preproc_exit_code": "%s",\n  "fuzzing_exit_code": "%s",\n  "codeql_version": "%s"' "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

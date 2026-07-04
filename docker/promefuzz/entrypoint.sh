@@ -163,11 +163,18 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   export PROME_FUZZ_SKIP_BAD_DOCS="${PROME_FUZZ_SKIP_BAD_DOCS:-1}"
+  export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
+  export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
+  export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
   export NLTK_DATA="${NLTK_DATA:-/opt/hgb/nltk_data}"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/promefuzz_out" /run/hgb/promefuzz
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
   project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+  selected_reference_dir="/target/reference_harnesses/selected"
+  api_selection_metadata="$workspace/promefuzz_api_selection.json"
+  selected_api_names_file="$workspace/promefuzz_selected_apis.json"
   safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
   language="c++"
   if find /target/source_input -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null | grep -q . && ! find /target/source_input -type f \( -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.hpp' \) 2>/dev/null | grep -q .; then
@@ -274,6 +281,20 @@ EOF_PROMEFUZZ_LIBS
     hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
     exit 2
   fi
+  selected_api_count="$(python3 /opt/hgb/bin/extract_api_list.py \
+    --source /target/source_input \
+    --out "$selected_api_names_file" \
+    --max "${PROME_FUZZ_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}" \
+    --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}" \
+    --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" \
+    --project "$project" \
+    --target-name "$target_name" \
+    --fuzz-target "$fuzz_target" \
+    --reference-dir "$selected_reference_dir" \
+    --selection-metadata "$api_selection_metadata" \
+    2>"$workspace/logs/promefuzz_api_extract.log" || printf '0')"
+  selected_api_count="${selected_api_count##*$'\n'}"
+  export PROME_FUZZ_SELECTED_API_NAMES_FILE="$selected_api_names_file"
   runtime_artifact=/run/hgb/promefuzz/artifact
   rm -rf "$runtime_artifact"
   mkdir -p "$runtime_artifact"
@@ -358,18 +379,48 @@ if preprocess_py.exists():
     text = preprocess_py.read_text()
     if "import os\n" not in text:
         text = text.replace("import json\n", "import json\nimport os\n", 1)
+    if "from pathlib import Path\n" not in text:
+        if "import os\n" in text:
+            text = text.replace("import os\n", "import os\nfrom pathlib import Path\n", 1)
+        else:
+            text = "from pathlib import Path\n" + text
     old = """    api = api_extractor.extract(pool_size=pool_size)
     api.dump(out_path / "api.pkl")"""
     new = """    api = api_extractor.extract(pool_size=pool_size)
-    max_apis = int(os.environ.get("PROME_FUZZ_MAX_APIS", "16") or "0")
+    max_apis = int(os.environ.get("PROME_FUZZ_MAX_APIS", os.environ.get("HGB_SELECTED_API_MAX", "8")) or "0")
+
+    def _hgb_api_rank(func):
+        text = " ".join(str(getattr(func, attr, "")) for attr in ("header", "name", "loc", "decl_loc")).lower()
+        penalty = 0
+        for token in ("/test", "/tests", "/example", "/examples", "test::", "testing"):
+            if token in text:
+                penalty += 10
+        return (penalty, len(str(getattr(func, "name", ""))), str(getattr(func, "name", "")), str(getattr(func, "loc", "")))
+
+    selected_names_file = os.environ.get("PROME_FUZZ_SELECTED_API_NAMES_FILE", "")
+    selected_names = []
+    if selected_names_file:
+        try:
+            selected_data = json.loads(Path(selected_names_file).read_text(encoding="utf-8"))
+            for item in selected_data:
+                if isinstance(item, str):
+                    selected_names.append(item.split("::")[-1])
+                elif isinstance(item, dict) and item.get("name"):
+                    selected_names.append(str(item.get("name")).split("::")[-1])
+        except Exception as exc:
+            logger.warning(f"Could not load HGB selected API names from {selected_names_file}: {exc}")
+    selected_rank = {name: index for index, name in enumerate(selected_names)}
+    if selected_rank and getattr(api, "funcs", None):
+        before = api.count
+        matched = [func for func in api.funcs if str(getattr(func, "name", "")).split("::")[-1] in selected_rank]
+        if matched:
+            api.funcs = sorted(matched, key=lambda func: (selected_rank.get(str(getattr(func, "name", "")).split("::")[-1], 9999), _hgb_api_rank(func)))
+            if max_apis > 0:
+                api.funcs = api.funcs[:max_apis]
+            logger.info(f"Filtered API functions from {before} to {api.count} using HGB selected FuzzBench harness APIs.")
+        else:
+            logger.warning("No PromeFuzz API functions matched HGB selected harness APIs; falling back to ranked trimming.")
     if max_apis > 0 and api.count > max_apis:
-        def _hgb_api_rank(func):
-            text = " ".join(str(getattr(func, attr, "")) for attr in ("header", "name", "loc", "decl_loc")).lower()
-            penalty = 0
-            for token in ("/test", "/tests", "/example", "/examples", "test::", "testing"):
-                if token in text:
-                    penalty += 10
-            return (penalty, len(str(getattr(func, "name", ""))), str(getattr(func, "name", "")), str(getattr(func, "loc", "")))
         before = api.count
         api.funcs = sorted(api.funcs, key=_hgb_api_rank)[:max_apis]
         logger.info(f"Limiting API functions from {before} to {api.count} for HGB integration. Set PROME_FUZZ_MAX_APIS=0 to disable.")
@@ -473,7 +524,7 @@ PY_PROME_API_COUNT
   if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
     rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
   fi
-  extra=$(printf '  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s"' "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")")
+  extra=$(printf '  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s"' "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

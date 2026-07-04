@@ -39,7 +39,7 @@ RUN mkdir -p /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tre
   && git clone --depth 1 --branch v0.20.5 https://github.com/tree-sitter/tree-sitter-cpp.git /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tree-sitter/tree-sitter-cpp \
   && /opt/hgb/venv/bin/python -c "from tree_sitter import Language; Language.build_library('/opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tree-sitter/cpp.so', ['/opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tree-sitter/tree-sitter-cpp'])"
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py /opt/hgb/bin/
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py /opt/hgb/bin/
 RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/extract_api_list.py
 COPY docker/ckgfuzzer/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh

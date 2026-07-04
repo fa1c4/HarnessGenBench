@@ -12,7 +12,7 @@ RUN python3 -m venv /opt/hgb/venv \
   && make source-only
 ENV PATH="/opt/hgb/venv/bin:${PATH}"
 RUN mkdir -p /opt/hgb/bin /opt/hgb/metadata
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py /opt/hgb/bin/
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py /opt/hgb/bin/
 COPY metadata/fuzzbench_target_formats.json /opt/hgb/metadata/fuzzbench_target_formats.json
 RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/extract_api_list.py
 COPY docker/g2fuzz/entrypoint.sh /opt/hgb/entrypoint.sh

@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
-from ofg_api_rank import rank_records
+from ofg_api_rank import load_reference_calls, rank_records
 
 
 DECL_RE = re.compile(
@@ -212,35 +213,118 @@ def extract(source: Path, limit: int) -> list[str]:
     return [record["name"] for record in extract_details(source, limit)]
 
 
+
+def effective_reference_dir(reference_dir: str, selected_reference_dir: str = "") -> str:
+    if selected_reference_dir:
+        return selected_reference_dir
+    if not reference_dir:
+        return ""
+    root = Path(reference_dir)
+    selected = root / "selected"
+    if selected.is_dir():
+        return str(selected)
+    return reference_dir
+
+
+def select_records(
+    raw: list[dict[str, Any]],
+    *,
+    max_records: int,
+    fallback_max: int,
+    selection_mode: str,
+    project: str,
+    target_name: str,
+    fuzz_target: str,
+    reference_dir: str,
+    keep_rejected: bool,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ranked = rank_records(
+        raw,
+        project=project,
+        target_name=target_name,
+        fuzz_target=fuzz_target,
+        reference_dir=reference_dir,
+        keep_rejected=keep_rejected,
+    )
+    reference_calls = load_reference_calls(reference_dir)
+    direct = [
+        record for record in ranked
+        if str(record.get("name") or "").split("::")[-1].lower() in reference_calls
+    ]
+    fallback_used = False
+    if selection_mode == "ranked":
+        selected = ranked[:max_records]
+    elif selection_mode == "selected_harness":
+        selected = direct[:max_records]
+    else:
+        if direct:
+            selected = direct[:max_records]
+        else:
+            fallback_used = True
+            selected = ranked[:max(0, fallback_max)]
+    metadata = {
+        "selection_mode": selection_mode,
+        "reference_dir": reference_dir,
+        "raw_candidate_count": len(raw),
+        "ranked_candidate_count": len(ranked),
+        "reference_call_count": len(reference_calls),
+        "direct_match_count": len(direct),
+        "selected_count": len(selected),
+        "fallback_used": fallback_used,
+        "fallback_max": fallback_max,
+        "max_records": max_records,
+        "selected_api_names": [str(record.get("name") or "") for record in selected],
+        "direct_api_names": [str(record.get("name") or "") for record in direct[:max_records]],
+    }
+    return selected, metadata
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--max", type=int, default=500)
+    parser.add_argument("--max", type=int, default=int(os.environ.get("HGB_SELECTED_API_MAX", "8") or "8"))
+    parser.add_argument("--fallback-max", type=int, default=int(os.environ.get("HGB_SELECTED_API_FALLBACK_MAX", "4") or "4"))
     parser.add_argument("--details", action="store_true", help="write detailed API records instead of only names")
     parser.add_argument("--project", default="")
     parser.add_argument("--target-name", default="")
     parser.add_argument("--fuzz-target", default="")
     parser.add_argument("--reference-dir", default="")
+    parser.add_argument("--selected-reference-dir", default="")
+    parser.add_argument(
+        "--selection-mode",
+        default=os.environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"),
+        choices=("ranked", "selected_harness", "selected_harness_fallback"),
+    )
+    parser.add_argument("--selection-metadata", default="")
     parser.add_argument("--keep-rejected", action="store_true")
     args = parser.parse_args()
-    raw_limit = max(args.max * 20, args.max, 1000)
+    max_records = max(0, args.max)
+    fallback_max = max(0, args.fallback_max)
+    raw_limit = max(max(max_records, fallback_max) * 20, max_records, fallback_max, 1000)
     raw = extract_details(Path(args.source), raw_limit)
-    ranked = rank_records(
+    ref_dir = effective_reference_dir(args.reference_dir, args.selected_reference_dir)
+    selected, metadata = select_records(
         raw,
+        max_records=max_records,
+        fallback_max=fallback_max,
+        selection_mode=args.selection_mode,
         project=args.project,
         target_name=args.target_name,
         fuzz_target=args.fuzz_target,
-        reference_dir=args.reference_dir,
+        reference_dir=ref_dir,
         keep_rejected=args.keep_rejected,
-    )[: args.max]
+    )
     if args.details:
-        data = ranked
+        data = selected
     else:
-        data = [record["name"] for record in ranked]
+        data = [record["name"] for record in selected]
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    if args.selection_metadata:
+        metadata_path = Path(args.selection_metadata)
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(len(data))
     return 0
 

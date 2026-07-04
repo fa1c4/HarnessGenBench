@@ -10,7 +10,7 @@ from typing import Any
 
 import yaml
 
-from ofg_api_rank import rank_records, reject_reason
+from ofg_api_rank import load_reference_calls, rank_records, reject_reason
 
 
 def _trim_list(value, max_items: int):
@@ -46,6 +46,13 @@ def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict
         fuzz_target=args.fuzz_target,
         reference_dir=args.reference_dir,
     )
+    reference_calls = load_reference_calls(args.reference_dir)
+    direct = [
+        item for item in ranked
+        if str(item.get("name") or "").split("::")[-1].lower() in reference_calls
+    ]
+    if args.selection_mode != "ranked" and reference_calls:
+        ranked = direct
     rejected = []
     ranked_ids = {id(item) for item in ranked}
     for item in normalised:
@@ -66,6 +73,7 @@ def main() -> int:
     parser.add_argument("--reference-dir", default="")
     parser.add_argument("--allow-test-files", action="store_true")
     parser.add_argument("--min-score", type=int, default=0)
+    parser.add_argument("--selection-mode", default=__import__("os").environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"), choices=("ranked", "selected_harness", "selected_harness_fallback"))
     args = parser.parse_args()
 
     src = Path(args.input_path)
