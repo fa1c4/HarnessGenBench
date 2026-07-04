@@ -39,6 +39,21 @@ def top_level_scalar(path: Path, key: str) -> str:
     return ""
 
 
+
+
+def has_top_level_key(path: Path, key: str) -> bool:
+    pattern = re.compile(rf"^\s*[\"']?{re.escape(key)}[\"']?\s*:")
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+    return any(pattern.match(line) for line in lines if line.strip() and not line.lstrip().startswith("#"))
+
+
+def is_test_only_benchmark(path: Path) -> bool:
+    return top_level_scalar(path, "is_test_benchmark").lower() == "true" and not has_top_level_key(path, "functions")
+
+
 def benchmark_set_rank(path: Path) -> tuple[int, str]:
     parts = path.parts
     for preferred in ("all", "new-light-fi", "comparison"):
@@ -53,6 +68,7 @@ def select_benchmark(
     fuzz_target: str = "",
     target_name: str = "",
     allow_project_fallback: bool = True,
+    allow_test_benchmarks: bool = False,
 ) -> dict[str, Any]:
     target_values = {value for value in (fuzz_target, target_name) if value}
     project_matches: list[dict[str, Any]] = []
@@ -63,6 +79,8 @@ def select_benchmark(
             continue
         yaml_project = top_level_scalar(candidate, "project")
         if yaml_project != project:
+            continue
+        if not allow_test_benchmarks and is_test_only_benchmark(candidate):
             continue
         yaml_target = top_level_scalar(candidate, "target_name")
         record = {
@@ -108,6 +126,7 @@ def main() -> int:
     parser.add_argument("--fuzz-target", default="")
     parser.add_argument("--target-name", default="")
     parser.add_argument("--allow-project-fallback", action="store_true")
+    parser.add_argument("--allow-test-benchmarks", action="store_true")
     parser.add_argument("--out")
     args = parser.parse_args()
 
@@ -117,6 +136,7 @@ def main() -> int:
         fuzz_target=args.fuzz_target,
         target_name=args.target_name,
         allow_project_fallback=args.allow_project_fallback,
+        allow_test_benchmarks=args.allow_test_benchmarks,
     )
     output = json.dumps(result, indent=2, sort_keys=True) + "\n"
     if args.out:

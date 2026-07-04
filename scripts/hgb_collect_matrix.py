@@ -41,8 +41,19 @@ TRANSIENT_DIR_NAMES = {
 }
 
 REMEDIATIONS = (
+    ('ofg_llm_rate_limited', 'The OpenAI-compatible provider returned 429; reduce HGB_LLM_PARALLELISM, increase HGB_LLM_MIN_INTERVAL_SECONDS, or rerun after the provider reset time.'),
+    ('ofg_post_success_validation_timeout', 'OSS-Fuzz-Gen produced a compiling referenced harness before later validation timed out; preserve the artifact or reduce post-generation validation work.'),
+    ('ofg_function_not_referenced', 'The harness compiled but referenced a weak/helper symbol instead of the selected function; improve API selection or lower repair rounds.'),
+    ('ofg_low_confidence_api_candidate', 'The selected upstream benchmark YAML had only low-confidence functions; fallback to synthesized target-aware YAML or improve reference-harness API extraction.'),
+    ('ofg_empty_fix_prompt', 'OSS-Fuzz-Gen stopped repair because there were no actionable build errors; inspect selected API quality and generated source.'),
+    ('ofg_bad_api_candidate', 'HGB rejected the selected benchmark APIs as test, perf, third-party, or target-mismatched symbols; use synthesized target-aware YAML or improve API extraction hints.'),
+    ('ofg_empty_unit_test_prompt', 'The selected benchmark YAML only has test files and no functions; default runs skip it. Set OFG_ALLOW_TEST_BENCHMARKS=1 only when test-to-harness prompts are intended.'),
+    ('ofg_coverage_artifact_missing', 'OSS-Fuzz-Gen compiled or ran a candidate but local coverage artifacts were unavailable; keep OFG_SKIP_COVERAGE_GAINS=1 and rebuild so OFG_SKIP_LOCAL_COVERAGE is active.'),
+    ('OFG_SKIP_LOCAL_COVERAGE', 'Local coverage extraction is disabled for matrix generation; generated harnesses should be preserved even if coverage would have failed.'),
+    ('OFG_PROJECT_IMAGE_BUILD_PARALLELISM', 'Reduce concurrent OSS-Fuzz project image builds or prebuild/cache project images when Docker/network pressure causes timeouts.'),
     ('ofg_empty_llm_response', 'The OpenAI-compatible endpoint returned empty content; verify the model/base URL supports chat completions and inspect raw response logs.'),
-    ('ofg_docker_pull_timeout', 'Pre-pull or cache the OSS-Fuzz project image, mount Docker with network access, or rely on target source fallback where possible.'),
+    ('ofg_oss_fuzz_helper_prompt_eof', 'Rebuild OSS-Fuzz-Gen so build_image passes an explicit --pull/--no-pull policy; default HGB behavior answers yes with --pull and never waits for stdin.'),
+    ('ofg_docker_pull_timeout', 'Set OFG_BUILD_IMAGE_PULL=0 to use cached base images, reduce OFG_PROJECT_IMAGE_BUILD_PARALLELISM, pre-pull/cache the OSS-Fuzz project image, or rely on target source fallback where possible.'),
     ('ofg_project_image_build_failed', 'Inspect OSS-Fuzz project image build logs; common causes are unavailable Docker/network, unsupported project Dockerfile, or missing source fallback.'),
     ('ofg_recompile_timeout', 'The generated harness reached compile/repair but exceeded the row budget; keep OFG_NUM_SAMPLES=1, reduce repair rounds, or inspect the generated candidate.'),
     ('G2Fuzz LLM API credentials were rejected', 'Set a valid OpenAI-compatible API key/base URL/model for G2Fuzz before rerunning.'),
@@ -236,6 +247,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
     missing_api_key = statuses.get("missing_api_key", 0)
     failed = total - completed - partial_completed - not_applicable - soft_skipped - missing_api_key
     harness_counts: collections.Counter[str] = collections.Counter()
+    build_script_counts: collections.Counter[str] = collections.Counter()
+    log_candidate_counts: collections.Counter[str] = collections.Counter()
     input_counts: collections.Counter[str] = collections.Counter()
     reasons: collections.Counter[str] = collections.Counter()
     remediation_counts: collections.Counter[str] = collections.Counter()
@@ -243,6 +256,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         meta = record["metadata"]
         gen = meta.get("generator") or meta.get("fuzzer") or record["row"].get("generator") or "unknown"
         harness_counts[gen] += int(meta.get("generated_harness_count") or meta.get("generated_driver_count") or 0)
+        build_script_counts[gen] += int(meta.get("generated_build_script_count") or 0)
+        log_candidate_counts[gen] += int(meta.get("generated_log_candidate_count") or 0)
         input_counts[gen] += int(meta.get("generated_input_count") or meta.get("generated_seed_count") or 0)
         reason = meta.get("reason") or record["row"].get("status") or "unknown"
         if reason and reason != "none":
@@ -262,6 +277,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         "missing_api_key_count": missing_api_key,
         "statuses": dict(statuses),
         "generated_harness_counts_by_generator": dict(harness_counts),
+        "generated_build_script_counts_by_generator": dict(build_script_counts),
+        "generated_log_candidate_counts_by_generator": dict(log_candidate_counts),
         "generated_input_counts_by_generator": dict(input_counts),
         "top_failure_reasons": reasons.most_common(10),
         "top_remediations": remediation_counts.most_common(10),
@@ -319,10 +336,19 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
         lines.append(f"- Generated artifacts: `{human_bytes(int(storage.get('generated_artifact_bytes', 0)))}`")
         lines.append(f"- Logs: `{human_bytes(int(storage.get('log_bytes', 0)))}`")
         lines.append(f"- Known transient dirs: `{human_bytes(int(storage.get('transient_bytes', 0)))}`")
-    if summary["generated_harness_counts_by_generator"] or summary["generated_input_counts_by_generator"]:
+    if (summary["generated_harness_counts_by_generator"] or
+            summary.get("generated_build_script_counts_by_generator") or
+            summary.get("generated_log_candidate_counts_by_generator") or
+            summary["generated_input_counts_by_generator"]):
         lines.extend(["", "## Generated Artifacts", ""])
         for generator, count in sorted(summary["generated_harness_counts_by_generator"].items()):
             lines.append(f"- `{generator}` harnesses: {count}")
+        for generator, count in sorted(summary.get("generated_build_script_counts_by_generator", {}).items()):
+            if count:
+                lines.append(f"- `{generator}` build scripts: {count}")
+        for generator, count in sorted(summary.get("generated_log_candidate_counts_by_generator", {}).items()):
+            if count:
+                lines.append(f"- `{generator}` log-extracted harness candidates: {count}")
         for generator, count in sorted(summary["generated_input_counts_by_generator"].items()):
             lines.append(f"- `{generator}` inputs: {count}")
     if summary["top_failure_reasons"]:

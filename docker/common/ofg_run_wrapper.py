@@ -157,6 +157,101 @@ def _patch_oss_fuzz_postprocess_logging() -> None:
     oss_fuzz_checkout.postprocess_oss_fuzz = wrapped_postprocess_oss_fuzz
 
 
+def _patch_project_target_downloads() -> None:
+    if env_bool("OFG_ALLOW_GCS_TARGET_DOWNLOAD", "0"):
+        return
+
+    from data_prep import project_targets  # pylint: disable=import-outside-toplevel
+
+    reference_dir = Path(os.environ.get("HGB_TARGET_REFERENCE_DIR", "/target/reference_harnesses"))
+
+    def _local_fuzz_target_dir(_project_name: str) -> str:
+        if reference_dir.is_dir():
+            return str(reference_dir)
+        return "/nonexistent-hgb-reference-harnesses"
+
+    project_targets._get_fuzz_target_dir = _local_fuzz_target_dir  # pylint: disable=protected-access
+    print("OFG_SKIP_GCS_TARGET_DOWNLOAD: using HGB target references", file=sys.stderr)
+
+
+def _patch_project_examples(upstream_args: list[str]) -> None:
+    if env_bool("OFG_ALLOW_REMOTE_PROJECT_EXAMPLES", "0"):
+        return
+
+    from data_prep import project_targets  # pylint: disable=import-outside-toplevel
+
+    data = _load_benchmark_data(upstream_args)
+    signatures = [
+        str(item.get("signature") or item.get("name") or "")
+        for item in data.get("functions") or []
+        if isinstance(item, dict)
+    ]
+    signatures = [sig for sig in signatures if sig]
+    reference_dir = Path(os.environ.get("HGB_TARGET_REFERENCE_DIR", "/target/reference_harnesses"))
+    max_bytes = int(os.environ.get("OFG_PROJECT_EXAMPLE_MAX_BYTES", "20000") or "20000")
+
+    def _read_reference_targets() -> list[str]:
+        if not reference_dir.is_dir():
+            return []
+        contents: list[str] = []
+        for path in sorted(reference_dir.rglob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            text = project_targets.filter_target_lines(text)[:max_bytes]
+            if "LLVMFuzzerTestOneInput" in text:
+                contents.append(text)
+        return contents
+
+    def _local_generate_data(_project_name: str, _language: str,
+                             sig_per_target: int = 1, max_samples: int = 1,
+                             cloud_experiment_bucket: str = ""):
+        del _language, sig_per_target, cloud_experiment_bucket
+        contents = _read_reference_targets()
+        if not contents:
+            return []
+        examples = []
+        example_signature = signatures[0] if signatures else ""
+        for content in contents[-max(1, max_samples):]:
+            examples.append([example_signature, content])
+        return examples[-max(1, max_samples):]
+
+    project_targets.generate_data = _local_generate_data
+    print("OFG_LOCAL_PROJECT_EXAMPLES: using HGB reference harnesses", file=sys.stderr)
+
+
+def _patch_coverage_skip() -> None:
+    if not env_bool("OFG_SKIP_COVERAGE_GAINS", "1"):
+        return
+
+    from experiment import builder_runner, evaluator, textcov  # pylint: disable=import-outside-toplevel
+
+    def _empty_textcov(*_args, **_kwargs) -> textcov.Textcov:
+        return textcov.Textcov()
+
+    def _empty_summary(*_args, **_kwargs) -> dict[str, Any]:
+        return {}
+
+    def _skip_get_coverage_local(self, generated_project: str,
+                                 benchmark_target_name: str):
+        del self, generated_project, benchmark_target_name
+        print("OFG_SKIP_LOCAL_COVERAGE: returning empty coverage", file=sys.stderr)
+        return textcov.Textcov(), {}
+
+    builder_runner.BuilderRunner.get_coverage_local = _skip_get_coverage_local
+    evaluator.load_existing_textcov = _empty_textcov
+    evaluator.load_existing_jvm_textcov = _empty_textcov
+    evaluator.load_existing_python_textcov = _empty_textcov
+    evaluator.load_existing_rust_textcov = _empty_textcov
+    evaluator.load_existing_coverage_summary = _empty_summary
+    evaluator.Evaluator.load_existing_textcov = _empty_textcov
+    evaluator.Evaluator._load_existing_coverage_summary = _empty_summary  # pylint: disable=protected-access
+    print("OFG_SKIP_LOCAL_COVERAGE: enabled", file=sys.stderr)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", default="/opt/hgb/artifacts/oss-fuzz-gen")
@@ -177,6 +272,9 @@ def main() -> int:
     import run_all_experiments  # pylint: disable=import-error,import-outside-toplevel
 
     _patch_oss_fuzz_postprocess_logging()
+    _patch_project_target_downloads()
+    _patch_project_examples(upstream_args)
+    _patch_coverage_skip()
     _install_local_introspector_shim(upstream_args)
 
     if env_bool("OFG_SKIP_COVERAGE_GAINS", "1"):

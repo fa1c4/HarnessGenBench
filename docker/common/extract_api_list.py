@@ -11,11 +11,19 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from ofg_api_rank import rank_records
+
 
 DECL_RE = re.compile(
     r"(?m)^[ \t]*(?!#)"
     r"([A-Za-z_][A-Za-z0-9_:\<\>\*\&\s,~]*?)\s+"
     r"([A-Za-z_][A-Za-z0-9_:]*)\s*\(([^;{}#]*)\)\s*(?:;|\{)"
+)
+OF_DECL_RE = re.compile(
+    r"(?m)^[ \t]*(?:ZEXTERN\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_:\<\>\*\&\s,~]*?(?:\s+ZEXPORT)?)\s+"
+    r"([A-Za-z_][A-Za-z0-9_:]*)\s+OF\s*\(\((.*?)\)\)\s*;",
+    re.S,
 )
 SKIP = {
     "if",
@@ -28,6 +36,7 @@ SKIP = {
     "void",
     "LLVMFuzzerTestOneInput",
     "LLVMFuzzerInitialize",
+    "OF",
 }
 EXTS = {".h", ".hh", ".hpp", ".hxx", ".c", ".cc", ".cpp", ".cxx"}
 
@@ -82,10 +91,18 @@ def valid_name(name: str) -> bool:
     return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_:]*$", name))
 
 
+def _clean_return_type(return_type: str) -> str:
+    return " ".join(
+        part for part in return_type.replace("ZEXPORT", " ").replace("ZEXTERN", " ").split()
+        if part
+    )
+
+
 def make_record(name: str, return_type: str, params: str, path: Path | None = None, source: Path | None = None) -> dict[str, Any]:
     short_name = name.split("::")[-1]
+    return_type = _clean_return_type(return_type)
     parsed_params = [parse_param(param) for param in split_params(params)]
-    signature = f"{return_type.strip() or 'int'} {name}({params.strip()})"
+    signature = f"{return_type.strip() or 'int'} {name}({', '.join(param.strip() for param in split_params(params))})"
     record: dict[str, Any] = {
         "name": short_name,
         "return_type": return_type.strip() or "int",
@@ -158,7 +175,8 @@ def regex_records(source: Path, limit: int) -> list[dict[str, Any]]:
             text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        for match in DECL_RE.finditer(text):
+        matches = list(OF_DECL_RE.finditer(text)) + list(DECL_RE.finditer(text))
+        for match in matches:
             return_type, name, params = match.groups()
             short_name = name.split("::")[-1]
             if not valid_name(name) or short_name in seen:
@@ -170,11 +188,24 @@ def regex_records(source: Path, limit: int) -> list[dict[str, Any]]:
     return records
 
 
+def _merge_records(primary: list[dict[str, Any]], secondary: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in [*primary, *secondary]:
+        name = str(record.get("name") or "")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        merged.append(record)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
 def extract_details(source: Path, limit: int) -> list[dict[str, Any]]:
-    records = ctags_records(source, limit)
-    if records:
-        return records[:limit]
-    return regex_records(source, limit)
+    regex = regex_records(source, limit)
+    ctags = ctags_records(source, limit)
+    return _merge_records(regex, ctags, limit)
 
 
 def extract(source: Path, limit: int) -> list[str]:
@@ -185,10 +216,28 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--max", type=int, default=200)
+    parser.add_argument("--max", type=int, default=500)
     parser.add_argument("--details", action="store_true", help="write detailed API records instead of only names")
+    parser.add_argument("--project", default="")
+    parser.add_argument("--target-name", default="")
+    parser.add_argument("--fuzz-target", default="")
+    parser.add_argument("--reference-dir", default="")
+    parser.add_argument("--keep-rejected", action="store_true")
     args = parser.parse_args()
-    data = extract_details(Path(args.source), args.max) if args.details else extract(Path(args.source), args.max)
+    raw_limit = max(args.max * 20, args.max, 1000)
+    raw = extract_details(Path(args.source), raw_limit)
+    ranked = rank_records(
+        raw,
+        project=args.project,
+        target_name=args.target_name,
+        fuzz_target=args.fuzz_target,
+        reference_dir=args.reference_dir,
+        keep_rejected=args.keep_rejected,
+    )[: args.max]
+    if args.details:
+        data = ranked
+    else:
+        data = [record["name"] for record in ranked]
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")

@@ -66,35 +66,120 @@ ofg_llm_preflight() {
   local log_file="$1"
   [[ "${OFG_LLM_PREFLIGHT:-1}" == "1" ]] || return 0
   "$python" - >"$log_file" 2>&1 <<'PY_OFG_PREFLIGHT'
+import fcntl
+import hashlib
 import os
+import random
+import re
 import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 import openai
 
-api_key = os.getenv('OPENAI_API_KEY') or os.getenv('API_KEY') or os.getenv('DEEPSEEK_API_KEY')
+api_key = os.getenv('OPENAI_API_KEY') or os.getenv('API_KEY') or os.getenv('DEEPSEEK_API_KEY') or ''
 model = os.getenv('OPENAI_MODEL') or os.getenv('MODEL') or 'gpt-4o-mini'
+base_url = os.getenv('OPENAI_BASE_URL') or os.getenv('BASE_URL') or ''
+lock_root = Path(os.getenv('HGB_LLM_LOCK_DIR') or '/tmp/hgb-llm-locks')
+cache_seconds = float(os.getenv('OFG_LLM_PREFLIGHT_CACHE_SECONDS', '3600'))
+max_attempts = max(1, int(os.getenv('OFG_LLM_PREFLIGHT_MAX_ATTEMPTS', '3')))
+max_sleep = max(1.0, float(os.getenv('HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS', '180')))
+
+
+def redact(text: object) -> str:
+    value = str(text)
+    for secret in (api_key, os.getenv('API_KEY', ''), os.getenv('DEEPSEEK_API_KEY', '')):
+        if secret:
+            value = value.replace(secret, '[REDACTED]')
+    value = re.sub(r'api_key:\s*[^\s,}\']+', 'api_key: [REDACTED]', value, flags=re.I)
+    value = re.sub(r'(authorization:\s*bearer\s+)[^\s,}\']+', r'\1[REDACTED]', value, flags=re.I)
+    return value
+
+
+def rate_limit_sleep_seconds(exc: Exception) -> float:
+    text = str(exc)
+    match = re.search(r'Limit resets at:\s*([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}) UTC', text)
+    if match:
+        try:
+            reset = datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc).timestamp()
+            return max(0.0, min(reset - time.time() + random.uniform(0.5, 2.0), max_sleep))
+        except ValueError:
+            pass
+    return min(10.0 + random.uniform(0.5, 2.0), max_sleep)
+
+
+def is_rate_limited(exc: Exception) -> bool:
+    status = getattr(exc, 'status_code', None)
+    text = str(exc).lower()
+    return status == 429 or 'rate limit' in text or 'too many requests' in text or 'error code: 429' in text
+
+
 kwargs = {'api_key': api_key, 'timeout': float(os.getenv('OFG_LLM_REQUEST_TIMEOUT_SECONDS', '600'))}
-base_url = os.getenv('OPENAI_BASE_URL') or os.getenv('BASE_URL')
 if base_url:
     kwargs['base_url'] = base_url
-max_retries = os.getenv('OFG_LLM_MAX_RETRIES', '0')
 try:
-    kwargs['max_retries'] = int(max_retries)
+    kwargs['max_retries'] = int(os.getenv('OFG_LLM_MAX_RETRIES', '0'))
 except ValueError:
-    print(f'Invalid OFG_LLM_MAX_RETRIES: {max_retries}')
+    print(f"Invalid OFG_LLM_MAX_RETRIES: {os.getenv('OFG_LLM_MAX_RETRIES')}")
     sys.exit(1)
+
+cache_key = hashlib.sha256('\0'.join([base_url, model, hashlib.sha256(api_key.encode()).hexdigest()]).encode()).hexdigest()[:24]
 try:
-    client = openai.OpenAI(**kwargs)
-    client.chat.completions.create(
-        model=model,
-        messages=[{'role': 'user', 'content': 'Return OK.'}],
-        max_tokens=1,
-        temperature=0,
-    )
-except Exception as exc:
-    print(f'{type(exc).__name__}: {exc}')
+    lock_root.mkdir(parents=True, exist_ok=True)
+    lock_path = lock_root / f'ofg_preflight_{cache_key}.lock'
+    ok_path = lock_root / f'ofg_preflight_{cache_key}.ok'
+    with lock_path.open('w') as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if ok_path.exists() and time.time() - ok_path.stat().st_mtime < cache_seconds:
+            print('llm_preflight_cached_ok')
+            sys.exit(0)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                client = openai.OpenAI(**kwargs)
+                client.chat.completions.create(
+                    model=model,
+                    messages=[{'role': 'user', 'content': 'Return OK.'}],
+                    max_tokens=1,
+                    temperature=0,
+                )
+                ok_path.write_text(f'{time.time()}\n', encoding='utf-8')
+                print('llm_preflight_ok')
+                sys.exit(0)
+            except Exception as exc:  # noqa: BLE001 - preflight must preserve provider exception text.
+                if is_rate_limited(exc) and attempt < max_attempts:
+                    delay = rate_limit_sleep_seconds(exc)
+                    print(f'ofg_llm_rate_limited: preflight attempt {attempt} hit rate limit; retrying in {delay:.1f}s')
+                    time.sleep(delay)
+                    continue
+                print(f'{type(exc).__name__}: {redact(exc)}')
+                sys.exit(1)
+except Exception as exc:  # noqa: BLE001
+    print(f'{type(exc).__name__}: {redact(exc)}')
     sys.exit(1)
-print('llm_preflight_ok')
 PY_OFG_PREFLIGHT
+}
+
+redact_log_file() {
+  [[ "$#" -gt 0 ]] || return 0
+  "$python" - "$@" <<'PY_OFG_REDACT' || true
+import os
+import re
+import sys
+from pathlib import Path
+secrets = [os.getenv(name, '') for name in ('OPENAI_API_KEY', 'API_KEY', 'DEEPSEEK_API_KEY')]
+for raw in sys.argv[1:]:
+    path = Path(raw)
+    if not path.exists() or not path.is_file():
+        continue
+    text = path.read_text(encoding='utf-8', errors='replace')
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, '[REDACTED]')
+    text = re.sub(r'api_key:\s*[^\s,}\']+', 'api_key: [REDACTED]', text, flags=re.I)
+    text = re.sub(r'(authorization:\s*bearer\s+)[^\s,}\']+', r'\1[REDACTED]', text, flags=re.I)
+    path.write_text(text, encoding='utf-8')
+PY_OFG_REDACT
 }
 classify_ofg_failure() {
   local code="$1" log_file="$2"
@@ -111,8 +196,28 @@ classify_ofg_failure() {
       printf 'ofg_invalid_api_key: OpenAI-compatible API key was rejected'
       return 0
     fi
+    if grep -Eiq 'RateLimitError|Error code: 429|HTTP/1\.1 429|Too Many Requests|rate limit exceeded|ofg_llm_rate_limited' "$log_file"; then
+      printf 'ofg_llm_rate_limited: OpenAI-compatible API rate limit was reached; reduce HGB_LLM_PARALLELISM or increase HGB_LLM_MIN_INTERVAL_SECONDS'
+      return 0
+    fi
+    if grep -Eiq 'ofg_empty_unit_test_prompt' "$log_file"; then
+      printf 'ofg_empty_unit_test_prompt: selected benchmark would produce an empty unit-test prompt'
+      return 0
+    fi
+    if grep -Eiq 'ofg_bad_api_candidate' "$log_file"; then
+      printf 'ofg_bad_api_candidate: selected benchmark APIs were rejected by HGB target-aware filtering'
+      return 0
+    fi
     if grep -Eiq 'ofg_empty_llm_response|LLM returned empty response|NoneType.*split|expected non-empty LLM response' "$log_file"; then
       printf 'ofg_empty_llm_response: OpenAI-compatible endpoint returned empty response content'
+      return 0
+    fi
+    if grep -Eiq 'textcov_reports/.+\.covreport|No such file or directory:.+covreport|coverage artifact missing' "$log_file"; then
+      printf 'ofg_coverage_artifact_missing: generated harness reached coverage extraction but no textcov report was produced'
+      return 0
+    fi
+    if grep -Eiq 'Pull latest base images.*EOF|EOFError: EOF when reading a line|EOF when reading a line' "$log_file"; then
+      printf 'ofg_oss_fuzz_helper_prompt_eof: OSS-Fuzz helper.py prompted for base-image pull policy in a noninteractive row'
       return 0
     fi
     if grep -Eiq 'TLS handshake timeout|net/http: TLS handshake timeout|docker pull.*timed out|Client\.Timeout exceeded|context deadline exceeded' "$log_file"; then
@@ -121,6 +226,18 @@ classify_ofg_failure() {
     fi
     if grep -Eiq 'ofg_project_image_build_failed|Failed to build image for|Failed to build project image' "$log_file"; then
       printf 'ofg_project_image_build_failed: OSS-Fuzz project image build failed during harness validation'
+      return 0
+    fi
+    if [[ "$code" == "124" ]] && grep -Eiq 'OnePromptPrototyper succeded|Final fuzz target function referenced: True' "$log_file"; then
+      printf 'ofg_post_success_validation_timeout: generated harness compiled and referenced the selected function before later validation timed out'
+      return 0
+    fi
+    if grep -Eiq 'ofg_function_not_referenced|Final fuzz target function referenced: False' "$log_file" && grep -Eiq 'Fuzz target compiles: True' "$log_file"; then
+      printf 'ofg_function_not_referenced: generated harness compiled but did not reference the selected function'
+      return 0
+    fi
+    if grep -Eiq 'ofg_empty_fix_prompt' "$log_file"; then
+      printf 'ofg_empty_fix_prompt: OSS-Fuzz-Gen stopped because the repair prompt had no actionable build errors'
       return 0
     fi
     if [[ "$code" == "124" ]] && grep -Eiq '===== ROUND .* Recompile|Recompile|fixing build' "$log_file"; then
@@ -233,8 +350,19 @@ if [[ "$mode" == "generate-target" ]]; then
   export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
   export OFG_REQUIRE_BENCHMARK_TRIM="${OFG_REQUIRE_BENCHMARK_TRIM:-1}"
   export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
+  export OFG_ALLOW_TEST_BENCHMARKS="${OFG_ALLOW_TEST_BENCHMARKS:-0}"
+  export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+  export OFG_BUILD_IMAGE_PULL="${OFG_BUILD_IMAGE_PULL:-1}"
+  export OFG_PROJECT_IMAGE_BUILD_PARALLELISM="${OFG_PROJECT_IMAGE_BUILD_PARALLELISM:-2}"
+  export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-500}"
   export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
   export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
+  export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+  export OFG_MIN_BENCHMARK_SCORE="${OFG_MIN_BENCHMARK_SCORE:-1}"
+  export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}"
+  export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
+  export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
+  export HGB_LLM_LOCK_DIR="${HGB_LLM_LOCK_DIR:-/tmp/hgb-llm-locks}"
   export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
   export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
@@ -247,7 +375,7 @@ if [[ "$mode" == "generate-target" ]]; then
     local out_yaml="$1"
     local api_json="$workspace/ofg_api_candidates.json"
     local api_count
-    api_count="$(python3 /opt/hgb/bin/extract_api_list.py --details --source /target/source_input --out "$api_json" --max "${OFG_SYNTH_MAX_APIS:-5}" 2>"$workspace/logs/ofg_api_extract.log" || printf '0')"
+    api_count="$(python3 /opt/hgb/bin/extract_api_list.py --details --source /target/source_input --out "$api_json" --max "${OFG_SYNTH_CANDIDATE_POOL:-500}" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir /target/reference_harnesses 2>"$workspace/logs/ofg_api_extract.log" || printf '0')"
     api_count="${api_count##*$'\n'}"
     if [[ "${api_count:-0}" == "0" ]]; then
       return 1
@@ -294,6 +422,7 @@ with open(out_yaml, 'w', encoding='utf-8') as f:
         'project': project,
         'target_name': fuzz_target or target_name,
         'target_path': target_path,
+        'use_project_examples': False,
     }, f, indent=2)
     f.write('\n')
 PY_OFG_YAML
@@ -337,6 +466,9 @@ PY_OFG_YAML
     if [[ "${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}" == "1" ]]; then
       selector_args+=(--allow-project-fallback)
     fi
+    if [[ "${OFG_ALLOW_TEST_BENCHMARKS:-0}" == "1" ]]; then
+      selector_args+=(--allow-test-benchmarks)
+    fi
     if python3 /opt/hgb/bin/ofg_select_benchmark.py "${selector_args[@]}" >"$workspace/logs/benchmark_yaml.log" 2>&1; then
       benchmark_yaml="$(json_file_value "$selection_json" path)"
     fi
@@ -365,21 +497,62 @@ PY_OFG_YAML
   if [[ -n "$benchmark_yaml" && "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" != "0" ]]; then
     trimmed_yaml="$workspace/ofg_benchmark.trimmed.yaml"
     trim_metadata="$workspace/ofg_benchmark_trim.json"
-    if "$python" /opt/hgb/bin/ofg_trim_benchmark.py --in "$benchmark_yaml" --out "$trimmed_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$trim_metadata" >>"$workspace/logs/benchmark_yaml.log" 2>&1; then
+    trim_benchmark_once() {
+      local source_yaml="$1" out_yaml="$2" metadata_json="$3"
+      local trim_args
+      trim_args=(/opt/hgb/bin/ofg_trim_benchmark.py --in "$source_yaml" --out "$out_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$metadata_json" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir /target/reference_harnesses --min-score "${OFG_MIN_BENCHMARK_SCORE:-1}")
+      if [[ "${OFG_ALLOW_TEST_BENCHMARKS:-0}" == "1" ]]; then
+        trim_args+=(--allow-test-files)
+      fi
+      "$python" "${trim_args[@]}" >>"$workspace/logs/benchmark_yaml.log" 2>&1
+    }
+    trim_reason=""
+    if trim_benchmark_once "$benchmark_yaml" "$trimmed_yaml" "$trim_metadata"; then
       benchmark_yaml="$trimmed_yaml"
       benchmark_original_function_count="$(json_file_value "$trim_metadata" original_function_count)"
       benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
       benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
       benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
-    elif [[ "${OFG_REQUIRE_BENCHMARK_TRIM:-1}" == "1" ]]; then
-      printf 'ofg_benchmark_trim_failed: failed to trim %s
-' "$benchmark_yaml" >>"$workspace/logs/benchmark_yaml.log"
-      extra=$(printf '  "benchmark_yaml": "%s",
-  "benchmark_match_kind": "%s",
-  "benchmark_trim_log": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$workspace/logs/benchmark_yaml.log")")
-      hgb_write_common_metadata failed 'ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed' 65 harness_generator "$extra"
-      hgb_write_common_summary failed 'ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed' harness_generator
-      exit 65
+    else
+      trim_reason='ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed'
+      if grep -Eq 'ofg_empty_unit_test_prompt' "$workspace/logs/benchmark_yaml.log"; then
+        trim_reason='ofg_empty_unit_test_prompt: selected benchmark YAML has only test files and would create an empty prompt; use synthesized APIs or set OFG_ALLOW_TEST_BENCHMARKS=1'
+      elif grep -Eq 'ofg_low_confidence_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
+        trim_reason='ofg_low_confidence_api_candidate: selected benchmark APIs scored below HGB target-aware threshold'
+      elif grep -Eq 'ofg_bad_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
+        trim_reason='ofg_bad_api_candidate: selected benchmark APIs were rejected by HGB target-aware filtering'
+      fi
+      if [[ "${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}" == "1" && "$benchmark_match_kind" != "synthesized" && "$benchmark_match_kind" != "explicit_override" ]] && grep -Eq 'ofg_bad_api_candidate|ofg_low_confidence_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
+        generated_yaml="$workspace/ofg_benchmark.synthesized.yaml"
+        printf 'Falling back to synthesized target-aware benchmark YAML after rejected/low-confidence upstream YAML: %s\n' "$benchmark_yaml" >>"$workspace/logs/benchmark_yaml.log"
+        if synthesize_benchmark_yaml "$generated_yaml"; then
+          benchmark_yaml="$generated_yaml"
+          benchmark_match_kind="synthesized_after_bad_benchmark"
+          selected_yaml_project="$project"
+          selected_yaml_target_name="${fuzz_target:-$target_name}"
+          trim_metadata="$workspace/ofg_benchmark_trim.synthesized.json"
+          if trim_benchmark_once "$benchmark_yaml" "$trimmed_yaml" "$trim_metadata"; then
+            benchmark_yaml="$trimmed_yaml"
+            benchmark_original_function_count="$(json_file_value "$trim_metadata" original_function_count)"
+            benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
+            benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
+            benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
+            trim_reason=""
+          else
+            trim_reason='ofg_benchmark_trim_failed: synthesized benchmark YAML trimming failed after upstream YAML was rejected'
+            if grep -Eq 'ofg_bad_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
+              trim_reason='ofg_bad_api_candidate: synthesized benchmark APIs were rejected by HGB target-aware filtering'
+            fi
+          fi
+        fi
+      fi
+      if [[ -n "$trim_reason" && "${OFG_REQUIRE_BENCHMARK_TRIM:-1}" == "1" ]]; then
+        printf 'ofg_benchmark_trim_failed: failed to trim %s\n' "$benchmark_yaml" >>"$workspace/logs/benchmark_yaml.log"
+        extra=$(printf '  "benchmark_yaml": "%s",\n  "benchmark_match_kind": "%s",\n  "benchmark_trim_log": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$workspace/logs/benchmark_yaml.log")")
+        hgb_write_common_metadata failed "$trim_reason" 65 harness_generator "$extra"
+        hgb_write_common_summary failed "$trim_reason" harness_generator
+        exit 65
+      fi
     fi
   fi
 
@@ -397,22 +570,44 @@ PY_OFG_YAML
     exit 65
   fi
   if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
+    redact_log_file "$workspace/logs/llm_preflight.log"
     reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
     hgb_write_common_metadata failed "$reason" 65 harness_generator
     hgb_write_common_summary failed "$reason" harness_generator
     exit 65
   fi
   mkdir -p "$workspace/pip-cache"
-  cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --work-dir "$workspace/ofg-work")
+  cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --max-round "${OFG_MAX_ROUND:-5}" --work-dir "$workspace/ofg-work")
   printf '%q ' "${cmd[@]}" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
   code=0
   (cd "$artifact" && PIP_CACHE_DIR="$workspace/pip-cache" timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
+  redact_log_file "$workspace/logs/run.log"
   if [[ -d "$workspace/ofg-work" ]]; then
     n=0
     while IFS= read -r generated; do
       n=$((n + 1))
       cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-    done < <(find "$workspace/ofg-work" -type f \( -path '*/fixed_targets/*' -o -path '*/raw_targets/*' \) \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) 2>/dev/null | sort)
+    done < <(find "$workspace/ofg-work" -type f \( -path '*/fixed_targets/*' -o -path '*/raw_targets/*' -o -path '*/fuzz_targets/*' \) 2>/dev/null | sort)
+  fi
+  if [[ "$(hgb_count_files "$workspace/generated_harnesses" -type f)" == "0" && -f "$workspace/logs/run.log" ]]; then
+    python3 - "$workspace/logs/run.log" "$workspace/generated_harnesses" <<'PY_OFG_LOG_HARNESS' || true
+import re
+import sys
+from pathlib import Path
+log_path = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+text = log_path.read_text(encoding='utf-8', errors='replace')
+blocks = re.findall(r"```(?:c\+\+|cpp|cc|c)?\s*\n(.*?)```", text, flags=re.S | re.I)
+count = 0
+out_dir.mkdir(parents=True, exist_ok=True)
+for block in blocks:
+    if 'LLVMFuzzerTestOneInput' not in block:
+        continue
+    block = block.strip() + '\n'
+    count += 1
+    (out_dir / f'log_candidate_{count}.cc').write_text(block, encoding='utf-8')
+print(count)
+PY_OFG_LOG_HARNESS
   fi
   if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
     rm -rf "$workspace/ofg-work" "$workspace/pip-cache" "$workspace/oss-fuzz"
@@ -422,10 +617,20 @@ PY_OFG_YAML
   if [[ "$code" -ne 0 ]]; then
     status=failed
     reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
-  elif [[ "$(hgb_count_files "$workspace/generated_harnesses" -type f)" == "0" ]] && grep -Eiq 'Bad model type|Exception while running experiment|Traceback' "$workspace/logs/run.log"; then
+  elif grep -Eiq 'ofg_function_not_referenced|ofg_empty_fix_prompt' "$workspace/logs/run.log"; then
+    code=65
+    status=failed
+    reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
+  elif [[ "$(hgb_count_generated_harness_files "$workspace/generated_harnesses")" == "0" ]] && grep -Eiq 'Bad model type|Exception while running experiment|Traceback' "$workspace/logs/run.log"; then
     code=1
     status=failed
     reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
+  fi
+  generated_harness_count="$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
+  if [[ "$status" == "failed" && "${generated_harness_count:-0}" -gt 0 ]] && grep -Eiq 'LLVMFuzzerTestOneInput|OnePromptPrototyper succeded|Fuzz target compiles: True|Final fuzz target function referenced: True' "$workspace/logs/run.log"; then
+    status=partial_completed
+    reason="OSS-Fuzz-Gen preserved $generated_harness_count generated harness candidate(s) before validation/execution failure: $reason"
+    code=0
   fi
   if [[ "$status" == "failed" && "$benchmark_match_kind" == "exact_project" && -n "$selected_yaml_target_name" && "$selected_yaml_target_name" != "$fuzz_target" && "$selected_yaml_target_name" != "$target_name" ]]; then
     case "$reason" in
@@ -453,13 +658,14 @@ PY_OFG_YAML
   "ofg_num_samples": %s,
   "ofg_num_exp": %s,
   "ofg_num_eva": %s,
+  "ofg_max_round": %s,
   "target_source_status": "%s",
   "target_source_file_count": %s,
   "target_source_fallback_statuses": %s,
   "command_file": "%s",
   "log_file": "%s",
   "oss_fuzz_dir": "%s",
-  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
+  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "${OFG_MAX_ROUND:-5}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
@@ -475,8 +681,19 @@ export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
 export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
 export OFG_REQUIRE_BENCHMARK_TRIM="${OFG_REQUIRE_BENCHMARK_TRIM:-1}"
 export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
+export OFG_ALLOW_TEST_BENCHMARKS="${OFG_ALLOW_TEST_BENCHMARKS:-0}"
+export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+export OFG_BUILD_IMAGE_PULL="${OFG_BUILD_IMAGE_PULL:-1}"
+export OFG_PROJECT_IMAGE_BUILD_PARALLELISM="${OFG_PROJECT_IMAGE_BUILD_PARALLELISM:-2}"
+export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-500}"
 export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
 export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
+export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+export OFG_MIN_BENCHMARK_SCORE="${OFG_MIN_BENCHMARK_SCORE:-1}"
+export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}"
+export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
+export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
+export HGB_LLM_LOCK_DIR="${HGB_LLM_LOCK_DIR:-/tmp/hgb-llm-locks}"
 export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
 export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
 benchmark="${OFG_BENCHMARK:-tinyxml2}"
@@ -520,6 +737,7 @@ if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 
   exit 65
 fi
 if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
+  redact_log_file "$workspace/logs/llm_preflight.log"
   reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
   printf 'llm preflight
 ' >"$command_file"
@@ -527,10 +745,11 @@ if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
   summary failed 65 "$reason"
   exit 65
 fi
-cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --work-dir "$workspace/ofg-work")
+cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --max-round "${OFG_MAX_ROUND:-5}" --work-dir "$workspace/ofg-work")
 printf '%q ' "${cmd[@]}" >"$command_file"; printf '\n' >>"$command_file"
 code=0
 (cd "$artifact" && timeout "${OFG_TOTAL_TIMEOUT_SECONDS:-600}" "${cmd[@]}") >"$run_log" 2>&1 || code=$?
+redact_log_file "$run_log"
 status=completed; reason=none
 if [[ "$code" -ne 0 ]]; then
   status=failed; reason="$(classify_ofg_failure "$code" "$run_log")"

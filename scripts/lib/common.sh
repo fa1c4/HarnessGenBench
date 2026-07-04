@@ -294,6 +294,13 @@ run_hgb_container() {
     -e OFG_ALLOW_PROJECT_YAML_FALLBACK \
     -e OFG_SKIP_COVERAGE_GAINS \
     -e OFG_SYNTH_MAX_APIS \
+    -e OFG_SYNTH_CANDIDATE_POOL \
+    -e OFG_ALLOW_TEST_BENCHMARKS \
+    -e OFG_ALLOW_GCS_TARGET_DOWNLOAD \
+    -e OFG_BUILD_IMAGE_PULL \
+    -e OFG_PROJECT_IMAGE_BUILD_PARALLELISM \
+    -e OFG_PROJECT_IMAGE_LOCK_DIR \
+    -e OFG_PROJECT_IMAGE_LOCK_POLL_SECONDS \
     -e OFG_RUN_TIMEOUT \
     -e OFG_MAX_BENCHMARK_FUNCTIONS \
     -e OFG_NUM_SAMPLES \
@@ -304,6 +311,13 @@ run_hgb_container() {
     -e OFG_LLM_REQUEST_TIMEOUT_SECONDS \
     -e OFG_LLM_MAX_RETRIES \
     -e OFG_LLM_PREFLIGHT \
+    -e OFG_MAX_ROUND \
+    -e OFG_MIN_BENCHMARK_SCORE \
+    -e OFG_SYNTHESIZE_ON_BAD_BENCHMARK \
+    -e HGB_LLM_PARALLELISM \
+    -e HGB_LLM_MIN_INTERVAL_SECONDS \
+    -e HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS \
+    -e HGB_LLM_LOCK_DIR \
     -e HF_TOKEN \
     -e ELFUZZ_TARGET_OVERRIDE \
     -e ELFUZZ_TRUST_FUZZBENCH_TARGET \
@@ -360,10 +374,13 @@ run_hgb_target_container() {
   local target_package="$5"
   local project="$6"
   local fuzz_target="$7"
-  local root artifact_name generator_commit
+  local root artifact_name generator_commit shared_llm_lock_dir
   local extra_docker_args=()
   shift 7
   root="$(repo_root)"
+  shared_llm_lock_dir="$(hgb_workspace_dir "$root")/llm-locks"
+  ensure_dir "$shared_llm_lock_dir"
+  extra_docker_args+=(-v "$shared_llm_lock_dir:/hgb-llm-locks" -e HGB_LLM_LOCK_DIR=/hgb-llm-locks)
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
   ensure_dir "$workspace"
@@ -401,6 +418,13 @@ run_hgb_target_container() {
     -e OFG_ALLOW_PROJECT_YAML_FALLBACK \
     -e OFG_SKIP_COVERAGE_GAINS \
     -e OFG_SYNTH_MAX_APIS \
+    -e OFG_SYNTH_CANDIDATE_POOL \
+    -e OFG_ALLOW_TEST_BENCHMARKS \
+    -e OFG_ALLOW_GCS_TARGET_DOWNLOAD \
+    -e OFG_BUILD_IMAGE_PULL \
+    -e OFG_PROJECT_IMAGE_BUILD_PARALLELISM \
+    -e OFG_PROJECT_IMAGE_LOCK_DIR \
+    -e OFG_PROJECT_IMAGE_LOCK_POLL_SECONDS \
     -e OFG_RUN_TIMEOUT \
     -e OFG_MAX_BENCHMARK_FUNCTIONS \
     -e OFG_NUM_SAMPLES \
@@ -411,6 +435,13 @@ run_hgb_target_container() {
     -e OFG_LLM_REQUEST_TIMEOUT_SECONDS \
     -e OFG_LLM_MAX_RETRIES \
     -e OFG_LLM_PREFLIGHT \
+    -e OFG_MAX_ROUND \
+    -e OFG_MIN_BENCHMARK_SCORE \
+    -e OFG_SYNTHESIZE_ON_BAD_BENCHMARK \
+    -e HGB_LLM_PARALLELISM \
+    -e HGB_LLM_MIN_INTERVAL_SECONDS \
+    -e HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS \
+    -e HGB_LLM_LOCK_DIR \
     -e HF_TOKEN \
     -e ELFUZZ_TARGET_OVERRIDE \
     -e ELFUZZ_TRUST_FUZZBENCH_TARGET \

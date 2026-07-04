@@ -19,6 +19,27 @@ hgb_count_files() {
   find "$dir" "$@" 2>/dev/null | wc -l | tr -d ' '
 }
 
+
+hgb_count_generated_harness_files() {
+  local dir="$1"
+  local count
+  count="$(hgb_count_files "$dir" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.fuzz_target' \))"
+  if [[ "${count:-0}" == "0" ]]; then
+    count="$(hgb_count_files "$dir" -type f ! -name '*.build_script' ! -name '*build*script*')"
+  fi
+  printf '%s\n' "${count:-0}"
+}
+
+hgb_count_generated_build_scripts() {
+  local dir="$1"
+  hgb_count_files "$dir" -type f \( -name '*.build_script' -o -name '*build*script*' \)
+}
+
+hgb_count_generated_log_candidates() {
+  local dir="$1"
+  hgb_count_files "$dir" -type f -name 'log_candidate_*'
+}
+
 hgb_target_manifest_value() {
   local key="$1"
   local manifest="${HGB_TARGET_MANIFEST:-/target/target_manifest.json}"
@@ -71,9 +92,11 @@ hgb_write_common_metadata() {
   local extra_json="${5:-}"
   local workspace="${workspace:-/workspace}"
   local manifest="${HGB_TARGET_MANIFEST:-/target/target_manifest.json}"
-  local harness_count input_count api_key_bool
+  local harness_count build_script_count log_candidate_count input_count api_key_bool
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/generated_inputs"
-  harness_count="$(hgb_count_files "$workspace/generated_harnesses" -type f)"
+  harness_count="$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
+  build_script_count="$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
+  log_candidate_count="$(hgb_count_generated_log_candidates "$workspace/generated_harnesses")"
   input_count="$(hgb_count_files "$workspace/generated_inputs" -type f)"
   if hgb_api_key_present; then api_key_bool=true; else api_key_bool=false; fi
   {
@@ -95,6 +118,8 @@ hgb_write_common_metadata() {
     printf '  "project": "%s",\n' "$(hgb_json_escape "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}")"
     printf '  "fuzz_target": "%s",\n' "$(hgb_json_escape "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}")"
     printf '  "generated_harness_count": %s,\n' "$harness_count"
+    printf '  "generated_build_script_count": %s,\n' "$build_script_count"
+    printf '  "generated_log_candidate_count": %s,\n' "$log_candidate_count"
     printf '  "generated_input_count": %s,\n' "$input_count"
     printf '  "log_dir": "%s"' "$(hgb_json_escape "$workspace/logs")"
     if [[ -n "$extra_json" ]]; then
@@ -120,7 +145,8 @@ hgb_write_common_summary() {
     printf -- '- Capability: `%s`\n' "$capability"
     printf -- '- Status: `%s`\n' "$status"
     printf -- '- API key present: `%s`\n' "$(hgb_api_key_present && printf true || printf false)"
-    printf -- '- Generated harnesses: `%s`\n' "$(hgb_count_files "$workspace/generated_harnesses" -type f)"
+    printf -- '- Generated harnesses: `%s`\n' "$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
+    printf -- '- Generated build scripts: `%s`\n' "$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
     printf -- '- Generated inputs: `%s`\n' "$(hgb_count_files "$workspace/generated_inputs" -type f)"
     printf -- '- Top failure reason: %s\n' "$reason"
     printf '\n## Logs\n\n'
