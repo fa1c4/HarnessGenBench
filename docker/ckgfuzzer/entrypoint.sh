@@ -133,6 +133,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+  export CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS="${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
   export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
@@ -414,13 +416,13 @@ llm_coder:
   api_key: "${OPENAI_API_KEY:-}"
   base_url: "${OPENAI_BASE_URL:-}"
   temperature: 0.0
-  request_timeout: 3600
+  request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}
 llm_analyzer:
   model: "${OPENAI_MODEL:-gpt-4o-mini}"
   api_key: "${OPENAI_API_KEY:-}"
   base_url: "${OPENAI_BASE_URL:-}"
   temperature: 0.0
-  request_timeout: 3600
+  request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}
 llm_embedding:
   model: "${CKGFUZZER_EMBEDDING_MODEL:-mock}"
   api_key: "${CKGFUZZER_EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}"
@@ -755,7 +757,7 @@ PY_CKG_HF_IMPORT_PATCH
       elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/fuzzing.log"; then
         reason='CKGFuzzer LLM API returned empty response content before harness generation'
       elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/fuzzing.log"; then
-        reason='CKGFuzzer LLM API request timed out before harness generation; reduce API caps or increase provider request timeout'
+        reason='CKGFuzzer LLM API request timed out before harness generation; reduce API caps or increase CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS/HGB_LLM_REQUEST_TIMEOUT_SECONDS'
       elif grep -qi 'Connection refused.*11434\|Failed to establish.*11434' "$workspace/logs/fuzzing.log"; then
         reason='CKGFuzzer embedding service is unavailable at localhost:11434; start Ollama or configure CKGFUZZER_EMBEDDING_MODEL/base URL'
       elif grep -q "ModuleNotFoundError: No module named" "$workspace/logs/fuzzing.log"; then
@@ -770,7 +772,7 @@ PY_CKG_HF_IMPORT_PATCH
     reason="CKGFuzzer $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
   fi
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
-  extra=$(printf '%s  "ckgfuzzer_project": "%s",\n  "ckgfuzzer_shared_dir": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "repo_exit_code": "%s",\n  "preproc_exit_code": "%s",\n  "fuzzing_exit_code": "%s",\n  "codeql_version": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")")
+  extra=$(printf '%s  "ckgfuzzer_project": "%s",\n  "ckgfuzzer_shared_dir": "%s",\n  "api_candidate_count": %s,\n  "llm_request_timeout_seconds": "%s",\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "repo_exit_code": "%s",\n  "preproc_exit_code": "%s",\n  "fuzzing_exit_code": "%s",\n  "codeql_version": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

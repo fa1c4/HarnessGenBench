@@ -115,7 +115,7 @@ def is_rate_limited(exc: Exception) -> bool:
     return status == 429 or 'rate limit' in text or 'too many requests' in text or 'error code: 429' in text
 
 
-kwargs = {'api_key': api_key, 'timeout': float(os.getenv('OFG_LLM_REQUEST_TIMEOUT_SECONDS', '600'))}
+kwargs = {'api_key': api_key, 'timeout': float(os.getenv('OFG_LLM_REQUEST_TIMEOUT_SECONDS', '1200'))}
 if base_url:
     kwargs['base_url'] = base_url
 try:
@@ -245,7 +245,7 @@ classify_ofg_failure() {
       return 0
     fi
     if grep -Eiq 'APITimeoutError|ReadTimeout|The read operation timed out|Request timed out|timed out while requesting|LLM request timeout' "$log_file"; then
-      printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out'
+      printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out after the configured request timeout'
       return 0
     fi
     if grep -Eiq 'Invalid n value' "$log_file"; then
@@ -343,6 +343,7 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
   export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
   export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
@@ -360,7 +361,7 @@ if [[ "$mode" == "generate-target" ]]; then
   export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-/opt/hgb/metadata/fuzzbench_selected_harness_apis.json}"
   export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-report_first}"
   export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-$HGB_SELECTED_API_MAX}"
-  export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
+  export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
   export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
   export OFG_MIN_BENCHMARK_SCORE="${OFG_MIN_BENCHMARK_SCORE:-1}"
@@ -711,7 +712,8 @@ export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
 export OFG_BUILD_IMAGE_PULL="${OFG_BUILD_IMAGE_PULL:-1}"
 export OFG_PROJECT_IMAGE_BUILD_PARALLELISM="${OFG_PROJECT_IMAGE_BUILD_PARALLELISM:-2}"
 export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-500}"
-export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
+export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
 export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
 export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
 export OFG_MIN_BENCHMARK_SCORE="${OFG_MIN_BENCHMARK_SCORE:-1}"

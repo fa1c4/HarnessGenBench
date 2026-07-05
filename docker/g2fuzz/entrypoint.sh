@@ -61,6 +61,15 @@ text = text.replace(
     'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, 1)',
     'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "1") or "1"))',
 )
+llm_path = path.parent / "py_utils" / "llm_utils.py"
+if llm_path.exists():
+    llm_text = llm_path.read_text()
+    timeout_expr = "float(os.environ.get(\"G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS\", os.environ.get(\"HGB_LLM_REQUEST_TIMEOUT_SECONDS\", \"1200\")))"
+    llm_text = llm_text.replace(
+        "OpenAI(api_key=OPENAI_KEY)",
+        f"OpenAI(api_key=OPENAI_KEY, timeout={timeout_expr})",
+    )
+    llm_path.write_text(llm_text)
 path.write_text(text)
 PY_G2_PROGRAM_PATCH
 }
@@ -180,6 +189,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+  export G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   mkdir -p "$workspace/logs" "$workspace/generated_inputs" "$workspace/config"
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
@@ -263,7 +274,7 @@ PY_G2_MODEL
     elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/program_gen.log"; then
       reason='G2Fuzz LLM API returned empty response content before saving generated inputs'
     elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/program_gen.log"; then
-      reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase provider request timeout'
+      reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS/HGB_LLM_REQUEST_TIMEOUT_SECONDS'
     fi
   fi
   extra=$(printf '  "program": "%s",
@@ -298,6 +309,8 @@ PYMODEL
     printf '%q ' "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$program" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
     export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
     export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+    export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+    export G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
     if [[ -z "$OPENAI_API_KEY" ]]; then
       printf 'OPENAI_API_KEY is not set. No credential file was created.\n' >"$workspace/logs/program_gen.log"
       write_seed_metadata missing_api_key 2 'OPENAI_API_KEY is not set' "$program" "$formats" 0 0 "$output_dir"
@@ -325,7 +338,7 @@ PYMODEL
       elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/program_gen.log"; then
         reason='G2Fuzz LLM API returned empty response content before saving generated inputs'
       elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/program_gen.log"; then
-        reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase provider request timeout'
+        reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS/HGB_LLM_REQUEST_TIMEOUT_SECONDS'
       fi
     fi
     write_seed_metadata "$status" "$program_gen_code" "$reason" "$program" "$formats" "$seeds" "$generators" "$output_dir"

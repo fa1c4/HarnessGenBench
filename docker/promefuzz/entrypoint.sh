@@ -162,6 +162,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+  export PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   export PROME_FUZZ_SKIP_BAD_DOCS="${PROME_FUZZ_SKIP_BAD_DOCS:-1}"
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
@@ -207,8 +209,8 @@ api_key = "${OPENAI_API_KEY:-}"
 model = "${OPENAI_MODEL:-}"
 temperature = 0.0
 max_tokens = -1
-timeout = 80
-retry_times = 3
+timeout = ${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}}
+retry_times = ${PROME_FUZZ_LLM_RETRY_TIMES:-3}
 
 [llm.hgb_embedding]
 llm_type = "${PROME_FUZZ_EMBEDDING_LLM_TYPE:-mock}"
@@ -525,7 +527,7 @@ PY_PROME_API_COUNT
       elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$stage_log"; then
         reason='PromeFuzz LLM API returned empty response content before harness generation'
       elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$stage_log"; then
-        reason='PromeFuzz LLM or embedding request timed out before harness generation; reduce API/doc caps or increase provider request timeout'
+        reason='PromeFuzz LLM or embedding request timed out before harness generation; reduce API/doc caps or increase PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS/HGB_LLM_REQUEST_TIMEOUT_SECONDS'
       elif grep -qi 'Expected Embeddings to be non-empty\|no non-empty chunks\|Skipping document' "$stage_log"; then
         reason='promefuzz_no_usable_docs: PromeFuzz comprehension had no usable non-empty documentation chunks after filtering bad docs'
       elif grep -qi 'pdfminer\|partition_pdf\|Failed to load document.*pdf' "$stage_log"; then
@@ -555,6 +557,8 @@ fi
 export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
 export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+export PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
 cfg="$(write_config)"
 (cd "$artifact" && ("$python" PromeFuzz.py --help || python3 PromeFuzz.py --help)) >"$workspace/logs/help.txt" 2>&1 || true
 printf 'PromeFuzz runtime config: /run/hgb/promefuzz_config.toml (not mounted)\n' >"$workspace/command.txt"
