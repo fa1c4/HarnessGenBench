@@ -552,6 +552,63 @@ def harness_hint_tokens(*values: str) -> list[str]:
     return tokens
 
 
+def _all_name_tokens(*values: str) -> list[str]:
+    tokens: list[str] = []
+    for value in values:
+        for token in re.split(r"[^A-Za-z0-9]+", value or ""):
+            token = token.lower()
+            if token and token not in tokens:
+                tokens.append(token)
+    return tokens
+
+
+def _project_alias_norms(project: str) -> set[str]:
+    aliases = {_norm_token(project)}
+    for token in _all_name_tokens(project):
+        aliases.add(_norm_token(token))
+    project_norm = _norm_token(project)
+    if project_norm.endswith("4"):
+        aliases.add(project_norm[:-1])
+    if project_norm == "openthread":
+        aliases.add("ot")
+    return {alias for alias in aliases if alias}
+
+
+def _project_path_score(rel: Path, project: str) -> int:
+    aliases = _project_alias_norms(project)
+    if not aliases or not rel.parts:
+        return 0
+    top = _norm_token(rel.parts[0])
+    if any(top == alias or top.startswith(alias) or alias.startswith(top) for alias in aliases):
+        return 150
+    return -160
+
+
+def _selected_harness_alias_norms(target: str, fuzz_target: str, project: str, build_stems: set[str]) -> set[str]:
+    project_aliases = _project_alias_norms(project)
+    generic = {"fuzz", "fuzzer", "target", "oss", "ossfuzz"}
+    aliases: set[str] = set()
+    for value in (target, fuzz_target, *sorted(build_stems)):
+        parts = _all_name_tokens(value, Path(value).stem)
+        if not parts:
+            continue
+        candidate_sets = [
+            parts,
+            [part for part in parts if _norm_token(part) not in project_aliases],
+            [part for part in parts if _norm_token(part) not in project_aliases and part not in generic],
+        ]
+        for candidate in candidate_sets:
+            if not candidate:
+                continue
+            joined = "".join(candidate)
+            aliases.add(_norm_token(joined))
+            if "fuzz" in candidate:
+                aliases.add(_norm_token("".join("fuzzer" if part == "fuzz" else part for part in candidate)))
+            if "fuzzer" in candidate:
+                aliases.add(_norm_token("".join("fuzz" if part == "fuzzer" else part for part in candidate)))
+    return {alias for alias in aliases if len(alias) >= 3}
+
+
 def _for_loop_values(build_text: str) -> dict[str, list[str]]:
     values: dict[str, list[str]] = {}
     for match in re.finditer(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)", build_text):
@@ -594,6 +651,7 @@ def selected_build_hints(build_sh: Path, target: str, fuzz_target: str) -> tuple
     text = build_sh.read_text(encoding="utf-8", errors="replace")
     tokens = harness_hint_tokens(target, fuzz_target)
     target_norms = {_norm_token(value) for value in (target, fuzz_target, *tokens) if value}
+    build_hint_norms = {_norm_token(value) for value in (target, fuzz_target) if value}
     refs: set[str] = set()
     stems: set[str] = set()
 
@@ -622,7 +680,10 @@ def selected_build_hints(build_sh: Path, target: str, fuzz_target: str) -> tuple
         hint = match.group(0).strip("./")
         if not hint or hint.lower() in {"fuzzers", "fuzzer", "fuzz"}:
             continue
-        stems.add(Path(hint).name.lower())
+        hint_name = Path(hint).name.lower()
+        hint_norm = _norm_token(hint_name)
+        if any(norm and (norm in hint_norm or hint_norm in norm) for norm in build_hint_norms):
+            stems.add(hint_name)
     return refs, stems
 
 
@@ -632,6 +693,7 @@ def _candidate_score(
     root: Path,
     target: str,
     fuzz_target: str,
+    project: str,
     build_refs: set[str],
     build_stems: set[str],
     benchmark_local: bool,
@@ -644,11 +706,16 @@ def _candidate_score(
     norm_rel = _norm_token(rel_s)
     tokens = harness_hint_tokens(target, fuzz_target)
     target_norms = {_norm_token(value) for value in (target, fuzz_target, *tokens) if value}
+    alias_norms = _selected_harness_alias_norms(target, fuzz_target, project, build_stems)
     score = 0
     if rel_l in build_refs or any(rel_l.endswith(ref) for ref in build_refs):
         score += 420
     if stem_l in build_stems or name_l in build_stems:
         score += 240
+    if norm_stem in alias_norms:
+        score += 300
+    elif any(alias and alias in norm_stem for alias in alias_norms):
+        score += 140
     if norm_stem in target_norms:
         score += 180
     for norm in target_norms:
@@ -667,13 +734,17 @@ def _candidate_score(
         score += 120
     if benchmark_local:
         score += 30
+    else:
+        score += _project_path_score(rel, project)
     try:
         if likely_reference_harness(path, root):
-            score += 45
+            score += 140
     except ValueError:
         pass
     if any(part.lower() in {"seed", "seeds", "testcases", "corpus"} for part in rel.parts):
         score -= 200
+    if not benchmark_local and "fuzz" not in rel_l and "fuzzer" not in rel_l:
+        score -= 80
     return score
 
 
@@ -694,6 +765,7 @@ def copy_selected_reference_harnesses(
     reference_dir: Path,
     target: str,
     fuzz_target: str,
+    project: str,
     source_label: str,
 ) -> list[str]:
     selected_dir = reference_dir / SELECTED_REFERENCE_SUBDIR
@@ -717,7 +789,7 @@ def copy_selected_reference_harnesses(
                 continue
             if benchmark_local and any(part in {"seeds", "testcases", "corpus"} for part in rel.parts):
                 continue
-            score = _candidate_score(candidate, rel, root, target, fuzz_target, build_refs, build_stems, benchmark_local)
+            score = _candidate_score(candidate, rel, root, target, fuzz_target, project, build_refs, build_stems, benchmark_local)
             if benchmark_local:
                 source_count = sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() in HARNESS_SOURCE_EXTS)
                 if source_count == 1:
@@ -907,6 +979,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         output / "reference_harnesses",
         target,
         resolved.get("fuzz_target", ""),
+        resolved.get("project", ""),
         source_label,
     )
     reference_files = strip_reference_harnesses(source_root, output / "source_input", output / "reference_harnesses", strip, source_label=source_label)

@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml
 
+from hgb_api_report import default_api_report_path, select_report_api_names
 from ofg_api_rank import load_reference_calls, rank_records, reject_reason
 
 
@@ -35,10 +36,34 @@ def _normalise_function(function: Any) -> dict[str, Any] | None:
     return item
 
 
-def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    report_metadata: dict[str, Any] = {}
     if not isinstance(functions, list):
-        return [], []
+        return [], [], report_metadata
     normalised = [item for item in (_normalise_function(function) for function in functions) if item]
+    if args.report_mode != "dynamic_only":
+        report_names, report_metadata = select_report_api_names(
+            report_path=args.api_report or default_api_report_path(),
+            target_name=args.target_name,
+            project=args.project,
+            fuzz_target=args.fuzz_target,
+            max_records=args.max_functions,
+        )
+        if report_names:
+            order = {name.split("::")[-1].lower(): index for index, name in enumerate(report_names)}
+            matched = [
+                item for item in normalised
+                if str(item.get("name") or "").split("::")[-1].lower() in order
+            ]
+            matched.sort(key=lambda item: order.get(str(item.get("name") or "").split("::")[-1].lower(), 10_000))
+            for item in matched:
+                item["_hgb_score"] = 1000
+                item["_hgb_score_reasons"] = ["api_report_candidate"]
+            if matched or args.report_mode == "report_only":
+                return matched, [], report_metadata
+        if args.report_mode == "report_only":
+            return [], [], report_metadata
+
     ranked = rank_records(
         normalised,
         project=args.project,
@@ -58,7 +83,7 @@ def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict
     for item in normalised:
         if id(item) not in ranked_ids and reject_reason(item):
             rejected.append({"name": item.get("name", ""), "signature": item.get("signature", ""), "reason": reject_reason(item)})
-    return ranked, rejected
+    return ranked, rejected, report_metadata
 
 
 def main() -> int:
@@ -71,6 +96,8 @@ def main() -> int:
     parser.add_argument("--target-name", default="")
     parser.add_argument("--fuzz-target", default="")
     parser.add_argument("--reference-dir", default="")
+    parser.add_argument("--api-report", default=__import__("os").environ.get("HGB_SELECTED_API_REPORT", default_api_report_path()))
+    parser.add_argument("--report-mode", default=__import__("os").environ.get("HGB_API_REPORT_MODE", "report_first"), choices=("report_first", "report_only", "dynamic_only"))
     parser.add_argument("--allow-test-files", action="store_true")
     parser.add_argument("--min-score", type=int, default=0)
     parser.add_argument("--selection-mode", default=__import__("os").environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"), choices=("ranked", "selected_harness", "selected_harness_fallback"))
@@ -87,7 +114,7 @@ def main() -> int:
     original_function_count = len(functions) if isinstance(functions, list) else 0
     original_test_file_count = len(test_files) if isinstance(test_files, list) else 0
 
-    ranked_functions, rejected_functions = _rank_functions(functions, args)
+    ranked_functions, rejected_functions, report_metadata = _rank_functions(functions, args)
     low_confidence_functions: list[dict[str, Any]] = []
     if args.min_score > 0 and ranked_functions:
         confident_functions = []
@@ -132,7 +159,11 @@ def main() -> int:
         "rejected_function_count": len(rejected_functions),
         "low_confidence_function_count": len(low_confidence_functions),
         "min_score": args.min_score,
+        "api_selection_source": "report" if report_metadata.get("api_candidate_names") and ranked_functions else "dynamic",
+        "report_mode": args.report_mode,
+        "fallback_used": bool(report_metadata and not ranked_functions and args.report_mode == "report_first"),
     }
+    metadata.update(report_metadata)
 
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")

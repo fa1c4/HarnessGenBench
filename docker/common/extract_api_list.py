@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from hgb_api_report import default_api_report_path, select_report_api_names
 from ofg_api_rank import load_reference_calls, rank_records
 
 
@@ -213,6 +214,41 @@ def extract(source: Path, limit: int) -> list[str]:
     return [record["name"] for record in extract_details(source, limit)]
 
 
+def _record_short_name(record: dict[str, Any]) -> str:
+    return str(record.get("name") or "").split("::")[-1]
+
+
+def _report_name_records(
+    raw: list[dict[str, Any]],
+    report_names: list[str],
+    *,
+    allow_name_only: bool,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    order = {name.split("::")[-1].lower(): index for index, name in enumerate(report_names)}
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in raw:
+        key = _record_short_name(record).lower()
+        if key not in order or key in seen:
+            continue
+        item = dict(record)
+        item["_hgb_selection_reason"] = "api_report_decl_match"
+        selected.append(item)
+        seen.add(key)
+    selected.sort(key=lambda record: order.get(_record_short_name(record).lower(), 10_000))
+    unmatched = [
+        name for name in report_names
+        if name.split("::")[-1].lower() not in seen
+    ]
+    if allow_name_only:
+        for name in unmatched:
+            item = make_record(name, "int", "")
+            item["_hgb_selection_reason"] = "api_report_name_only"
+            item["_hgb_name_only"] = True
+            selected.append(item)
+        unmatched = []
+    return selected, unmatched
+
 
 def effective_reference_dir(reference_dir: str, selected_reference_dir: str = "") -> str:
     if selected_reference_dir:
@@ -237,7 +273,66 @@ def select_records(
     fuzz_target: str,
     reference_dir: str,
     keep_rejected: bool,
+    api_report: str = "",
+    report_mode: str = "report_first",
+    allow_name_only_report_apis: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    report_metadata: dict[str, Any] = {}
+    if report_mode != "dynamic_only":
+        report_names, report_metadata = select_report_api_names(
+            report_path=api_report or default_api_report_path(),
+            target_name=target_name,
+            project=project,
+            fuzz_target=fuzz_target,
+            max_records=max_records,
+        )
+        if report_names:
+            report_records, unmatched_report_names = _report_name_records(
+                raw,
+                report_names,
+                allow_name_only=allow_name_only_report_apis,
+            )
+            if report_records:
+                metadata = {
+                    "selection_mode": selection_mode,
+                    "report_mode": report_mode,
+                    "api_selection_source": "report",
+                    "reference_dir": reference_dir,
+                    "raw_candidate_count": len(raw),
+                    "ranked_candidate_count": 0,
+                    "reference_call_count": len(load_reference_calls(reference_dir)),
+                    "direct_match_count": len(report_records),
+                    "selected_count": len(report_records),
+                    "fallback_used": False,
+                    "fallback_max": fallback_max,
+                    "max_records": max_records,
+                    "selected_api_names": [str(record.get("name") or "") for record in report_records],
+                    "direct_api_names": [str(record.get("name") or "") for record in report_records],
+                    "unmatched_report_api_names": unmatched_report_names,
+                }
+                metadata.update(report_metadata)
+                return report_records, metadata
+        if report_mode == "report_only":
+            metadata = {
+                "selection_mode": selection_mode,
+                "report_mode": report_mode,
+                "api_selection_source": "report",
+                "reference_dir": reference_dir,
+                "raw_candidate_count": len(raw),
+                "ranked_candidate_count": 0,
+                "reference_call_count": len(load_reference_calls(reference_dir)),
+                "direct_match_count": 0,
+                "selected_count": 0,
+                "fallback_used": False,
+                "fallback_max": fallback_max,
+                "max_records": max_records,
+                "selected_api_names": [],
+                "direct_api_names": [],
+                "unmatched_report_api_names": report_metadata.get("api_candidate_names", []),
+            }
+            metadata.update(report_metadata)
+            return [], metadata
+
     ranked = rank_records(
         raw,
         project=project,
@@ -251,7 +346,7 @@ def select_records(
         record for record in ranked
         if str(record.get("name") or "").split("::")[-1].lower() in reference_calls
     ]
-    fallback_used = False
+    fallback_used = bool(report_metadata and report_mode == "report_first")
     if selection_mode == "ranked":
         selected = ranked[:max_records]
     elif selection_mode == "selected_harness":
@@ -264,6 +359,8 @@ def select_records(
             selected = ranked[:max(0, fallback_max)]
     metadata = {
         "selection_mode": selection_mode,
+        "report_mode": report_mode,
+        "api_selection_source": "dynamic",
         "reference_dir": reference_dir,
         "raw_candidate_count": len(raw),
         "ranked_candidate_count": len(ranked),
@@ -276,6 +373,7 @@ def select_records(
         "selected_api_names": [str(record.get("name") or "") for record in selected],
         "direct_api_names": [str(record.get("name") or "") for record in direct[:max_records]],
     }
+    metadata.update(report_metadata)
     return selected, metadata
 
 def main() -> int:
@@ -290,6 +388,13 @@ def main() -> int:
     parser.add_argument("--fuzz-target", default="")
     parser.add_argument("--reference-dir", default="")
     parser.add_argument("--selected-reference-dir", default="")
+    parser.add_argument("--api-report", default=os.environ.get("HGB_SELECTED_API_REPORT", default_api_report_path()))
+    parser.add_argument(
+        "--report-mode",
+        default=os.environ.get("HGB_API_REPORT_MODE", "report_first"),
+        choices=("report_first", "report_only", "dynamic_only"),
+    )
+    parser.add_argument("--allow-name-only-report-apis", action="store_true")
     parser.add_argument(
         "--selection-mode",
         default=os.environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"),
@@ -313,6 +418,9 @@ def main() -> int:
         fuzz_target=args.fuzz_target,
         reference_dir=ref_dir,
         keep_rejected=args.keep_rejected,
+        api_report=args.api_report,
+        report_mode=args.report_mode,
+        allow_name_only_report_apis=args.allow_name_only_report_apis,
     )
     if args.details:
         data = selected

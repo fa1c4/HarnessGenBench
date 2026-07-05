@@ -28,7 +28,7 @@ COPY artifacts/oss-fuzz-gen /opt/hgb/artifacts/oss-fuzz-gen
 ENV OFG_OSS_FUZZ_DIR=/opt/hgb/oss-fuzz
 ENV OFG_OSS_FUZZ_VENV=/opt/hgb/oss-fuzz-venv
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/ofg_select_benchmark.py docker/common/ofg_run_wrapper.py docker/common/ofg_trim_benchmark.py /opt/hgb/bin/
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/ofg_select_benchmark.py docker/common/ofg_run_wrapper.py docker/common/ofg_trim_benchmark.py /opt/hgb/bin/
 RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/ofg_select_benchmark.py /opt/hgb/bin/ofg_run_wrapper.py /opt/hgb/bin/ofg_trim_benchmark.py
 COPY docker/oss-fuzz-gen/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh

@@ -357,6 +357,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
   export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
+  export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-/opt/hgb/metadata/fuzzbench_selected_harness_apis.json}"
+  export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-report_first}"
   export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-$HGB_SELECTED_API_MAX}"
   export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-600}"
   export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
@@ -390,6 +392,8 @@ if [[ "$mode" == "generate-target" ]]; then
       --target-name "$target_name" \
       --fuzz-target "$fuzz_target" \
       --reference-dir "$selected_reference_dir" \
+      --api-report "$HGB_SELECTED_API_REPORT" \
+      --report-mode "$HGB_API_REPORT_MODE" \
       --selection-metadata "$api_selection_metadata" \
       2>"$workspace/logs/ofg_api_extract.log" || printf '0')"
     api_count="${api_count##*$'\n'}"
@@ -517,7 +521,7 @@ PY_OFG_YAML
     trim_benchmark_once() {
       local source_yaml="$1" out_yaml="$2" metadata_json="$3"
       local trim_args
-      trim_args=(/opt/hgb/bin/ofg_trim_benchmark.py --in "$source_yaml" --out "$out_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$metadata_json" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir "$selected_reference_dir" --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" --min-score "${OFG_MIN_BENCHMARK_SCORE:-1}")
+      trim_args=(/opt/hgb/bin/ofg_trim_benchmark.py --in "$source_yaml" --out "$out_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$metadata_json" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir "$selected_reference_dir" --api-report "$HGB_SELECTED_API_REPORT" --report-mode "$HGB_API_REPORT_MODE" --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" --min-score "${OFG_MIN_BENCHMARK_SCORE:-1}")
       if [[ "${OFG_ALLOW_TEST_BENCHMARKS:-0}" == "1" ]]; then
         trim_args+=(--allow-test-files)
       fi
@@ -530,6 +534,7 @@ PY_OFG_YAML
       benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
       benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
       benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
+      api_selection_metadata="$trim_metadata"
     else
       trim_reason='ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed'
       if grep -Eq 'ofg_empty_unit_test_prompt' "$workspace/logs/benchmark_yaml.log"; then
@@ -554,6 +559,7 @@ PY_OFG_YAML
             benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
             benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
             benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
+            api_selection_metadata="$trim_metadata"
             trim_reason=""
           else
             trim_reason='ofg_benchmark_trim_failed: synthesized benchmark YAML trimming failed after upstream YAML was rejected'
@@ -661,7 +667,8 @@ PY_OFG_LOG_HARNESS
   target_source_file_count="${target_source_file_count:-0}"
   target_source_fallback_statuses="$(hgb_target_manifest_value source_fallback_statuses)"
   target_source_fallback_statuses="${target_source_fallback_statuses:-[]}"
-  extra=$(printf '  "benchmark_yaml": "%s",
+  api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
+  extra=$(printf '%s  "benchmark_yaml": "%s",
   "benchmark_match_kind": "%s",
   "selected_yaml_project": "%s",
   "selected_yaml_target_name": "%s",
@@ -683,7 +690,7 @@ PY_OFG_LOG_HARNESS
   "command_file": "%s",
   "log_file": "%s",
   "oss_fuzz_dir": "%s",
-  "pip_cache_dir": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "$(hgb_json_escape "$api_selection_metadata")" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "${OFG_MAX_ROUND:-5}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
+  "pip_cache_dir": "%s"' "$api_selection_extra" "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "$(hgb_json_escape "$api_selection_metadata")" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "${OFG_MAX_ROUND:-5}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

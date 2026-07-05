@@ -183,3 +183,32 @@ hgb_soft_skip() {
   hgb_write_common_summary "$status" "$reason" "$capability"
   exit 0
 }
+
+hgb_api_selection_metadata_json() {
+  local file="${1:-}"
+  python3 - "$file" <<'PY_HGB_API_SELECTION_METADATA'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1] else None
+try:
+    data = json.loads(path.read_text(encoding="utf-8")) if path and path.is_file() else {}
+except (OSError, json.JSONDecodeError):
+    data = {}
+
+def emit(key, value):
+    print(f'  "{key}": {json.dumps(value)},')
+
+selected = data.get("selected_api_names") or data.get("api_candidate_names") or []
+emit("api_selection_source", data.get("api_selection_source", "unknown"))
+emit("api_report_mode", data.get("report_mode", ""))
+emit("api_report_path", data.get("api_report_path", ""))
+emit("api_report_row_found", bool(data.get("api_report_row_found")))
+emit("api_report_source_field", data.get("api_report_source_field", ""))
+emit("api_report_target", data.get("api_report_target", ""))
+emit("api_selection_fallback_used", bool(data.get("fallback_used")))
+emit("api_candidate_names", selected if isinstance(selected, list) else [])
+PY_HGB_API_SELECTION_METADATA
+}
+

@@ -166,6 +166,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
   export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
+  export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-/opt/hgb/metadata/fuzzbench_selected_harness_apis.json}"
+  export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-report_first}"
   export NLTK_DATA="${NLTK_DATA:-/opt/hgb/nltk_data}"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/promefuzz_out" /run/hgb/promefuzz
   hgb_require_target_package
@@ -291,10 +293,13 @@ EOF_PROMEFUZZ_LIBS
     --target-name "$target_name" \
     --fuzz-target "$fuzz_target" \
     --reference-dir "$selected_reference_dir" \
+    --api-report "$HGB_SELECTED_API_REPORT" \
+    --report-mode "$HGB_API_REPORT_MODE" \
     --selection-metadata "$api_selection_metadata" \
     2>"$workspace/logs/promefuzz_api_extract.log" || printf '0')"
   selected_api_count="${selected_api_count##*$'\n'}"
   export PROME_FUZZ_SELECTED_API_NAMES_FILE="$selected_api_names_file"
+  export PROME_FUZZ_API_SELECTION_METADATA_FILE="$api_selection_metadata"
   runtime_artifact=/run/hgb/promefuzz/artifact
   rm -rf "$runtime_artifact"
   mkdir -p "$runtime_artifact"
@@ -410,6 +415,21 @@ if preprocess_py.exists():
         except Exception as exc:
             logger.warning(f"Could not load HGB selected API names from {selected_names_file}: {exc}")
     selected_rank = {name: index for index, name in enumerate(selected_names)}
+
+    def _hgb_mark_api_fallback(reason):
+        metadata_file = os.environ.get("PROME_FUZZ_API_SELECTION_METADATA_FILE", "")
+        if not metadata_file:
+            return
+        try:
+            metadata_path = Path(metadata_file)
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
+            metadata["fallback_used"] = True
+            metadata["api_selection_source"] = "dynamic"
+            metadata["promefuzz_api_object_filter_fallback_reason"] = reason
+            metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+        except Exception as exc:
+            logger.warning(f"Could not mark HGB API fallback metadata: {exc}")
+
     if selected_rank and getattr(api, "funcs", None):
         before = api.count
         matched = [func for func in api.funcs if str(getattr(func, "name", "")).split("::")[-1] in selected_rank]
@@ -420,6 +440,7 @@ if preprocess_py.exists():
             logger.info(f"Filtered API functions from {before} to {api.count} using HGB selected FuzzBench harness APIs.")
         else:
             logger.warning("No PromeFuzz API functions matched HGB selected harness APIs; falling back to ranked trimming.")
+            _hgb_mark_api_fallback("promefuzz_api_object_name_mismatch")
     if max_apis > 0 and api.count > max_apis:
         before = api.count
         api.funcs = sorted(api.funcs, key=_hgb_api_rank)[:max_apis]
@@ -524,7 +545,8 @@ PY_PROME_API_COUNT
   if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
     rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
   fi
-  extra=$(printf '  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s"' "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")")
+  api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
+  extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s"' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
