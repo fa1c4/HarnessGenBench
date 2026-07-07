@@ -64,6 +64,26 @@ hgb_api_key_present() {
   [[ -n "${OPENAI_API_KEY:-${API_KEY:-}}" ]]
 }
 
+hgb_trace_summary_value() {
+  local key="$1"
+  local dir="${2:-${HGB_LLM_TRACE_DIR:-${workspace:-/workspace}/api_traces}}"
+  local summary="$dir/summary.json"
+  [[ -f "$summary" ]] || { printf '0\n'; return 0; }
+  python3 - "$summary" "$key" <<'PY_HGB_TRACE_SUMMARY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        value = json.load(f).get(sys.argv[2], 0)
+except Exception:
+    value = 0
+try:
+    print(int(value))
+except Exception:
+    print(0)
+PY_HGB_TRACE_SUMMARY
+}
+
 hgb_fix_workspace_permissions() {
   local workspace="${workspace:-/workspace}"
   if [[ -n "${HGB_HOST_UID:-}" && -n "${HGB_HOST_GID:-}" ]] && command -v chown >/dev/null 2>&1; then
@@ -92,13 +112,16 @@ hgb_write_common_metadata() {
   local extra_json="${5:-}"
   local workspace="${workspace:-/workspace}"
   local manifest="${HGB_TARGET_MANIFEST:-/target/target_manifest.json}"
-  local harness_count build_script_count log_candidate_count input_count api_key_bool
+  local harness_count build_script_count log_candidate_count input_count api_key_bool trace_path trace_total trace_sample
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/generated_inputs"
   harness_count="$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
   build_script_count="$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
   log_candidate_count="$(hgb_count_generated_log_candidates "$workspace/generated_harnesses")"
   input_count="$(hgb_count_files "$workspace/generated_inputs" -type f)"
   if hgb_api_key_present; then api_key_bool=true; else api_key_bool=false; fi
+  trace_path="${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"
+  trace_total="$(hgb_trace_summary_value total_count "$trace_path")"
+  trace_sample="$(hgb_trace_summary_value sample_count "$trace_path")"
   {
     printf '{\n'
     printf '  "schema_version": 1,\n'
@@ -121,7 +144,10 @@ hgb_write_common_metadata() {
     printf '  "generated_build_script_count": %s,\n' "$build_script_count"
     printf '  "generated_log_candidate_count": %s,\n' "$log_candidate_count"
     printf '  "generated_input_count": %s,\n' "$input_count"
-    printf '  "log_dir": "%s"' "$(hgb_json_escape "$workspace/logs")"
+    printf '  "log_dir": "%s",\n' "$(hgb_json_escape "$workspace/logs")"
+    printf '  "api_trace_dir": "%s",\n' "$(hgb_json_escape "$trace_path")"
+    printf '  "api_trace_total_count": %s,\n' "${trace_total:-0}"
+    printf '  "api_trace_sample_count": %s' "${trace_sample:-0}"
     if [[ -n "$extra_json" ]]; then
       printf ',\n%s\n' "$extra_json"
     else
@@ -136,6 +162,7 @@ hgb_write_common_summary() {
   local reason="$2"
   local capability="${3:-harness_generator}"
   local workspace="${workspace:-/workspace}"
+  local trace_path
   {
     printf '# HarnessGenBench Target Run Summary\n\n'
     printf -- '- Generator: `%s`\n' "${HGB_GENERATOR:-unknown}"
@@ -148,6 +175,9 @@ hgb_write_common_summary() {
     printf -- '- Generated harnesses: `%s`\n' "$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
     printf -- '- Generated build scripts: `%s`\n' "$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
     printf -- '- Generated inputs: `%s`\n' "$(hgb_count_files "$workspace/generated_inputs" -type f)"
+    trace_path="${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"
+    printf -- '- API trace dir: `%s`\n' "$trace_path"
+    printf -- '- API trace calls/samples: `%s/%s`\n' "$(hgb_trace_summary_value total_count "$trace_path")" "$(hgb_trace_summary_value sample_count "$trace_path")"
     printf -- '- Top failure reason: %s\n' "$reason"
     printf '\n## Logs\n\n'
     find "$workspace/logs" -type f 2>/dev/null | sort | sed "s#^$workspace/##" | sed 's/^/- `/' | sed 's/$/`/'

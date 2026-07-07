@@ -188,34 +188,43 @@ export CXX="${CXX:-clang++}"
 export CFLAGS="${CFLAGS:--g -O0}"
 export CXXFLAGS="${CXXFLAGS:--g -O0}"
 export LIB_FUZZING_ENGINE="${LIB_FUZZING_ENGINE:-}"
+export HGB_CKG_BUILD_DIR="${HGB_CKG_BUILD_DIR:-$SRC}"
 mkdir -p "$OUT" "$WORK" "$WORK/hgb-codeql-objects"
 marker="/src/fuzzing_os/hgb_compiled_units_${project}.txt"
 printf '0\n' >"$marker"
 run_build=0
 if [[ -x /target/fuzzbench_benchmark/build.sh ]]; then
-  echo "[hgb-codeql] replaying /target/fuzzbench_benchmark/build.sh with SRC=$SRC"
-  (cd "$SRC" && bash /target/fuzzbench_benchmark/build.sh) || run_build=$?
+  echo "[hgb-codeql] replaying /target/fuzzbench_benchmark/build.sh with SRC=$SRC and build dir=$HGB_CKG_BUILD_DIR"
+  (cd "$HGB_CKG_BUILD_DIR" && bash /target/fuzzbench_benchmark/build.sh) || run_build=$?
 elif [[ -x /src/build.sh ]]; then
-  echo "[hgb-codeql] replaying /src/build.sh with SRC=$SRC"
-  (cd "$SRC" && bash /src/build.sh) || run_build=$?
+  echo "[hgb-codeql] replaying /src/build.sh with SRC=$SRC and build dir=$HGB_CKG_BUILD_DIR"
+  (cd "$HGB_CKG_BUILD_DIR" && bash /src/build.sh) || run_build=$?
 elif [[ -x "$SRC/build.sh" ]]; then
   echo "[hgb-codeql] replaying $SRC/build.sh"
-  (cd "$SRC" && bash "$SRC/build.sh") || run_build=$?
+  (cd "$HGB_CKG_BUILD_DIR" && bash "$SRC/build.sh") || run_build=$?
 fi
 count=0
+include_args=(-I"$SRC")
+while IFS= read -r -d '' include_dir; do
+  include_args+=("-I$include_dir")
+done < <(find "$SRC" -maxdepth 3 -type d -name include -print0 2>/dev/null | sort -z)
 while IFS= read -r -d '' src_file; do
   case "$src_file" in
     *.c) compiler="$CC"; std="-std=c11" ;;
     *) compiler="$CXX"; std="-std=c++17" ;;
   esac
   obj="$WORK/hgb-codeql-objects/${count}.o"
-  if "$compiler" $std -I"$SRC" -D_FORTIFY_SOURCE=0 -c "$src_file" -o "$obj" >/dev/null 2>&1; then
+  if "$compiler" $std "${include_args[@]}" -D_FORTIFY_SOURCE=0 -c "$src_file" -o "$obj" >/dev/null 2>&1; then
     count=$((count + 1))
     printf '%s\n' "$count" >"$marker"
   fi
 done < <(find "$SRC" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) -print0 2>/dev/null | sort -z)
 echo "[hgb-codeql] fallback compiled $count translation units"
-if [[ "$count" -gt 0 || "$run_build" -eq 0 ]]; then
+build_artifact="$(find "$HGB_CKG_BUILD_DIR" "$SRC" "$OUT" "$WORK" -type f \( -name '*.o' -o -name '*.lo' -o -name '*.a' -o -name '*.so' -o -name '*.so.*' -o -name '*.dylib' -o -name '*.dll' \) -print -quit 2>/dev/null || true)"
+if [[ -n "$build_artifact" ]]; then
+  echo "[hgb-codeql] build replay produced compiled artifact: $build_artifact"
+fi
+if [[ "$count" -gt 0 || "$run_build" -eq 0 || -n "$build_artifact" ]]; then
   exit 0
 fi
 exit "$run_build"
@@ -315,22 +324,14 @@ select
 EOF_CKG_CALL_GRAPH_QL
     done
   fi
-  if [[ -d /target/source_input ]]; then
-    mapfile -t source_roots < <(find /target/source_input -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort)
-    if [[ "${#source_roots[@]}" -eq 1 && -f "${source_roots[0]}/CMakeLists.txt" ]]; then
-      cp -a "${source_roots[0]}/." "$ckg_proj/" 2>/dev/null || true
-      repo_leaf="$(basename "${source_roots[0]}")"
-      if [[ ! -e "$ckg_proj/$repo_leaf" ]]; then
-        ln -s . "$ckg_proj/$repo_leaf" 2>/dev/null || true
-      fi
-    else
-      cp -a /target/source_input/. "$ckg_proj/" 2>/dev/null || true
-    fi
-  fi
-  if [[ -f /target/fuzzbench_benchmark/build.sh ]]; then
-    cp /target/fuzzbench_benchmark/build.sh "$ckg_proj/build.sh" 2>/dev/null || true
-    chmod +x "$ckg_proj/build.sh" 2>/dev/null || true
-  fi
+  ckg_analysis_src="$ckg_shared/source_code/$ckg_project"
+  ckg_stage_metadata="$workspace/ckg_stage.json"
+  ckg_build_dir="$(python3 /opt/hgb/bin/ckgfuzzer_stage_project.py \
+    --target-root /target \
+    --project-dir "$ckg_proj" \
+    --analysis-dir "$ckg_analysis_src" \
+    --project-name "$ckg_project" \
+    --metadata "$ckg_stage_metadata")"
   if [[ ! -f "$ckg_proj/build.sh" ]]; then
     cat >"$ckg_proj/build.sh" <<'EOF_CKG_STUB_BUILD'
 #!/usr/bin/env bash
@@ -349,8 +350,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake ninja-build make pkg-config clang git ca-certificates \
     autoconf automake libtool meson python3 python3-pip zlib1g-dev libssl-dev libxml2-dev \
+    zip ruby rake bison nasm subversion libgcrypt-dev wget \
   && rm -rf /var/lib/apt/lists/*
 ENV SRC=/src/$ckg_project
+ENV HGB_CKG_BUILD_DIR=$ckg_build_dir
 ENV OUT=/out
 ENV WORK=/work
 ENV CC=clang
@@ -361,7 +364,7 @@ ENV LIB_FUZZING_ENGINE=
 RUN mkdir -p /out /work
 COPY . /src/$ckg_project/
 COPY build.sh /src/build.sh
-WORKDIR /src/$ckg_project
+WORKDIR $ckg_build_dir
 EOF_CKG_DOCKERFILE
   if [[ "$(hgb_count_files "$ckg_proj" -type f)" == "0" ]]; then
     hgb_soft_skip source_input_missing 'target package does not contain source files for CKGFuzzer API extraction' harness_generator
@@ -393,6 +396,7 @@ EOF_CKG_USAGE
     --selection-metadata "$api_selection_metadata" \
     2>"$workspace/logs/api_extract.log" || printf '0')"
   api_count="${api_count##*$'\n'}"
+  export CKGFUZZER_SELECTED_API_LIST="$ckg_db/api_list.json"
   cat >"$ckg_db/config.yaml" <<EOF_CKG_CONFIG
 config:
   project_name: "$ckg_project"
@@ -431,7 +435,7 @@ llm_code_embedding:
   model: "${CKGFUZZER_EMBEDDING_MODEL:-mock}"
   api_key: "${CKGFUZZER_EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}"
   base_url: "${CKGFUZZER_EMBEDDING_BASE_URL:-${OPENAI_BASE_URL:-}}"
-source_dir: "$ckg_proj"
+source_dir: "$ckg_analysis_src"
 output_dir: "$workspace/generated_harnesses"
 build_command: "bash /target/fuzzbench_benchmark/build.sh"
 EOF_CKG_CONFIG
@@ -461,13 +465,45 @@ EOF_CKG_CONFIG
   fi
   python3 - "$repo_py" <<'PY_CKG_REPO_PATCH'
 from pathlib import Path
+import re
 import sys
 path = Path(sys.argv[1])
 text = path.read_text()
+for required_import in ("import json\n", "import os\n", "import sys\n"):
+    if required_import not in text:
+        text = required_import + text
 old = """        eggs = [ (api[0].strip(), api[1].strip(), self.database_db, self.output_results_folder, self.shared_llm_dir) for api in src_api ]
         logger.info(f"Total number of API to be processed: {len(eggs)}")
 """
 new = """        eggs = [ (api[0].strip(), api[1].strip(), self.database_db, self.output_results_folder, self.shared_llm_dir) for api in src_api ]
+        selected_api_names = []
+        selected_api_path = os.environ.get("CKGFUZZER_SELECTED_API_LIST", "")
+        if selected_api_path and os.path.isfile(selected_api_path):
+            try:
+                selected_raw = json.load(open(selected_api_path))
+                for item in selected_raw:
+                    if isinstance(item, str):
+                        selected_api_names.append(item)
+                    elif isinstance(item, dict) and item.get("name"):
+                        selected_api_names.append(str(item.get("name")))
+            except Exception as exc:
+                logger.warning(f"Failed to load HGB selected API list {selected_api_path}: {exc}")
+        if selected_api_names:
+            selected_keys = [name.split("::")[-1].lower() for name in selected_api_names]
+            matched = []
+            used = set()
+            for wanted in selected_keys:
+                for egg in eggs:
+                    key = egg[0].split("::")[-1].lower()
+                    if key == wanted and id(egg) not in used:
+                        matched.append(egg)
+                        used.add(id(egg))
+                        break
+            if matched:
+                logger.info(f"Filtered API call graph processing from {len(eggs)} to {len(matched)} HGB-selected APIs: {selected_api_names}")
+                eggs = matched
+            else:
+                logger.warning(f"No extracted source definitions matched HGB-selected APIs: {selected_api_names}")
         max_apis = int(os.environ.get("CKGFUZZER_MAX_CALL_GRAPH_APIS", "8") or "0")
         if max_apis > 0 and len(eggs) > max_apis:
             logger.info(f"Limiting API call graph processing from {len(eggs)} to {max_apis} for HGB integration.")
@@ -475,7 +511,32 @@ new = """        eggs = [ (api[0].strip(), api[1].strip(), self.database_db, sel
         logger.info(f"Total number of API to be processed: {len(eggs)}")
 """
 if old in text:
-    path.write_text(text.replace(old, new, 1))
+    text = text.replace(old, new, 1)
+cleanup_pattern = re.compile(
+    r"""        for i in tqdm\(range\(pool_num\)\):
+            shutil\.copytree\(self\.database_db, f'\{self\.database_db\}_\{i\}', dirs_exist_ok=True\)
+            queue_id\.put\(i\)
+
+        with Pool\(pool_num\) as pool:[ \t]*
+            results = list\(tqdm\(pool\.imap\(RepositoryAgent\.handle_extract_api_call_graph_multiple_path, eggs\), total=len\(eggs\), desc='Processing transactions'\)\)[ \t]*
+[ \t]*
+        for i in range\(pool_num\):
+            shutil\.rmtree\(f'\{self\.database_db\}_\{i\}'\)
+"""
+)
+new_cleanup = """        try:
+            for i in tqdm(range(pool_num)):
+                shutil.copytree(self.database_db, f'{self.database_db}_{i}', dirs_exist_ok=True)
+                queue_id.put(i)
+
+            with Pool(pool_num) as pool:
+                results = list(tqdm(pool.imap(RepositoryAgent.handle_extract_api_call_graph_multiple_path, eggs), total=len(eggs), desc='Processing transactions'))
+        finally:
+            for i in range(pool_num):
+                shutil.rmtree(f'{self.database_db}_{i}', ignore_errors=True)
+"""
+text = cleanup_pattern.sub(new_cleanup, text, count=1)
+path.write_text(text)
 PY_CKG_REPO_PATCH
   python3 - "$repo_py" <<'PY_CKG_REPO_DOCKER_MOUNT_PATCH'
 from pathlib import Path
@@ -501,15 +562,142 @@ new = """        # Run the Docker container with the CodeQL command. HGB exposes
             command.extend(['-v', f'{target_package_host}:/target:ro'])
         elif os.path.isdir('/target'):
             command.extend(['-v', '/target:/target:ro'])
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            command.extend(['-t'])
         command.extend([
-            '-t', image_name,
+            image_name,
             '/bin/bash', '-c', codeql_command
         ])
 """
 if old in text and "'/target:/target:ro'" not in text:
     text = text.replace(old, new, 1)
+old_success = """        if f"Successfully created database at /src/fuzzing_os/codeqldb/{args.project_name}" in result.stdout:
+            with open(f'{args.shared_llm_dir}/codeqldb/{args.project_name}/.successfully_created', 'w') as f:
+                f.write('')
+            logger.info(result.stdout)
+            logger.info(f"Confirmed Successfully created database at /src/fuzzing_os/codeqldb/{args.project_name}")
+        else:
+            print(result.stdout)
+            print(result.stderr)
+            assert False, f"Failed to create database at /src/fuzzing_os/codeqldb/{args.project_name}"
+"""
+new_success = """        success_message = f"Successfully created database at /src/fuzzing_os/codeqldb/{args.project_name}"
+        combined_output = (result.stdout or "") + "\\n" + (result.stderr or "")
+        database_dir = f'{args.shared_llm_dir}/codeqldb/{args.project_name}'
+        database_created = result.returncode == 0 and (success_message in combined_output or os.path.isdir(database_dir))
+        if database_created:
+            with open(f'{database_dir}/.successfully_created', 'w') as f:
+                f.write('')
+            if result.stdout:
+                logger.info(result.stdout)
+            if result.stderr:
+                logger.info(result.stderr)
+            logger.info(f"Confirmed Successfully created database at /src/fuzzing_os/codeqldb/{args.project_name}")
+        else:
+            print(result.stdout)
+            print(result.stderr)
+            logger.error(f"CodeQL database create exited {result.returncode} for {args.project_name}")
+            assert False, f"Failed to create database at /src/fuzzing_os/codeqldb/{args.project_name}"
+"""
+if old_success in text and "database_created = result.returncode == 0" not in text:
+    text = text.replace(old_success, new_success, 1)
 path.write_text(text)
 PY_CKG_REPO_DOCKER_MOUNT_PATCH
+  python3 - "$artifact" <<'PY_CKG_RUNTIME_DOCKER_PATCH'
+from pathlib import Path
+import re
+import sys
+root = Path(sys.argv[1])
+check_path = root / "fuzzing_llm_engine/utils/check_gen_fuzzer.py"
+if check_path.exists():
+    text = check_path.read_text()
+    if "import sys\n" not in text:
+        text = "import sys\n" + text
+    old = """  command = [
+      'docker', 'exec', '-u', 'root','-it', project_name+"_check" ]
+  command.extend(run_args)
+"""
+    new = """  command = ['docker', 'exec', '-u', 'root']
+  if sys.stdin.isatty() and sys.stdout.isatty():
+    command.extend(['-i', '-t'])
+  command.append(project_name+"_check")
+  command.extend(run_args)
+"""
+    if old in text:
+        text = text.replace(old, new, 1)
+    old = """  except subprocess.CalledProcessError as e:
+    if print_output:
+      return e.output.decode('utf-8', errors='replace')
+"""
+    new = """  except subprocess.CalledProcessError as e:
+    if print_output:
+      return e.output.decode('utf-8', errors='replace')
+    return f"ERROR: docker exec failed with exit code {e.returncode}"
+"""
+    if old in text:
+        text = text.replace(old, new, 1)
+    check_path.write_text(text)
+
+run_path = root / "fuzzing_llm_engine/roles/run_fuzzer.py"
+if run_path.exists():
+    text = run_path.read_text()
+    replacements = [
+        (
+            r'''build_fuzzer_result =  run\(run_args\)[ \t]*
+        logger\.info\(f"compile \{fuzz_driver_file\}, result \{build_fuzzer_result\}"\)''',
+            """build_fuzzer_result =  run(run_args)
+        if not isinstance(build_fuzzer_result, str):
+            build_fuzzer_result = f"ERROR: non-string result from build_fuzzer_file: {build_fuzzer_result!r}"
+        logger.info(f"compile {fuzz_driver_file}, result {build_fuzzer_result}")""",
+        ),
+        (
+            r'''run_fuzzer_result =  run\(run_args\)[ \t]*
+            logger\.info\(f"run_fuzzer \{fuzz_driver_file\}, result \{run_fuzzer_result\}"\)''',
+            """run_fuzzer_result =  run(run_args)
+            if not isinstance(run_fuzzer_result, str):
+                run_fuzzer_result = f"ERROR: non-string result from run_fuzzer: {run_fuzzer_result!r}"
+            logger.info(f"run_fuzzer {fuzz_driver_file}, result {run_fuzzer_result}")""",
+        ),
+        (
+            r'''build_fuzzer_result =  run\(run_args\)[ \t]*
+                        logger\.info\(f"compile \{fuzz_driver_file\}, result \{build_fuzzer_result\}"\)''',
+            """build_fuzzer_result =  run(run_args)
+                        if not isinstance(build_fuzzer_result, str):
+                            build_fuzzer_result = f"ERROR: non-string result from build_fuzzer_file: {build_fuzzer_result!r}"
+                        logger.info(f"compile {fuzz_driver_file}, result {build_fuzzer_result}")""",
+        ),
+        (
+            r'''run_fuzzer_result =  run\(run_args\)[ \t]*
+                        logger\.info\(f"run_fuzzer \{fuzz_driver_file\}, result \{run_fuzzer_result\}"\)''',
+            """run_fuzzer_result =  run(run_args)
+                        if not isinstance(run_fuzzer_result, str):
+                            run_fuzzer_result = f"ERROR: non-string result from run_fuzzer: {run_fuzzer_result!r}"
+                        logger.info(f"run_fuzzer {fuzz_driver_file}, result {run_fuzzer_result}")""",
+        ),
+    ]
+    for pattern, replacement in replacements:
+        if replacement not in text:
+            text = re.sub(pattern, replacement, text, count=1)
+    run_path.write_text(text)
+
+fix_path = root / "fuzzing_llm_engine/roles/compilation_fix_agent.py"
+if fix_path.exists():
+    text = fix_path.read_text()
+    pattern = r'''                result =  run\(run_args\)[ \t]*
+            logger\.info\(f"check_compilation \{file\}, result:\\n \{result\}"\)
+            if "error:" not in result:
+'''
+    replacement = """                result =  run(run_args)
+            if not isinstance(result, str):
+                result = f"ERROR: non-string result from check_compilation: {result!r}"
+            logger.info(f"check_compilation {file}, result:\\n {result}")
+            lowered_result = result.lower()
+            if "error:" not in lowered_result and "input device is not a tty" not in lowered_result and "error" not in lowered_result:
+"""
+    if replacement not in text:
+        text = re.sub(pattern, replacement, text, count=1)
+    fix_path.write_text(text)
+PY_CKG_RUNTIME_DOCKER_PATCH
   get_model_py="$(find "$artifact" -path '*/models/get_model.py' -type f 2>/dev/null | head -n 1 || true)"
   if [[ -n "$get_model_py" ]]; then
     python3 - "$get_model_py" <<'PY_CKG_MODEL_PATCH'
@@ -680,6 +868,111 @@ if path.exists():
         text = text.replace(old, new, 1)
     path.write_text(text)
 PY_CKG_HF_IMPORT_PATCH
+  python3 - "$artifact" <<'PY_CKG_LLM_TRACE_PATCH'
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+get_model_path = root / "fuzzing_llm_engine/models/get_model.py"
+if get_model_path.exists():
+    text = get_model_path.read_text()
+    if "def _hgb_trace_llm" not in text:
+        import_block = """
+import sys as _hgb_trace_sys
+_hgb_trace_sys.path.insert(0, "/opt/hgb/bin")
+try:
+    import hgb_llm_trace as _hgb_llm_trace
+except Exception as _hgb_trace_exc:
+    _hgb_llm_trace = None
+    print(f"HGB_LLM_TRACE: CKGFuzzer get_model tracing unavailable: {_hgb_trace_exc}", file=_hgb_trace_sys.stderr)
+
+
+def _hgb_trace_llm(llm, model_name, provider="llama-index"):
+    if _hgb_llm_trace is None or getattr(llm, "_hgb_trace_wrapped", False):
+        return llm
+    original_complete = getattr(llm, "complete", None)
+    if callable(original_complete):
+        def traced_complete(prompt, *args, **kwargs):
+            return _hgb_llm_trace.trace_call(
+                lambda: original_complete(prompt, *args, **kwargs),
+                stage="ckgfuzzer",
+                provider=provider,
+                operation="complete",
+                model=str(model_name),
+                request={"prompt": prompt, "args": args, "kwargs": kwargs},
+            )
+        try:
+            llm.complete = traced_complete
+        except Exception as _hgb_wrap_exc:
+            print(f"HGB_LLM_TRACE: CKGFuzzer could not wrap complete(): {_hgb_wrap_exc}", file=_hgb_trace_sys.stderr)
+    original_chat = getattr(llm, "chat", None)
+    if callable(original_chat):
+        def traced_chat(messages, *args, **kwargs):
+            return _hgb_llm_trace.trace_call(
+                lambda: original_chat(messages, *args, **kwargs),
+                stage="ckgfuzzer",
+                provider=provider,
+                operation="chat",
+                model=str(model_name),
+                request={"messages": messages, "args": args, "kwargs": kwargs},
+            )
+        try:
+            llm.chat = traced_chat
+        except Exception as _hgb_wrap_exc:
+            print(f"HGB_LLM_TRACE: CKGFuzzer could not wrap chat(): {_hgb_wrap_exc}", file=_hgb_trace_sys.stderr)
+    try:
+        setattr(llm, "_hgb_trace_wrapped", True)
+    except Exception:
+        pass
+    return llm
+"""
+        text = text.replace("import os\n", "import os\n" + import_block, 1)
+    replacements = {
+        'return Ollama(model="llama3:70b",  base_url="http://csl-server14.dynip.ntu.edu.sg:51030", request_timeout=3600)': 'return _hgb_trace_llm(Ollama(model="llama3:70b",  base_url="http://csl-server14.dynip.ntu.edu.sg:51030", request_timeout=3600), "llama3:70b", "ollama")',
+        'return OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"] )': 'return _hgb_trace_llm(OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"] ), model_name, "openai-compatible")',
+        'return OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"])': 'return _hgb_trace_llm(OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"]), model_name, "openai-compatible")',
+        'return Ollama(model=model_name,  base_url=llm_config["base_url"], request_timeout=llm_config["request_timeout"])': 'return _hgb_trace_llm(Ollama(model=model_name,  base_url=llm_config["base_url"], request_timeout=llm_config["request_timeout"]), model_name, "ollama")',
+    }
+    for old, new in replacements.items():
+        if old in text and new not in text:
+            text = text.replace(old, new)
+    get_model_path.write_text(text)
+openai_path = root / "fuzzing_llm_engine/models/openai.py"
+if openai_path.exists():
+    text = openai_path.read_text()
+    if "import hgb_llm_trace" not in text:
+        text = text.replace("from openai.types.chat import ChatCompletion\n", "from openai.types.chat import ChatCompletion\nimport sys\nsys.path.insert(0, \"/opt/hgb/bin\")\ntry:\n    import hgb_llm_trace\nexcept Exception:\n    hgb_llm_trace = None\n", 1)
+    old = """        response: ChatCompletion = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=messages,
+            **kwargs
+        )"""
+    new = """        request = {\"model\": self.model_name, \"messages\": messages, **kwargs}
+        if hgb_llm_trace is not None:
+            response: ChatCompletion = hgb_llm_trace.trace_call(
+                lambda: self.client.chat.completions.create(**request),
+                stage=\"ckgfuzzer\",
+                provider=\"openai-compatible\",
+                operation=\"chat.completions.create\",
+                model=self.model_name,
+                request=request,
+            )
+        else:
+            response: ChatCompletion = self.client.chat.completions.create(**request)"""
+    if old in text and "hgb_llm_trace.trace_call" not in text:
+        text = text.replace(old, new, 1)
+    openai_path.write_text(text)
+PY_CKG_LLM_TRACE_PATCH
+  cleanup_ckg_codeql_shards() {
+    if [[ -d "$ckg_shared/codeqldb" ]]; then
+      find "$ckg_shared/codeqldb" -maxdepth 1 -mindepth 1 -type d -name "${ckg_project}_*" -exec rm -rf {} + 2>/dev/null || true
+    fi
+  }
+  compact_ckg_workspace() {
+    cleanup_ckg_codeql_shards
+    if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+      rm -rf "$ckg_shared/codeql" "$ckg_shared/codeqldb" "$ckg_shared/source_code" 2>/dev/null || true
+    fi
+  }
   ckg_input_args=()
   if [[ "${CKGFUZZER_GEN_INPUT:-0}" == "1" ]]; then
     ckg_input_args+=(--gen_input)
@@ -702,6 +995,7 @@ PY_CKG_HF_IMPORT_PATCH
   preproc_code=not_run
   fuzzing_code=not_run
   (cd "$(dirname "$repo_py")" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$repo_py" --project_name "$ckg_project" --shared_llm_dir "$ckg_shared" --saved_dir "$ckg_db/codebase" --src_api --call_graph) >"$workspace/logs/repo.log" 2>&1 || repo_code=$?
+  cleanup_ckg_codeql_shards
   if [[ "$repo_code" != "0" ]]; then
     code="$repo_code"
     failed_stage=repo
@@ -734,11 +1028,16 @@ PY_CKG_HF_IMPORT_PATCH
       failed_stage=fuzzing
     fi
   fi
-  n=0
-  while IFS= read -r generated; do
-    n=$((n + 1))
-    cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-  done < <(find "$ckg_proj" "$ckg_db" "$ckg_shared" -type f \( -name 'driver_*.c' -o -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' \) 2>/dev/null | sort)
+  if [[ "$fuzzing_code" != "not_run" ]]; then
+    n=0
+    while IFS= read -r generated; do
+      case "$generated" in
+        "$workspace/generated_harnesses"/*|"$ckg_db/test"/*) continue ;;
+      esac
+      n=$((n + 1))
+      cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
+    done < <(find "$ckg_db" -type f \( -name 'driver_*.c' -o -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' \) 2>/dev/null | sort)
+  fi
   status=completed
   reason=none
   if [[ "$code" -ne 0 ]]; then
@@ -747,6 +1046,10 @@ PY_CKG_HF_IMPORT_PATCH
     if [[ "$failed_stage" == "repo" && -f "$workspace/logs/repo.log" ]]; then
       if grep -Eqi 'No source code was seen|did not process any source|No source code was seen during the build|hgb-codeql.*fallback compiled 0' "$workspace/logs/repo.log"; then
         reason='ckg_no_compilable_sources: CKGFuzzer CodeQL database build saw no C/C++ source after target build replay; inspect repo.log and target build scripts'
+      elif [[ "$code" == "124" ]] && grep -Eqi 'Processing transactions|Starting evaluation of cpp-queries|codeql query run|Extracting call graph' "$workspace/logs/repo.log"; then
+        reason='ckg_codeql_call_graph_timeout: CKGFuzzer CodeQL call-graph extraction timed out; reduce CKGFUZZER_MAX_CALL_GRAPH_APIS or inspect selected API filtering'
+      elif [[ "$code" == "124" ]] && grep -Eqi 'copy_source_code_fromDocker|Extracting source code from the repository|source_code' "$workspace/logs/repo.log"; then
+        reason='ckg_source_copy_timeout: CKGFuzzer timed out while copying source from the synthetic Docker image'
       fi
     fi
     if [[ "$failed_stage" == "fuzzing" && -f "$workspace/logs/fuzzing.log" ]]; then
@@ -760,6 +1063,8 @@ PY_CKG_HF_IMPORT_PATCH
         reason='CKGFuzzer LLM API request timed out before harness generation; reduce API caps or increase CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS/HGB_LLM_REQUEST_TIMEOUT_SECONDS'
       elif grep -qi 'Connection refused.*11434\|Failed to establish.*11434' "$workspace/logs/fuzzing.log"; then
         reason='CKGFuzzer embedding service is unavailable at localhost:11434; start Ollama or configure CKGFUZZER_EMBEDDING_MODEL/base URL'
+      elif grep -qi 'input device is not a TTY\|non-string result from run_fuzzer\|non-string result from build_fuzzer_file\|TypeError: argument of type' "$workspace/logs/fuzzing.log"; then
+        reason='ckg_docker_noninteractive_compile_check: CKGFuzzer Docker compile/run check failed in non-interactive mode or returned a non-string result'
       elif grep -q "ModuleNotFoundError: No module named" "$workspace/logs/fuzzing.log"; then
         missing_mod="$(sed -n "s/.*ModuleNotFoundError: No module named '\\([^']*\\)'.*/\1/p" "$workspace/logs/fuzzing.log" | tail -n 1)"
         reason="CKGFuzzer missing Python dependency${missing_mod:+: $missing_mod}"
@@ -767,10 +1072,11 @@ PY_CKG_HF_IMPORT_PATCH
     fi
   fi
   generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
-  if [[ "$code" -ne 0 && "${generated_harness_count:-0}" -gt 0 ]]; then
+  if [[ "$code" -ne 0 && "$failed_stage" == "fuzzing" && "${generated_harness_count:-0}" -gt 0 ]]; then
     status=partial_completed
     reason="CKGFuzzer $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
   fi
+  compact_ckg_workspace
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "ckgfuzzer_project": "%s",\n  "ckgfuzzer_shared_dir": "%s",\n  "api_candidate_count": %s,\n  "llm_request_timeout_seconds": "%s",\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "repo_exit_code": "%s",\n  "preproc_exit_code": "%s",\n  "fuzzing_exit_code": "%s",\n  "codeql_version": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"

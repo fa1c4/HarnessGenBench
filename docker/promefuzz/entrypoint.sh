@@ -306,10 +306,30 @@ EOF_PROMEFUZZ_LIBS
   rm -rf "$runtime_artifact"
   mkdir -p "$runtime_artifact"
   cp -a "$artifact/." "$runtime_artifact/"
-  python3 - "$runtime_artifact" <<'PY_PROMEFUZZ_LOCAL_RAG_PATCH'
+  python3 - "$runtime_artifact" <<'PY_PROMEFUZZ_LLM_TRACE_PATCH'
 from pathlib import Path
 import sys
 root = Path(sys.argv[1])
+llm_py = root / "src/llm/llm.py"
+if llm_py.exists():
+    llm_text = llm_py.read_text()
+    if "import hgb_llm_trace" not in llm_text:
+        llm_text = llm_text.replace("import sys\n", "import sys\nsys.path.insert(0, \"/opt/hgb/bin\")\ntry:\n    import hgb_llm_trace\nexcept Exception:\n    hgb_llm_trace = None\n", 1)
+    old = """            completion = self.client.chat.completions.create(**api_params)"""
+    new = """            if hgb_llm_trace is not None:
+                completion = hgb_llm_trace.trace_call(
+                    lambda: self.client.chat.completions.create(**api_params),
+                    stage=\"promefuzz\",
+                    provider=\"openai-compatible\",
+                    operation=\"chat.completions.create\",
+                    model=self.model,
+                    request=api_params,
+                )
+            else:
+                completion = self.client.chat.completions.create(**api_params)"""
+    if old in llm_text and "hgb_llm_trace.trace_call" not in llm_text:
+        llm_text = llm_text.replace(old, new)
+    llm_py.write_text(llm_text)
 rag_py = root / "src/llm/rag.py"
 utils_py = root / "src/utils.py"
 if rag_py.exists():
@@ -451,7 +471,7 @@ if preprocess_py.exists():
     if old in text and "PROME_FUZZ_MAX_APIS" not in text:
         text = text.replace(old, new, 1)
     preprocess_py.write_text(text)
-PY_PROMEFUZZ_LOCAL_RAG_PATCH
+PY_PROMEFUZZ_LLM_TRACE_PATCH
   if ! promefuzz_processors_ready "$runtime_artifact"; then
     printf 'PromeFuzz processor binaries are missing under %s/build/bin. Rebuild the image so docker/promefuzz/Dockerfile runs setup.sh.\n' "$runtime_artifact" >"$workspace/logs/processor.log"
     hgb_soft_skip missing_processor_binaries 'PromeFuzz processor binaries are missing; rebuild the PromeFuzz image so setup.sh runs during docker build' harness_generator
@@ -506,6 +526,9 @@ PY_PROME_API_COUNT
       break
     fi
   done
+  if [[ -f "$runtime_artifact/logs/llm.log" ]]; then
+    cp "$runtime_artifact/logs/llm.log" "$workspace/logs/promefuzz_llm.log" 2>/dev/null || true
+  fi
   n=0
   while IFS= read -r generated; do
     n=$((n + 1))

@@ -69,6 +69,57 @@ if llm_path.exists():
         "OpenAI(api_key=OPENAI_KEY)",
         f"OpenAI(api_key=OPENAI_KEY, timeout={timeout_expr})",
     )
+    if "hgb_llm_trace" not in llm_text:
+        llm_text = f"""from openai import OpenAI
+import os
+import sys
+
+sys.path.insert(0, \"/opt/hgb/bin\")
+try:
+    import hgb_llm_trace
+except Exception as exc:  # noqa: BLE001 - tracing is best-effort.
+    hgb_llm_trace = None
+    print(f\"HGB_LLM_TRACE: G2FUZZ tracing unavailable: {{exc}}\", file=sys.stderr)
+
+with open('openai_key.txt', 'r') as file:
+    key = file.read().strip()
+
+OPENAI_KEY = key
+
+
+def _client():
+    timeout = float(os.environ.get(\"G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS\", os.environ.get(\"HGB_LLM_REQUEST_TIMEOUT_SECONDS\", \"1200\")))
+    return OpenAI(api_key=OPENAI_KEY, timeout=timeout)
+
+
+def _create(model, messages, temperature):
+    client = _client()
+    request = {{\"model\": model, \"messages\": messages, \"temperature\": temperature}}
+    if hgb_llm_trace is not None:
+        response = hgb_llm_trace.trace_call(
+            lambda: client.chat.completions.create(**request),
+            stage=\"g2fuzz\",
+            provider=\"openai-compatible\",
+            operation=\"chat.completions.create\",
+            model=model,
+            request=request,
+        )
+    else:
+        response = client.chat.completions.create(**request)
+    return response.choices[0].message.content
+
+
+def llm(model, prompt, temperature):
+    return _create(model, [{{\"role\": \"user\", \"content\": prompt}}], temperature)
+
+
+def llm_messages(model, messages, temperature):
+    return _create(model, messages, temperature)
+
+
+if __name__ == \"__main__\":
+    print(llm(\"gpt-4o-mini-2024-07-18\", \"hi\", 0.0))
+"""
     llm_path.write_text(llm_text)
 path.write_text(text)
 PY_G2_PROGRAM_PATCH

@@ -67,6 +67,39 @@ metadata() {
   } >"$workspace/metadata.json"
 }
 
+patch_elfuzz_trace() {
+  local py=/opt/hgb/artifacts/elfuzz/genvariants_parallel.py
+  [[ -f "$py" ]] || return 0
+  python3 - "$py" <<'PY_ELFUZZ_TRACE_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+if "import hgb_llm_trace" not in text:
+    if "import requests\n" in text:
+        text = text.replace(
+            "import requests\n",
+            "import requests\nimport sys\nsys.path.insert(0, \"/opt/hgb/bin\")\ntry:\n    import hgb_llm_trace\nexcept Exception as exc:\n    hgb_llm_trace = None\n    print(f\"HGB_LLM_TRACE: ELFuzz tracing unavailable: {exc}\", file=sys.stderr)\n",
+            1,
+        )
+old = "    return requests.post(f'{ENDPOINT}/generate', json=data).json()"
+new = """    request = {'url': f'{ENDPOINT}/generate', 'json': data}
+    if hgb_llm_trace is not None:
+        return hgb_llm_trace.trace_call(
+            lambda: requests.post(request['url'], json=data).json(),
+            stage='elfuzz',
+            provider='tgi',
+            operation='generate',
+            model=os.environ.get('ELFUZZ_MODEL', os.environ.get('MODEL', '')),
+            request=request,
+        )
+    return requests.post(request['url'], json=data).json()"""
+if old in text and "stage='elfuzz'" not in text:
+    text = text.replace(old, new, 1)
+path.write_text(text)
+PY_ELFUZZ_TRACE_PATCH
+}
+
 patch_elfuzz_cleanup() {
   local py=/opt/hgb/artifacts/elfuzz/cli/pre_experiments.py
   [[ -f "$py" ]] || return 0
@@ -130,6 +163,7 @@ if [[ "$mode" == "generate-target" ]]; then
     hgb_soft_skip target_not_supported_by_elfuzz 'ELFuzz supports a small fixed target set; no mapping exists for this HGB/FuzzBench target name' input_generator
   fi
   patch_elfuzz_cleanup
+  patch_elfuzz_trace
   configured_hf_token="$(elfuzz_configured_hf_token)"
   if [[ "${ELFUZZ_REQUIRE_HF_TOKEN:-1}" == "1" && -z "${HF_TOKEN:-}" && -z "$configured_hf_token" && "${ELFUZZ_LOCAL_MODEL_CACHE_READY:-0}" != "1" ]]; then
     hgb_soft_skip elfuzz_missing_hf_token_or_model_access 'ELFuzz TGI synthesis requires HF_TOKEN, a configured Hugging Face token, or ELFUZZ_LOCAL_MODEL_CACHE_READY=1 for an already-cached model' input_generator
@@ -210,6 +244,7 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
 else
   printf 'HF_TOKEN is not set; skipped.\n' >"$workspace/logs/hf_config.log"; printf '0\n' >"$workspace/logs/hf_config.exit"
 fi
+patch_elfuzz_trace
 run_stage synth elfuzz synth -T fuzzer.elfuzz --use-small-model --tgi-waiting "${ELFUZZ_TGI_WAITING_SECONDS:-120}" --evolution-iterations "${ELFUZZ_EVOLUTION_ITERATIONS:-1}" "$target"
 run_stage produce elfuzz produce -T elfuzz --time "${ELFUZZ_PRODUCE_SECONDS:-60}" "$target"
 run_stage afl elfuzz run rq1.afl --fuzzers elfuzz --repeat 1 --time "${ELFUZZ_AFL_SECONDS:-300}" "$target"

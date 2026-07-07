@@ -223,6 +223,59 @@ def _patch_project_examples(upstream_args: list[str]) -> None:
     print("OFG_LOCAL_PROJECT_EXAMPLES: using HGB reference harnesses", file=sys.stderr)
 
 
+def _install_hgb_llm_trace() -> None:
+    """Patch OSS-Fuzz-Gen LLM calls to save sampled HGB traces."""
+    if "/opt/hgb/bin" not in sys.path:
+        sys.path.insert(0, "/opt/hgb/bin")
+    try:
+        import hgb_llm_trace  # type: ignore
+        from llm_toolkit import models as llm_models  # pylint: disable=import-outside-toplevel
+    except Exception as exc:  # noqa: BLE001 - tracing is best-effort.
+        print(f"HGB_LLM_TRACE: disabled for OSS-Fuzz-Gen: {exc}", file=sys.stderr)
+        return
+
+    gpt_cls = getattr(llm_models, "GPT", None)
+    if gpt_cls is None or getattr(gpt_cls, "_hgb_trace_installed", False):
+        return
+
+    original_create = gpt_cls._create_chat_completion
+
+    def traced_create(self, client: Any, kwargs: dict[str, Any]) -> Any:
+        model = str(kwargs.get("model") or getattr(self, "name", ""))
+        return hgb_llm_trace.trace_call(
+            lambda: original_create(self, client, kwargs),
+            stage="oss-fuzz-gen",
+            provider="openai-compatible",
+            operation="chat.completions.create",
+            model=model,
+            request=kwargs,
+        )
+
+    gpt_cls._create_chat_completion = traced_create
+
+    original_tools = gpt_cls.chat_llm_with_tools
+
+    def traced_chat_llm_with_tools(self, client: Any, prompt: Any, tools: Any) -> Any:
+        prompt_messages = prompt.get() if prompt else []
+        request = {
+            "model": self._completion_model_name(),
+            "input": list(getattr(self, "messages", [])) + list(prompt_messages),
+            "tools": tools,
+        }
+        return hgb_llm_trace.trace_call(
+            lambda: original_tools(self, client, prompt, tools),
+            stage="oss-fuzz-gen",
+            provider="openai-compatible",
+            operation="responses.create",
+            model=str(request["model"]),
+            request=request,
+        )
+
+    gpt_cls.chat_llm_with_tools = traced_chat_llm_with_tools
+    gpt_cls._hgb_trace_installed = True
+    print("HGB_LLM_TRACE: OSS-Fuzz-Gen hooks installed", file=sys.stderr)
+
+
 def _patch_coverage_skip() -> None:
     if not env_bool("OFG_SKIP_COVERAGE_GAINS", "1"):
         return
@@ -275,6 +328,7 @@ def main() -> int:
     _patch_project_target_downloads()
     _patch_project_examples(upstream_args)
     _patch_coverage_skip()
+    _install_hgb_llm_trace()
     _install_local_introspector_shim(upstream_args)
 
     if env_bool("OFG_SKIP_COVERAGE_GAINS", "1"):

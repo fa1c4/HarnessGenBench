@@ -78,6 +78,13 @@ from pathlib import Path
 
 import openai
 
+sys.path.insert(0, "/opt/hgb/bin")
+try:
+    import hgb_llm_trace
+except Exception as exc:  # noqa: BLE001 - tracing is best-effort.
+    hgb_llm_trace = None
+    print(f"HGB_LLM_TRACE: preflight tracing unavailable: {exc}")
+
 api_key = os.getenv('OPENAI_API_KEY') or os.getenv('API_KEY') or os.getenv('DEEPSEEK_API_KEY') or ''
 model = os.getenv('OPENAI_MODEL') or os.getenv('MODEL') or 'gpt-4o-mini'
 base_url = os.getenv('OPENAI_BASE_URL') or os.getenv('BASE_URL') or ''
@@ -137,12 +144,23 @@ try:
         for attempt in range(1, max_attempts + 1):
             try:
                 client = openai.OpenAI(**kwargs)
-                client.chat.completions.create(
-                    model=model,
-                    messages=[{'role': 'user', 'content': 'Return OK.'}],
-                    max_tokens=1,
-                    temperature=0,
-                )
+                request = {
+                    'model': model,
+                    'messages': [{'role': 'user', 'content': 'Return OK.'}],
+                    'max_tokens': 1,
+                    'temperature': 0,
+                }
+                if hgb_llm_trace is not None:
+                    hgb_llm_trace.trace_call(
+                        lambda: client.chat.completions.create(**request),
+                        stage='oss-fuzz-gen-preflight',
+                        provider='openai-compatible',
+                        operation='chat.completions.create',
+                        model=model,
+                        request=request,
+                    )
+                else:
+                    client.chat.completions.create(**request)
                 ok_path.write_text(f'{time.time()}\n', encoding='utf-8')
                 print('llm_preflight_ok')
                 sys.exit(0)

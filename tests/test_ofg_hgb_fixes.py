@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,145 @@ selector = load_module("ofg_select_benchmark", "docker/common/ofg_select_benchma
 extractor = load_module("extract_api_list", "docker/common/extract_api_list.py")
 ofg_trim = load_module("ofg_trim_benchmark", "docker/common/ofg_trim_benchmark.py")
 hgb_targets = load_module("hgb_targets", "scripts/hgb_targets.py")
+ckg_stage = load_module("ckgfuzzer_stage_project", "docker/common/ckgfuzzer_stage_project.py")
+llm_trace = load_module("hgb_llm_trace", "docker/common/hgb_llm_trace.py")
+
+
+
+def _configure_trace(monkeypatch, tmp_path: Path, sample_rate: str = "100") -> Path:
+    trace_dir = tmp_path / "api_traces"
+    llm_trace._SEQUENCE = 0
+    monkeypatch.setenv("HGB_LLM_TRACE_ENABLED", "1")
+    monkeypatch.setenv("HGB_LLM_TRACE_DIR", str(trace_dir))
+    monkeypatch.setenv("HGB_LLM_TRACE_SAMPLE_RATE", sample_rate)
+    monkeypatch.setenv("HGB_LLM_TRACE_FIRST", "1")
+    return trace_dir
+
+
+def _load_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_hgb_llm_trace_samples_first_and_every_hundred(monkeypatch, tmp_path: Path) -> None:
+    trace_dir = _configure_trace(monkeypatch, tmp_path, "100")
+
+    for index in range(100):
+        llm_trace.record(
+            stage="unit",
+            provider="openai-compatible",
+            operation="chat.completions.create",
+            model="test-model",
+            request={"index": index},
+            response={"ok": index},
+        )
+
+    samples = _load_jsonl(trace_dir / "llm_api_samples.jsonl")
+    summary = json.loads((trace_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert [sample["sequence"] for sample in samples] == [1, 100]
+    assert [sample["sample_reason"] for sample in samples] == ["first", "every_100"]
+    assert summary["total_count"] == 100
+    assert summary["sample_count"] == 2
+
+
+def test_hgb_llm_trace_redacts_nested_secret_payloads(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
+    monkeypatch.setenv("HF_TOKEN", "hf-test-secret")
+
+    payload = {
+        "api_key": "plain-field-secret",
+        "headers": {"Authorization": "Bearer header-secret"},
+        "nested": [
+            "prefix sk-test-secret suffix",
+            {"text": "authorization: bearer inline-secret"},
+            {"token": "hf-test-secret"},
+        ],
+    }
+
+    serialized = llm_trace.safe_serialize(payload)
+    blob = json.dumps(serialized, sort_keys=True)
+
+    assert "sk-test-secret" not in blob
+    assert "hf-test-secret" not in blob
+    assert "plain-field-secret" not in blob
+    assert "header-secret" not in blob
+    assert "inline-secret" not in blob
+    assert "[REDACTED]" in blob
+
+
+def test_hgb_llm_trace_serializes_openai_like_response_objects(monkeypatch, tmp_path: Path) -> None:
+    trace_dir = _configure_trace(monkeypatch, tmp_path, "1")
+    response = SimpleNamespace(
+        id="chatcmpl-test",
+        choices=[SimpleNamespace(message=SimpleNamespace(content="hello"))],
+        usage=SimpleNamespace(prompt_tokens=3, completion_tokens=2, total_tokens=5),
+    )
+
+    llm_trace.record(
+        stage="unit",
+        provider="openai-compatible",
+        operation="chat.completions.create",
+        model="test-model",
+        request={"messages": [{"role": "user", "content": "hi"}]},
+        response=response,
+    )
+
+    sample = _load_jsonl(trace_dir / "llm_api_samples.jsonl")[0]
+
+    assert sample["response"]["id"] == "chatcmpl-test"
+    assert sample["response"]["choices"][0]["message"]["content"] == "hello"
+    assert sample["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+
+
+def test_hgb_llm_trace_write_failure_does_not_raise(monkeypatch, tmp_path: Path) -> None:
+    bad_trace_dir = tmp_path / "not_a_dir"
+    bad_trace_dir.write_text("occupied", encoding="utf-8")
+    llm_trace._SEQUENCE = 0
+    monkeypatch.setenv("HGB_LLM_TRACE_ENABLED", "1")
+    monkeypatch.setenv("HGB_LLM_TRACE_DIR", str(bad_trace_dir))
+    monkeypatch.setenv("HGB_LLM_TRACE_SAMPLE_RATE", "1")
+
+    llm_trace.record(
+        stage="unit",
+        provider="openai-compatible",
+        operation="chat.completions.create",
+        request={"ok": True},
+        response={"ok": True},
+    )
+
+
+def test_hgb_llm_trace_helper_is_installed_in_every_generator_image() -> None:
+    for generator in ("oss-fuzz-gen", "ckgfuzzer", "promefuzz", "g2fuzz", "elfuzz"):
+        dockerfile = Path(f"docker/{generator}/Dockerfile").read_text(encoding="utf-8")
+        assert "docker/common/hgb_llm_trace.py" in dockerfile
+        assert "/opt/hgb/bin/" in dockerfile
+
+
+def test_hgb_llm_trace_hooks_are_wired_for_all_generators() -> None:
+    common_sh = Path("scripts/lib/common.sh").read_text(encoding="utf-8")
+    target_contract = Path("docker/common/target_contract.sh").read_text(encoding="utf-8")
+    ofg_wrapper = Path("docker/common/ofg_run_wrapper.py").read_text(encoding="utf-8")
+    ofg_entrypoint = Path("docker/oss-fuzz-gen/entrypoint.sh").read_text(encoding="utf-8")
+    ckg_entrypoint = Path("docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    prome_entrypoint = Path("docker/promefuzz/entrypoint.sh").read_text(encoding="utf-8")
+    g2_entrypoint = Path("docker/g2fuzz/entrypoint.sh").read_text(encoding="utf-8")
+    elfuzz_entrypoint = Path("docker/elfuzz/entrypoint.sh").read_text(encoding="utf-8")
+
+    for name in ("HGB_LLM_TRACE_ENABLED", "HGB_LLM_TRACE_DIR", "HGB_LLM_TRACE_SAMPLE_RATE", "HGB_LLM_TRACE_FIRST"):
+        assert name in common_sh
+    for name in ("api_trace_dir", "api_trace_total_count", "api_trace_sample_count"):
+        assert name in target_contract
+
+    assert "_install_hgb_llm_trace" in ofg_wrapper
+    assert "chat.completions.create" in ofg_wrapper
+    assert "oss-fuzz-gen-preflight" in ofg_entrypoint
+    assert "PY_CKG_LLM_TRACE_PATCH" in ckg_entrypoint
+    assert "_hgb_trace_llm" in ckg_entrypoint
+    assert "PY_PROMEFUZZ_LLM_TRACE_PATCH" in prome_entrypoint
+    assert "promefuzz_llm.log" in prome_entrypoint
+    assert "HGB_LLM_TRACE: G2FUZZ" in g2_entrypoint
+    assert "patch_elfuzz_trace" in elfuzz_entrypoint
+    assert "stage='elfuzz'" in elfuzz_entrypoint
 
 
 def write_yaml(path: Path, project: str, target_name: str) -> None:
@@ -31,6 +171,82 @@ def write_yaml(path: Path, project: str, target_name: str) -> None:
         f'"functions": []\n"project": "{project}"\n"target_name": "{target_name}"\n',
         encoding="utf-8",
     )
+
+
+def test_ckgfuzzer_stage_maps_relative_workdir_and_keeps_analysis_clean(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    source_input = target / "source_input"
+    benchmark = target / "fuzzbench_benchmark"
+    project_dir = tmp_path / "project"
+    analysis_dir = tmp_path / "analysis"
+    (source_input / "openh264").mkdir(parents=True)
+    benchmark.mkdir(parents=True)
+    (source_input / "openh264" / "codec.c").write_text("int codec(void);\n", encoding="utf-8")
+    (benchmark / "Dockerfile").write_text(
+        "FROM gcr.io/fuzzbench/base-builder\n"
+        "COPY build.sh decoder_fuzzer.cpp $SRC/\n"
+        "WORKDIR openh264\n",
+        encoding="utf-8",
+    )
+    (benchmark / "benchmark.yaml").write_text("project: openh264\n", encoding="utf-8")
+    (benchmark / "build.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    (benchmark / "decoder_fuzzer.cpp").write_text("int LLVMFuzzerTestOneInput();\n", encoding="utf-8")
+
+    metadata = ckg_stage.stage_project(
+        target,
+        project_dir,
+        analysis_dir,
+        "hgb_openh264_decoder_fuzzer",
+    )
+
+    assert metadata["build_dir"] == "/src/hgb_openh264_decoder_fuzzer/openh264"
+    assert (project_dir / "openh264" / "codec.c").is_file()
+    assert (project_dir / "build.sh").is_file()
+    assert (project_dir / "decoder_fuzzer.cpp").is_file()
+    assert (analysis_dir / "openh264" / "codec.c").is_file()
+    assert not (analysis_dir / "decoder_fuzzer.cpp").exists()
+    assert not (analysis_dir / "build.sh").exists()
+
+
+def test_ckgfuzzer_stage_maps_src_and_absolute_workdirs() -> None:
+    assert ckg_stage.map_workdir("$SRC/curl_fuzzer", "hgb_curl") == "/src/hgb_curl/curl_fuzzer"
+    assert ckg_stage.map_workdir("${SRC}/curl_fuzzer", "hgb_curl") == "/src/hgb_curl/curl_fuzzer"
+    assert ckg_stage.map_workdir("/src/libxslt", "hgb_libxslt") == "/src/hgb_libxslt/libxslt"
+    assert ckg_stage.map_workdir("", "hgb_freetype") == "/src/hgb_freetype"
+
+
+def test_ckgfuzzer_dockerfile_installs_stage_helper() -> None:
+    dockerfile = Path("docker/ckgfuzzer/Dockerfile").read_text(encoding="utf-8")
+
+    assert "docker/common/ckgfuzzer_stage_project.py" in dockerfile
+    assert "/opt/hgb/bin/ckgfuzzer_stage_project.py" in dockerfile
+
+
+def test_ckgfuzzer_repo_patch_accepts_codeql_success_on_stderr() -> None:
+    entrypoint = Path("docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+
+    assert 'combined_output = (result.stdout or "") + "\\\\n" + (result.stderr or "")' in entrypoint
+    assert "database_created = result.returncode == 0" in entrypoint
+    assert "success_message in combined_output" in entrypoint
+    assert "os.path.isdir(database_dir)" in entrypoint
+
+
+def test_ckgfuzzer_wrapper_allows_link_failure_after_compile_trace() -> None:
+    entrypoint = Path("docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+
+    assert "build replay produced compiled artifact" in entrypoint
+    assert "-name '*.o'" in entrypoint
+    assert "-name '*.a'" in entrypoint
+    assert '[[ "$count" -gt 0 || "$run_build" -eq 0 || -n "$build_artifact" ]]' in entrypoint
+
+
+def test_ckgfuzzer_does_not_count_bundled_drivers_before_fuzzing() -> None:
+    entrypoint = Path("docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+
+    assert 'if [[ "$fuzzing_code" != "not_run" ]]; then' in entrypoint
+    assert 'done < <(find "$ckg_db" -type f' in entrypoint
+    assert 'done < <(find "$ckg_proj" "$ckg_db" "$ckg_shared"' not in entrypoint
+    assert '"$failed_stage" == "fuzzing" && "${generated_harness_count:-0}" -gt 0' in entrypoint
 
 
 def test_selector_requires_exact_project_for_generic_target_names(tmp_path: Path) -> None:
