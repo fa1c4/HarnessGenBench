@@ -84,6 +84,27 @@ except Exception:
 PY_HGB_TRACE_SUMMARY
 }
 
+hgb_trace_summary_string() {
+  local key="$1"
+  local dir="${2:-${HGB_LLM_TRACE_DIR:-${workspace:-/workspace}/api_traces}}"
+  local default="${3:-}"
+  local summary="$dir/summary.json"
+  [[ -f "$summary" ]] || { printf '%s\n' "$default"; return 0; }
+  python3 -c 'import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        data = json.load(f)
+    value = data.get(sys.argv[2], sys.argv[3])
+except Exception:
+    value = sys.argv[3]
+if value is None:
+    value = sys.argv[3]
+if isinstance(value, (dict, list)):
+    print(json.dumps(value, sort_keys=True))
+else:
+    print(str(value))' "$summary" "$key" "$default"
+}
+
 hgb_fix_workspace_permissions() {
   local workspace="${workspace:-/workspace}"
   if [[ -n "${HGB_HOST_UID:-}" && -n "${HGB_HOST_GID:-}" ]] && command -v chown >/dev/null 2>&1; then
@@ -112,7 +133,7 @@ hgb_write_common_metadata() {
   local extra_json="${5:-}"
   local workspace="${workspace:-/workspace}"
   local manifest="${HGB_TARGET_MANIFEST:-/target/target_manifest.json}"
-  local harness_count build_script_count log_candidate_count input_count api_key_bool trace_path trace_total trace_sample
+  local harness_count build_script_count log_candidate_count input_count api_key_bool trace_path trace_file trace_rate trace_total trace_sample
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/generated_inputs"
   harness_count="$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
   build_script_count="$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
@@ -120,6 +141,8 @@ hgb_write_common_metadata() {
   input_count="$(hgb_count_files "$workspace/generated_inputs" -type f)"
   if hgb_api_key_present; then api_key_bool=true; else api_key_bool=false; fi
   trace_path="${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"
+  trace_file="$(hgb_trace_summary_string trace_file "$trace_path" "$trace_path/llm_api_samples.jsonl")"
+  trace_rate="$(hgb_trace_summary_string sample_rate "$trace_path" "${HGB_LLM_TRACE_SAMPLE_RATE:-10}")"
   trace_total="$(hgb_trace_summary_value total_count "$trace_path")"
   trace_sample="$(hgb_trace_summary_value sample_count "$trace_path")"
   {
@@ -146,6 +169,8 @@ hgb_write_common_metadata() {
     printf '  "generated_input_count": %s,\n' "$input_count"
     printf '  "log_dir": "%s",\n' "$(hgb_json_escape "$workspace/logs")"
     printf '  "api_trace_dir": "%s",\n' "$(hgb_json_escape "$trace_path")"
+    printf '  "api_trace_file": "%s",\n' "$(hgb_json_escape "$trace_file")"
+    printf '  "api_trace_sample_rate": "%s",\n' "$(hgb_json_escape "$trace_rate")"
     printf '  "api_trace_total_count": %s,\n' "${trace_total:-0}"
     printf '  "api_trace_sample_count": %s' "${trace_sample:-0}"
     if [[ -n "$extra_json" ]]; then
@@ -162,7 +187,7 @@ hgb_write_common_summary() {
   local reason="$2"
   local capability="${3:-harness_generator}"
   local workspace="${workspace:-/workspace}"
-  local trace_path
+  local trace_path trace_file trace_rate
   {
     printf '# HarnessGenBench Target Run Summary\n\n'
     printf -- '- Generator: `%s`\n' "${HGB_GENERATOR:-unknown}"
@@ -176,7 +201,11 @@ hgb_write_common_summary() {
     printf -- '- Generated build scripts: `%s`\n' "$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
     printf -- '- Generated inputs: `%s`\n' "$(hgb_count_files "$workspace/generated_inputs" -type f)"
     trace_path="${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"
+    trace_file="$(hgb_trace_summary_string trace_file "$trace_path" "$trace_path/llm_api_samples.jsonl")"
+    trace_rate="$(hgb_trace_summary_string sample_rate "$trace_path" "${HGB_LLM_TRACE_SAMPLE_RATE:-10}")"
     printf -- '- API trace dir: `%s`\n' "$trace_path"
+    printf -- '- API trace file: `%s`\n' "$trace_file"
+    printf -- '- API trace sample rate: `%s`\n' "$trace_rate"
     printf -- '- API trace calls/samples: `%s/%s`\n' "$(hgb_trace_summary_value total_count "$trace_path")" "$(hgb_trace_summary_value sample_count "$trace_path")"
     printf -- '- Top failure reason: %s\n' "$reason"
     printf '\n## Logs\n\n'

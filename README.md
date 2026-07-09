@@ -66,7 +66,11 @@ List targets:
 ```bash
 make artifacts
 make targets
+bash scripts/hgb_targets.sh list --sets
+bash scripts/hgb_targets.sh list valuable
 ```
+
+Use `--targets valuable` for the curated high-signal deduplicated target set, or `--targets deduped` for all unique project/fuzz-target representatives.
 
 Prepare a target package:
 

@@ -8,3 +8,8 @@ export MODEL="gpt-4o-mini"
 export OPENAI_API_KEY="$API_KEY"
 export OPENAI_BASE_URL="$BASE_URL"
 export OPENAI_MODEL="$MODEL"
+
+# Optional LLM API tracing controls. Defaults save the first call and every 10th call.
+# export HGB_LLM_TRACE_ENABLED=1
+# export HGB_LLM_TRACE_SAMPLE_RATE=10
+# export HGB_LLM_TRACE_FIRST=1

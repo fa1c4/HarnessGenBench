@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import py_compile
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -23,13 +25,14 @@ api_report = load_module("hgb_api_report", "docker/common/hgb_api_report.py")
 selector = load_module("ofg_select_benchmark", "docker/common/ofg_select_benchmark.py")
 extractor = load_module("extract_api_list", "docker/common/extract_api_list.py")
 ofg_trim = load_module("ofg_trim_benchmark", "docker/common/ofg_trim_benchmark.py")
+matrix_collector = load_module("hgb_collect_matrix", "scripts/hgb_collect_matrix.py")
 hgb_targets = load_module("hgb_targets", "scripts/hgb_targets.py")
 ckg_stage = load_module("ckgfuzzer_stage_project", "docker/common/ckgfuzzer_stage_project.py")
 llm_trace = load_module("hgb_llm_trace", "docker/common/hgb_llm_trace.py")
 
 
 
-def _configure_trace(monkeypatch, tmp_path: Path, sample_rate: str = "100") -> Path:
+def _configure_trace(monkeypatch, tmp_path: Path, sample_rate: str = "10") -> Path:
     trace_dir = tmp_path / "api_traces"
     llm_trace._SEQUENCE = 0
     monkeypatch.setenv("HGB_LLM_TRACE_ENABLED", "1")
@@ -43,10 +46,10 @@ def _load_jsonl(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_hgb_llm_trace_samples_first_and_every_hundred(monkeypatch, tmp_path: Path) -> None:
-    trace_dir = _configure_trace(monkeypatch, tmp_path, "100")
+def test_hgb_llm_trace_samples_first_and_every_tenth(monkeypatch, tmp_path: Path) -> None:
+    trace_dir = _configure_trace(monkeypatch, tmp_path, "10")
 
-    for index in range(100):
+    for index in range(20):
         llm_trace.record(
             stage="unit",
             provider="openai-compatible",
@@ -59,10 +62,36 @@ def test_hgb_llm_trace_samples_first_and_every_hundred(monkeypatch, tmp_path: Pa
     samples = _load_jsonl(trace_dir / "llm_api_samples.jsonl")
     summary = json.loads((trace_dir / "summary.json").read_text(encoding="utf-8"))
 
-    assert [sample["sequence"] for sample in samples] == [1, 100]
-    assert [sample["sample_reason"] for sample in samples] == ["first", "every_100"]
-    assert summary["total_count"] == 100
-    assert summary["sample_count"] == 2
+    assert [sample["sequence"] for sample in samples] == [1, 10, 20]
+    assert [sample["sample_reason"] for sample in samples] == ["first", "every_10", "every_10"]
+    assert summary["total_count"] == 20
+    assert summary["sample_count"] == 3
+    assert summary["sample_rate"] == "10"
+
+
+def test_hgb_llm_trace_defaults_to_every_tenth_when_unset(monkeypatch, tmp_path: Path) -> None:
+    trace_dir = tmp_path / "api_traces"
+    llm_trace._SEQUENCE = 0
+    monkeypatch.setenv("HGB_LLM_TRACE_ENABLED", "1")
+    monkeypatch.setenv("HGB_LLM_TRACE_DIR", str(trace_dir))
+    monkeypatch.delenv("HGB_LLM_TRACE_SAMPLE_RATE", raising=False)
+    monkeypatch.setenv("HGB_LLM_TRACE_FIRST", "1")
+
+    for index in range(10):
+        llm_trace.record(
+            stage="unit",
+            provider="openai-compatible",
+            operation="chat.completions.create",
+            request={"index": index},
+            response={"ok": index},
+        )
+
+    samples = _load_jsonl(trace_dir / "llm_api_samples.jsonl")
+    summary = json.loads((trace_dir / "summary.json").read_text(encoding="utf-8"))
+
+    assert [sample["sequence"] for sample in samples] == [1, 10]
+    assert [sample["sample_reason"] for sample in samples] == ["first", "every_10"]
+    assert summary["sample_rate"] == "10"
 
 
 def test_hgb_llm_trace_redacts_nested_secret_payloads(monkeypatch) -> None:
@@ -131,6 +160,47 @@ def test_hgb_llm_trace_write_failure_does_not_raise(monkeypatch, tmp_path: Path)
     )
 
 
+def test_matrix_collector_aggregates_api_trace_counts(tmp_path: Path) -> None:
+    matrix_dir = tmp_path / "matrix" / "run"
+    matrix_dir.mkdir(parents=True)
+    workspaces = [tmp_path / "ws1", tmp_path / "ws2"]
+    rows = []
+    for index, (workspace, total, sampled) in enumerate(zip(workspaces, (12, 3), (2, 1)), start=1):
+        workspace.mkdir()
+        metadata = workspace / "metadata.json"
+        metadata.write_text(
+            json.dumps(
+                {
+                    "generator": "ckgfuzzer",
+                    "target": f"target_{index}",
+                    "status": "failed",
+                    "reason": "unit failure",
+                    "api_trace_total_count": total,
+                    "api_trace_sample_count": sampled,
+                }
+            ),
+            encoding="utf-8",
+        )
+        rows.append((f"target_{index}", workspace, metadata))
+    with (matrix_dir / "matrix.tsv").open("w", encoding="utf-8") as f:
+        f.write("generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n")
+        for target, workspace, metadata in rows:
+            f.write(f"ckgfuzzer\t{target}\tfailed\t{workspace}\t{metadata}\t{workspace / 'HGB_SUMMARY.md'}\n")
+
+    summary = matrix_collector.collect(matrix_dir)
+    matrix_collector.write_outputs(matrix_dir, summary)
+
+    assert summary["api_trace_total_count"] == 15
+    assert summary["api_trace_sample_count"] == 3
+    written_summary = json.loads((matrix_dir / "summary.json").read_text(encoding="utf-8"))
+    assert written_summary["api_trace_total_count"] == 15
+    assert "api_trace_total_count\t15" in (matrix_dir / "summary.tsv").read_text(encoding="utf-8")
+    matrix_md = (matrix_dir / "HGB_MATRIX_SUMMARY.md").read_text(encoding="utf-8")
+    assert "## API Traces" in matrix_md
+    assert "- Total calls: `15`" in matrix_md
+    assert "- Sampled calls: `3`" in matrix_md
+
+
 def test_hgb_llm_trace_helper_is_installed_in_every_generator_image() -> None:
     for generator in ("oss-fuzz-gen", "ckgfuzzer", "promefuzz", "g2fuzz", "elfuzz"):
         dockerfile = Path(f"docker/{generator}/Dockerfile").read_text(encoding="utf-8")
@@ -150,8 +220,16 @@ def test_hgb_llm_trace_hooks_are_wired_for_all_generators() -> None:
 
     for name in ("HGB_LLM_TRACE_ENABLED", "HGB_LLM_TRACE_DIR", "HGB_LLM_TRACE_SAMPLE_RATE", "HGB_LLM_TRACE_FIRST"):
         assert name in common_sh
-    for name in ("api_trace_dir", "api_trace_total_count", "api_trace_sample_count"):
+    for name in (
+        "api_trace_dir",
+        "api_trace_file",
+        "api_trace_sample_rate",
+        "api_trace_total_count",
+        "api_trace_sample_count",
+    ):
         assert name in target_contract
+    assert "API trace file" in target_contract
+    assert "API trace sample rate" in target_contract
 
     assert "_install_hgb_llm_trace" in ofg_wrapper
     assert "chat.completions.create" in ofg_wrapper
@@ -229,6 +307,55 @@ def test_ckgfuzzer_repo_patch_accepts_codeql_success_on_stderr() -> None:
     assert "database_created = result.returncode == 0" in entrypoint
     assert "success_message in combined_output" in entrypoint
     assert "os.path.isdir(database_dir)" in entrypoint
+
+
+
+def test_ckgfuzzer_runtime_patch_uses_literal_replacements_and_syntax_guard() -> None:
+    entrypoint = Path("docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+
+    assert "lambda _match: replacement" in entrypoint
+    assert "runtime_patch_py_compile.log" in entrypoint
+    assert "python3 -m py_compile" in entrypoint
+
+
+def test_ckgfuzzer_runtime_patch_preserves_check_compilation_newline_escape(tmp_path: Path) -> None:
+    source = "\n".join(
+        [
+            "def check(file, run_args, logger, run):",
+            "    if True:",
+            "        if True:",
+            "            if True:",
+            "                result =  run(run_args)",
+            r'            logger.info(f"check_compilation {file}, result:\n {result}")',
+            '            if "error:" not in result:',
+            "                return True",
+            "    return False",
+        ]
+    ) + "\n"
+    pattern = (
+        r"                result =  run\(run_args\)[ \t]*" + "\n"
+        + r'            logger\.info\(f"check_compilation \{file\}, result:\\n \{result\}"\)' + "\n"
+        + r'            if "error:" not in result:' + "\n"
+    )
+    replacement = "\n".join(
+        [
+            "                result =  run(run_args)",
+            "            if not isinstance(result, str):",
+            '                result = f"ERROR: non-string result from check_compilation: {result!r}"',
+            r'            logger.info(f"check_compilation {file}, result:\n {result}")',
+            "            lowered_result = result.lower()",
+            '            if "error:" not in lowered_result and "input device is not a tty" not in lowered_result and "error" not in lowered_result:',
+        ]
+    ) + "\n"
+
+    patched = re.sub(pattern, lambda _match: replacement, source, count=1)
+    patched_path = tmp_path / "compilation_fix_agent.py"
+    patched_path.write_text(patched, encoding="utf-8")
+
+    assert patched != source
+    assert "result:\\n {result}" in patched
+    assert "result:\n {result}" not in patched
+    py_compile.compile(str(patched_path), doraise=True)
 
 
 def test_ckgfuzzer_wrapper_allows_link_failure_after_compile_trace() -> None:
@@ -348,6 +475,45 @@ def test_materialize_repo_uses_cached_checkout_when_fetch_fails(monkeypatch, tmp
     assert result["materialize_status"] == "fetch_failed_using_cached_checkout"
     assert result["cache_fallback"] is True
     assert result["checkout_status"] == "checked_out_commit"
+
+
+
+def _project_fuzz_keys(registry: dict, targets: list[str]) -> list[tuple[str, str]]:
+    return [
+        (hgb_targets.resolve_target(Path("."), target)["project"], hgb_targets.resolve_target(Path("."), target)["fuzz_target"])
+        for target in targets
+    ]
+
+
+def test_target_sets_select_curated_deduplicated_targets() -> None:
+    registry = hgb_targets.load_registry(Path("."))
+    all_targets = hgb_targets.targets_for_set(registry, "all")
+    deduped = hgb_targets.targets_for_set(registry, "deduped")
+    valuable = hgb_targets.targets_for_set(registry, "valuable")
+
+    assert len(all_targets) == 29
+    assert len(deduped) == 25
+    assert len(valuable) == 20
+    assert set(valuable).issubset(deduped)
+
+    for duplicate in (
+        "bloaty_fuzz_target_52948c",
+        "harfbuzz_hb-shape-fuzzer_17863b",
+        "libxml2_xml_e85b9b",
+        "mbedtls_fuzz_dtlsclient_7c6b0e",
+    ):
+        assert duplicate not in deduped
+        assert duplicate not in valuable
+
+    assert len(_project_fuzz_keys(registry, deduped)) == len(set(_project_fuzz_keys(registry, deduped)))
+    assert len(_project_fuzz_keys(registry, valuable)) == len(set(_project_fuzz_keys(registry, valuable)))
+
+
+def test_matrix_script_accepts_named_target_sets() -> None:
+    matrix = Path("scripts/hgb_generate_matrix.sh").read_text(encoding="utf-8")
+
+    assert "LIST|all|valuable|deduped" in matrix
+    assert 'hgb_targets.sh" list "$targets"' in matrix
 
 
 def _make_reference_selection_fixture(tmp_path: Path, build_script: str) -> tuple[Path, Path, Path]:

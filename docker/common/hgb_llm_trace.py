@@ -17,6 +17,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+DEFAULT_SAMPLE_RATE = 10
 _LOCK = threading.Lock()
 _SEQUENCE = 0
 
@@ -145,6 +146,16 @@ def _next_sequence() -> int:
         return _SEQUENCE
 
 
+def sample_rate() -> int:
+    try:
+        return int(
+            os.environ.get("HGB_LLM_TRACE_SAMPLE_RATE", str(DEFAULT_SAMPLE_RATE))
+            or str(DEFAULT_SAMPLE_RATE)
+        )
+    except ValueError:
+        return DEFAULT_SAMPLE_RATE
+
+
 def sample_decision(sequence: int) -> str:
     """Return sample reason or empty string."""
     if not enabled():
@@ -156,10 +167,7 @@ def sample_decision(sequence: int) -> str:
         "off",
     } and sequence == 1:
         return "first"
-    try:
-        rate = int(os.environ.get("HGB_LLM_TRACE_SAMPLE_RATE", "100") or "100")
-    except ValueError:
-        rate = 100
+    rate = sample_rate()
     if rate <= 0:
         return ""
     if sequence % rate == 0:
@@ -184,7 +192,7 @@ def _read_summary(root: Path) -> dict[str, Any]:
             "schema_version": SCHEMA_VERSION,
             "total_count": 0,
             "sample_count": 0,
-            "sample_rate": os.environ.get("HGB_LLM_TRACE_SAMPLE_RATE", "100"),
+            "sample_rate": str(sample_rate()),
             "trace_file": str(_samples_path(root)),
         }
 
@@ -195,7 +203,7 @@ def _write_summary(root: Path, sampled: bool) -> None:
     summary["total_count"] = int(summary.get("total_count") or 0) + 1
     if sampled:
         summary["sample_count"] = int(summary.get("sample_count") or 0) + 1
-    summary["sample_rate"] = os.environ.get("HGB_LLM_TRACE_SAMPLE_RATE", "100")
+    summary["sample_rate"] = str(sample_rate())
     summary["trace_file"] = str(_samples_path(root))
     summary["updated_at"] = datetime.now(timezone.utc).isoformat()
     _summary_path(root).write_text(

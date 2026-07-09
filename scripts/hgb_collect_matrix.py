@@ -252,6 +252,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
     input_counts: collections.Counter[str] = collections.Counter()
     reasons: collections.Counter[str] = collections.Counter()
     remediation_counts: collections.Counter[str] = collections.Counter()
+    api_trace_total_count = 0
+    api_trace_sample_count = 0
     for record in records:
         meta = record["metadata"]
         gen = meta.get("generator") or meta.get("fuzzer") or record["row"].get("generator") or "unknown"
@@ -259,6 +261,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         build_script_counts[gen] += int(meta.get("generated_build_script_count") or 0)
         log_candidate_counts[gen] += int(meta.get("generated_log_candidate_count") or 0)
         input_counts[gen] += int(meta.get("generated_input_count") or meta.get("generated_seed_count") or 0)
+        api_trace_total_count += int(meta.get("api_trace_total_count") or 0)
+        api_trace_sample_count += int(meta.get("api_trace_sample_count") or 0)
         reason = meta.get("reason") or record["row"].get("status") or "unknown"
         if reason and reason != "none":
             reason_s = str(reason)
@@ -280,6 +284,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         "generated_build_script_counts_by_generator": dict(build_script_counts),
         "generated_log_candidate_counts_by_generator": dict(log_candidate_counts),
         "generated_input_counts_by_generator": dict(input_counts),
+        "api_trace_total_count": api_trace_total_count,
+        "api_trace_sample_count": api_trace_sample_count,
         "top_failure_reasons": reasons.most_common(10),
         "top_remediations": remediation_counts.most_common(10),
         "storage": storage_report(matrix_dir, records),
@@ -299,6 +305,8 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
             "soft_skipped_pairs",
             "not_applicable_pairs",
             "missing_api_key_count",
+            "api_trace_total_count",
+            "api_trace_sample_count",
         ):
             writer.writerow([key, summary[key]])
         storage = summary.get("storage", {})
@@ -321,6 +329,11 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
         f"- Soft-skipped pairs: `{summary['soft_skipped_pairs']}`",
         f"- Not-applicable pairs: `{summary['not_applicable_pairs']}`",
         f"- Missing API key count: `{summary['missing_api_key_count']}`",
+        "",
+        "## API Traces",
+        "",
+        f"- Total calls: `{summary.get('api_trace_total_count', 0)}`",
+        f"- Sampled calls: `{summary.get('api_trace_sample_count', 0)}`",
         "",
         "## Statuses",
         "",

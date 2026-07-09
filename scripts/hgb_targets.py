@@ -102,6 +102,34 @@ def enabled_targets(registry: dict[str, Any]) -> list[str]:
     return [entry["name"] for entry in registry.get("targets", []) if entry.get("enabled", True)]
 
 
+def registry_target_sets(registry: dict[str, Any]) -> dict[str, Any]:
+    target_sets = registry.get("target_sets", {})
+    return target_sets if isinstance(target_sets, dict) else {}
+
+
+def target_set_names(registry: dict[str, Any]) -> list[str]:
+    return sorted(registry_target_sets(registry))
+
+
+def targets_for_set(registry: dict[str, Any], target_set: str = "all") -> list[str]:
+    if target_set in {"", "all"}:
+        return enabled_targets(registry)
+    target_sets = registry_target_sets(registry)
+    raw_set = target_sets.get(target_set)
+    if raw_set is None:
+        available = ", ".join(["all", *target_set_names(registry)])
+        raise SystemExit(f"unknown target set: {target_set}; available sets: {available}")
+    raw_targets = raw_set.get("targets", raw_set) if isinstance(raw_set, dict) else raw_set
+    if not isinstance(raw_targets, list):
+        raise SystemExit(f"target set is not a list: {target_set}")
+    enabled = set(enabled_targets(registry))
+    selected = [str(target) for target in raw_targets]
+    unknown = [target for target in selected if target not in enabled]
+    if unknown:
+        raise SystemExit(f"target set {target_set} references disabled or unknown targets: {', '.join(unknown)}")
+    return selected
+
+
 def fuzzbench_dir(root: Path) -> Path:
     override = os.environ.get("HGB_FUZZBENCH_DIR")
     if override:
@@ -189,6 +217,14 @@ def validate(root: Path, soft: bool = False) -> int:
     warnings: list[str] = []
     if expected != len(targets):
         errors.append(f"enabled target count {len(targets)} does not match expected_target_count {expected}")
+    for set_name in target_set_names(registry):
+        try:
+            selected = targets_for_set(registry, set_name)
+        except SystemExit as exc:
+            errors.append(str(exc))
+            continue
+        if len(selected) != len(set(selected)):
+            errors.append(f"target set {set_name} contains duplicate target names")
     fb_dir = fuzzbench_dir(root)
     for target in targets:
         bench_dir = fb_dir / registry.get("source", {}).get("benchmark_root", "benchmarks") / target
@@ -1035,7 +1071,9 @@ def main(argv: list[str] | None = None) -> int:
     root = find_repo_root()
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("list")
+    list_parser = sub.add_parser("list")
+    list_parser.add_argument("target_set", nargs="?", default="all")
+    list_parser.add_argument("--sets", action="store_true", help="list available named target sets")
     validate_parser = sub.add_parser("validate")
     validate_parser.add_argument("--soft", action="store_true")
     resolve_parser = sub.add_parser("resolve")
@@ -1048,7 +1086,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "list":
-        for target in enabled_targets(load_registry(root)):
+        registry = load_registry(root)
+        if args.sets:
+            for name in target_set_names(registry):
+                print(name)
+            return 0
+        for target in targets_for_set(registry, args.target_set):
             print(target)
         return 0
     if args.command == "validate":

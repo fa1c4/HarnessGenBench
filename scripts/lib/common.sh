@@ -141,7 +141,7 @@ load_hgb_config() {
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export HGB_LLM_TRACE_ENABLED="${HGB_LLM_TRACE_ENABLED:-1}"
   export HGB_LLM_TRACE_DIR="${HGB_LLM_TRACE_DIR:-/workspace/api_traces}"
-  export HGB_LLM_TRACE_SAMPLE_RATE="${HGB_LLM_TRACE_SAMPLE_RATE:-100}"
+  export HGB_LLM_TRACE_SAMPLE_RATE="${HGB_LLM_TRACE_SAMPLE_RATE:-10}"
   export HGB_LLM_TRACE_FIRST="${HGB_LLM_TRACE_FIRST:-1}"
 }
 
@@ -360,6 +360,9 @@ run_hgb_container() {
     -e CKGFUZZER_MAX_CALL_GRAPH_APIS \
     -e CKGFUZZER_LOCAL_API_SUMMARY \
     -e CKGFUZZER_GEN_INPUT \
+    -e CKGFUZZER_KEEP_CHECK_CONTAINER \
+    -e CKGFUZZER_CODEQL_CACHE \
+    -e CKGFUZZER_CODEQL_CACHE_REFRESH \
     -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
     -e PROME_FUZZ_EMBEDDING_HOST \
     -e PROME_FUZZ_EMBEDDING_PORT \
@@ -395,7 +398,7 @@ run_hgb_target_container() {
   local target_package="$5"
   local project="$6"
   local fuzz_target="$7"
-  local root artifact_name generator_commit shared_llm_lock_dir
+  local root artifact_name generator_commit shared_llm_lock_dir ckg_codeql_cache_dir
   local extra_docker_args=()
   shift 7
   root="$(repo_root)"
@@ -413,7 +416,11 @@ run_hgb_target_container() {
   fi
   if [[ "$generator" == "ckgfuzzer" ]]; then
     ensure_dir "$workspace/docker_shared"
+    ckg_codeql_cache_dir="$(hgb_workspace_dir "$root")/ckgfuzzer-codeql-cache"
+    ensure_dir "$ckg_codeql_cache_dir"
     extra_docker_args+=(-v "$workspace/docker_shared:$workspace/docker_shared" -e "HGB_CKG_DOCKER_SHARED=$workspace/docker_shared" -e "CKGFUZZER_MAX_CALL_GRAPH_APIS=${CKGFUZZER_MAX_CALL_GRAPH_APIS:-8}")
+    extra_docker_args+=(-v "$ckg_codeql_cache_dir:/hgb-ckg-cache" -e HGB_CKG_CODEQL_CACHE_DIR=/hgb-ckg-cache -e "CKGFUZZER_CODEQL_CACHE=${CKGFUZZER_CODEQL_CACHE:-1}" -e "CKGFUZZER_CODEQL_CACHE_REFRESH=${CKGFUZZER_CODEQL_CACHE_REFRESH:-0}")
+    extra_docker_args+=(-v "$(hgb_workspace_dir "$root"):/hgb-workspace:ro" -e HGB_CKG_PREVIOUS_WORKSPACE_ROOT=/hgb-workspace)
     if [[ -S /var/run/docker.sock ]]; then
       extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     fi
@@ -499,6 +506,7 @@ run_hgb_target_container() {
     -e CKGFUZZER_MAX_CALL_GRAPH_APIS \
     -e CKGFUZZER_LOCAL_API_SUMMARY \
     -e CKGFUZZER_GEN_INPUT \
+    -e CKGFUZZER_KEEP_CHECK_CONTAINER \
     -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
     -e PROME_FUZZ_EMBEDDING_HOST \
     -e PROME_FUZZ_EMBEDDING_PORT \

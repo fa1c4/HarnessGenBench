@@ -8,10 +8,11 @@ source "$SCRIPT_DIR/lib/common.sh"
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  bash scripts/hgb_generate_matrix.sh --generators LIST|all --targets LIST|all [--dry-run] [--parallel-worker N]
+  bash scripts/hgb_generate_matrix.sh --generators LIST|all --targets LIST|all|valuable|deduped [--dry-run] [--parallel-worker N]
 
 Options:
   --parallel-worker N        Run up to N targets concurrently for each generator (default: 5).
+  --targets VALUE            Comma list, all, or a named set from scripts/hgb_targets.sh list --sets.
   --jobs N                   Backward-compatible alias for --parallel-worker.
   --allow-input-generators   Allow generators that require input corpus/source material.
   --target-package-mode MODE Prepare targets once per matrix run with shared, or once per pair with per-pair (default: shared).
@@ -107,8 +108,13 @@ if [[ "$generators" == "all" ]]; then
 else
   IFS=',' read -r -a generator_list <<<"$generators"
 fi
-if [[ "$targets" == "all" ]]; then
-  mapfile -t target_list < <(bash "$SCRIPT_DIR/hgb_targets.sh" list)
+if [[ "$targets" != *,* ]]; then
+  target_set_output=""
+  if target_set_output="$(bash "$SCRIPT_DIR/hgb_targets.sh" list "$targets" 2>/dev/null)"; then
+    mapfile -t target_list <<<"$target_set_output"
+  else
+    IFS=',' read -r -a target_list <<<"$targets"
+  fi
 else
   IFS=',' read -r -a target_list <<<"$targets"
 fi
