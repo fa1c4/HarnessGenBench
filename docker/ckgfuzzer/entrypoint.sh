@@ -325,6 +325,7 @@ EOF_CKG_CALL_GRAPH_QL
     done
   fi
   ckg_analysis_src="$ckg_shared/source_code/$ckg_project"
+  export CKGFUZZER_SOURCE_ROOT="$ckg_analysis_src"
   ckg_stage_metadata="$workspace/ckg_stage.json"
   ckg_build_dir="$(python3 /opt/hgb/bin/ckgfuzzer_stage_project.py \
     --target-root /target \
@@ -504,6 +505,7 @@ new = """        eggs = [ (api[0].strip(), api[1].strip(), self.database_db, sel
                 eggs = matched
             else:
                 logger.warning(f"No extracted source definitions matched HGB-selected APIs: {selected_api_names}")
+                eggs = []
         max_apis = int(os.environ.get("CKGFUZZER_MAX_CALL_GRAPH_APIS", "8") or "0")
         if max_apis > 0 and len(eggs) > max_apis:
             logger.info(f"Limiting API call graph processing from {len(eggs)} to {max_apis} for HGB integration.")
@@ -962,9 +964,21 @@ if openai_path.exists():
         text = text.replace(old, new, 1)
     openai_path.write_text(text)
 PY_CKG_LLM_TRACE_PATCH
+  ckg_runtime_patch_log="$workspace/logs/runtime_patch.log"
+  if ! python3 /opt/hgb/bin/ckgfuzzer_runtime_patch.py "$artifact" >"$ckg_runtime_patch_log" 2>&1; then
+    cat "$ckg_runtime_patch_log" >&2 || true
+    hgb_write_common_metadata failed 'CKGFuzzer deterministic runtime patch failed' 1 harness_generator
+    hgb_write_common_summary failed 'CKGFuzzer deterministic runtime patch failed' harness_generator
+    exit 1
+  fi
   ckg_patch_compile_candidates=(
     "$artifact/fuzzing_llm_engine/roles/compilation_fix_agent.py"
     "$artifact/fuzzing_llm_engine/roles/run_fuzzer.py"
+    "$artifact/fuzzing_llm_engine/utils/check_gen_fuzzer.py"
+    "$artifact/fuzzing_llm_engine/rag/code_base.py"
+    "$artifact/fuzzing_llm_engine/rag/kg.py"
+    "$artifact/fuzzing_llm_engine/repo/preproc.py"
+    "$artifact/fuzzing_llm_engine/fuzzing.py"
   )
   ckg_patch_compile_files=()
   for ckg_patch_compile_file in "${ckg_patch_compile_candidates[@]}"; do
@@ -1062,7 +1076,7 @@ query_files = {
     "wrapper": shared_dir / "wrapper.sh",
 }
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "target": os.environ.get("CKG_CACHE_TARGET", ""),
     "project": os.environ.get("CKG_CACHE_PROJECT", ""),
     "fuzz_target": os.environ.get("CKG_CACHE_FUZZ_TARGET", ""),
@@ -1122,13 +1136,17 @@ try:
     data = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
-sys.exit(0 if data.get("cache_key") == sys.argv[2] else 1)
+sys.exit(0 if data.get("schema_version") == 2 and data.get("cache_key") == sys.argv[2] else 1)
 PY_CKG_CACHE_VALIDATE
     then
       ckg_codeql_cache_reason='cache metadata key mismatch'
       return 1
     fi
     ckg_codeql_cache_required_present "$entry/data" || { ckg_codeql_cache_reason='cache entry is missing required CodeQL/preproc files'; return 1; }
+    if ! python3 /opt/hgb/bin/ckgfuzzer_cache.py validate --root "$entry/data" --project "$ckg_project" --source-root "$ckg_analysis_src" --portable >"$workspace/logs/codeql_cache_validate.log" 2>&1; then
+      ckg_codeql_cache_reason='cache entry is non-portable, oversized, or invalid'
+      return 1
+    fi
     return 0
   }
 
@@ -1152,8 +1170,15 @@ PY_CKG_CACHE_VALIDATE
       ckg_codeql_cache_reason='failed to restore cache entry into CKG database'
       return 1
     fi
+    if ! python3 /opt/hgb/bin/ckgfuzzer_cache.py rebase --root "$ckg_db" --project "$ckg_project" --source-root "$ckg_analysis_src" >"$workspace/logs/codeql_cache_rebase.log" 2>&1 \
+      || ! python3 /opt/hgb/bin/ckgfuzzer_cache.py validate --root "$ckg_db" --project "$ckg_project" --source-root "$ckg_analysis_src" >"$workspace/logs/codeql_cache_resolved_validate.log" 2>&1; then
+      rm -rf "$ckg_db/codebase" "$ckg_db/api_summary" "$ckg_db/src" "$ckg_db/api_combine" 2>/dev/null || true
+      ckg_codeql_cache_status=invalid
+      ckg_codeql_cache_reason='cache paths could not be rebased to the current source tree'
+      return 1
+    fi
     ckg_codeql_cache_status=hit
-    ckg_codeql_cache_reason='restored completed CodeQL/preproc data from cache'
+    ckg_codeql_cache_reason='restored completed CodeQL/preproc data from portable cache'
     printf 'CKGFuzzer CodeQL cache hit: %s\n' "$ckg_codeql_cache_path" >"$workspace/logs/repo.log"
     printf 'CKGFuzzer preproc cache hit: %s\n' "$ckg_codeql_cache_path" >"$workspace/logs/preproc.log"
     return 0
@@ -1270,6 +1295,13 @@ PY_CKG_CACHE_PREVIOUS
       && cp -a "$source_dir/src" "$tmp/data/" \
       && cp -a "$source_dir/api_combine" "$tmp/data/" \
       && cp -f "$ckg_codeql_cache_key_json" "$tmp/key.json"; then
+      if ! python3 /opt/hgb/bin/ckgfuzzer_cache.py normalize --root "$tmp/data" --project "$ckg_project" --source-root "$ckg_analysis_src" >"$workspace/logs/codeql_cache_normalize.log" 2>&1 \
+        || ! python3 /opt/hgb/bin/ckgfuzzer_cache.py validate --root "$tmp/data" --project "$ckg_project" --source-root "$ckg_analysis_src" --portable >"$workspace/logs/codeql_cache_store_validate.log" 2>&1; then
+        ckg_codeql_cache_reason='current CodeQL/preproc output is non-portable, oversized, or invalid'
+        rm -rf "$tmp" 2>/dev/null || true
+        rmdir "$lock" 2>/dev/null || true
+        return 1
+      fi
       if ! CKG_CACHE_METADATA="$tmp/metadata.json" \
         CKG_CACHE_KEY="$ckg_codeql_cache_key" \
         CKG_CACHE_PROJECT="$ckg_project" \
@@ -1282,7 +1314,7 @@ import json
 import os
 from pathlib import Path
 metadata = {
-    "schema_version": 1,
+    "schema_version": 2,
     "cache_key": os.environ["CKG_CACHE_KEY"],
     "ckgfuzzer_project": os.environ["CKG_CACHE_PROJECT"],
     "target": os.environ["CKG_CACHE_TARGET"],
@@ -1401,17 +1433,26 @@ PY_CKG_CACHE_WRITE_METADATA
         code="$preproc_code"
         failed_stage=preproc
       else
-        mkdir -p "$ckg_db/api_combine"
-        if [[ ! -s "$ckg_db/api_combine/combined_call_graph.csv" ]]; then
-          printf '%s
+        resolved_api_count="$(jq 'length' "$ckg_db/src/src_api_code.json" 2>/dev/null || printf '0')"
+        if [[ "${resolved_api_count:-0}" -eq 0 ]]; then
+          preproc_code=3
+          code=3
+          failed_stage=preproc
+        else
+          mkdir -p "$ckg_db/api_combine"
+          if [[ ! -s "$ckg_db/api_combine/combined_call_graph.csv" ]]; then
+            printf '%s
 ' 'caller,callee,caller_src,callee_src,start_body_start_line,start_body_end_line,end_body_start_line,end_body_end_line,caller_signature,caller_parameter_string,caller_return_type,caller_return_type_inferred,callee_signature,callee_parameter_string,callee_return_type,callee_return_type_inferred' >"$ckg_db/api_combine/combined_call_graph.csv"
+          fi
+          ckg_codeql_cache_store
         fi
-        ckg_codeql_cache_store
       fi
     fi
   fi
   if [[ "$code" == "0" ]]; then
     fuzzing_code=0
+    rm -f "$workspace/verified_harnesses.json"
+    export HGB_CKG_VERIFIED_HARNESS_FILE="$workspace/verified_harnesses.json"
     cleanup_ckg_check_container
     timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --check_compilation "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
     cleanup_ckg_check_container
@@ -1435,6 +1476,9 @@ PY_CKG_CACHE_WRITE_METADATA
   if [[ "$code" -ne 0 ]]; then
     status=failed
     reason="CKGFuzzer $failed_stage stage exited $code"
+    if [[ "$failed_stage" == "preproc" && "$code" == "3" ]]; then
+      reason='ckg_selected_api_unresolved: CKGFuzzer could not recover source for any selected API'
+    fi
     if [[ "$failed_stage" == "repo" && -f "$workspace/logs/repo.log" ]]; then
       if grep -Eqi 'No source code was seen|did not process any source|No source code was seen during the build|hgb-codeql.*fallback compiled 0' "$workspace/logs/repo.log"; then
         reason='ckg_no_compilable_sources: CKGFuzzer CodeQL database build saw no C/C++ source after target build replay; inspect repo.log and target build scripts'
@@ -1464,15 +1508,34 @@ PY_CKG_CACHE_WRITE_METADATA
     fi
   fi
   generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
+  verified_harness_count="$(jq 'length' "$workspace/verified_harnesses.json" 2>/dev/null || printf '0')"
+  if [[ "$code" -eq 0 && "${generated_harness_count:-0}" -eq 0 ]]; then
+    code=4
+    fuzzing_code=4
+    failed_stage=fuzzing
+    status=failed
+    reason='ckg_no_harness_generated: CKGFuzzer exited successfully without producing a harness candidate'
+  elif [[ "$code" -eq 0 && "${verified_harness_count:-0}" -eq 0 ]]; then
+    code=5
+    fuzzing_code=5
+    failed_stage=fuzzing
+    status=failed
+    reason='ckg_no_verified_harness: no generated harness passed compilation verification'
+  fi
   if [[ "$code" -ne 0 && "$failed_stage" == "fuzzing" && "${generated_harness_count:-0}" -gt 0 ]]; then
     status=partial_completed
-    reason="CKGFuzzer $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
+    if [[ "$code" == "5" ]]; then
+      reason="ckg_no_verified_harness: produced $generated_harness_count candidates but none passed compilation verification"
+    else
+      reason="CKGFuzzer $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
+    fi
   fi
   compact_ckg_workspace
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "ckgfuzzer_project": "%s",
   "ckgfuzzer_shared_dir": "%s",
   "api_candidate_count": %s,
+  "verified_harness_count": %s,
   "llm_request_timeout_seconds": "%s",
   "api_selection_metadata": "%s",
   "command_file": "%s",
@@ -1484,7 +1547,7 @@ PY_CKG_CACHE_WRITE_METADATA
   "ckgfuzzer_codeql_cache_status": "%s",
   "ckgfuzzer_codeql_cache_key": "%s",
   "ckgfuzzer_codeql_cache_path": "%s",
-  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
+  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${verified_harness_count:-0}" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
