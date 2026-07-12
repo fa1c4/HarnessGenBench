@@ -877,89 +877,70 @@ root = Path(sys.argv[1])
 get_model_path = root / "fuzzing_llm_engine/models/get_model.py"
 if get_model_path.exists():
     text = get_model_path.read_text()
-    if "def _hgb_trace_llm" not in text:
-        import_block = """
+    if "class HGBOpenAILike" not in text:
+        trace_block = '''
 import sys as _hgb_trace_sys
 _hgb_trace_sys.path.insert(0, "/opt/hgb/bin")
 try:
     import hgb_llm_trace as _hgb_llm_trace
 except Exception as _hgb_trace_exc:
     _hgb_llm_trace = None
-    print(f"HGB_LLM_TRACE: CKGFuzzer get_model tracing unavailable: {_hgb_trace_exc}", file=_hgb_trace_sys.stderr)
+    print(f"HGB_LLM_TRACE: CKGFuzzer OpenAILike tracing unavailable: {_hgb_trace_exc}", file=_hgb_trace_sys.stderr)
 
 
-def _hgb_trace_llm(llm, model_name, provider="llama-index"):
-    if _hgb_llm_trace is None or getattr(llm, "_hgb_trace_wrapped", False):
-        return llm
-    original_complete = getattr(llm, "complete", None)
-    if callable(original_complete):
-        def traced_complete(prompt, *args, **kwargs):
-            return _hgb_llm_trace.trace_call(
-                lambda: original_complete(prompt, *args, **kwargs),
-                stage="ckgfuzzer",
-                provider=provider,
-                operation="complete",
-                model=str(model_name),
-                request={"prompt": prompt, "args": args, "kwargs": kwargs},
-            )
-        try:
-            llm.complete = traced_complete
-        except Exception as _hgb_wrap_exc:
-            print(f"HGB_LLM_TRACE: CKGFuzzer could not wrap complete(): {_hgb_wrap_exc}", file=_hgb_trace_sys.stderr)
-    original_chat = getattr(llm, "chat", None)
-    if callable(original_chat):
-        def traced_chat(messages, *args, **kwargs):
-            return _hgb_llm_trace.trace_call(
-                lambda: original_chat(messages, *args, **kwargs),
-                stage="ckgfuzzer",
-                provider=provider,
-                operation="chat",
-                model=str(model_name),
-                request={"messages": messages, "args": args, "kwargs": kwargs},
-            )
-        try:
-            llm.chat = traced_chat
-        except Exception as _hgb_wrap_exc:
-            print(f"HGB_LLM_TRACE: CKGFuzzer could not wrap chat(): {_hgb_wrap_exc}", file=_hgb_trace_sys.stderr)
-    try:
-        setattr(llm, "_hgb_trace_wrapped", True)
-    except Exception:
-        pass
-    return llm
-"""
-        text = text.replace("import os\n", "import os\n" + import_block, 1)
-    replacements = {
-        'return Ollama(model="llama3:70b",  base_url="http://csl-server14.dynip.ntu.edu.sg:51030", request_timeout=3600)': 'return _hgb_trace_llm(Ollama(model="llama3:70b",  base_url="http://csl-server14.dynip.ntu.edu.sg:51030", request_timeout=3600), "llama3:70b", "ollama")',
-        'return OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"] )': 'return _hgb_trace_llm(OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"] ), model_name, "openai-compatible")',
-        'return OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"])': 'return _hgb_trace_llm(OpenAILike(model=model_name, api_base=llm_config["base_url"], api_key=llm_config["api_key"], is_chat_model=True, temperature=llm_config["temperature"]), model_name, "openai-compatible")',
-        'return Ollama(model=model_name,  base_url=llm_config["base_url"], request_timeout=llm_config["request_timeout"])': 'return _hgb_trace_llm(Ollama(model=model_name,  base_url=llm_config["base_url"], request_timeout=llm_config["request_timeout"]), model_name, "ollama")',
-    }
-    for old, new in replacements.items():
-        if old in text and new not in text:
-            text = text.replace(old, new)
+class HGBOpenAILike(OpenAILike):
+    # Supported subclass hook; do not mutate Pydantic model methods.
+    def complete(self, prompt, *args, **kwargs):
+        parent_complete = super().complete
+        if _hgb_llm_trace is None:
+            return parent_complete(prompt, *args, **kwargs)
+        return _hgb_llm_trace.trace_call(
+            lambda: parent_complete(prompt, *args, **kwargs),
+            stage="ckgfuzzer",
+            provider="openai-compatible",
+            operation="complete",
+            model=str(getattr(self, "model", "")),
+            request={"prompt": prompt, "args": args, "kwargs": kwargs},
+        )
+
+    def chat(self, messages, *args, **kwargs):
+        parent_chat = super().chat
+        if _hgb_llm_trace is None:
+            return parent_chat(messages, *args, **kwargs)
+        return _hgb_llm_trace.trace_call(
+            lambda: parent_chat(messages, *args, **kwargs),
+            stage="ckgfuzzer",
+            provider="openai-compatible",
+            operation="chat",
+            model=str(getattr(self, "model", "")),
+            request={"messages": messages, "args": args, "kwargs": kwargs},
+        )
+'''
+        text = text.replace("import os\n", "import os\n" + trace_block, 1)
+    text = text.replace("return OpenAILike(", "return HGBOpenAILike(")
     get_model_path.write_text(text)
 openai_path = root / "fuzzing_llm_engine/models/openai.py"
 if openai_path.exists():
     text = openai_path.read_text()
     if "import hgb_llm_trace" not in text:
         text = text.replace("from openai.types.chat import ChatCompletion\n", "from openai.types.chat import ChatCompletion\nimport sys\nsys.path.insert(0, \"/opt/hgb/bin\")\ntry:\n    import hgb_llm_trace\nexcept Exception:\n    hgb_llm_trace = None\n", 1)
-    old = """        response: ChatCompletion = self.client.chat.completions.create(
+    old = '''        response: ChatCompletion = self.client.chat.completions.create(
             model=self.model_name,
             messages=messages,
             **kwargs
-        )"""
-    new = """        request = {\"model\": self.model_name, \"messages\": messages, **kwargs}
+        )'''
+    new = '''        request = {"model": self.model_name, "messages": messages, **kwargs}
         if hgb_llm_trace is not None:
             response: ChatCompletion = hgb_llm_trace.trace_call(
                 lambda: self.client.chat.completions.create(**request),
-                stage=\"ckgfuzzer\",
-                provider=\"openai-compatible\",
-                operation=\"chat.completions.create\",
+                stage="ckgfuzzer",
+                provider="openai-compatible",
+                operation="chat.completions.create",
                 model=self.model_name,
                 request=request,
             )
         else:
-            response: ChatCompletion = self.client.chat.completions.create(**request)"""
+            response: ChatCompletion = self.client.chat.completions.create(**request)'''
     if old in text and "hgb_llm_trace.trace_call" not in text:
         text = text.replace(old, new, 1)
     openai_path.write_text(text)
@@ -995,6 +976,24 @@ PY_CKG_LLM_TRACE_PATCH
       exit 1
     fi
   fi
+  ckg_compile_call_graph_templates() {
+    local ql_template ql_log
+    for ql_template in \
+      "$ckg_shared/qlpacks/cpp_queries/extract_call_graph_template.ql" \
+      "$ckg_shared/qlpacks/cpp_queries/extract_call_graph_template_fast.ql"; do
+      [[ -f "$ql_template" ]] || continue
+      ql_log="$workspace/logs/$(basename "$ql_template").compile.log"
+      if ! codeql query compile "$ql_template" >"$ql_log" 2>&1; then
+        printf 'CodeQL query compile failed: %s\n' "$ql_template" >&2
+        return 1
+      fi
+    done
+  }
+  if [[ "${CKGFUZZER_SKIP_CODEQL:-0}" != "1" ]] && ! ckg_compile_call_graph_templates; then
+    hgb_write_common_metadata failed 'ckg_codeql_query_invalid: call-graph QL did not compile' 7 harness_generator
+    hgb_write_common_summary failed 'ckg_codeql_query_invalid: call-graph QL did not compile' harness_generator
+    exit 7
+  fi
   cleanup_ckg_codeql_shards() {
     if [[ -d "$ckg_shared/codeqldb" ]]; then
       find "$ckg_shared/codeqldb" -maxdepth 1 -mindepth 1 -type d -name "${ckg_project}_*" -exec rm -rf {} + 2>/dev/null || true
@@ -1025,12 +1024,13 @@ PY_CKG_LLM_TRACE_PATCH
   ckg_codeql_cache_root="${HGB_CKG_CODEQL_CACHE_DIR:-}"
 
   ckg_codeql_cache_required_present() {
-    local base="$1" call_graph_csv=''
+    local base="$1" call_graph_csv='' call_graph_ok=''
     [[ -s "$base/api_list.json" ]] || return 1
     [[ -s "$base/codebase/api/src_api.json" ]] || return 1
     [[ -d "$base/codebase/call_graph" ]] || return 1
     call_graph_csv="$(find "$base/codebase/call_graph" -maxdepth 1 -type f -name '*.csv' -print -quit 2>/dev/null || true)"
-    [[ -n "$call_graph_csv" ]] || return 1
+    call_graph_ok="$(find "$base/codebase/call_graph" -maxdepth 1 -type f -name '*.ok' -print -quit 2>/dev/null || true)"
+    [[ -n "$call_graph_csv" && -n "$call_graph_ok" ]] || return 1
     [[ -s "$base/api_summary/api_with_summary.json" ]] || return 1
     [[ -s "$base/src/src_api_code.json" ]] || return 1
     [[ -s "$base/api_combine/combined_call_graph.csv" ]] || return 1
@@ -1221,7 +1221,10 @@ def required_present(base):
     call_graph_dir = base / "codebase/call_graph"
     if not call_graph_dir.is_dir():
         return False
-    return any(path.is_file() and path.stat().st_size > 0 for path in call_graph_dir.glob("*.csv"))
+    return (
+        any(path.is_file() and path.stat().st_size > 0 for path in call_graph_dir.glob("*.csv"))
+        and any(path.is_file() for path in call_graph_dir.glob("*.ok"))
+    )
 
 
 def candidate_data_dirs(run_dir):
@@ -1392,7 +1395,7 @@ PY_CKG_CACHE_WRITE_METADATA
 ' "$(dirname "$repo_py")" "$repo_py" "$ckg_project" "$ckg_shared" "$ckg_db/codebase"
     printf 'python %q --project_name %q --src_api_file_path %q
 ' "$preproc_py" "$ckg_project" "$ckg_db"
-    printf 'python %q --yaml %q --gen_driver --summary_api --check_compilation' "$fuzzing_py" "$ckg_db/config.yaml"
+    printf 'python %q --yaml %q --gen_driver --summary_api --skip_check_compilation' "$fuzzing_py" "$ckg_db/config.yaml"
     printf ' %q' "${ckg_input_args[@]}"
     printf '
 '
@@ -1418,12 +1421,22 @@ PY_CKG_CACHE_WRITE_METADATA
     cleanup_ckg_codeql_shards
     if [[ "$repo_code" != "0" ]]; then
       code="$repo_code"
-      failed_stage=repo
-    elif [[ "${CKGFUZZER_SKIP_CODEQL:-0}" != "1" && -f "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" ]]; then
-      compiled_units="$(cat "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" 2>/dev/null || printf '0')"
-      if [[ "${compiled_units:-0}" == "0" && ! -f "$ckg_shared/codeqldb/$ckg_project/.successfully_created" ]]; then
-        code=2
+      if grep -Eqi 'Error executing CodeQL query|codeql query (compile|run)|duplicate variables|Query compilation failed' "$workspace/logs/repo.log"; then
+        failed_stage=analysis
+      else
         failed_stage=repo
+      fi
+    elif [[ "${CKGFUZZER_SKIP_CODEQL:-0}" != "1" ]]; then
+      call_graph_ok="$(find "$ckg_db/codebase/call_graph" -maxdepth 1 -type f -name '*.ok' -print -quit 2>/dev/null || true)"
+      if [[ -z "$call_graph_ok" ]]; then
+        code=7
+        failed_stage=analysis
+      elif [[ -f "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" ]]; then
+        compiled_units="$(cat "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" 2>/dev/null || printf '0')"
+        if [[ "${compiled_units:-0}" == "0" && ! -f "$ckg_shared/codeqldb/$ckg_project/.successfully_created" ]]; then
+          code=2
+          failed_stage=repo
+        fi
       fi
     fi
     if [[ "$code" == "0" ]]; then
@@ -1452,9 +1465,9 @@ PY_CKG_CACHE_WRITE_METADATA
   if [[ "$code" == "0" ]]; then
     fuzzing_code=0
     rm -f "$workspace/verified_harnesses.json"
-    export HGB_CKG_VERIFIED_HARNESS_FILE="$workspace/verified_harnesses.json"
+    export HGB_CKG_EXTERNAL_VERIFIER=1
     cleanup_ckg_check_container
-    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --check_compilation "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --skip_check_compilation "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
     cleanup_ckg_check_container
     if [[ "$fuzzing_code" != "0" ]]; then
       code="$fuzzing_code"
@@ -1469,7 +1482,37 @@ PY_CKG_CACHE_WRITE_METADATA
       esac
       n=$((n + 1))
       cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-    done < <(find "$ckg_db" -type f \( -name 'driver_*.c' -o -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' \) 2>/dev/null | sort)
+    done < <(find "$ckg_db" -type f \( -name 'driver_*.c' -o -name 'driver_*.cc' -o -name 'driver_*.cpp' -o -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' \) 2>/dev/null | sort)
+  fi
+  generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
+  candidate_verification_dir="$workspace/candidate_verification"
+  candidate_verification_file="$candidate_verification_dir/results.json"
+  verification_code=not_run
+  verification_ran=false
+  verified_harness_count=0
+  if [[ "${generated_harness_count:-0}" -gt 0 ]]; then
+    verification_code=0
+    timeout "${CKGFUZZER_CANDIDATE_VERIFY_TIMEOUT_SECONDS:-7200}" \
+      python3 /opt/hgb/bin/ckgfuzzer_candidate_verifier.py \
+        --target-root /target \
+        --candidates "$workspace/generated_harnesses" \
+        --work-dir "$candidate_verification_dir" \
+        --fuzz-target "$fuzz_target" \
+        --timeout-seconds "${CKGFUZZER_CANDIDATE_BUILD_TIMEOUT_SECONDS:-1800}" \
+        >"$workspace/logs/candidate_verification.log" 2>&1 || verification_code=$?
+    if [[ -f "$candidate_verification_file" ]]; then
+      verification_ran="$(jq -r '.verification_ran // false' "$candidate_verification_file" 2>/dev/null || printf false)"
+      jq '.verified_candidates // []' "$candidate_verification_file" >"$workspace/verified_harnesses.json" 2>/dev/null || printf '[]\n' >"$workspace/verified_harnesses.json"
+      verified_harness_count="$(jq '(.verified_candidates // []) | length' "$candidate_verification_file" 2>/dev/null || printf '0')"
+    else
+      printf '[]\n' >"$workspace/verified_harnesses.json"
+    fi
+    if [[ "$verification_code" != "0" || "$verification_ran" != "true" ]]; then
+      code=6
+      failed_stage=verification
+    fi
+  else
+    printf '[]\n' >"$workspace/verified_harnesses.json"
   fi
   status=completed
   reason=none
@@ -1478,6 +1521,11 @@ PY_CKG_CACHE_WRITE_METADATA
     reason="CKGFuzzer $failed_stage stage exited $code"
     if [[ "$failed_stage" == "preproc" && "$code" == "3" ]]; then
       reason='ckg_selected_api_unresolved: CKGFuzzer could not recover source for any selected API'
+    elif [[ "$failed_stage" == "analysis" ]]; then
+      reason='ckg_codeql_analysis_failed: call-graph extraction failed; no empty graph was accepted'
+    elif [[ "$failed_stage" == "verification" ]]; then
+      status=infra_failed
+      reason='ckg_verification_infra_failed: candidate compile/link verification did not run; inspect candidate_verification results and logs'
     fi
     if [[ "$failed_stage" == "repo" && -f "$workspace/logs/repo.log" ]]; then
       if grep -Eqi 'No source code was seen|did not process any source|No source code was seen during the build|hgb-codeql.*fallback compiled 0' "$workspace/logs/repo.log"; then
@@ -1523,11 +1571,12 @@ PY_CKG_CACHE_WRITE_METADATA
     reason='ckg_no_verified_harness: no generated harness passed compilation verification'
   fi
   if [[ "$code" -ne 0 && "$failed_stage" == "fuzzing" && "${generated_harness_count:-0}" -gt 0 ]]; then
-    status=partial_completed
-    if [[ "$code" == "5" ]]; then
-      reason="ckg_no_verified_harness: produced $generated_harness_count candidates but none passed compilation verification"
+    if [[ "${verified_harness_count:-0}" -gt 0 ]]; then
+      status=partial_completed
+      reason="CKGFuzzer fuzzing stage exited $code after producing candidates, but $verified_harness_count passed independent compile/link verification"
     else
-      reason="CKGFuzzer $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
+      status=failed
+      reason="CKGFuzzer fuzzing stage exited $code after producing $generated_harness_count candidates; verification did not establish a valid harness"
     fi
   fi
   compact_ckg_workspace
@@ -1535,7 +1584,11 @@ PY_CKG_CACHE_WRITE_METADATA
   extra=$(printf '%s  "ckgfuzzer_project": "%s",
   "ckgfuzzer_shared_dir": "%s",
   "api_candidate_count": %s,
+  "generated_harness_count": %s,
   "verified_harness_count": %s,
+  "candidate_verification_ran": %s,
+  "candidate_verification_exit_code": "%s",
+  "candidate_verification_file": "%s",
   "llm_request_timeout_seconds": "%s",
   "api_selection_metadata": "%s",
   "command_file": "%s",
@@ -1547,7 +1600,7 @@ PY_CKG_CACHE_WRITE_METADATA
   "ckgfuzzer_codeql_cache_status": "%s",
   "ckgfuzzer_codeql_cache_key": "%s",
   "ckgfuzzer_codeql_cache_path": "%s",
-  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${verified_harness_count:-0}" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
+  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

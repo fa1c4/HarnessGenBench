@@ -26,6 +26,31 @@ def _replace_functions(source: str, name: str, replacement: str) -> str:
     return "".join(lines)
 
 
+def _replace_in_functions(source: str, name: str, old: str, new: str) -> str:
+    """Replace text only within named top-level functions."""
+    tree = ast.parse(source)
+    matches = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    if not matches:
+        raise ValueError(f"could not find top-level function {name}")
+    lines = source.splitlines(keepends=True)
+    changed = False
+    for node in sorted(matches, key=lambda item: item.lineno, reverse=True):
+        if node.end_lineno is None:
+            raise ValueError(f"function {name} has no end line")
+        body = "".join(lines[node.lineno - 1 : node.end_lineno])
+        if old not in body:
+            continue
+        lines[node.lineno - 1 : node.end_lineno] = [body.replace(old, new)]
+        changed = True
+    if not changed:
+        raise ValueError(f"could not find expected text in function {name}")
+    return "".join(lines)
+
+
 def _write_if_changed(path: Path, source: str) -> bool:
     old = path.read_text(encoding="utf-8")
     if old == source:
@@ -134,6 +159,22 @@ def patch_preproc(path: Path) -> bool:
     os.makedirs(os.path.dirname(api_code_path), exist_ok=True)
     with open(os.path.join(src_api_file_path, "codebase/api/src_api.json"), "r", encoding="utf-8") as f:
         src_api_data = json.load(f)
+
+    import sys
+    if "/opt/hgb/bin" not in sys.path:
+        sys.path.insert(0, "/opt/hgb/bin")
+    from ckgfuzzer_api_recovery import recover_selected_api_code
+
+    source_root = os.environ.get("CKGFUZZER_SOURCE_ROOT", "")
+    max_files = max(1, int(os.environ.get("CKGFUZZER_SOURCE_FALLBACK_MAX_FILES", "5000") or "5000"))
+    api_code_dict, missing = recover_selected_api_code(src_api_data, api_list, source_root, max_files)
+    with open(api_code_path, "w", encoding="utf-8") as f:
+        json.dump(api_code_dict, f, indent=2, sort_keys=True, ensure_ascii=False)
+    api_combine_dir = os.path.join(src_api_file_path, "api_combine")
+    os.makedirs(api_combine_dir, exist_ok=True)
+    shutil.copy2(api_code_path, os.path.join(api_combine_dir, os.path.basename(api_code_path)))
+    print(f"Resolved {len(api_code_dict)} selected APIs; unresolved: {missing}")
+    return
 
     api_code_dict = {}
     for src_value in src_api_data.get("src", {}).values():
@@ -309,7 +350,13 @@ def patch_check_gen_fuzzer(path: Path) -> bool:
     source = _replace_functions(source, "_check_fuzzer_exists", check_exists)
     source = _replace_functions(source, "docker_run", _docker_run_source())
     source = _replace_functions(source, "docker_build", docker_build)
-    source = source.replace(
+    # ``start_docker_check_compilation_impl`` returns a bool, whereas our
+    # patched docker_run returns a status string. Keep the string check in the
+    # one caller that consumes docker_run; a global substitution changes the
+    # Docker-start boolean branch and calls ``.startswith`` on it.
+    source = _replace_in_functions(
+        source,
+        "build_fuzzers_impl",
         "if not result:\n    logger.error('Building fuzzers failed.')",
         "if not result or result.startswith(('ERROR:', 'INFRA_ERROR:')):\n    logger.error('Building fuzzers failed: %s', result)",
     )
@@ -348,16 +395,17 @@ def patch_run_fuzzer(path: Path) -> bool:
 
 def patch_fuzzing(path: Path) -> bool:
     source = path.read_text(encoding="utf-8")
-    source = source.replace(
-        "    fuzzer.build_and_fuzz()\n",
-        "    fuzzer.build_and_fuzz()\n"
-        "    verification_path = os.environ.get(\"HGB_CKG_VERIFIED_HARNESS_FILE\", \"/workspace/verified_harnesses.json\")\n"
-        "    with open(verification_path, \"w\", encoding=\"utf-8\") as verification_file:\n"
-        "        json.dump(fuzzer.successful_builds, verification_file, indent=2)\n"
-        "    if not fuzzer.successful_builds:\n"
-        "        logger.error(\"No generated harness passed compilation verification\")\n"
-        "        sys.exit(5)\n",
-        1,
+    # Candidate verification is performed by HarnessGenBench after generation
+    # in the native FuzzBench build context. Skipping upstream checking must
+    # also avoid starting its nested-Docker verifier container.
+    source = _replace_in_functions(
+        source,
+        "start_docker_for_check_compilation",
+        "def start_docker_for_check_compilation(project_dir, project_name):\n",
+        "def start_docker_for_check_compilation(project_dir, project_name):\n"
+        "    if os.environ.get(\"HGB_CKG_EXTERNAL_VERIFIER\") == \"1\":\n"
+        "        logger.info(\"Using HarnessGenBench external candidate verifier.\")\n"
+        "        return True\n",
     )
     return _write_if_changed(path, source)
 
@@ -375,29 +423,29 @@ predicate selectedRoot(Function function) {
   function.hasName("ENTRY_FNC")
 }
 
-from Function caller, Function callee, Location caller_loc, Location callee_loc
+from Function start, Function end, Location start_loc, Location end_loc
 where
-  selectedRoot(caller) and
-  directCall(caller, callee) and
-  caller_loc = caller.getLocation() and
-  callee_loc = callee.getLocation()
+  selectedRoot(start) and
+  directCall(start, end) and
+  start_loc = start.getLocation() and
+  end_loc = end.getLocation()
 select
-  caller as caller,
-  callee as callee,
-  caller.getFile() as caller_src,
-  callee.getFile() as callee_src,
-  caller_loc.getStartLine() as start_body_start_line,
-  caller_loc.getEndLine() as start_body_end_line,
-  callee_loc.getStartLine() as end_body_start_line,
-  callee_loc.getEndLine() as end_body_end_line,
-  caller.getName() as caller_signature,
-  caller.getParameterString() as caller_parameter_string,
-  caller.getType() as caller_return_type,
-  caller.getUnspecifiedType() as caller_return_type_inferred,
-  callee.getName() as callee_signature,
-  callee.getParameterString() as callee_parameter_string,
-  callee.getType() as callee_return_type,
-  callee.getUnspecifiedType() as callee_return_type_inferred
+  start as caller,
+  end as callee,
+  start.getFile() as caller_src,
+  end.getFile() as callee_src,
+  start_loc.getStartLine() as start_body_start_line,
+  start_loc.getEndLine() as start_body_end_line,
+  end_loc.getStartLine() as end_body_start_line,
+  end_loc.getEndLine() as end_body_end_line,
+  start.getName() as caller_signature,
+  start.getParameterString() as caller_parameter_string,
+  start.getType() as caller_return_type,
+  start.getUnspecifiedType() as caller_return_type_inferred,
+  end.getName() as callee_signature,
+  end.getParameterString() as callee_parameter_string,
+  end.getType() as callee_return_type,
+  end.getUnspecifiedType() as callee_return_type_inferred
 '''
 
 
@@ -414,6 +462,10 @@ def patch_call_graph_assets(root: Path) -> list[Path]:
         source = source.replace(
             'if codeql query run "$QUERY" --database="$dbbase" --output="$outputfile"; then',
             'if timeout "${CKGFUZZER_CODEQL_QUERY_TIMEOUT_SECONDS:-600}" codeql query run "$QUERY" --database="$dbbase" --output="$outputfile"; then',
+        )
+        source = source.replace(
+            '        echo "BQRS file successfully converted to CSV: $csv_output"',
+            '        echo "BQRS file successfully converted to CSV: $csv_output"\n        touch "${outputfile%.bqrs}.ok"',
         )
         if _write_if_changed(shell_path, source):
             changed.append(shell_path)

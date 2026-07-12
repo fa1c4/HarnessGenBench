@@ -17,6 +17,7 @@ def load_module(name: str, path: str):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -29,6 +30,9 @@ matrix_collector = load_module("hgb_collect_matrix", "scripts/hgb_collect_matrix
 hgb_targets = load_module("hgb_targets", "scripts/hgb_targets.py")
 ckg_stage = load_module("ckgfuzzer_stage_project", "docker/common/ckgfuzzer_stage_project.py")
 llm_trace = load_module("hgb_llm_trace", "docker/common/hgb_llm_trace.py")
+ckg_runtime_patch = load_module("ckgfuzzer_runtime_patch", "docker/common/ckgfuzzer_runtime_patch.py")
+ckg_api_recovery = load_module("ckgfuzzer_api_recovery", "docker/common/ckgfuzzer_api_recovery.py")
+ckg_candidate_verifier = load_module("ckgfuzzer_candidate_verifier", "docker/common/ckgfuzzer_candidate_verifier.py")
 
 
 
@@ -235,7 +239,9 @@ def test_hgb_llm_trace_hooks_are_wired_for_all_generators() -> None:
     assert "chat.completions.create" in ofg_wrapper
     assert "oss-fuzz-gen-preflight" in ofg_entrypoint
     assert "PY_CKG_LLM_TRACE_PATCH" in ckg_entrypoint
-    assert "_hgb_trace_llm" in ckg_entrypoint
+    assert "class HGBOpenAILike(OpenAILike)" in ckg_entrypoint
+    assert "llm.complete =" not in ckg_entrypoint
+    assert "self.client.chat.completions.create" in ckg_entrypoint
     assert "PY_PROMEFUZZ_LLM_TRACE_PATCH" in prome_entrypoint
     assert "promefuzz_llm.log" in prome_entrypoint
     assert "HGB_LLM_TRACE: G2FUZZ" in g2_entrypoint
@@ -318,6 +324,229 @@ def test_ckgfuzzer_runtime_patch_uses_literal_replacements_and_syntax_guard() ->
     assert "python3 -m py_compile" in entrypoint
 
 
+def test_ckgfuzzer_runtime_patch_scopes_string_checks_away_from_boolean_docker_start(tmp_path: Path) -> None:
+    upstream = tmp_path / "check_gen_fuzzer.py"
+    upstream.write_text(
+        "\n".join(
+            [
+                "import os, sys, subprocess",
+                "class Logger:",
+                "    def error(self, *args): pass",
+                "logger = Logger()",
+                "def docker_exec_command(run_args, project_name, print_output=True):",
+                "    return ''",
+                "def _check_fuzzer_exists(project, fuzzer_name, architecture='x86_64'):",
+                "    return True",
+                "def docker_run(run_args, print_output=True, architecture='x86_64'):",
+                "    return ''",
+                "def docker_build(build_args):",
+                "    return True",
+                "def start_docker_check_compilation_impl():",
+                "  result = True",
+                "  if not result:",
+                "    logger.error('Building fuzzers failed.')",
+                "  return result",
+                "def build_fuzzers_impl():",
+                "  result = 'ERROR: failed'",
+                "  if not result:",
+                "    logger.error('Building fuzzers failed.')",
+                "  return result",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ckg_runtime_patch.patch_check_gen_fuzzer(upstream)
+    patched = upstream.read_text(encoding="utf-8")
+    start = patched.index("def start_docker_check_compilation_impl")
+    build = patched.index("def build_fuzzers_impl")
+
+    assert "if not result:" in patched[start:build]
+    assert ".startswith" not in patched[start:build]
+    assert "result.startswith(('ERROR:', 'INFRA_ERROR:'))" in patched[build:]
+    py_compile.compile(str(upstream), doraise=True)
+
+
+def test_ckgfuzzer_call_graph_query_uses_distinct_variable_and_column_names() -> None:
+    query = ckg_runtime_patch._DIRECT_CALL_GRAPH_QUERY
+
+    assert "from Function start, Function end" in query
+    assert "start as caller" in query
+    assert "end as callee" in query
+    assert "from Function caller" not in query
+
+
+def test_ckgfuzzer_api_recovery_handles_knr_c_and_cpp_templates() -> None:
+    knr = """int uncompress (dest, destLen, source, sourceLen)
+    Bytef *dest;
+    uLongf *destLen;
+    const Bytef *source;
+    uLong sourceLen;
+{
+    return 0;
+}
+"""
+    re2_template = """template <typename... A>
+static bool RE2::Consume(StringPiece* input, const RE2& re, A&&... a) {
+  return Apply(ConsumeN, input, re, Arg(a)...);
+}
+"""
+    jsoncpp = """CharReader* CharReaderBuilder::newCharReader() const {
+  return new OurCharReader();
+}
+"""
+    openssl_macro = """IMPLEMENT_ASN1_FUNCTIONS(X509)
+"""
+
+    knr_snippet = ckg_api_recovery.function_snippet(knr, "uncompress")
+    re2_snippet = ckg_api_recovery.function_snippet(re2_template, "Consume")
+    jsoncpp_snippet = ckg_api_recovery.function_snippet(jsoncpp, "newCharReader")
+    openssl_snippet = ckg_api_recovery.macro_generated_snippet(openssl_macro, "X509_free")
+
+    assert "Bytef *dest;" in knr_snippet
+    assert "return 0;" in knr_snippet
+    assert "RE2::Consume" in re2_snippet
+    assert "Json::CharReaderBuilder" not in jsoncpp_snippet
+    assert "CharReaderBuilder::newCharReader" in jsoncpp_snippet
+    assert "IMPLEMENT_ASN1_FUNCTIONS(X509)" in openssl_snippet
+
+
+def test_ckgfuzzer_recovery_prefers_definition_over_early_header_declaration(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "api.h").write_text("int uncompress(void);\n", encoding="utf-8")
+    (source / "uncompr.c").write_text(
+        "int uncompress (arg)\nint arg;\n{ return arg; }\n",
+        encoding="utf-8",
+    )
+
+    recovered, missing = ckg_api_recovery.recover_selected_api_code(
+        {"src": {}}, ["uncompress"], str(source), 10
+    )
+
+    assert missing == []
+    assert "return arg;" in recovered["uncompress"]
+
+
+def test_ckgfuzzer_report_private_helper_falls_back_to_ranked_library_api(tmp_path: Path) -> None:
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps({"rows": [{"target": "target", "candidate_api_names": ["helper"]}]}),
+        encoding="utf-8",
+    )
+    raw = [
+        {"name": "helper", "path": "fuzzbench_benchmark/helper.cc", "signature": "int helper()"},
+        {"name": "library_api", "path": "library/api.cc", "signature": "int library_api()"},
+    ]
+
+    selected, metadata = extractor.select_records(
+        raw,
+        max_records=1,
+        fallback_max=1,
+        selection_mode="ranked",
+        project="library",
+        target_name="target",
+        fuzz_target="fuzz_target",
+        reference_dir="",
+        keep_rejected=False,
+        api_report=str(report),
+        report_mode="report_first",
+    )
+
+    assert [record["name"] for record in selected] == ["library_api"]
+    assert metadata["api_selection_source"] == "dynamic"
+
+
+def test_ckgfuzzer_candidate_verifier_stages_and_records_candidate_builds(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    benchmark = target / "fuzzbench_benchmark"
+    candidates = tmp_path / "candidates"
+    benchmark.mkdir(parents=True)
+    candidates.mkdir()
+    (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    candidate = candidates / "candidate.cc"
+    candidate.write_text("int LLVMFuzzerTestOneInput(const unsigned char*, unsigned long) { return 0; }\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def runner(command, _timeout):
+        calls.append(list(command))
+        stderr = ckg_candidate_verifier.COMPILE_MARKER if "run" in command else ""
+        return ckg_candidate_verifier.CommandResult(list(command), 0, "ok", stderr)
+
+    result = ckg_candidate_verifier.verify_candidates(
+        target_root=target,
+        candidates_dir=candidates,
+        work_dir=tmp_path / "verification",
+        fuzz_target="native_fuzzer",
+        runner=runner,
+    )
+
+    assert result["verification_ran"] is True
+    assert result["verified_candidates"] == [str(candidate)]
+    assert (tmp_path / "verification" / "results.json").is_file()
+    assert any("docker" == command[0] and "build" in command for command in calls)
+    run_command = next(command for command in calls if "run" in command)
+    assert any("HGB_CANDIDATE_FILE=native_fuzzer.cc" == part for part in run_command)
+    assert any("HGB_FUZZ_TARGET=native_fuzzer" == part for part in run_command)
+    assert any(part.endswith(":/hgb-candidate:ro") for part in run_command)
+    assert "ninja -C" in run_command[-1]
+    assert result["records"][0]["exit_code"] == 0
+    assert result["records"][0]["compile_attempted"] is True
+    assert "stderr" in result["records"][0]
+
+
+def test_ckgfuzzer_candidate_verifier_reports_pre_candidate_build_failure_as_infra(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    benchmark = target / "fuzzbench_benchmark"
+    candidates = tmp_path / "candidates"
+    benchmark.mkdir(parents=True)
+    candidates.mkdir()
+    (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (candidates / "candidate.cc").write_text("int main() {}\n", encoding="utf-8")
+
+    def runner(command, _timeout):
+        if "run" in command:
+            return ckg_candidate_verifier.CommandResult(list(command), 1, "", "dependency build failed")
+        return ckg_candidate_verifier.CommandResult(list(command), 0, "ok", "")
+
+    result = ckg_candidate_verifier.verify_candidates(
+        target_root=target,
+        candidates_dir=candidates,
+        work_dir=tmp_path / "verification",
+        fuzz_target="native_fuzzer",
+        runner=runner,
+    )
+
+    assert result["verification_ran"] is False
+    assert result["records"][0]["compile_attempted"] is False
+    assert "before compiling any staged candidate" in result["infrastructure_error"]
+
+
+def test_ckgfuzzer_candidate_verifier_reports_image_setup_as_infrastructure_failure(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    benchmark = target / "fuzzbench_benchmark"
+    candidates = tmp_path / "candidates"
+    benchmark.mkdir(parents=True)
+    candidates.mkdir()
+    (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (candidates / "candidate.cc").write_text("int main() {}\n", encoding="utf-8")
+
+    def runner(command, _timeout):
+        return ckg_candidate_verifier.CommandResult(list(command), 1, "", "image failure")
+
+    result = ckg_candidate_verifier.verify_candidates(
+        target_root=target,
+        candidates_dir=candidates,
+        work_dir=tmp_path / "verification",
+        fuzz_target="native_fuzzer",
+        runner=runner,
+    )
+
+    assert result["verification_ran"] is False
+    assert "image build exited" in result["infrastructure_error"]
+
+
 def test_ckgfuzzer_runtime_patch_preserves_check_compilation_newline_escape(tmp_path: Path) -> None:
     source = "\n".join(
         [
@@ -372,6 +601,8 @@ def test_ckgfuzzer_does_not_count_bundled_drivers_before_fuzzing() -> None:
 
     assert 'if [[ "$fuzzing_code" != "not_run" ]]; then' in entrypoint
     assert 'done < <(find "$ckg_db" -type f' in entrypoint
+    assert "ckgfuzzer_candidate_verifier.py" in entrypoint
+    assert "--skip_check_compilation" in entrypoint
     assert 'done < <(find "$ckg_proj" "$ckg_db" "$ckg_shared"' not in entrypoint
     assert '"$failed_stage" == "fuzzing" && "${generated_harness_count:-0}" -gt 0' in entrypoint
 

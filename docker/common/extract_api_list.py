@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from hgb_api_report import default_api_report_path, select_report_api_names
-from ofg_api_rank import load_reference_calls, rank_records
+from ofg_api_rank import load_reference_calls, rank_records, reject_reason
 
 
 DECL_RE = re.compile(
@@ -218,6 +218,26 @@ def _record_short_name(record: dict[str, Any]) -> str:
     return str(record.get("name") or "").split("::")[-1]
 
 
+def _benchmark_private_reason(record: dict[str, Any]) -> str:
+    """Reject a benchmark-local helper even when a report names it directly."""
+    path = str(record.get("path") or "").replace("\\", "/").lower()
+    parts = {part for part in path.split("/") if part}
+    if {"fuzzbench_benchmark", "fuzz_driver", "reference_harnesses"} & parts:
+        return "benchmark_private_helper"
+    return reject_reason(record)
+
+
+def _selectable_report_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[str]]:
+    selected: list[dict[str, Any]] = []
+    rejected: list[str] = []
+    for record in records:
+        if _benchmark_private_reason(record):
+            rejected.append(_record_short_name(record))
+        else:
+            selected.append(record)
+    return selected, rejected
+
+
 def _report_name_records(
     raw: list[dict[str, Any]],
     report_names: list[str],
@@ -292,6 +312,7 @@ def select_records(
                 report_names,
                 allow_name_only=allow_name_only_report_apis,
             )
+            report_records, rejected_report_names = _selectable_report_records(report_records)
             if report_records:
                 metadata = {
                     "selection_mode": selection_mode,
@@ -309,6 +330,7 @@ def select_records(
                     "selected_api_names": [str(record.get("name") or "") for record in report_records],
                     "direct_api_names": [str(record.get("name") or "") for record in report_records],
                     "unmatched_report_api_names": unmatched_report_names,
+                    "rejected_report_api_names": rejected_report_names,
                 }
                 metadata.update(report_metadata)
                 return report_records, metadata
@@ -329,6 +351,7 @@ def select_records(
                 "selected_api_names": [],
                 "direct_api_names": [],
                 "unmatched_report_api_names": report_metadata.get("api_candidate_names", []),
+                "rejected_report_api_names": [],
             }
             metadata.update(report_metadata)
             return [], metadata
