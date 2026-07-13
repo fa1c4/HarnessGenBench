@@ -1405,6 +1405,9 @@ PY_CKG_CACHE_WRITE_METADATA
   repo_code=0
   preproc_code=not_run
   fuzzing_code=not_run
+  analysis_mode=codeql
+  analysis_fallback_reason=''
+  source_fallback_recovered_body_count=0
   ckg_codeql_cache_restored=0
   ckg_codeql_cache_init
   if ckg_codeql_cache_try_restore; then
@@ -1429,8 +1432,16 @@ PY_CKG_CACHE_WRITE_METADATA
     elif [[ "${CKGFUZZER_SKIP_CODEQL:-0}" != "1" ]]; then
       call_graph_ok="$(find "$ckg_db/codebase/call_graph" -maxdepth 1 -type f -name '*.ok' -print -quit 2>/dev/null || true)"
       if [[ -z "$call_graph_ok" ]]; then
-        code=7
-        failed_stage=analysis
+        # CKGFuzzer can omit valid APIs whose definitions use syntax it does
+        # not parse (notably zlib's K&R-style uncompress). The preprocessor
+        # has a source-recovery path for this case, so let it run first.
+        # This is not a successful CodeQL result and is not cached below.
+        analysis_mode=source_fallback_only
+        analysis_fallback_reason='CodeQL produced no selected-API call-graph artifact; using source recovery with an empty graph'
+        mkdir -p "$ckg_db/codebase/call_graph"
+        printf '%s\n' 'caller,callee,caller_src,callee_src,start_body_start_line,start_body_end_line,end_body_start_line,end_body_end_line,caller_signature,caller_parameter_string,caller_return_type,caller_return_type_inferred,callee_signature,callee_parameter_string,callee_return_type,callee_return_type_inferred' >"$ckg_db/codebase/call_graph/hgb_source_fallback_call_graph.csv"
+        printf '%s\n' "$analysis_mode" >"$ckg_db/codebase/call_graph/hgb_analysis_mode"
+        printf 'CKGFuzzer: %s\n' "$analysis_fallback_reason" >>"$workspace/logs/repo.log"
       elif [[ -f "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" ]]; then
         compiled_units="$(cat "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" 2>/dev/null || printf '0')"
         if [[ "${compiled_units:-0}" == "0" && ! -f "$ckg_shared/codeqldb/$ckg_project/.successfully_created" ]]; then
@@ -1457,7 +1468,38 @@ PY_CKG_CACHE_WRITE_METADATA
             printf '%s
 ' 'caller,callee,caller_src,callee_src,start_body_start_line,start_body_end_line,end_body_start_line,end_body_end_line,caller_signature,caller_parameter_string,caller_return_type,caller_return_type_inferred,callee_signature,callee_parameter_string,callee_return_type,callee_return_type_inferred' >"$ckg_db/api_combine/combined_call_graph.csv"
           fi
-          ckg_codeql_cache_store
+          if [[ "$analysis_mode" == source_fallback_only ]]; then
+            source_fallback_recovered_body_count="$(python3 - "$ckg_db/api_list.json" "$ckg_db/src/src_api_code.json" <<'PY_CKG_SOURCE_FALLBACK_BODIES'
+import json
+import sys
+from pathlib import Path
+
+from ckgfuzzer_api_recovery import recovered_body_count
+
+try:
+    selected = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    recovered = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+except Exception:
+    print(0)
+    raise SystemExit(0)
+
+# Macro/declaration recovery is useful context but is not sufficient to
+# replace a missing definition in source_fallback_only mode.
+print(recovered_body_count(selected, recovered))
+PY_CKG_SOURCE_FALLBACK_BODIES
+)"
+            if [[ "${source_fallback_recovered_body_count:-0}" -eq 0 ]]; then
+              preproc_code=3
+              code=3
+              failed_stage=preproc
+            else
+              printf '{"analysis_mode":"source_fallback_only","recovered_body_count":%s}\n' "$source_fallback_recovered_body_count" >"$ckg_db/analysis_mode.json"
+              ckg_codeql_cache_status=not_cached
+              ckg_codeql_cache_reason='source_fallback_only output is intentionally excluded from the CodeQL cache'
+            fi
+          else
+            ckg_codeql_cache_store
+          fi
         fi
       fi
     fi
@@ -1596,11 +1638,14 @@ PY_CKG_CACHE_WRITE_METADATA
   "repo_exit_code": "%s",
   "preproc_exit_code": "%s",
   "fuzzing_exit_code": "%s",
+  "analysis_mode": "%s",
+  "analysis_fallback_reason": "%s",
+  "source_fallback_recovered_body_count": %s,
   "codeql_version": "%s",
   "ckgfuzzer_codeql_cache_status": "%s",
   "ckgfuzzer_codeql_cache_key": "%s",
   "ckgfuzzer_codeql_cache_path": "%s",
-  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
+  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

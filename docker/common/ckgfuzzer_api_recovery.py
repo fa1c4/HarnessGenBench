@@ -246,3 +246,18 @@ def recover_selected_api_code(
             if not missing:
                 break
     return recovered, missing
+
+
+def recovered_body_count(api_list: list[str], recovered: dict[str, str]) -> int:
+    """Count selected APIs for which recovery found a function body.
+
+    A declaration or macro-generated context may help the LLM, but it cannot
+    substitute for a definition when CKGFuzzer had no call-graph result.  The
+    source-fallback mode in the entrypoint uses this guard before continuing.
+    """
+
+    return sum(
+        1
+        for name in api_list
+        if "{" in str(recovered.get(name, "")) and "}" in str(recovered.get(name, ""))
+    )

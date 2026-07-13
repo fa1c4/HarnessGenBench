@@ -18,9 +18,12 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Sequence
+
+from ckgfuzzer_verifier_context import VerificationContextError, prepare_verification_context
 
 
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx"}
@@ -84,6 +87,29 @@ def _write_log(path: Path, result: CommandResult) -> None:
     )
 
 
+def _write_phase_log(path: Path, results: Sequence[tuple[str, CommandResult]]) -> None:
+    """Write every container lifecycle phase to one candidate log."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chunks = []
+    for phase, result in results:
+        chunks.append(
+            f"## {phase}\n$ " + " ".join(result.command) + "\n\n[stdout]\n" + result.stdout
+            + "\n[stderr]\n" + result.stderr
+        )
+    path.write_text("\n\n".join(chunks), encoding="utf-8")
+
+
+def _run_phase(runner: Runner, command: Sequence[str], timeout_seconds: int, phase: str) -> CommandResult:
+    """Run a Docker lifecycle phase without preventing cleanup."""
+    try:
+        return runner(command, timeout_seconds)
+    except subprocess.TimeoutExpired as exc:
+        return CommandResult(list(command), 124, "", f"{phase} timed out: {exc}")
+    except OSError as exc:
+        return CommandResult(list(command), 127, "", f"could not {phase}: {exc}")
+
+
 def _summary_path(work_dir: Path) -> Path:
     return work_dir / "results.json"
 
@@ -135,8 +161,28 @@ def verify_candidates(
         _write_summary(work_dir, payload)
         return payload
 
+    try:
+        verification_context = prepare_verification_context(target_root, work_dir)
+    except VerificationContextError as exc:
+        payload["verification_context"] = {
+            "mode": "verification_context_unreproducible",
+            "error": str(exc),
+        }
+        payload["infrastructure_error"] = f"verification_context_unreproducible: {exc}"
+        _write_summary(work_dir, payload)
+        return payload
+    payload["verification_context"] = verification_context
+
     image_tag = _safe_tag(target_root, fuzz_target)
-    build_command = ["docker", "build", "--tag", image_tag, str(benchmark_dir)]
+    build_command = [
+        "docker",
+        "build",
+        "--file",
+        verification_context["dockerfile"],
+        "--tag",
+        image_tag,
+        verification_context["context_dir"],
+    ]
     try:
         image_build = runner(build_command, timeout_seconds)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -173,12 +219,24 @@ def verify_candidates(
             "set -euo pipefail; "
             ': "${SRC:=/src}"; : "${OUT:=/out}"; : "${WORK:=/work}"; '
             'mkdir -p "$OUT" "$WORK"; '
+            'export CFLAGS="${CFLAGS:-} -pthread" CXXFLAGS="${CXXFLAGS:-} -pthread"; '
+            'if ! find /usr/local/lib/clang -type f -name "libFuzzingEngine.a" -print -quit | grep -q .; then '
+            'fuzzer_runtime="$(find /usr/local/lib/clang -type f -name "libclang_rt.fuzzer-${ARCHITECTURE}.a" -print -quit)"; '
+            '[ -n "$fuzzer_runtime" ] && ln -sf "$fuzzer_runtime" "$WORK/libFuzzingEngine.a" && export LIBRARY_PATH="$WORK${LIBRARY_PATH:+:$LIBRARY_PATH}"; fi; '
             'test -x "$SRC/build.sh" || { echo "missing $SRC/build.sh" >&2; exit 125; }; '
-            'candidate="/hgb-candidate/${HGB_CANDIDATE_FILE}"; '
+            'candidate="/tmp/${HGB_CANDIDATE_FILE}"; '
             'test -f "$candidate" || { echo "missing staged candidate $candidate" >&2; exit 126; }; '
             'mapfile -t native_sources < <(find "$SRC" -mindepth 2 -type f -name "${HGB_CANDIDATE_FILE}" -print | sort); '
             'if [ "${#native_sources[@]}" -eq 1 ]; then cp "$candidate" "${native_sources[0]}"; '
-            'elif [ "${#native_sources[@]}" -eq 0 ] && grep -Fq "${HGB_CANDIDATE_FILE}" "$SRC/build.sh"; then cp "$candidate" "$SRC/${HGB_CANDIDATE_FILE}"; '
+            'elif [ "${#native_sources[@]}" -eq 0 ]; then '
+            'mapfile -t declared_sources < <(grep -Eo "[^[:space:]\\\"'"'"']*${HGB_CANDIDATE_FILE}" "$SRC/build.sh" | sort -u); '
+            'if [ "${#declared_sources[@]}" -eq 1 ]; then '
+            'native_source="${declared_sources[0]}"; '
+            'native_source="${native_source/\\$\\{SRC\\}/$SRC}"; '
+            'native_source="${native_source/\\$SRC/$SRC}"; '
+            'mkdir -p "$(dirname "$native_source")" && cp "$candidate" "$native_source"; '
+            'elif [ "${#declared_sources[@]}" -eq 0 ] && grep -Fq "${HGB_CANDIDATE_FILE}" "$SRC/build.sh"; then cp "$candidate" "$SRC/${HGB_CANDIDATE_FILE}"; '
+            'else echo "could not identify a unique native candidate path" >&2; exit 126; fi; '
             'else echo "could not stage candidate into the native FuzzBench build" >&2; exit 126; fi; '
             'set +e; bash "$SRC/build.sh"; build_status=$?; set -e; '
             'if find "$OUT" -type f -perm -111 -print -quit | grep -q .; then exit 0; fi; '
@@ -189,10 +247,12 @@ def verify_candidates(
             'fi; '
             'find "$OUT" -type f -perm -111 -print -quit | grep -q . || { [ "$build_status" -ne 0 ] && exit "$build_status"; exit 125; }'
         )
-        command = [
+        container_name = f"hgb-ckgverify-{uuid.uuid4().hex}"
+        create_command = [
             "docker",
-            "run",
-            "--rm",
+            "create",
+            "--name",
+            container_name,
             "-e",
             "FUZZING_ENGINE=libfuzzer",
             "-e",
@@ -209,28 +269,62 @@ def verify_candidates(
             f"HGB_CANDIDATE_FILE={staged_candidate.name}",
             "-e",
             f"HGB_FUZZ_TARGET={Path(fuzz_target).stem}",
-            "-v",
-            f"{stage_dir}:/hgb-candidate:ro",
-            "-v",
-            f"{output_dir}:/out",
-            "-v",
-            f"{build_work_dir}:/work",
             image_tag,
             "bash",
             "-lc",
             shell_command,
         ]
+        phases: list[tuple[str, CommandResult]] = []
+        create_result = _run_phase(
+            runner, create_command, timeout_seconds, "create verifier container"
+        )
+        phases.append(("create", create_result))
+        result = create_result
+        container_created = create_result.exit_code == 0
         try:
-            result = runner(command, timeout_seconds)
-        except subprocess.TimeoutExpired as exc:
-            result = CommandResult(list(command), 124, "", f"candidate build timed out: {exc}")
-        except OSError as exc:
-            payload["verification_ran"] = False
-            payload["infrastructure_error"] = f"could not run candidate verifier: {exc}"
-            _write_summary(work_dir, payload)
-            return payload
+            if container_created:
+                stage_command = [
+                    "docker",
+                    "cp",
+                    str(staged_candidate),
+                    f"{container_name}:/tmp/{staged_candidate.name}",
+                ]
+                stage_result = _run_phase(
+                    runner,
+                    stage_command,
+                    timeout_seconds,
+                    "stage candidate in verifier container",
+                )
+                phases.append(("stage_candidate", stage_result))
+                result = stage_result
+                if stage_result.exit_code == 0:
+                    start_command = ["docker", "start", "-a", container_name]
+                    result = _run_phase(
+                        runner, start_command, timeout_seconds, "run candidate verifier"
+                    )
+                    phases.append(("build", result))
+                    for label, source, destination in (
+                        ("copy_out", f"{container_name}:/out/.", output_dir),
+                        ("copy_work", f"{container_name}:/work/.", build_work_dir),
+                    ):
+                        copy_result = _run_phase(
+                            runner,
+                            ["docker", "cp", source, str(destination)],
+                            timeout_seconds,
+                            f"copy {label} from verifier container",
+                        )
+                        phases.append((label, copy_result))
+        finally:
+            if container_created:
+                cleanup_result = _run_phase(
+                    runner,
+                    ["docker", "rm", "-f", container_name],
+                    timeout_seconds,
+                    "remove verifier container",
+                )
+                phases.append(("cleanup", cleanup_result))
         log_path = work_dir / "logs" / f"{index:03d}_{candidate.name}.log"
-        _write_log(log_path, result)
+        _write_phase_log(log_path, phases)
         combined_output = result.stdout + "\n" + result.stderr
         compile_attempted = COMPILE_MARKER in combined_output
         verified = result.exit_code == 0 and compile_attempted

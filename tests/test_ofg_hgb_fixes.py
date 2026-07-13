@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import py_compile
 import re
 import subprocess
@@ -458,12 +459,34 @@ def test_ckgfuzzer_report_private_helper_falls_back_to_ranked_library_api(tmp_pa
     assert metadata["api_selection_source"] == "dynamic"
 
 
+def _prepare_verifier_snapshot(target: Path) -> None:
+    source = target / "source_input" / "project"
+    source.mkdir(parents=True)
+    (source / "api.cc").write_text("int api() { return 0; }\n", encoding="utf-8")
+    (target / "source_repos.json").write_text(
+        json.dumps(
+            [
+                {
+                    "kind": "git",
+                    "url": "https://example.invalid/project.git",
+                    "dest": "project",
+                    "checkout_status": "checked_out_revision",
+                    "revision_status": "resolved",
+                    "copy_status": "copied_to_source_input",
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def test_ckgfuzzer_candidate_verifier_stages_and_records_candidate_builds(tmp_path: Path) -> None:
     target = tmp_path / "target"
     benchmark = target / "fuzzbench_benchmark"
     candidates = tmp_path / "candidates"
     benchmark.mkdir(parents=True)
     candidates.mkdir()
+    _prepare_verifier_snapshot(target)
     (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     candidate = candidates / "candidate.cc"
     candidate.write_text("int LLVMFuzzerTestOneInput(const unsigned char*, unsigned long) { return 0; }\n", encoding="utf-8")
@@ -471,7 +494,7 @@ def test_ckgfuzzer_candidate_verifier_stages_and_records_candidate_builds(tmp_pa
 
     def runner(command, _timeout):
         calls.append(list(command))
-        stderr = ckg_candidate_verifier.COMPILE_MARKER if "run" in command else ""
+        stderr = ckg_candidate_verifier.COMPILE_MARKER if command[1] == "start" else ""
         return ckg_candidate_verifier.CommandResult(list(command), 0, "ok", stderr)
 
     result = ckg_candidate_verifier.verify_candidates(
@@ -485,16 +508,60 @@ def test_ckgfuzzer_candidate_verifier_stages_and_records_candidate_builds(tmp_pa
     assert result["verification_ran"] is True
     assert result["verified_candidates"] == [str(candidate)]
     assert (tmp_path / "verification" / "results.json").is_file()
-    assert any("docker" == command[0] and "build" in command for command in calls)
-    run_command = next(command for command in calls if "run" in command)
-    assert any("HGB_CANDIDATE_FILE=native_fuzzer.cc" == part for part in run_command)
-    assert any("HGB_FUZZ_TARGET=native_fuzzer" == part for part in run_command)
-    assert any(part.endswith(":/hgb-candidate:ro") for part in run_command)
-    assert "ninja -C" in run_command[-1]
+    lifecycle = [command for command in calls if command[0] == "docker"]
+    assert [command[1] for command in lifecycle] == ["build", "create", "cp", "start", "cp", "cp", "rm"]
+    assert "--file" in lifecycle[0]
+    assert "sealed_context" in lifecycle[0][lifecycle[0].index("--file") + 1]
+    create_command = lifecycle[1]
+    start_command = lifecycle[3]
+    assert any("HGB_CANDIDATE_FILE=native_fuzzer.cc" == part for part in create_command)
+    assert any("HGB_FUZZ_TARGET=native_fuzzer" == part for part in create_command)
+    assert all("-v" not in command for command in lifecycle)
+    assert "declared_sources" in create_command[-1]
+    assert "could not identify a unique native candidate path" in create_command[-1]
+    assert "libFuzzingEngine.a" in create_command[-1]
+    assert "LIBRARY_PATH" in create_command[-1]
+    assert "CXXFLAGS" in create_command[-1]
+    assert lifecycle[2][-1].endswith(":/tmp/native_fuzzer.cc")
+    assert lifecycle[2][2] == str(result["records"][0]["staged_candidate"])
+    assert "ninja -C" in create_command[-1]
+    assert start_command == ["docker", "start", "-a", create_command[create_command.index("--name") + 1]]
     assert result["records"][0]["exit_code"] == 0
     assert result["records"][0]["compile_attempted"] is True
     assert "stderr" in result["records"][0]
+    log = Path(result["records"][0]["log"]).read_text(encoding="utf-8")
+    assert "## create" in log and "## cleanup" in log
 
+
+def test_ckgfuzzer_candidate_verifier_removes_container_after_staging_failure(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    benchmark = target / "fuzzbench_benchmark"
+    candidates = tmp_path / "candidates"
+    benchmark.mkdir(parents=True)
+    candidates.mkdir()
+    _prepare_verifier_snapshot(target)
+    (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (candidates / "candidate.cc").write_text("int main() {}\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def runner(command, _timeout):
+        calls.append(list(command))
+        if command[:2] == ["docker", "cp"] and command[-1].startswith("hgb-ckgverify-"):
+            return ckg_candidate_verifier.CommandResult(list(command), 1, "", "staging failed")
+        return ckg_candidate_verifier.CommandResult(list(command), 0, "ok", "")
+
+    result = ckg_candidate_verifier.verify_candidates(
+        target_root=target,
+        candidates_dir=candidates,
+        work_dir=tmp_path / "verification",
+        fuzz_target="native_fuzzer",
+        runner=runner,
+    )
+
+    assert result["verification_ran"] is False
+    assert result["records"][0]["exit_code"] == 1
+    lifecycle = [command[1] for command in calls if command[0] == "docker"]
+    assert lifecycle == ["build", "create", "cp", "rm"]
 
 def test_ckgfuzzer_candidate_verifier_reports_pre_candidate_build_failure_as_infra(tmp_path: Path) -> None:
     target = tmp_path / "target"
@@ -502,11 +569,12 @@ def test_ckgfuzzer_candidate_verifier_reports_pre_candidate_build_failure_as_inf
     candidates = tmp_path / "candidates"
     benchmark.mkdir(parents=True)
     candidates.mkdir()
+    _prepare_verifier_snapshot(target)
     (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     (candidates / "candidate.cc").write_text("int main() {}\n", encoding="utf-8")
 
     def runner(command, _timeout):
-        if "run" in command:
+        if command[:2] == ["docker", "start"]:
             return ckg_candidate_verifier.CommandResult(list(command), 1, "", "dependency build failed")
         return ckg_candidate_verifier.CommandResult(list(command), 0, "ok", "")
 
@@ -529,6 +597,7 @@ def test_ckgfuzzer_candidate_verifier_reports_image_setup_as_infrastructure_fail
     candidates = tmp_path / "candidates"
     benchmark.mkdir(parents=True)
     candidates.mkdir()
+    _prepare_verifier_snapshot(target)
     (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
     (candidates / "candidate.cc").write_text("int main() {}\n", encoding="utf-8")
 
@@ -545,6 +614,34 @@ def test_ckgfuzzer_candidate_verifier_reports_image_setup_as_infrastructure_fail
 
     assert result["verification_ran"] is False
     assert "image build exited" in result["infrastructure_error"]
+
+
+def test_ckgfuzzer_candidate_verifier_rejects_unreproducible_source_context(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    benchmark = target / "fuzzbench_benchmark"
+    candidates = tmp_path / "candidates"
+    benchmark.mkdir(parents=True)
+    candidates.mkdir()
+    (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (candidates / "candidate.cc").write_text("int main() {}\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def runner(command, _timeout):
+        calls.append(list(command))
+        return ckg_candidate_verifier.CommandResult(list(command), 0, "", "")
+
+    result = ckg_candidate_verifier.verify_candidates(
+        target_root=target,
+        candidates_dir=candidates,
+        work_dir=tmp_path / "verification",
+        fuzz_target="native_fuzzer",
+        runner=runner,
+    )
+
+    assert result["verification_ran"] is False
+    assert result["verification_context"]["mode"] == "verification_context_unreproducible"
+    assert "verification_context_unreproducible" in result["infrastructure_error"]
+    assert calls == []
 
 
 def test_ckgfuzzer_runtime_patch_preserves_check_compilation_newline_escape(tmp_path: Path) -> None:
@@ -705,7 +802,174 @@ def test_materialize_repo_uses_cached_checkout_when_fetch_fails(monkeypatch, tmp
     assert result["clone_status"] == "fetch_failed"
     assert result["materialize_status"] == "fetch_failed_using_cached_checkout"
     assert result["cache_fallback"] is True
-    assert result["checkout_status"] == "checked_out_commit"
+    assert result["checkout_status"] == "checked_out_revision"
+    assert result["revision_status"] == "resolved"
+
+
+def test_source_parser_expands_docker_variables_and_attributes_each_repo_revision(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "ARG ARCHIVE_VERSION=1.2.3\n"
+        "ENV ARCHIVE_ROOT=https://example.invalid/releases\n"
+        "RUN git clone --branch dependency-v1 https://example.invalid/dependency.git dependency && \\\n+"
+        "    git -C dependency checkout dependency-commit\n"
+        "RUN git clone https://example.invalid/primary.git primary\n"
+        "RUN wget ${ARCHIVE_ROOT}/archive-${ARCHIVE_VERSION}.tar.gz\n",
+        encoding="utf-8",
+    )
+
+    repos = hgb_targets.parse_clone_repos(dockerfile)
+    hgb_targets.attribute_source_revisions(repos, "primary", "primary-commit")
+    by_dest = {repo["dest"]: repo for repo in repos}
+
+    assert by_dest["dependency"]["revision"] == "dependency-commit"
+    assert by_dest["dependency"]["revision_source"] == "dockerfile_git_checkout"
+    assert by_dest["dependency"]["is_primary_project"] is False
+    assert by_dest["primary"]["revision"] == "primary-commit"
+    assert by_dest["primary"]["revision_source"] == "benchmark.yaml.commit"
+    assert by_dest["primary"]["is_primary_project"] is True
+    archive = next(repo for repo in repos if repo["kind"] == "archive")
+    assert archive["url"] == "https://example.invalid/releases/archive-1.2.3.tar.gz"
+
+
+def test_libxslt_archive_urls_expand_declared_env_values() -> None:
+    repos = hgb_targets.parse_clone_repos(Path("artifacts/fuzzbench/benchmarks/libxslt_xpath/Dockerfile"))
+    urls = {repo["url"] for repo in repos if repo["kind"] == "archive"}
+
+    assert "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.gz" in urls
+    assert "https://ftp.gnu.org/gnu/autoconf/autoconf-2.71.tar.gz" in urls
+    assert "https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.gz" in urls
+
+
+def test_materialize_repo_rejects_unresolved_or_failed_revisions(monkeypatch, tmp_path: Path) -> None:
+    unresolved = hgb_targets.materialize_repo(
+        {"kind": "git", "url": "https://example.invalid/dependency.git", "dest": "dependency"},
+        "target",
+        "",
+        tmp_path,
+    )
+    assert unresolved["materialize_status"] == "revision_unresolved"
+    assert unresolved["revision_status"] == "unresolved"
+
+    def fake_run(cmd, cwd=None, check=False):
+        del cwd, check
+        if cmd[:2] == ["git", "clone"]:
+            (Path(cmd[-1]) / ".git").mkdir(parents=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "checkout" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "revision is unavailable")
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "head-after-failure\n", "")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hgb_targets, "run", fake_run)
+    failed = hgb_targets.materialize_repo(
+        {
+            "kind": "git",
+            "url": "https://example.invalid/dependency.git",
+            "dest": "dependency",
+            "revision": "required-commit",
+        },
+        "target",
+        "",
+        tmp_path,
+    )
+
+    assert failed["checkout_status"] == "checkout_failed"
+    assert failed["materialize_status"] == "checkout_failed"
+    assert failed["revision_status"] == "unavailable"
+    assert failed["checked_out_commit"] == "head-after-failure"
+
+
+def test_copy_tree_preserves_symlinks_and_replaces_destination_atomically(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    (source / "real.txt").write_text("new", encoding="utf-8")
+    os.symlink("real.txt", source / "linked.txt")
+    destination.mkdir()
+    (destination / "old.txt").write_text("old", encoding="utf-8")
+
+    hgb_targets.copy_tree(source, destination)
+
+    assert not (destination / "old.txt").exists()
+    assert (destination / "linked.txt").is_symlink()
+    assert os.readlink(destination / "linked.txt") == "real.txt"
+    assert (destination / "linked.txt").read_text(encoding="utf-8") == "new"
+
+
+def test_synthetic_build_script_is_excluded_from_native_docker_context(tmp_path: Path) -> None:
+    benchmark = tmp_path / "fuzzbench_benchmark"
+    benchmark.mkdir()
+    (benchmark / "Dockerfile").write_text(
+        "RUN cp libpng/contrib/oss-fuzz/build.sh $SRC\nCOPY * $SRC/\n",
+        encoding="utf-8",
+    )
+
+    assert hgb_targets.ensure_package_build_script(benchmark) == "missing_stubbed_soft_skip"
+    assert (benchmark / "build.sh").is_file()
+    assert "/build.sh" in (benchmark / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+
+def test_source_status_requires_copied_resolved_revisions() -> None:
+    assert hgb_targets.source_status_for_records(
+        [{"copy_status": "copied_to_source_input", "revision_status": "resolved"}]
+    ) == "materialized"
+    assert hgb_targets.source_status_for_records(
+        [{"copy_status": "copied_to_source_input", "revision_status": "unresolved"}]
+    ) == "partial"
+
+
+def test_package_target_applies_benchmark_commit_only_to_primary_repo(monkeypatch, tmp_path: Path) -> None:
+    benchmark = tmp_path / "benchmark"
+    source = tmp_path / "cached_source"
+    benchmark.mkdir()
+    source.mkdir()
+    (benchmark / "Dockerfile").write_text("FROM scratch\n", encoding="utf-8")
+    (benchmark / "benchmark.yaml").write_text("project: primary\n", encoding="utf-8")
+    (benchmark / "build.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (source / "library.c").write_text("int library(void) { return 0; }\n", encoding="utf-8")
+    repos = [
+        {"kind": "git", "url": "https://example.invalid/dependency.git", "dest": "dependency", "source": "Dockerfile"},
+        {"kind": "git", "url": "https://example.invalid/primary.git", "dest": "primary", "source": "Dockerfile"},
+    ]
+    seen_commit_arguments: list[str] = []
+
+    monkeypatch.setattr(
+        hgb_targets,
+        "resolve_target",
+        lambda _root, _target: {
+            "benchmark_dir": str(benchmark),
+            "project": "primary",
+            "commit": "primary-commit",
+            "fuzz_target": "native_fuzzer",
+            "fuzzbench_commit": "fuzzbench-commit",
+        },
+    )
+    monkeypatch.setattr(hgb_targets, "parse_clone_repos", lambda *_args: [dict(repo) for repo in repos])
+
+    def fake_materialize(repo, _target, commit, _root):
+        seen_commit_arguments.append(commit)
+        record = dict(repo)
+        record.update(
+            {
+                "artifact_path": str(source),
+                "materialize_status": "fetched" if repo.get("revision") else "revision_unresolved",
+                "revision_status": "resolved" if repo.get("revision") else "unresolved",
+            }
+        )
+        return record
+
+    monkeypatch.setattr(hgb_targets, "materialize_source", fake_materialize)
+    output = hgb_targets.package_target(tmp_path, "target", tmp_path / "package")
+    manifest = json.loads((output / "target_manifest.json").read_text(encoding="utf-8"))
+    records = {record["dest"]: record for record in manifest["source_repos"]}
+
+    assert seen_commit_arguments == ["", ""]
+    assert records["primary"]["revision"] == "primary-commit"
+    assert records["dependency"]["revision_source"] == "unresolved"
+    assert records["dependency"].get("copy_status") is None
+    assert manifest["source_status"] == "partial"
 
 
 

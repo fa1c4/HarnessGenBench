@@ -61,6 +61,15 @@ GIT_CLONE_OPTIONS_WITH_ARG = {
     "--jobs",
     "-j",
 }
+GIT_CLONE_REVISION_OPTIONS = {"-b", "--branch"}
+REPRODUCIBLE_REVISION_STATUSES = {"resolved", "resolved_url"}
+PROJECT_REPO_ALIASES = {
+    # FuzzBench project names are normally the repository basename.  These
+    # historical projects are the exceptions in the bundled target set.
+    "lcms": {"littlecms"},
+    "proj4": {"proj"},
+    "php": {"phpsrc"},
+}
 
 
 def now_iso() -> str:
@@ -306,6 +315,55 @@ def shell_words(command: str) -> list[str]:
         return command.split()
 
 
+def docker_instruction(line: str) -> tuple[str, str]:
+    """Return an upper-case Dockerfile instruction and its argument text."""
+    match = re.match(r"^([A-Za-z]+)\s+(.*)$", line.strip())
+    if not match:
+        return "", ""
+    return match.group(1).upper(), match.group(2).strip()
+
+
+_DOCKER_VARIABLE_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+
+
+def substitute_docker_variables(value: str, variables: dict[str, str]) -> str:
+    """Expand Docker-style variables with values known from ARG/ENV only."""
+
+    def replace(match: re.Match[str]) -> str:
+        name = match.group(1) or match.group(2)
+        # Preserve unknown values: an empty replacement would silently turn an
+        # unresolved source URL into a different URL.
+        return variables.get(name, match.group(0))
+
+    return _DOCKER_VARIABLE_RE.sub(replace, value)
+
+
+def update_docker_variables(instruction: str, argument: str, variables: dict[str, str]) -> None:
+    """Apply the ARG/ENV forms needed to resolve deterministic source URLs."""
+    if instruction == "ARG":
+        name, separator, value = argument.partition("=")
+        name = name.strip()
+        if name and separator:
+            variables[name] = substitute_docker_variables(value.strip(), variables)
+        return
+    if instruction != "ENV":
+        return
+    try:
+        words = shlex.split(argument, posix=True)
+    except ValueError:
+        words = argument.split()
+    if not words:
+        return
+    if "=" not in words[0]:
+        if len(words) > 1:
+            variables[words[0]] = substitute_docker_variables(" ".join(words[1:]), variables)
+        return
+    for word in words:
+        name, separator, value = word.partition("=")
+        if name and separator:
+            variables[name] = substitute_docker_variables(value, variables)
+
+
 def parse_git_clone_sources(tokens: list[str], used: set[str]) -> list[dict[str, str]]:
     repos: list[dict[str, str]] = []
     i = 0
@@ -316,6 +374,7 @@ def parse_git_clone_sources(tokens: list[str], used: set[str]) -> list[dict[str,
         j = i + 2
         url = ""
         raw_dest: str | None = None
+        revision = ""
         while j < len(tokens):
             token = tokens[j]
             if token in SHELL_OPS:
@@ -323,8 +382,12 @@ def parse_git_clone_sources(tokens: list[str], used: set[str]) -> list[dict[str,
             if token.startswith("-"):
                 opt = token.split("=", 1)[0]
                 if "=" not in token and opt in GIT_CLONE_OPTIONS_WITH_ARG and j + 1 < len(tokens):
+                    if opt in GIT_CLONE_REVISION_OPTIONS:
+                        revision = tokens[j + 1]
                     j += 2
                 else:
+                    if opt in GIT_CLONE_REVISION_OPTIONS and "=" in token:
+                        revision = token.split("=", 1)[1]
                     j += 1
                 continue
             if not url:
@@ -335,7 +398,13 @@ def parse_git_clone_sources(tokens: list[str], used: set[str]) -> list[dict[str,
             break
         if url and is_source_url(url):
             dest = normalize_repo_name(url, raw_dest, used)
-            repos.append({"kind": "git", "url": url, "dest": dest, "source": "Dockerfile"})
+            repo = {"kind": "git", "url": url, "dest": dest, "source": "Dockerfile"}
+            if raw_dest:
+                repo["docker_dest"] = raw_dest
+            if revision:
+                repo["revision"] = revision
+                repo["revision_source"] = "dockerfile_git_clone_branch"
+            repos.append(repo)
         i = max(j + 1, i + 1)
     return repos
 
@@ -388,6 +457,114 @@ def parse_archive_sources(tokens: list[str], used: set[str]) -> list[dict[str, s
     return repos
 
 
+def _docker_workdir_name(value: str) -> str:
+    return docker_path_basename(value).lower()
+
+
+def _repo_matches_workdir(repo: dict[str, str], workdir: str) -> bool:
+    if not workdir:
+        return False
+    expected = _docker_workdir_name(workdir)
+    candidates = {
+        _docker_workdir_name(str(repo.get("dest", ""))),
+        _docker_workdir_name(str(repo.get("docker_dest", ""))),
+    }
+    return expected in candidates
+
+
+def _git_revision_argument(tokens: list[str], start: int) -> str:
+    """Return the first revision argument after checkout/reset options."""
+    index = start
+    while index < len(tokens) and tokens[index] not in SHELL_OPS:
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            if index < len(tokens) and tokens[index] not in SHELL_OPS:
+                return tokens[index]
+            return ""
+        if not token.startswith("-"):
+            return token
+        index += 1
+    return ""
+
+
+def apply_git_checkout_revisions(
+    tokens: list[str], repos: list[dict[str, str]], default_workdir: str = ""
+) -> None:
+    """Attach explicit ``git checkout``/``git reset --hard`` revisions."""
+    workdir = default_workdir
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "cd" and index + 1 < len(tokens):
+            workdir = tokens[index + 1]
+            index += 2
+            continue
+        if token != "git":
+            index += 1
+            continue
+        command_index = index + 1
+        command_workdir = workdir
+        if command_index < len(tokens) and tokens[command_index] == "-C" and command_index + 1 < len(tokens):
+            command_workdir = tokens[command_index + 1]
+            command_index += 2
+        if command_index >= len(tokens) or tokens[command_index] not in {"checkout", "reset"}:
+            index += 1
+            continue
+        command = tokens[command_index]
+        revision = _git_revision_argument(tokens, command_index + 1)
+        if command == "reset" and "--hard" not in tokens[command_index + 1 :]:
+            revision = ""
+        if revision:
+            for repo in repos:
+                if _repo_matches_workdir(repo, command_workdir):
+                    repo["revision"] = revision
+                    repo["revision_source"] = f"dockerfile_git_{command}"
+        index = command_index + 1
+
+
+def canonical_repo_identifiers(value: str) -> set[str]:
+    raw = value.rstrip("/").split("/")[-1]
+    raw = raw.removesuffix(".git")
+    normalized = re.sub(r"[^a-z0-9]+", "", raw.lower())
+    identifiers = {normalized} if normalized else set()
+    if normalized.endswith("src") and len(normalized) > 3:
+        identifiers.add(normalized[:-3])
+    return identifiers
+
+
+def attribute_source_revisions(repos: list[dict[str, str]], project: str, benchmark_commit: str) -> None:
+    """Assign the benchmark revision only to the primary project repository."""
+    project_id = re.sub(r"[^a-z0-9]+", "", project.lower())
+    aliases = PROJECT_REPO_ALIASES.get(project_id, set())
+    primary_indexes: list[int] = []
+    for index, repo in enumerate(repos):
+        if repo.get("kind") == "archive":
+            continue
+        identifiers = set()
+        for value in (str(repo.get("dest", "")), str(repo.get("docker_dest", "")), str(repo.get("url", ""))):
+            identifiers.update(canonical_repo_identifiers(value))
+        if project_id in identifiers or bool(identifiers & aliases):
+            primary_indexes.append(index)
+    for index, repo in enumerate(repos):
+        repo["is_primary_project"] = index in primary_indexes
+        if repo.get("kind") == "archive":
+            repo.setdefault("revision", str(repo.get("url", "")))
+            repo.setdefault("revision_source", "archive_url")
+        elif index in primary_indexes and benchmark_commit and len(primary_indexes) == 1:
+            repo["revision"] = benchmark_commit
+            repo["revision_source"] = "benchmark.yaml.commit"
+        elif not repo.get("revision"):
+            repo["revision_source"] = "unresolved"
+    if len(primary_indexes) > 1:
+        for index in primary_indexes:
+            repos[index]["primary_project_match"] = "ambiguous"
+
+
+def revision_is_resolved(revision: str) -> bool:
+    return bool(revision) and "$" not in revision
+
+
 def load_source_overrides(root: Path, target: str) -> list[dict[str, str]]:
     path = root / "metadata" / "fuzzbench_source_overrides.json"
     if not path.exists():
@@ -426,19 +603,75 @@ def dedupe_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
 def parse_clone_repos(dockerfile: Path, root: Path | None = None, target: str | None = None) -> list[dict[str, str]]:
     used: set[str] = set()
     sources: list[dict[str, str]] = []
+    variables: dict[str, str] = {}
+    workdir = ""
     for line in logical_dockerfile_lines(dockerfile):
-        tokens = shell_words(line)
+        instruction, argument = docker_instruction(line)
+        if instruction in {"ARG", "ENV"}:
+            update_docker_variables(instruction, argument, variables)
+            continue
+        expanded_argument = substitute_docker_variables(argument, variables)
+        if instruction == "WORKDIR":
+            workdir = expanded_argument
+            continue
+        if instruction != "RUN":
+            continue
+        tokens = shell_words(f"RUN {expanded_argument}")
         sources.extend(parse_git_clone_sources(tokens, used))
         sources.extend(parse_archive_sources(tokens, used))
+        apply_git_checkout_revisions(tokens, sources, workdir)
     if root is not None and target is not None:
         sources.extend(load_source_overrides(root, target))
     return dedupe_sources(sources)
 
 
 def copy_tree(src: Path, dst: Path) -> None:
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"), dirs_exist_ok=False)
+    """Replace ``dst`` with a symlink-preserving copy of ``src``.
+
+    Source projects such as systemd contain symlinks.  ``copytree`` defaults to
+    dereferencing them, which can escape the copied tree or turn a link into a
+    stale host-dependent file.  Copy into a sibling first so failed copies
+    leave an existing package intact.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    temporary = Path(tempfile.mkdtemp(prefix=f".{dst.name}.tmp-", dir=str(dst.parent)))
+    temporary.rmdir()
+    backup = Path(tempfile.mkdtemp(prefix=f".{dst.name}.old-", dir=str(dst.parent)))
+    backup.rmdir()
+    moved_existing = False
+    installed = False
+
+    def exists_or_link(path: Path) -> bool:
+        return path.exists() or path.is_symlink()
+
+    def remove_path(path: Path) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+
+    try:
+        shutil.copytree(
+            src,
+            temporary,
+            symlinks=True,
+            ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"),
+            dirs_exist_ok=False,
+        )
+        if exists_or_link(dst):
+            os.replace(dst, backup)
+            moved_existing = True
+        os.replace(temporary, dst)
+        installed = True
+    finally:
+        if not installed and moved_existing and exists_or_link(backup):
+            if exists_or_link(dst):
+                remove_path(dst)
+            os.replace(backup, dst)
+        if exists_or_link(temporary):
+            remove_path(temporary)
+        if installed and exists_or_link(backup):
+            remove_path(backup)
 
 
 def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path) -> dict[str, Any]:
@@ -448,9 +681,18 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
     result: dict[str, Any] = dict(repo)
     result.setdefault("kind", "git")
     result["artifact_path"] = str(local)
+    revision = str(repo.get("revision") or commit or "").strip()
+    result["requested_revision"] = revision
+    result.setdefault("revision_source", "legacy_commit_argument" if commit else "unresolved")
+    if not revision_is_resolved(revision):
+        result["checkout_status"] = "revision_unresolved"
+        result["revision_status"] = "unresolved"
+        result["materialize_status"] = "revision_unresolved"
+        return result
     if local.exists() and not (local / ".git").exists():
         result["clone_status"] = "path_exists_not_git"
         result["materialize_status"] = "path_exists_not_git"
+        result["revision_status"] = "unavailable"
         return result
     if (local / ".git").exists():
         proc = run(["git", "-C", str(local), "fetch", "--all", "--tags", "--prune"])
@@ -462,6 +704,7 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
                 result["materialize_status"] = "fetch_failed_using_cached_checkout"
                 result["cache_fallback"] = True
             else:
+                result["revision_status"] = "unavailable"
                 return result
     else:
         proc = run(["git", "clone", repo["url"], str(local)])
@@ -469,16 +712,17 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
         result["materialize_status"] = result["clone_status"]
         if proc.returncode != 0:
             result["error"] = (proc.stderr or proc.stdout).strip()[-1000:]
+            result["revision_status"] = "unavailable"
             return result
-    if commit:
-        proc = run(["git", "-C", str(local), "checkout", "--detach", commit])
-        if proc.returncode == 0:
-            result["checkout_status"] = "checked_out_commit"
-        else:
-            result["checkout_status"] = "commit_not_found_kept_head"
-            result["checkout_error"] = (proc.stderr or proc.stdout).strip()[-1000:]
+    proc = run(["git", "-C", str(local), "checkout", "--detach", revision])
+    if proc.returncode == 0:
+        result["checkout_status"] = "checked_out_revision"
+        result["revision_status"] = "resolved"
     else:
-        result["checkout_status"] = "kept_head_no_commit"
+        result["checkout_status"] = "checkout_failed"
+        result["checkout_error"] = (proc.stderr or proc.stdout).strip()[-1000:]
+        result["revision_status"] = "unavailable"
+        result["materialize_status"] = "checkout_failed"
     result["checked_out_commit"] = git_head(local)
     return result
 
@@ -486,9 +730,7 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
 def copy_extracted_archive(extract_root: Path, local: Path) -> None:
     entries = [p for p in extract_root.iterdir() if p.name not in {"__MACOSX"}]
     source = entries[0] if len(entries) == 1 and entries[0].is_dir() else extract_root
-    if local.exists():
-        shutil.rmtree(local)
-    shutil.copytree(source, local, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"), dirs_exist_ok=False)
+    copy_tree(source, local)
 
 
 def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[str, Any]:
@@ -498,8 +740,15 @@ def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[s
     result: dict[str, Any] = dict(repo)
     result["kind"] = "archive"
     result["artifact_path"] = str(local)
+    result["requested_revision"] = str(repo.get("revision") or repo.get("url") or "")
+    result.setdefault("revision_source", "archive_url")
+    if not revision_is_resolved(result["requested_revision"]):
+        result["revision_status"] = "unresolved"
+        result["materialize_status"] = "revision_unresolved"
+        return result
     if local.is_dir() and any(local.rglob("*")):
         result["materialize_status"] = "cached"
+        result["revision_status"] = "resolved_url"
         return result
     try:
         with tempfile.TemporaryDirectory(prefix="hgb-source-", dir=str(artifacts_root)) as tmp_s:
@@ -519,9 +768,11 @@ def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[s
                         tf.extractall(extract_root)
             copy_extracted_archive(extract_root, local)
         result["materialize_status"] = "extracted"
+        result["revision_status"] = "resolved_url"
     except Exception as exc:  # noqa: BLE001 - record best-effort source acquisition errors.
         result["materialize_status"] = "archive_failed"
         result["error"] = str(exc)[-1000:]
+        result["revision_status"] = "unavailable"
     return result
 
 
@@ -893,6 +1144,25 @@ def copy_seeds_and_dicts(benchmark_dir: Path, seeds_dir: Path, dictionary_dir: P
 
 
 
+def exclude_synthetic_build_script_from_docker_context(benchmark_copy: Path) -> None:
+    """Keep a package-only build wrapper out of the native Docker context.
+
+    Some FuzzBench Dockerfiles first copy a project's native build.sh into
+    $SRC and later use ``COPY * $SRC``.  A package stub at the context root
+    would overwrite that native script (libpng is one example).
+    """
+    dockerignore = benchmark_copy / ".dockerignore"
+    rule = "/build.sh"
+    existing = dockerignore.read_text(encoding="utf-8") if dockerignore.exists() else ""
+    if rule in {line.strip() for line in existing.splitlines()}:
+        return
+    suffix = "" if not existing or existing.endswith("\n") else "\n"
+    dockerignore.write_text(
+        existing + suffix + "# HarnessGenBench: package-only build wrapper\n" + rule + "\n",
+        encoding="utf-8",
+    )
+
+
 def ensure_package_build_script(benchmark_copy: Path) -> str:
     build_sh = benchmark_copy / "build.sh"
     if build_sh.is_file():
@@ -908,6 +1178,7 @@ def ensure_package_build_script(benchmark_copy: Path) -> str:
             encoding="utf-8",
         )
         build_sh.chmod(0o755)
+        exclude_synthetic_build_script_from_docker_context(benchmark_copy)
         return "wrapped_third_party_build_sh"
     build_sh.write_text(
         "#!/usr/bin/env bash\n"
@@ -917,7 +1188,23 @@ def ensure_package_build_script(benchmark_copy: Path) -> str:
         encoding="utf-8",
     )
     build_sh.chmod(0o755)
+    exclude_synthetic_build_script_from_docker_context(benchmark_copy)
     return "missing_stubbed_soft_skip"
+
+
+def source_status_for_records(records: list[dict[str, Any]]) -> str:
+    """Return materialized only when every copied source has a resolved ref."""
+    if not records:
+        return "benchmark_only"
+    copied_statuses = {"copied_to_package", "copied_to_source_input"}
+    if all(
+        record.get("copy_status") in copied_statuses
+        and record.get("revision_status") in REPRODUCIBLE_REVISION_STATUSES
+        for record in records
+    ):
+        return "materialized"
+    return "partial"
+
 
 def count_source_files(path: Path) -> int:
     if not path.exists():
@@ -989,13 +1276,18 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     copy_tree(benchmark_dir, benchmark_copy)
     build_script_status = ensure_package_build_script(benchmark_copy)
     repos = parse_clone_repos(benchmark_copy / "Dockerfile", root, target)
+    attribute_source_revisions(repos, resolved.get("project", ""), resolved.get("commit", ""))
     materialized: list[dict[str, Any]] = []
     source_root = output / ("source_full" if layout == "full" else "source_input")
     for repo in repos:
-        record = materialize_source(repo, target, resolved.get("commit", ""), root)
+        record = materialize_source(repo, target, "", root)
         materialized.append(record)
         local = Path(record.get("artifact_path", ""))
-        if record.get("materialize_status") in {"cloned", "fetched", "cached", "extracted", "fetch_failed_using_cached_checkout"} and local.is_dir():
+        if (
+            record.get("materialize_status") in {"cloned", "fetched", "cached", "extracted", "fetch_failed_using_cached_checkout"}
+            and record.get("revision_status") in REPRODUCIBLE_REVISION_STATUSES
+            and local.is_dir()
+        ):
             package_dst = source_root / repo["dest"]
             try:
                 copy_tree(local, package_dst)
@@ -1024,14 +1316,9 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     source_file_count = count_source_files(output / "source_input")
     cmake_file_count = count_named_files(output / "source_input", "CMakeLists.txt")
     compile_commands_count = count_named_files(output / "source_input", "compile_commands.json")
-    copied_statuses = {"copied_to_package", "copied_to_source_input"}
     source_fallback_statuses = sorted({str(r.get("materialize_status", "")) for r in materialized if r.get("cache_fallback")})
-    if not repos:
-        source_status = "benchmark_only"
-    elif all(r.get("copy_status") in copied_statuses for r in materialized):
-        source_status = "materialized"
-    else:
-        source_status = "partial"
+    source_revision_statuses = sorted({str(r.get("revision_status", "")) for r in materialized})
+    source_status = source_status_for_records(materialized)
     manifest = {
         "schema_version": 1,
         "target": target,
@@ -1045,6 +1332,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         "source_layout": layout,
         "source_status": source_status,
         "source_fallback_statuses": source_fallback_statuses,
+        "source_revision_statuses": source_revision_statuses,
         "source_repos": materialized,
         "source_artifact_paths": sorted({str(r.get("artifact_path", "")) for r in materialized if r.get("artifact_path")}),
         "source_file_count": source_file_count,
@@ -1060,6 +1348,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         "seed_count": seed_count,
         "dictionary_count": dictionary_count,
         "build_script_status": build_script_status,
+        "synthetic_build_script_excluded_from_docker_context": build_script_status != "present",
         "created_at": now_iso(),
     }
     (output / "target_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
