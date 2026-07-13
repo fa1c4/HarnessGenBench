@@ -49,8 +49,37 @@ def test_sealed_context_uses_snapshot_and_removes_git_clone(tmp_path: Path) -> N
     assert result["mode"] == "sealed_source_snapshot"
     assert result["removed_acquisition_commands"] == 1
     assert "COPY source_input/ /src/" in dockerfile
+    assert "COPY hgb_reference_harnesses/source_input/ /src/" in dockerfile
     assert "git clone" not in dockerfile
     assert "cd project && ./configure" in dockerfile
+
+
+def test_sealed_context_restores_selected_source_harness_only_for_verification(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    selected = target / "reference_harnesses" / "selected" / "source_input" / "project"
+    selected.mkdir(parents=True)
+    (selected / "native_fuzzer.c").write_text("int LLVMFuzzerTestOneInput(void);\n", encoding="utf-8")
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+
+    restored = Path(result["context_dir"]) / "hgb_reference_harnesses" / "source_input" / "project" / "native_fuzzer.c"
+    assert restored.is_file()
+
+
+def test_sealed_context_accepts_explicit_captured_unpinned_commit(tmp_path: Path) -> None:
+    target = _target(tmp_path, checkout_status="captured_unpinned_commit")
+    provenance = target / "source_repos.json"
+    provenance.write_text(
+        provenance.read_text(encoding="utf-8").replace(
+            '"copy_status":"copied_to_source_input"',
+            '"copy_status":"copied_to_source_input","revision_status":"captured_unpinned"',
+        ),
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+
+    assert result["captured_unpinned_source_count"] == 1
 
 
 def test_sealed_context_rejects_unpinned_source(tmp_path: Path) -> None:
@@ -79,3 +108,4 @@ def test_ckgfuzzer_image_installs_sealed_context_helper() -> None:
     dockerfile = Path("docker/ckgfuzzer/Dockerfile").read_text(encoding="utf-8")
 
     assert "docker/common/ckgfuzzer_verifier_context.py" in dockerfile
+    assert "docker/common/ckgfuzzer_target_harness.py" in dockerfile

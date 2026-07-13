@@ -398,10 +398,18 @@ EOF_CKG_USAGE
     2>"$workspace/logs/api_extract.log" || printf '0')"
   api_count="${api_count##*$'\n'}"
   export CKGFUZZER_SELECTED_API_LIST="$ckg_db/api_list.json"
+  if ! ckg_program_language="$(python3 /opt/hgb/bin/ckgfuzzer_target_harness.py \
+    --target-root /target --fuzz-target "$fuzz_target" --field language 2>"$workspace/logs/native_harness.log")"; then
+    hgb_soft_skip ckg_native_harness_unresolved 'target package does not identify one native C/C++ harness path for candidate verification' harness_generator
+  fi
+  case "$ckg_program_language" in
+    c|c++) ;;
+    *) hgb_soft_skip ckg_native_harness_unresolved "unsupported native harness language: $ckg_program_language" harness_generator ;;
+  esac
   cat >"$ckg_db/config.yaml" <<EOF_CKG_CONFIG
 config:
   project_name: "$ckg_project"
-  program_language: "c++"
+  program_language: "$ckg_program_language"
   fuzz_projects_dir: "$ckg_db/"
   work_dir: "$artifact/"
   shared_dir: "$ckg_shared/"
@@ -440,7 +448,7 @@ source_dir: "$ckg_analysis_src"
 output_dir: "$workspace/generated_harnesses"
 build_command: "bash /target/fuzzbench_benchmark/build.sh"
 EOF_CKG_CONFIG
-  printf 'CKGFuzzer project: %s\napi_list: %s\nconfig: %s\n' "$ckg_project" "$ckg_db/api_list.json" "$ckg_db/config.yaml" >"$workspace/command.txt"
+  printf 'CKGFuzzer project: %s\nlanguage: %s\napi_list: %s\nconfig: %s\n' "$ckg_project" "$ckg_program_language" "$ckg_db/api_list.json" "$ckg_db/config.yaml" >"$workspace/command.txt"
   if [[ "${api_count:-0}" == "0" ]]; then
     hgb_soft_skip no_api_candidates 'no C/C++ API candidates were extracted from target source_input' harness_generator
   fi
@@ -1469,7 +1477,7 @@ PY_CKG_CACHE_WRITE_METADATA
 ' 'caller,callee,caller_src,callee_src,start_body_start_line,start_body_end_line,end_body_start_line,end_body_end_line,caller_signature,caller_parameter_string,caller_return_type,caller_return_type_inferred,callee_signature,callee_parameter_string,callee_return_type,callee_return_type_inferred' >"$ckg_db/api_combine/combined_call_graph.csv"
           fi
           if [[ "$analysis_mode" == source_fallback_only ]]; then
-            source_fallback_recovered_body_count="$(python3 - "$ckg_db/api_list.json" "$ckg_db/src/src_api_code.json" <<'PY_CKG_SOURCE_FALLBACK_BODIES'
+            source_fallback_recovered_body_count="$(PYTHONPATH="/opt/hgb/bin${PYTHONPATH:+:$PYTHONPATH}" python3 - "$ckg_db/api_list.json" "$ckg_db/src/src_api_code.json" <<'PY_CKG_SOURCE_FALLBACK_BODIES'
 import json
 import sys
 from pathlib import Path
@@ -1532,6 +1540,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   verification_code=not_run
   verification_ran=false
   verified_harness_count=0
+  verification_context_mode=''
   if [[ "${generated_harness_count:-0}" -gt 0 ]]; then
     verification_code=0
     timeout "${CKGFUZZER_CANDIDATE_VERIFY_TIMEOUT_SECONDS:-7200}" \
@@ -1544,6 +1553,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
         >"$workspace/logs/candidate_verification.log" 2>&1 || verification_code=$?
     if [[ -f "$candidate_verification_file" ]]; then
       verification_ran="$(jq -r '.verification_ran // false' "$candidate_verification_file" 2>/dev/null || printf false)"
+      verification_context_mode="$(jq -r '.verification_context.mode // ""' "$candidate_verification_file" 2>/dev/null || printf '')"
       jq '.verified_candidates // []' "$candidate_verification_file" >"$workspace/verified_harnesses.json" 2>/dev/null || printf '[]\n' >"$workspace/verified_harnesses.json"
       verified_harness_count="$(jq '(.verified_candidates // []) | length' "$candidate_verification_file" 2>/dev/null || printf '0')"
     else
@@ -1551,7 +1561,11 @@ PY_CKG_SOURCE_FALLBACK_BODIES
     fi
     if [[ "$verification_code" != "0" || "$verification_ran" != "true" ]]; then
       code=6
-      failed_stage=verification
+      if [[ "$verification_context_mode" == "verification_context_unreproducible" ]]; then
+        failed_stage=verification_context
+      else
+        failed_stage=verification
+      fi
     fi
   else
     printf '[]\n' >"$workspace/verified_harnesses.json"
@@ -1568,6 +1582,9 @@ PY_CKG_SOURCE_FALLBACK_BODIES
     elif [[ "$failed_stage" == "verification" ]]; then
       status=infra_failed
       reason='ckg_verification_infra_failed: candidate compile/link verification did not run; inspect candidate_verification results and logs'
+    elif [[ "$failed_stage" == "verification_context" ]]; then
+      status=not_applicable
+      reason='ckg_verification_context_unreproducible: target dependency source is not pinned; generated candidates were not evaluated against a moving source tree'
     fi
     if [[ "$failed_stage" == "repo" && -f "$workspace/logs/repo.log" ]]; then
       if grep -Eqi 'No source code was seen|did not process any source|No source code was seen during the build|hgb-codeql.*fallback compiled 0' "$workspace/logs/repo.log"; then

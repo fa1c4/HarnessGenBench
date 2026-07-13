@@ -29,6 +29,7 @@ class VerificationContext:
     mode: str
     removed_acquisition_commands: int
     excluded_synthetic_build_script: bool
+    captured_unpinned_source_count: int
 
 
 class VerificationContextError(RuntimeError):
@@ -73,7 +74,7 @@ def _assert_reproducible_sources(target_root: Path) -> None:
         if copy_status not in {"copied_to_source_input", "copied_to_package"}:
             unresolved.append(f"{location}: source snapshot was not copied ({copy_status or materialize_status or 'unknown'})")
             continue
-        if revision_status and revision_status not in {"resolved", "resolved_url"}:
+        if revision_status and revision_status not in {"resolved", "resolved_url", "captured_unpinned"}:
             unresolved.append(f"{location}: source revision is {revision_status}")
             continue
         if kind == "git" and checkout_status in {"", "kept_head_no_commit", "commit_not_found_kept_head"}:
@@ -144,6 +145,7 @@ def _rewrite_dockerfile(dockerfile: Path) -> tuple[str, int]:
                     "# HGB sealed verifier source snapshot.",
                     "ENV HGB_SEALED_VERIFIER=1",
                     "COPY source_input/ /src/",
+                    "COPY hgb_reference_harnesses/source_input/ /src/",
                 ]
             )
             inserted_snapshot = True
@@ -156,10 +158,27 @@ def _copytree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=False)
 
 
+def _copy_selected_source_references(target_root: Path, context: Path) -> None:
+    """Restore stripped native sources only in the verifier image context."""
+
+    destination = context / "hgb_reference_harnesses" / "source_input"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    selected = target_root / "reference_harnesses" / "selected" / "source_input"
+    if selected.is_dir():
+        _copytree(selected, destination)
+    else:
+        destination.mkdir()
+
+
 def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str, Any]:
     """Create a Docker context whose sources are the target-package snapshot."""
 
     _assert_reproducible_sources(target_root)
+    captured_unpinned_source_count = sum(
+        1
+        for record in _source_records(target_root)
+        if record.get("revision_status") == "captured_unpinned"
+    )
     benchmark = target_root / "fuzzbench_benchmark"
     dockerfile = benchmark / "Dockerfile"
     if not dockerfile.is_file():
@@ -170,6 +189,7 @@ def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str,
         shutil.rmtree(context)
     _copytree(benchmark, context)
     _copytree(target_root / "source_input", context / "source_input")
+    _copy_selected_source_references(target_root, context)
 
     synthetic_build = context / "build.sh"
     excluded_synthetic_build = False
@@ -188,5 +208,6 @@ def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str,
         mode="sealed_source_snapshot",
         removed_acquisition_commands=removed,
         excluded_synthetic_build_script=excluded_synthetic_build,
+        captured_unpinned_source_count=captured_unpinned_source_count,
     )
     return asdict(result)

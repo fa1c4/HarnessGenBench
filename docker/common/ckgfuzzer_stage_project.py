@@ -98,7 +98,10 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
     # files are needed for build replay, but intentionally not copied to the
     # analysis source directory so generators do not see the benchmark answer.
     for child in benchmark.iterdir():
-        if child.name in {"Dockerfile", "benchmark.yaml"}:
+        # A package-only .dockerignore can intentionally hide a synthetic
+        # top-level build.sh from native replay. It must not leak into the
+        # distinct synthetic CKG project Docker context.
+        if child.name in {"Dockerfile", "benchmark.yaml", ".dockerignore"}:
             continue
         target = project_dir / child.name
         if child.is_dir() and not child.is_symlink():

@@ -32,6 +32,16 @@ except Exception:
 sys.exit(0 if isinstance(data, list) and len(data) > 0 else 1)
 PY_COMPILE_DB_CHECK
 }
+filter_compile_db() {
+  local db="$1" phase="$2" result
+  [[ -f "$db" ]] || return 0
+  if ! result="$("$python" /opt/hgb/bin/hgb_compile_db.py --input "$db" --output "$db" --source-root /target/source_input --source-root "$workspace/promefuzz_build/src" 2>&1)"; then
+    printf 'Could not filter %s compile_commands.json: %s\n' "$phase" "$result" >>"$workspace/logs/compile_commands.log"
+    return 1
+  fi
+  printf 'Filtered %s compile_commands.json: %s\n' "$phase" "$result" >>"$workspace/logs/compile_commands.log"
+}
+
 write_synthetic_compile_db() {
   local db="$1" language="$2" project="$3"
   mkdir -p "$(dirname "$db")"
@@ -102,6 +112,19 @@ Path(db).write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 print(len(entries))
 PY_SYNTHETIC_COMPILE_DB
 }
+stage_fuzzbench_source() {
+  local destination="$1" benchmark=/target/fuzzbench_benchmark child name
+  rm -rf "$destination"
+  mkdir -p "$destination"
+  cp -a /target/source_input/. "$destination/"
+  while IFS= read -r -d '' child; do
+    name="$(basename "$child")"
+    case "$name" in Dockerfile|benchmark.yaml|.dockerignore) continue ;; esac
+    rm -rf "$destination/$name"
+    cp -a "$child" "$destination/$name"
+  done < <(find "$benchmark" -mindepth 1 -maxdepth 1 -print0)
+}
+
 write_config() {
   local cfg=/run/hgb/promefuzz_config.toml
   if [[ -f "$artifact/config.template.toml" ]]; then
@@ -185,6 +208,31 @@ if [[ "$mode" == "generate-target" ]]; then
     language="c"
   fi
   config=/run/hgb/promefuzz/config.toml
+  native_build_enabled="${HGB_PROMEFUZZ_NATIVE_BUILD:-1}"
+  native_build_root="$workspace/promefuzz_native_build"
+  native_template="$native_build_root/template"
+  native_harness_json=""
+  native_harness_destination=""
+  native_build_json=false
+  if [[ "$native_build_enabled" == "1" ]]; then
+    if ! native_harness_json="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" 2>&1)"; then
+      printf 'Could not resolve the manifest-selected native harness: %s\n' "$native_harness_json" >"$workspace/logs/native_build.log"
+      hgb_write_common_metadata failed 'PromeFuzz could not resolve the manifest-selected native harness required for target build verification' 65 harness_generator
+      hgb_write_common_summary failed 'PromeFuzz could not resolve the manifest-selected native harness required for target build verification' harness_generator
+      exit 65
+    fi
+    native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination)"
+    language="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field language)"
+    stage_fuzzbench_source "$native_template"
+    printf '%s\n' "$native_harness_json" >"$workspace/promefuzz_native_harness.json"
+    export PROME_FUZZ_DRIVER_BUILD_WRAPPER=/opt/hgb/bin/promefuzz_target_build.sh
+    export PROME_FUZZ_NATIVE_SOURCE_TEMPLATE="$native_template"
+    export PROME_FUZZ_NATIVE_BUILD_ROOT="$native_build_root"
+    export PROME_FUZZ_NATIVE_HARNESS_DESTINATION="$native_harness_destination"
+    export PROME_FUZZ_NATIVE_FUZZ_TARGET="$fuzz_target"
+    native_build_json=true
+  fi
+
   libraries=/run/hgb/promefuzz/libraries.toml
   cat >"$config" <<EOF_PROMEFUZZ_CONFIG
 [comprehender]
@@ -232,18 +280,21 @@ EOF_PROMEFUZZ_CONFIG
   if [[ -n "$cmake_src" ]]; then
     cmake -S "$cmake_src" -B "$workspace/promefuzz_build" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >"$workspace/logs/cmake.log" 2>&1 || true
   fi
+  filter_compile_db "$compile_db" cmake || true
   if ! compile_db_has_entries "$compile_db" && [[ "${HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD:-1}" == "1" ]] && command -v bear >/dev/null 2>&1; then
     mkdir -p "$workspace/promefuzz_build/src" "$workspace/promefuzz_build/out" "$workspace/promefuzz_build/work"
-    cp -a /target/source_input/. "$workspace/promefuzz_build/src/" 2>/dev/null || true
-    (cd "$workspace/promefuzz_build" && SRC="$workspace/promefuzz_build/src" OUT="$workspace/promefuzz_build/out" WORK="$workspace/promefuzz_build/work" bear -- bash /target/fuzzbench_benchmark/build.sh) >"$workspace/logs/bear.log" 2>&1 || true
+    stage_fuzzbench_source "$workspace/promefuzz_build/src"
+    (cd "$workspace/promefuzz_build" && SRC="$workspace/promefuzz_build/src" OUT="$workspace/promefuzz_build/out" WORK="$workspace/promefuzz_build/work" bear -- bash "$workspace/promefuzz_build/src/build.sh") >"$workspace/logs/bear.log" 2>&1 || true
     if [[ -f "$workspace/promefuzz_build/compile_commands.json" && "$workspace/promefuzz_build/compile_commands.json" != "$compile_db" ]]; then
       cp "$workspace/promefuzz_build/compile_commands.json" "$compile_db" 2>/dev/null || true
     fi
   fi
+  filter_compile_db "$compile_db" bear || true
   if ! compile_db_has_entries "$compile_db"; then
     synthetic_count="$(write_synthetic_compile_db "$compile_db" "$language" "$project" 2>/dev/null || printf '0')"
     printf 'Wrote synthetic compile_commands.json with %s entries for /target/source_input.\n' "$synthetic_count" >>"$workspace/logs/cmake.log"
   fi
+  filter_compile_db "$compile_db" synthetic || true
   if compile_db_has_entries "$compile_db"; then
     cp "$compile_db" "$preserved_compile_db" 2>/dev/null || true
     compile_db_for_metadata="$preserved_compile_db"
@@ -251,29 +302,29 @@ EOF_PROMEFUZZ_CONFIG
   cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
 [$safe_target]
 language = "$language"
-header_paths = ["/target/source_input", "/target/source_input/$project/include", "/target/source_input/$project/include/json"]
+header_paths = ["/target/source_input"]
 compile_commands_path = "$compile_db"
 document_paths = ["/target/docs"]
 document_has_api_usage = true
 output_path = "$workspace/promefuzz_out/$safe_target"
-source_paths = ["/target/source_input", "/target/source_input/$project/src/lib_json"]
-exclude_paths = ["/target/source_input/$project/example"]
-driver_headers = ["/target/source_input/$project/include/json/json.h"]
-driver_build_args = ["-I/target/source_input/$project/include"]
-consumer_build_args = ["-I/target/source_input/$project/include"]
+source_paths = ["/target/source_input"]
+exclude_paths = ["/target/source_input/test", "/target/source_input/tests", "/target/source_input/example", "/target/source_input/examples", "/target/source_input/third_party", "/target/source_input/benchmark", "/target/source_input/benchmarks"]
+driver_headers = []
+driver_build_args = []
+consumer_build_args = []
 EOF_PROMEFUZZ_LIBS
   printf 'PromeFuzz config: %s\nPromeFuzz libraries: %s\n' "$config" "$libraries" >"$workspace/command.txt"
   if ! compile_db_has_entries "$compile_db"; then
     cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
     if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
+      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
     fi
     hgb_soft_skip needs_compile_commands 'PromeFuzz requires a non-empty compile_commands.json; CMake, Bear/FuzzBench build replay, and synthetic fallback did not produce one. Inspect cmake.log and bear.log.' harness_generator
   fi
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
     if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
+      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
     fi
     hgb_write_common_metadata dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' 0 harness_generator
     hgb_write_common_summary dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' harness_generator
@@ -401,6 +452,42 @@ if knowledge_py.exists():
     if old in ktext and "PROME_FUZZ_SKIP_BAD_DOCS" not in ktext:
         ktext = ktext.replace(old, new, 1)
     knowledge_py.write_text(ktext)
+driver_py = root / "src/generator/driver.py"
+if driver_py.exists():
+    text = driver_py.read_text()
+    if "PROME_FUZZ_DRIVER_BUILD_WRAPPER" not in text:
+        if "import os\n" not in text:
+            text = text.replace("import threading\n", "import os\nimport threading\n", 1)
+        old = '''        logger.debug(f"Building fuzz driver {self.id} with command: {build_cmd}")
+
+        # build fuzz driver
+        try:
+            output = subprocess.check_output(
+                build_cmd, stderr=subprocess.STDOUT, shell=True, text=True
+            )'''
+        new = '''        build_wrapper = os.environ.get("PROME_FUZZ_DRIVER_BUILD_WRAPPER", "").strip()
+        wrapper_cmd = [build_wrapper, str(src_path), str(bin_path)] if build_wrapper else []
+        logger.debug(
+            f"Building fuzz driver {self.id} with "
+            f"{'target build wrapper: ' + ' '.join(wrapper_cmd) if wrapper_cmd else 'command: ' + build_cmd}"
+        )
+
+        # build fuzz driver
+        try:
+            output = subprocess.check_output(
+                wrapper_cmd if wrapper_cmd else build_cmd,
+                stderr=subprocess.STDOUT,
+                shell=not bool(wrapper_cmd),
+                text=True,
+            )'''
+        if old in text:
+            text = text.replace(old, new, 1)
+    text = text.replace('''f"{func.name.split("::")[-1]}("''', '''f"{func.name.split('::')[-1]}("''')
+    text = text.replace(
+        '''f"Function in fuzz driver does not exist in API collection: {calling["calleeName"]} at {calling["calleeDeclLoc"]}"''',
+        '''f"Function in fuzz driver does not exist in API collection: {calling['calleeName']} at {calling['calleeDeclLoc']}"''',
+    )
+    driver_py.write_text(text)
 preprocess_py = root / "cli/preprocess.py"
 if preprocess_py.exists():
     text = preprocess_py.read_text()
@@ -529,11 +616,14 @@ PY_PROME_API_COUNT
   if [[ -f "$runtime_artifact/logs/llm.log" ]]; then
     cp "$runtime_artifact/logs/llm.log" "$workspace/logs/promefuzz_llm.log" 2>/dev/null || true
   fi
+  final_driver_dir="$workspace/promefuzz_out/$safe_target/fuzz_driver"
+  temporary_driver_dir="$workspace/promefuzz_out/$safe_target/tmp"
   n=0
   while IFS= read -r generated; do
     n=$((n + 1))
     cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-  done < <(find "$workspace/promefuzz_out" "$runtime_artifact" -type f \( -name '*fuzz*.c' -o -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name 'fuzz_driver_*' \) 2>/dev/null | sort)
+  done < <(find "$final_driver_dir" -maxdepth 1 -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | sort)
+  temporary_harness_attempt_count="$(find "$temporary_driver_dir" -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | wc -l | tr -d ' ')"
   status=completed
   reason=none
   if [[ "$code" -ne 0 ]]; then
@@ -562,16 +652,25 @@ PY_PROME_API_COUNT
       fi
     fi
   fi
+  deprecated_api_event_count="$(grep -R -hE 'has failed to generate more than [0-9]+ times, deprecated' "$workspace/logs" 2>/dev/null | wc -l | tr -d ' ')"
   generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
-  if [[ "$code" -ne 0 && "${generated_harness_count:-0}" -gt 0 ]]; then
+  if [[ "$code" -eq 0 && "${generated_harness_count:-0}" -eq 0 ]]; then
+    code=1
+    failed_stage=generate
+    status=failed
+    reason='PromeFuzz generation completed without producing a sanitized target harness; temporary retry sources were not retained as results'
+  elif [[ "$code" -eq 0 && "${deprecated_api_event_count:-0}" -gt 0 ]]; then
     status=partial_completed
-    reason="PromeFuzz $failed_stage stage exited $code after producing $generated_harness_count harness candidates"
+    reason="PromeFuzz finalized $generated_harness_count sanitized target harnesses but reported $deprecated_api_event_count deprecated API generation events"
+  elif [[ "$code" -ne 0 && "${generated_harness_count:-0}" -gt 0 ]]; then
+    status=partial_completed
+    reason="PromeFuzz $failed_stage stage exited $code after producing $generated_harness_count sanitized target harnesses"
   fi
   if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-    rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_out"
+    rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
   fi
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
-  extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s"' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")")
+  extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "native_build_enabled": %s,\n  "native_harness_destination": "%s",\n  "final_harness_count": %s,\n  "temporary_harness_attempt_count": %s,\n  "deprecated_api_event_count": %s' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$native_build_json" "$(hgb_json_escape "$native_harness_destination")" "${generated_harness_count:-0}" "${temporary_harness_attempt_count:-0}" "${deprecated_api_event_count:-0}")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

@@ -463,6 +463,18 @@ def _prepare_verifier_snapshot(target: Path) -> None:
     source = target / "source_input" / "project"
     source.mkdir(parents=True)
     (source / "api.cc").write_text("int api() { return 0; }\n", encoding="utf-8")
+    selected = target / "reference_harnesses" / "selected" / "source_input" / "project"
+    selected.mkdir(parents=True)
+    (selected / "native_fuzzer.cc").write_text(
+        "int LLVMFuzzerTestOneInput(const unsigned char*, unsigned long) { return 0; }\n",
+        encoding="utf-8",
+    )
+    (target / "target_manifest.json").write_text(
+        json.dumps(
+            {"selected_reference_harness_files": ["source_input/project/native_fuzzer.cc"]}
+        ),
+        encoding="utf-8",
+    )
     (target / "source_repos.json").write_text(
         json.dumps(
             [
@@ -517,8 +529,10 @@ def test_ckgfuzzer_candidate_verifier_stages_and_records_candidate_builds(tmp_pa
     assert any("HGB_CANDIDATE_FILE=native_fuzzer.cc" == part for part in create_command)
     assert any("HGB_FUZZ_TARGET=native_fuzzer" == part for part in create_command)
     assert all("-v" not in command for command in lifecycle)
-    assert "declared_sources" in create_command[-1]
-    assert "could not identify a unique native candidate path" in create_command[-1]
+    assert "HGB_CANDIDATE_DEST" in create_command[-1]
+    assert "selected native candidate destination is absent" in create_command[-1]
+    assert any("HGB_CANDIDATE_DEST=/src/project/native_fuzzer.cc" == part for part in create_command)
+    assert any("FUZZER_LIB=-fsanitize=fuzzer" == part for part in create_command)
     assert "libFuzzingEngine.a" in create_command[-1]
     assert "LIBRARY_PATH" in create_command[-1]
     assert "CXXFLAGS" in create_command[-1]
@@ -806,6 +820,38 @@ def test_materialize_repo_uses_cached_checkout_when_fetch_fails(monkeypatch, tmp
     assert result["revision_status"] == "resolved"
 
 
+def test_materialize_repo_initializes_pinned_submodules(monkeypatch, tmp_path: Path) -> None:
+    local = tmp_path / "artifacts" / "fuzzbench-target-sources" / "target" / "project"
+    (local / ".git").mkdir(parents=True)
+    (local / ".gitmodules").write_text("[submodule \"dep\"]\n", encoding="utf-8")
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, check=False):
+        del cwd, check
+        calls.append(cmd)
+        if "fetch" in cmd or "checkout" in cmd or "submodule" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "pinned-commit\n", "")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hgb_targets, "run", fake_run)
+    result = hgb_targets.materialize_repo(
+        {
+            "kind": "git",
+            "url": "https://example.invalid/project.git",
+            "dest": "project",
+            "revision": "pinned-commit",
+        },
+        "target",
+        "",
+        tmp_path,
+    )
+
+    assert result["submodule_status"] == "initialized_recursive"
+    assert any("submodule" in command for command in calls)
+
+
 def test_source_parser_expands_docker_variables_and_attributes_each_repo_revision(tmp_path: Path) -> None:
     dockerfile = tmp_path / "Dockerfile"
     dockerfile.write_text(
@@ -841,28 +887,37 @@ def test_libxslt_archive_urls_expand_declared_env_values() -> None:
     assert "https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.gz" in urls
 
 
-def test_materialize_repo_rejects_unresolved_or_failed_revisions(monkeypatch, tmp_path: Path) -> None:
-    unresolved = hgb_targets.materialize_repo(
-        {"kind": "git", "url": "https://example.invalid/dependency.git", "dest": "dependency"},
-        "target",
-        "",
-        tmp_path,
-    )
-    assert unresolved["materialize_status"] == "revision_unresolved"
-    assert unresolved["revision_status"] == "unresolved"
-
+def test_materialize_repo_captures_unpinned_or_rejects_failed_revisions(monkeypatch, tmp_path: Path) -> None:
     def fake_run(cmd, cwd=None, check=False):
         del cwd, check
         if cmd[:2] == ["git", "clone"]:
             (Path(cmd[-1]) / ".git").mkdir(parents=True)
             return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "fetch" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
         if "checkout" in cmd:
+            if cmd[-1] == "head-after-failure":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
             return subprocess.CompletedProcess(cmd, 1, "", "revision is unavailable")
         if "rev-parse" in cmd:
             return subprocess.CompletedProcess(cmd, 0, "head-after-failure\n", "")
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(hgb_targets, "run", fake_run)
+    captured = hgb_targets.materialize_repo(
+        {"kind": "git", "url": "https://example.invalid/dependency.git", "dest": "dependency"},
+        "target",
+        "",
+        tmp_path,
+    )
+    assert captured["checkout_status"] == "captured_unpinned_commit"
+    assert captured["revision_status"] == "captured_unpinned"
+    assert captured["captured_revision"] == "head-after-failure"
+    # Keep the recipe's missing (or otherwise unresolved) revision visible;
+    # the captured SHA is a package-time observation, not a benchmark pin.
+    assert captured["requested_revision"] == ""
+    assert captured["source_reproducibility"] == "captured_at_package_time"
+
     failed = hgb_targets.materialize_repo(
         {
             "kind": "git",
@@ -918,6 +973,25 @@ def test_source_status_requires_copied_resolved_revisions() -> None:
     assert hgb_targets.source_status_for_records(
         [{"copy_status": "copied_to_source_input", "revision_status": "unresolved"}]
     ) == "partial"
+    assert hgb_targets.source_status_for_records(
+        [{"copy_status": "copied_to_source_input", "revision_status": "captured_unpinned"}]
+    ) == "materialized"
+
+
+def test_ckgfuzzer_stage_ignores_package_only_dockerignore(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    source = target / "source_input" / "project"
+    benchmark = target / "fuzzbench_benchmark"
+    source.mkdir(parents=True)
+    benchmark.mkdir(parents=True)
+    (source / "api.c").write_text("int api(void);\n", encoding="utf-8")
+    (benchmark / "build.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+    (benchmark / ".dockerignore").write_text("/build.sh\n", encoding="utf-8")
+
+    ckg_stage.stage_project(target, tmp_path / "project", tmp_path / "analysis", "project")
+
+    assert (tmp_path / "project" / "build.sh").is_file()
+    assert not (tmp_path / "project" / ".dockerignore").exists()
 
 
 def test_package_target_applies_benchmark_commit_only_to_primary_repo(monkeypatch, tmp_path: Path) -> None:

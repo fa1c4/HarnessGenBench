@@ -38,6 +38,7 @@ TRANSIENT_DIR_NAMES = {
     "pip-cache",
     "promefuzz_build",
     "promefuzz_out",
+    "promefuzz_native_build",
 }
 
 REMEDIATIONS = (
@@ -89,6 +90,7 @@ REMEDIATIONS = (
     ("missing_codeql", "Mount or install CodeQL: set HGB_CODEQL_DIR=/path/to/codeql or build CKGFuzzer with HGB_INSTALL_CODEQL=1; use CKGFUZZER_SKIP_CODEQL=1 only as a fallback."),
     ("missing_processor_binaries", "Rebuild the PromeFuzz image so setup.sh builds preprocessor and cgprocessor during docker build."),
     ("needs_compile_commands", "Improve target package build replay or enable Bear/CMake compile_commands generation for PromeFuzz."),
+    ('PromeFuzz generation completed without producing a sanitized target harness', 'PromeFuzz exhausted generation without a final native-build-validated harness; inspect generate.log and native_build.log, then improve target build compatibility or API selection.'),
     ("needs_ofg_benchmark_yaml", "Generate or provide an OSS-Fuzz-Gen function-level benchmark YAML for this target."),
     ("no_api_candidates", "Improve source packaging/API extraction for this target before running function-level harness generators."),
     ("source_input_missing", "Fix Dockerfile source parsing or add metadata/fuzzbench_source_overrides.json for this target."),

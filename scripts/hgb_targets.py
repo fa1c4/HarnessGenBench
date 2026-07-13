@@ -62,7 +62,10 @@ GIT_CLONE_OPTIONS_WITH_ARG = {
     "-j",
 }
 GIT_CLONE_REVISION_OPTIONS = {"-b", "--branch"}
-REPRODUCIBLE_REVISION_STATUSES = {"resolved", "resolved_url"}
+# ``captured_unpinned`` is a concrete commit observed while packaging an
+# upstream recipe that omitted a revision. It is reproducible for this HGB
+# run, while manifest metadata still exposes that it was not benchmark-pinned.
+REPRODUCIBLE_REVISION_STATUSES = {"resolved", "resolved_url", "captured_unpinned"}
 PROJECT_REPO_ALIASES = {
     # FuzzBench project names are normally the repository basename.  These
     # historical projects are the exceptions in the bundled target set.
@@ -674,6 +677,22 @@ def copy_tree(src: Path, dst: Path) -> None:
             remove_path(backup)
 
 
+def materialize_submodules(local: Path, result: dict[str, Any]) -> bool:
+    """Populate pinned git submodules required by a checked-out project."""
+
+    if not (local / ".gitmodules").is_file():
+        result["submodule_status"] = "not_present"
+        return True
+    proc = run(["git", "-C", str(local), "submodule", "update", "--init", "--recursive"])
+    if proc.returncode == 0:
+        result["submodule_status"] = "initialized_recursive"
+        return True
+    result["submodule_status"] = "update_failed"
+    result["submodule_error"] = (proc.stderr or proc.stdout).strip()[-1000:]
+    result["materialize_status"] = "submodule_update_failed"
+    return False
+
+
 def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path) -> dict[str, Any]:
     artifacts_root = root / "artifacts" / "fuzzbench-target-sources" / target
     artifacts_root.mkdir(parents=True, exist_ok=True)
@@ -682,13 +701,11 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
     result.setdefault("kind", "git")
     result["artifact_path"] = str(local)
     revision = str(repo.get("revision") or commit or "").strip()
+    capture_unpinned = not revision_is_resolved(revision)
     result["requested_revision"] = revision
     result.setdefault("revision_source", "legacy_commit_argument" if commit else "unresolved")
-    if not revision_is_resolved(revision):
-        result["checkout_status"] = "revision_unresolved"
-        result["revision_status"] = "unresolved"
-        result["materialize_status"] = "revision_unresolved"
-        return result
+    if capture_unpinned:
+        result["revision_source"] = "captured_unpinned_head"
     if local.exists() and not (local / ".git").exists():
         result["clone_status"] = "path_exists_not_git"
         result["materialize_status"] = "path_exists_not_git"
@@ -714,10 +731,36 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
             result["error"] = (proc.stderr or proc.stdout).strip()[-1000:]
             result["revision_status"] = "unavailable"
             return result
+    if capture_unpinned:
+        captured = git_head(local)
+        if captured == "unknown":
+            result["checkout_status"] = "capture_failed"
+            result["revision_status"] = "unavailable"
+            result["materialize_status"] = "capture_failed"
+            return result
+        proc = run(["git", "-C", str(local), "checkout", "--detach", captured])
+        if proc.returncode == 0:
+            result["revision"] = captured
+            result["captured_revision"] = captured
+            result["checkout_status"] = "captured_unpinned_commit"
+            result["revision_status"] = "captured_unpinned"
+            result["source_reproducibility"] = "captured_at_package_time"
+            if not materialize_submodules(local, result):
+                result["revision_status"] = "unavailable"
+        else:
+            result["checkout_status"] = "capture_checkout_failed"
+            result["checkout_error"] = (proc.stderr or proc.stdout).strip()[-1000:]
+            result["revision_status"] = "unavailable"
+            result["materialize_status"] = "capture_checkout_failed"
+        result["checked_out_commit"] = git_head(local)
+        return result
+
     proc = run(["git", "-C", str(local), "checkout", "--detach", revision])
     if proc.returncode == 0:
         result["checkout_status"] = "checked_out_revision"
         result["revision_status"] = "resolved"
+        if not materialize_submodules(local, result):
+            result["revision_status"] = "unavailable"
     else:
         result["checkout_status"] = "checkout_failed"
         result["checkout_error"] = (proc.stderr or proc.stdout).strip()[-1000:]
@@ -1318,6 +1361,15 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     compile_commands_count = count_named_files(output / "source_input", "compile_commands.json")
     source_fallback_statuses = sorted({str(r.get("materialize_status", "")) for r in materialized if r.get("cache_fallback")})
     source_revision_statuses = sorted({str(r.get("revision_status", "")) for r in materialized})
+    captured_unpinned_sources = [
+        {
+            "dest": str(record.get("dest", "")),
+            "url": str(record.get("url", "")),
+            "commit": str(record.get("captured_revision") or record.get("revision") or ""),
+        }
+        for record in materialized
+        if record.get("revision_status") == "captured_unpinned"
+    ]
     source_status = source_status_for_records(materialized)
     manifest = {
         "schema_version": 1,
@@ -1333,6 +1385,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
         "source_status": source_status,
         "source_fallback_statuses": source_fallback_statuses,
         "source_revision_statuses": source_revision_statuses,
+        "captured_unpinned_sources": captured_unpinned_sources,
         "source_repos": materialized,
         "source_artifact_paths": sorted({str(r.get("artifact_path", "")) for r in materialized if r.get("artifact_path")}),
         "source_file_count": source_file_count,

@@ -23,6 +23,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
+from ckgfuzzer_target_harness import TargetHarnessError, select_native_harness
 from ckgfuzzer_verifier_context import VerificationContextError, prepare_verification_context
 
 
@@ -69,13 +70,6 @@ def _candidate_files(candidates_dir: Path) -> list[Path]:
         for path in sorted(candidates_dir.iterdir())
         if path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES
     ]
-
-
-def _source_name(fuzz_target: str, candidate: Path) -> str:
-    target = Path(fuzz_target).name
-    if Path(target).suffix.lower() in SOURCE_SUFFIXES:
-        target = Path(target).stem
-    return target + candidate.suffix.lower()
 
 
 def _write_log(path: Path, result: CommandResult) -> None:
@@ -173,6 +167,14 @@ def verify_candidates(
         return payload
     payload["verification_context"] = verification_context
 
+    try:
+        native_harness = select_native_harness(target_root, fuzz_target)
+    except TargetHarnessError as exc:
+        payload["infrastructure_error"] = f"native_harness_unresolved: {exc}"
+        _write_summary(work_dir, payload)
+        return payload
+    payload["native_harness"] = asdict(native_harness)
+
     image_tag = _safe_tag(target_root, fuzz_target)
     build_command = [
         "docker",
@@ -203,7 +205,10 @@ def verify_candidates(
     for index, candidate in enumerate(candidates, start=1):
         stage_dir = work_dir / "staged" / f"{index:03d}_{candidate.stem}"
         stage_dir.mkdir(parents=True, exist_ok=True)
-        staged_candidate = stage_dir / _source_name(fuzz_target, candidate)
+        # The generated filename is not necessarily the native build input.
+        # Preserve the manifest-selected basename and overlay it at the exact
+        # native destination below.
+        staged_candidate = stage_dir / Path(native_harness.container_destination).name
         # A portable pragma proves that the native build reached this staged
         # candidate. Without it, a dependency failure can otherwise look like
         # a candidate compilation failure even when no candidate was tested.
@@ -226,18 +231,10 @@ def verify_candidates(
             'test -x "$SRC/build.sh" || { echo "missing $SRC/build.sh" >&2; exit 125; }; '
             'candidate="/tmp/${HGB_CANDIDATE_FILE}"; '
             'test -f "$candidate" || { echo "missing staged candidate $candidate" >&2; exit 126; }; '
-            'mapfile -t native_sources < <(find "$SRC" -mindepth 2 -type f -name "${HGB_CANDIDATE_FILE}" -print | sort); '
-            'if [ "${#native_sources[@]}" -eq 1 ]; then cp "$candidate" "${native_sources[0]}"; '
-            'elif [ "${#native_sources[@]}" -eq 0 ]; then '
-            'mapfile -t declared_sources < <(grep -Eo "[^[:space:]\\\"'"'"']*${HGB_CANDIDATE_FILE}" "$SRC/build.sh" | sort -u); '
-            'if [ "${#declared_sources[@]}" -eq 1 ]; then '
-            'native_source="${declared_sources[0]}"; '
-            'native_source="${native_source/\\$\\{SRC\\}/$SRC}"; '
-            'native_source="${native_source/\\$SRC/$SRC}"; '
-            'mkdir -p "$(dirname "$native_source")" && cp "$candidate" "$native_source"; '
-            'elif [ "${#declared_sources[@]}" -eq 0 ] && grep -Fq "${HGB_CANDIDATE_FILE}" "$SRC/build.sh"; then cp "$candidate" "$SRC/${HGB_CANDIDATE_FILE}"; '
-            'else echo "could not identify a unique native candidate path" >&2; exit 126; fi; '
-            'else echo "could not stage candidate into the native FuzzBench build" >&2; exit 126; fi; '
+            'native_source="${HGB_CANDIDATE_DEST}"; '
+            'case "$native_source" in "$SRC"/*) ;; *) echo "unsafe native candidate destination: $native_source" >&2; exit 126;; esac; '
+            'test -f "$native_source" || { echo "selected native candidate destination is absent: $native_source" >&2; exit 126; }; '
+            'cp "$candidate" "$native_source"; '
             'set +e; bash "$SRC/build.sh"; build_status=$?; set -e; '
             'if find "$OUT" -type f -perm -111 -print -quit | grep -q .; then exit 0; fi; '
             'if [ -f "$WORK/build.ninja" ] && command -v ninja >/dev/null 2>&1; then '
@@ -266,9 +263,13 @@ def verify_candidates(
             "-e",
             "LIB_FUZZING_ENGINE=-fsanitize=fuzzer",
             "-e",
+            "FUZZER_LIB=-fsanitize=fuzzer",
+            "-e",
             f"HGB_CANDIDATE_FILE={staged_candidate.name}",
             "-e",
             f"HGB_FUZZ_TARGET={Path(fuzz_target).stem}",
+            "-e",
+            f"HGB_CANDIDATE_DEST={native_harness.container_destination}",
             image_tag,
             "bash",
             "-lc",
