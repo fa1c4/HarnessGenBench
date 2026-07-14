@@ -14,6 +14,31 @@ source configs/set_api_key.sh
 
 Do not commit `configs/set_api_key.sh` or any generated workspace output.
 
+### OpenAI-compatible provider profiles
+
+All remote-LLM harness generators use the same profile resolver. Set
+`HGB_LLM_PROVIDER` to `ustc`, `deepseek`, `custom`, or `auto`; the first two
+supply the appropriate base URL and default model. `HGB_LLM_API_KEY`,
+`HGB_LLM_BASE_URL`, and `HGB_LLM_MODEL` override a profile. Existing
+`API_KEY`, `BASE_URL`, and `MODEL` settings remain supported.
+
+```bash
+# USTC defaults to https://api.llm.ustc.edu.cn and glm-5.2
+export HGB_LLM_PROVIDER=ustc
+export API_KEY='...'
+
+# DeepSeek defaults to https://api.deepseek.com and deepseek-v4-pro
+export HGB_LLM_PROVIDER=deepseek
+export API_KEY='...'
+# export HGB_LLM_MODEL=deepseek-v4-flash
+```
+
+Inspect the resolved configuration without a network request with
+`bash scripts/hgb_llm_preflight.sh`; append `--live` to send one minimal
+OpenAI-compatible chat request. The command never prints the credential.
+ELFuzz remains a local TGI/Hugging Face input-generation workflow; it receives
+profile metadata but does not use the remote chat API.
+
 ## Artifact Refresh
 
 Upstream source checkouts live under ignored `artifacts/`. Refreshing artifacts fetches current upstream HEAD, overwrites `metadata/work_index.yaml`, and checks out the pinned commit recorded there:

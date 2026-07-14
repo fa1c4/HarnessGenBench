@@ -66,6 +66,12 @@ GIT_CLONE_REVISION_OPTIONS = {"-b", "--branch"}
 # upstream recipe that omitted a revision. It is reproducible for this HGB
 # run, while manifest metadata still exposes that it was not benchmark-pinned.
 REPRODUCIBLE_REVISION_STATUSES = {"resolved", "resolved_url", "captured_unpinned"}
+# The historical Savannah mirror was retired. The GitHub mirror retains the
+# submodule history required by text-rendering-tests.
+LEGACY_SUBMODULE_URL_REWRITES = {
+    "git://git.sv.nongnu.org/freetype/freetype2.git": "https://github.com/freetype/freetype.git",
+    "https://git.sv.nongnu.org/freetype/freetype2.git": "https://github.com/freetype/freetype.git",
+}
 PROJECT_REPO_ALIASES = {
     # FuzzBench project names are normally the repository basename.  These
     # historical projects are the exceptions in the bundled target set.
@@ -432,16 +438,22 @@ def archive_url(value: str) -> bool:
     )
 
 
+def archive_extract_dir_name(url: str) -> str:
+    """Return the conventional top-level directory for an archive URL."""
+
+    name = url.split("?", 1)[0].rstrip("/").split("/")[-1]
+    for suffix in (".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tar", ".tgz", ".zip"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return name or "source"
+
+
 def parse_archive_sources(tokens: list[str], used: set[str]) -> list[dict[str, str]]:
     repos: list[dict[str, str]] = []
-    current_dir = ""
     i = 0
     while i < len(tokens):
         token = tokens[i]
-        if token == "cd" and i + 1 < len(tokens):
-            current_dir = tokens[i + 1]
-            i += 2
-            continue
         if token in {"curl", "wget"}:
             url = ""
             j = i + 1
@@ -451,8 +463,11 @@ def parse_archive_sources(tokens: list[str], used: set[str]) -> list[dict[str, s
                     url = candidate
                 j += 1
             if url:
-                dest_hint = docker_path_basename(current_dir) if current_dir else None
-                dest = normalize_repo_name(url, dest_hint, used)
+                # Docker's default ``tar xf`` creates a directory named from
+                # the archive, not from an earlier ``cd`` in a parenthesized
+                # build group. Keeping that stale directory was the cause of
+                # the shifted m4/autoconf/automake snapshots for libxslt.
+                dest = normalize_repo_name(url, archive_extract_dir_name(url), used)
                 repos.append({"kind": "archive", "url": url, "dest": dest, "source": "Dockerfile"})
             i = max(j, i + 1)
             continue
@@ -587,7 +602,11 @@ def load_source_overrides(root: Path, target: str) -> list[dict[str, str]]:
         url = str(entry["url"]).rstrip(".,")
         kind = str(entry.get("kind") or ("archive" if archive_url(url) else "git"))
         dest = normalize_repo_name(url, str(entry.get("dest") or "") or None, used)
-        normalized.append({"kind": kind, "url": url, "dest": dest, "source": "metadata/fuzzbench_source_overrides.json"})
+        record = {"kind": kind, "url": url, "dest": dest, "source": "metadata/fuzzbench_source_overrides.json"}
+        for key in ("revision", "revision_source", "docker_dest", "clone_branch"):
+            if entry.get(key):
+                record[key] = str(entry[key])
+        normalized.append(record)
     return normalized
 
 
@@ -624,7 +643,13 @@ def parse_clone_repos(dockerfile: Path, root: Path | None = None, target: str | 
         sources.extend(parse_archive_sources(tokens, used))
         apply_git_checkout_revisions(tokens, sources, workdir)
     if root is not None and target is not None:
-        sources.extend(load_source_overrides(root, target))
+        overrides = load_source_overrides(root, target)
+        # An override is authoritative for an archive whose Docker command
+        # extracts into a non-standard directory (SQLite). Do not retain the
+        # inferred duplicate under a different destination.
+        override_urls = {(entry["kind"], entry["url"]) for entry in overrides}
+        sources = [entry for entry in sources if (entry.get("kind"), entry.get("url")) not in override_urls]
+        sources.extend(overrides)
     return dedupe_sources(sources)
 
 
@@ -677,12 +702,60 @@ def copy_tree(src: Path, dst: Path) -> None:
             remove_path(backup)
 
 
+def normalize_legacy_submodule_urls(local: Path, result: dict[str, Any]) -> bool:
+    """Rewrite insecure/unavailable git:// submodules to HTTPS in the cache.
+
+    The rewrite is local to the disposable artifact checkout. Provenance keeps
+    both URLs so package consumers can see that the transport, not the commit,
+    was normalized.
+    """
+
+    gitmodules = local / ".gitmodules"
+    try:
+        original = gitmodules.read_text(encoding="utf-8")
+    except OSError as exc:
+        result["submodule_url_rewrite_error"] = str(exc)
+        return False
+
+    rewrites: list[dict[str, str]] = []
+
+    def replace(match: re.Match[str]) -> str:
+        prefix, url = match.group(1), match.group(2)
+        replacement = LEGACY_SUBMODULE_URL_REWRITES.get(url)
+        if not replacement:
+            replacement = "https://" + url[len("git://") :] if url.startswith("git://") else url
+        if replacement != url:
+            rewrites.append({"original": url, "replacement": replacement})
+        return prefix + replacement
+
+    rewritten = re.sub(r"(?m)^(\s*url\s*=\s*)([^\s#]+)", replace, original)
+    if not rewrites:
+        return True
+    try:
+        gitmodules.write_text(rewritten, encoding="utf-8")
+    except OSError as exc:
+        result["submodule_url_rewrite_error"] = str(exc)
+        return False
+    result["submodule_url_rewrites"] = rewrites
+    sync = run(["git", "-C", str(local), "submodule", "sync", "--recursive"])
+    if sync.returncode == 0:
+        result["submodule_url_sync_status"] = "synchronized"
+        return True
+    result["submodule_url_sync_status"] = "sync_failed"
+    result["submodule_url_sync_error"] = (sync.stderr or sync.stdout).strip()[-1000:]
+    return False
+
+
 def materialize_submodules(local: Path, result: dict[str, Any]) -> bool:
     """Populate pinned git submodules required by a checked-out project."""
 
     if not (local / ".gitmodules").is_file():
         result["submodule_status"] = "not_present"
         return True
+    if not normalize_legacy_submodule_urls(local, result):
+        result["submodule_status"] = "url_normalization_failed"
+        result["materialize_status"] = "submodule_update_failed"
+        return False
     proc = run(["git", "-C", str(local), "submodule", "update", "--init", "--recursive"])
     if proc.returncode == 0:
         result["submodule_status"] = "initialized_recursive"
@@ -724,7 +797,13 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
                 result["revision_status"] = "unavailable"
                 return result
     else:
-        proc = run(["git", "clone", repo["url"], str(local)])
+        clone_command = ["git", "clone"]
+        clone_branch = str(repo.get("clone_branch") or "").strip()
+        if clone_branch:
+            clone_command.extend(["--branch", clone_branch])
+            result["clone_branch"] = clone_branch
+        clone_command.extend([repo["url"], str(local)])
+        proc = run(clone_command)
         result["clone_status"] = "cloned" if proc.returncode == 0 else "clone_failed"
         result["materialize_status"] = result["clone_status"]
         if proc.returncode != 0:
@@ -823,6 +902,64 @@ def materialize_source(repo: dict[str, str], target: str, commit: str, root: Pat
     if repo.get("kind") == "archive":
         return materialize_archive(repo, target, root)
     return materialize_repo(repo, target, commit, root)
+
+
+def _dynamic_branch_variable(repo: dict[str, str]) -> str:
+    destination = str(repo.get("docker_dest") or "")
+    match = re.search(r"\$(?:\{)?([A-Za-z_][A-Za-z0-9_]*)", destination)
+    return match.group(1) if match else ""
+
+
+def expand_dynamic_branch_sources(
+    repos: list[dict[str, str]], materialized: list[dict[str, Any]]
+) -> list[dict[str, str]]:
+    """Expand Docker clone destinations such as ``project.$branch``.
+
+    Some FuzzBench recipes keep a branch list in a separately cloned source
+    repository. Capturing each branch head lets sealed verification remove the
+    live shell loop while preserving the source layout native ``build.sh``
+    expects (libjpeg-turbo).
+    """
+
+    dynamic = [repo for repo in repos if _dynamic_branch_variable(repo)]
+    if not dynamic:
+        return []
+    values: list[str] = []
+    for record in materialized:
+        artifact = Path(str(record.get("artifact_path") or ""))
+        if not artifact.is_dir():
+            continue
+        for branch_file in sorted(artifact.rglob("branches.txt")):
+            try:
+                lines = branch_file.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for raw in lines:
+                branch = raw.split("#", 1)[0].strip()
+                if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", branch) and branch not in values:
+                    values.append(branch)
+    if not values:
+        return []
+
+    used = {str(repo.get("dest", "")) for repo in repos if not _dynamic_branch_variable(repo)}
+    expanded: list[dict[str, str]] = []
+    for repo in dynamic:
+        variable = _dynamic_branch_variable(repo)
+        raw_destination = str(repo.get("docker_dest") or repo.get("dest") or "")
+        for branch in values:
+            docker_destination = raw_destination.replace(f"${{{variable}}}", branch).replace(f"${variable}", branch)
+            entry = dict(repo)
+            entry["dest"] = normalize_repo_name(str(repo["url"]), docker_destination, used)
+            entry["docker_dest"] = docker_destination
+            entry["clone_branch"] = branch
+            entry["dynamic_branch"] = branch
+            entry["source"] = "Dockerfile_dynamic_branch"
+            if branch != "main":
+                entry.pop("revision", None)
+                entry["revision_source"] = "captured_dynamic_branch_head"
+                entry["is_primary_project"] = False
+            expanded.append(entry)
+    return expanded
 
 
 def likely_reference_harness(path: Path, root: Path) -> bool:
@@ -1322,7 +1459,8 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     attribute_source_revisions(repos, resolved.get("project", ""), resolved.get("commit", ""))
     materialized: list[dict[str, Any]] = []
     source_root = output / ("source_full" if layout == "full" else "source_input")
-    for repo in repos:
+
+    def materialize_and_copy(repo: dict[str, str]) -> None:
         record = materialize_source(repo, target, "", root)
         materialized.append(record)
         local = Path(record.get("artifact_path", ""))
@@ -1339,6 +1477,20 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
             except OSError as exc:
                 record["copy_status"] = "copy_failed"
                 record["copy_error"] = str(exc)
+
+    static_repos = [repo for repo in repos if not _dynamic_branch_variable(repo)]
+    dynamic_repos = [repo for repo in repos if _dynamic_branch_variable(repo)]
+    for repo in static_repos:
+        materialize_and_copy(repo)
+    expanded_dynamic_repos = expand_dynamic_branch_sources(dynamic_repos, materialized)
+    if dynamic_repos and not expanded_dynamic_repos:
+        # Keep a provenance record rather than silently dropping a source when
+        # the branch-list repository could not be materialized.
+        for repo in dynamic_repos:
+            materialize_and_copy(repo)
+    else:
+        for repo in expanded_dynamic_repos:
+            materialize_and_copy(repo)
     (output / "source_repos.json").write_text(json.dumps(materialized, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if layout == "full" and any((output / "source_full").rglob("*")):
         copy_tree(output / "source_full", output / "source_input")

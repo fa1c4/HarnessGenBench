@@ -227,7 +227,7 @@ def verify_candidates(
             'export CFLAGS="${CFLAGS:-} -pthread" CXXFLAGS="${CXXFLAGS:-} -pthread"; '
             'if ! find /usr/local/lib/clang -type f -name "libFuzzingEngine.a" -print -quit | grep -q .; then '
             'fuzzer_runtime="$(find /usr/local/lib/clang -type f -name "libclang_rt.fuzzer-${ARCHITECTURE}.a" -print -quit)"; '
-            '[ -n "$fuzzer_runtime" ] && ln -sf "$fuzzer_runtime" "$WORK/libFuzzingEngine.a" && export LIBRARY_PATH="$WORK${LIBRARY_PATH:+:$LIBRARY_PATH}"; fi; '
+            '[ -n "$fuzzer_runtime" ] && ln -sf "$fuzzer_runtime" "$WORK/libFuzzingEngine.a" && ln -sf "$fuzzer_runtime" /usr/lib/libFuzzingEngine.a && export LIBRARY_PATH="$WORK${LIBRARY_PATH:+:$LIBRARY_PATH}"; fi; '
             'test -x "$SRC/build.sh" || { echo "missing $SRC/build.sh" >&2; exit 125; }; '
             'candidate="/tmp/${HGB_CANDIDATE_FILE}"; '
             'test -f "$candidate" || { echo "missing staged candidate $candidate" >&2; exit 126; }; '
@@ -252,6 +252,8 @@ def verify_candidates(
             container_name,
             "-e",
             "FUZZING_ENGINE=libfuzzer",
+            "-e",
+            "FUZZER=libfuzzer",
             "-e",
             "SANITIZER=address",
             "-e",

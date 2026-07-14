@@ -49,7 +49,8 @@ def test_sealed_context_uses_snapshot_and_removes_git_clone(tmp_path: Path) -> N
     assert result["mode"] == "sealed_source_snapshot"
     assert result["removed_acquisition_commands"] == 1
     assert "COPY source_input/ /src/" in dockerfile
-    assert "COPY hgb_reference_harnesses/source_input/ /src/" in dockerfile
+    assert "COPY hgb_reference_harnesses/ /src/" in dockerfile
+    assert "apt-get install -y meson ninja-build python3-jinja2 python3-jsonschema" in dockerfile
     assert "git clone" not in dockerfile
     assert "cd project && ./configure" in dockerfile
 
@@ -62,8 +63,103 @@ def test_sealed_context_restores_selected_source_harness_only_for_verification(t
 
     result = context.prepare_verification_context(target, tmp_path / "work")
 
-    restored = Path(result["context_dir"]) / "hgb_reference_harnesses" / "source_input" / "project" / "native_fuzzer.c"
+    restored = Path(result["context_dir"]) / "hgb_reference_harnesses" / "project" / "native_fuzzer.c"
     assert restored.is_file()
+
+
+def test_sealed_context_restores_all_stripped_reference_sources(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    references = target / "reference_harnesses" / "project" / "fuzz"
+    references.mkdir(parents=True)
+    (references / "support_fuzzer.c").write_text("int support(void);\n", encoding="utf-8")
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+
+    restored = Path(result["context_dir"]) / "hgb_reference_harnesses" / "project" / "fuzz" / "support_fuzzer.c"
+    assert restored.is_file()
+
+
+def test_rewrite_preserves_quoted_sed_after_continuation_comment(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM scratch\n"
+        "RUN git clone https://example.invalid/systemd.git && \\\n"
+        "    # retain the command after this comment\n"
+        "    sed -i '119d;126d' $SRC/build.sh\n",
+        encoding="utf-8",
+    )
+
+    rewritten, removed = context._rewrite_dockerfile(dockerfile)
+
+    assert removed == 1
+    assert "git clone" not in rewritten
+    assert "sed -i '119d;126d' $SRC/build.sh" in rewritten
+
+
+def test_rewrite_uses_snapshot_for_archive_and_preexisting_directory(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM scratch\n"
+        "RUN mkdir $SRC/sqlite3 && cd $SRC/sqlite3 && \\\n"
+        "    curl 'https://sqlite.org/sqlite.tar.gz' -o sqlite3.tar.gz && \\\n"
+        "    tar xzf sqlite3.tar.gz --strip-components 1\n",
+        encoding="utf-8",
+    )
+
+    rewritten, removed = context._rewrite_dockerfile(dockerfile)
+
+    assert removed == 2
+    assert "mkdir -p $SRC/sqlite3" in rewritten
+    assert "curl " not in rewritten
+    assert "tar xzf" not in rewritten
+
+
+def test_rewrite_removes_source_only_branch_clone_loop(tmp_path: Path) -> None:
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM scratch\n"
+        "RUN git clone https://example.invalid/fuzz && cat fuzz/branches.txt | while read branch; do \\\n"
+        "  git clone https://example.invalid/project -b $branch project.$branch; \\\n"
+        "done\n",
+        encoding="utf-8",
+    )
+
+    rewritten, removed = context._rewrite_dockerfile(dockerfile)
+
+    assert removed == 2
+    assert "RUN true" in rewritten
+    assert "git clone" not in rewritten
+
+
+def test_sealed_context_replaces_legacy_harfbuzz_pip_bootstrap(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    (target / "fuzzbench_benchmark" / "build.sh").write_text(
+        "#!/bin/sh\npython3.8 -m pip install ninja meson==0.56.0\n",
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+    build = Path(result["context_dir"]) / "build.sh"
+
+    assert result["build_tool_fallbacks"] == 1
+    assert "python3.8 -m pip install" not in build.read_text(encoding="utf-8")
+    assert "command -v meson" in build.read_text(encoding="utf-8")
+
+
+def test_sealed_context_replaces_legacy_mbedtls_pip_bootstrap(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    (target / "fuzzbench_benchmark" / "build.sh").write_text(
+        "#!/bin/sh\npip3 install -r $SRC/mbedtls/scripts/basic.requirements.txt\n",
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+    build = Path(result["context_dir"]) / "build.sh"
+
+    assert result["build_tool_fallbacks"] == 1
+    assert "pip3 install" not in build.read_text(encoding="utf-8")
+    assert "/usr/lib/python3/dist-packages" in build.read_text(encoding="utf-8")
+    assert "import jsonschema" in build.read_text(encoding="utf-8")
 
 
 def test_sealed_context_accepts_explicit_captured_unpinned_commit(tmp_path: Path) -> None:

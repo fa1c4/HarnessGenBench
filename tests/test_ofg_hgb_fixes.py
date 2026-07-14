@@ -533,7 +533,9 @@ def test_ckgfuzzer_candidate_verifier_stages_and_records_candidate_builds(tmp_pa
     assert "selected native candidate destination is absent" in create_command[-1]
     assert any("HGB_CANDIDATE_DEST=/src/project/native_fuzzer.cc" == part for part in create_command)
     assert any("FUZZER_LIB=-fsanitize=fuzzer" == part for part in create_command)
+    assert any("FUZZER=libfuzzer" == part for part in create_command)
     assert "libFuzzingEngine.a" in create_command[-1]
+    assert "/usr/lib/libFuzzingEngine.a" in create_command[-1]
     assert "LIBRARY_PATH" in create_command[-1]
     assert "CXXFLAGS" in create_command[-1]
     assert lifecycle[2][-1].endswith(":/tmp/native_fuzzer.cc")
@@ -852,6 +854,39 @@ def test_materialize_repo_initializes_pinned_submodules(monkeypatch, tmp_path: P
     assert any("submodule" in command for command in calls)
 
 
+def test_materialize_submodules_rewrites_legacy_git_transport(monkeypatch, tmp_path: Path) -> None:
+    local = tmp_path / "project"
+    local.mkdir()
+    gitmodules = local / ".gitmodules"
+    gitmodules.write_text(
+        '[submodule "freetype"]\n'
+        '  path = third_party/freetype\n'
+        '  url = git://git.sv.nongnu.org/freetype/freetype2.git\n',
+        encoding="utf-8",
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, check=False):
+        del cwd, check
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(hgb_targets, "run", fake_run)
+    result: dict = {}
+
+    assert hgb_targets.materialize_submodules(local, result) is True
+    assert "https://github.com/freetype/freetype.git" in gitmodules.read_text(encoding="utf-8")
+    assert result["submodule_url_rewrites"] == [
+        {
+            "original": "git://git.sv.nongnu.org/freetype/freetype2.git",
+            "replacement": "https://github.com/freetype/freetype.git",
+        }
+    ]
+    assert result["submodule_url_sync_status"] == "synchronized"
+    assert calls[0][-3:] == ["submodule", "sync", "--recursive"]
+    assert calls[1][-3:] == ["submodule", "update", "--init", "--recursive"][-3:]
+
+
 def test_source_parser_expands_docker_variables_and_attributes_each_repo_revision(tmp_path: Path) -> None:
     dockerfile = tmp_path / "Dockerfile"
     dockerfile.write_text(
@@ -881,10 +916,108 @@ def test_source_parser_expands_docker_variables_and_attributes_each_repo_revisio
 def test_libxslt_archive_urls_expand_declared_env_values() -> None:
     repos = hgb_targets.parse_clone_repos(Path("artifacts/fuzzbench/benchmarks/libxslt_xpath/Dockerfile"))
     urls = {repo["url"] for repo in repos if repo["kind"] == "archive"}
+    archive_destinations = {repo["url"]: repo["dest"] for repo in repos if repo["kind"] == "archive"}
 
     assert "https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.gz" in urls
     assert "https://ftp.gnu.org/gnu/autoconf/autoconf-2.71.tar.gz" in urls
     assert "https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.gz" in urls
+    assert archive_destinations["https://ftp.gnu.org/gnu/m4/m4-1.4.19.tar.gz"] == "m4-1.4.19"
+    assert archive_destinations["https://ftp.gnu.org/gnu/autoconf/autoconf-2.71.tar.gz"] == "autoconf-2.71"
+    assert archive_destinations["https://ftp.gnu.org/gnu/automake/automake-1.16.5.tar.gz"] == "automake-1.16.5"
+
+
+def test_source_override_replaces_inferred_archive_destination(tmp_path: Path) -> None:
+    metadata = tmp_path / "metadata"
+    metadata.mkdir()
+    (metadata / "fuzzbench_source_overrides.json").write_text(
+        json.dumps(
+            {
+                "sqlite": [
+                    {
+                        "kind": "archive",
+                        "url": "https://sqlite.org/src/tarball/sqlite.tar.gz?r=abc",
+                        "dest": "sqlite3",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text(
+        "FROM scratch\nRUN curl 'https://sqlite.org/src/tarball/sqlite.tar.gz?r=abc' -o sqlite3.tar.gz\n",
+        encoding="utf-8",
+    )
+
+    repos = hgb_targets.parse_clone_repos(dockerfile, tmp_path, "sqlite")
+
+    assert [(repo["url"], repo["dest"]) for repo in repos] == [
+        ("https://sqlite.org/src/tarball/sqlite.tar.gz?r=abc", "sqlite3")
+    ]
+
+
+def test_dynamic_branch_sources_expand_from_captured_branch_list(tmp_path: Path) -> None:
+    branch_source = tmp_path / "fuzz"
+    branch_source.mkdir()
+    (branch_source / "branches.txt").write_text("main\n3.1.x\n3.0.x\n", encoding="utf-8")
+    repos = [
+        {"kind": "git", "url": "https://example.invalid/fuzz", "dest": "fuzz"},
+        {
+            "kind": "git",
+            "url": "https://example.invalid/project",
+            "dest": "project._branch",
+            "docker_dest": "project.$branch",
+            "revision": "benchmark-commit",
+            "is_primary_project": True,
+        },
+    ]
+
+    expanded = hgb_targets.expand_dynamic_branch_sources(
+        repos,
+        [{"artifact_path": str(branch_source)}],
+    )
+
+    assert [(repo["dest"], repo["clone_branch"]) for repo in expanded] == [
+        ("project.main", "main"),
+        ("project.3.1.x", "3.1.x"),
+        ("project.3.0.x", "3.0.x"),
+    ]
+    assert expanded[0]["revision"] == "benchmark-commit"
+    assert "revision" not in expanded[1]
+    assert expanded[1]["revision_source"] == "captured_dynamic_branch_head"
+
+
+def test_materialize_repo_clones_requested_dynamic_branch(monkeypatch, tmp_path: Path) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, cwd=None, check=False):
+        del cwd, check
+        calls.append(cmd)
+        if cmd[:2] == ["git", "clone"]:
+            (Path(cmd[-1]) / ".git").mkdir(parents=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "checkout" in cmd or "submodule" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        if "rev-parse" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, "captured-branch-head\n", "")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(hgb_targets, "run", fake_run)
+    result = hgb_targets.materialize_repo(
+        {
+            "kind": "git",
+            "url": "https://example.invalid/project",
+            "dest": "project.3.1.x",
+            "clone_branch": "3.1.x",
+        },
+        "target",
+        "",
+        tmp_path,
+    )
+
+    assert ["--branch", "3.1.x"] == calls[0][2:4]
+    assert result["clone_branch"] == "3.1.x"
+    assert result["revision_status"] == "captured_unpinned"
 
 
 def test_materialize_repo_captures_unpinned_or_rejects_failed_revisions(monkeypatch, tmp_path: Path) -> None:

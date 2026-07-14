@@ -26,8 +26,8 @@ RUN cd /opt/hgb/artifacts/promefuzz \
   && test -x build/bin/cgprocessor
 ENV PATH="/opt/hgb/venv/bin:${PATH}"
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/hgb_llm_trace.py docker/common/hgb_compile_db.py docker/common/hgb_target_harness.py docker/common/promefuzz_target_build.sh /opt/hgb/bin/
-RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/hgb_compile_db.py /opt/hgb/bin/hgb_target_harness.py /opt/hgb/bin/promefuzz_target_build.sh
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh docker/common/hgb_compile_db.py docker/common/hgb_target_harness.py docker/common/promefuzz_target_build.sh /opt/hgb/bin/
+RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/hgb_compile_db.py /opt/hgb/bin/hgb_target_harness.py /opt/hgb/bin/promefuzz_target_build.sh
 COPY docker/promefuzz/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh
 WORKDIR /opt/hgb/artifacts/promefuzz

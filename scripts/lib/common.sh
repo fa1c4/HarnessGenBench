@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+_hgb_common_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=docker/common/llm_provider.sh
+source "$_hgb_common_dir/../../docker/common/llm_provider.sh"
+unset _hgb_common_dir
+
 repo_root() {
   git rev-parse --show-toplevel
 }
@@ -129,15 +134,7 @@ load_hgb_config() {
     fi
   fi
 
-  if [[ -n "${API_KEY:-}" ]]; then
-    export OPENAI_API_KEY="${OPENAI_API_KEY:-$API_KEY}"
-  fi
-  if [[ -n "${BASE_URL:-}" ]]; then
-    export OPENAI_BASE_URL="${OPENAI_BASE_URL:-$BASE_URL}"
-  fi
-  if [[ -n "${MODEL:-}" ]]; then
-    export OPENAI_MODEL="${OPENAI_MODEL:-$MODEL}"
-  fi
+  hgb_resolve_llm_provider
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export HGB_LLM_TRACE_ENABLED="${HGB_LLM_TRACE_ENABLED:-1}"
   export HGB_LLM_TRACE_DIR="${HGB_LLM_TRACE_DIR:-/workspace/api_traces}"
@@ -292,6 +289,11 @@ run_hgb_container() {
     -e OPENAI_API_KEY \
     -e OPENAI_BASE_URL \
     -e OPENAI_MODEL \
+    -e HGB_LLM_PROVIDER \
+    -e HGB_LLM_PROVIDER_RESOLVED \
+    -e HGB_LLM_API_KEY \
+    -e HGB_LLM_BASE_URL \
+    -e HGB_LLM_MODEL \
     -e HGB_LLM_REQUEST_TIMEOUT_SECONDS \
     -e HGB_LLM_TRACE_ENABLED \
     -e HGB_LLM_TRACE_DIR \
@@ -379,6 +381,7 @@ run_hgb_container() {
     -e PROME_FUZZ_EMBEDDING_TIMEOUT \
     -e PROME_FUZZ_EMBEDDING_RETRY_TIMES \
     -e PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
+    -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
     -e PROME_FUZZ_COMPREHEND_TASK \
     -e G2FUZZ_MAX_FORMATS \
@@ -445,6 +448,11 @@ run_hgb_target_container() {
     -e OPENAI_API_KEY \
     -e OPENAI_BASE_URL \
     -e OPENAI_MODEL \
+    -e HGB_LLM_PROVIDER \
+    -e HGB_LLM_PROVIDER_RESOLVED \
+    -e HGB_LLM_API_KEY \
+    -e HGB_LLM_BASE_URL \
+    -e HGB_LLM_MODEL \
     -e HGB_LLM_REQUEST_TIMEOUT_SECONDS \
     -e HGB_LLM_TRACE_ENABLED \
     -e HGB_LLM_TRACE_DIR \
@@ -529,6 +537,7 @@ run_hgb_target_container() {
     -e PROME_FUZZ_EMBEDDING_TIMEOUT \
     -e PROME_FUZZ_EMBEDDING_RETRY_TIMES \
     -e PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
+    -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
     -e PROME_FUZZ_COMPREHEND_TASK \
     -e HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD \

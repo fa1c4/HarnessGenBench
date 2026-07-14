@@ -4,6 +4,9 @@ set -euo pipefail
 artifact=/opt/hgb/artifacts/promefuzz
 python=/opt/hgb/venv/bin/python
 workspace=/workspace
+# shellcheck source=/opt/hgb/bin/llm_provider.sh
+source /opt/hgb/bin/llm_provider.sh
+hgb_resolve_llm_provider
 
 fix_workspace_permissions() {
   if [[ -n "${HGB_HOST_UID:-}" && -n "${HGB_HOST_GID:-}" ]] && command -v chown >/dev/null 2>&1; then
@@ -187,6 +190,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
+  export PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR="${PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR:-1}"
+  export PROME_FUZZ_PROVIDER_ERROR_FILE="$workspace/logs/provider_error.log"
   export PROME_FUZZ_SKIP_BAD_DOCS="${PROME_FUZZ_SKIP_BAD_DOCS:-1}"
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
@@ -380,6 +385,13 @@ if llm_py.exists():
                 completion = self.client.chat.completions.create(**api_params)"""
     if old in llm_text and "hgb_llm_trace.trace_call" not in llm_text:
         llm_text = llm_text.replace(old, new)
+    fail_fast_old = '        except Exception as e:\n            logger.error(f"OpenAI API exception: {e}")\n            return None'
+    fail_fast_new = '        except Exception as e:\n            error_text = str(e)\n            for _secret in (os.environ.get("OPENAI_API_KEY", ""), os.environ.get("API_KEY", "")):\n                if _secret:\n                    error_text = error_text.replace(_secret, "[REDACTED]")\n            logger.error(f"OpenAI API exception: {error_text}")\n            _nonretryable = (\n                "Error code: 400", "Error code: 401", "Error code: 402",\n                "Error code: 403", "Error code: 404", "Error code: 422",\n                "Insufficient Balance", "invalid api key", "invalid_request_error",\n                "model_not_found",\n            )\n            if (os.environ.get("PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR", "1") != "0"\n                    and any(_marker.lower() in error_text.lower() for _marker in _nonretryable)):\n                _message = "hgb_llm_nonretryable: " + error_text\n                _error_file = os.environ.get("PROME_FUZZ_PROVIDER_ERROR_FILE", "")\n                if _error_file:\n                    try:\n                        with open(_error_file, "w", encoding="utf-8") as _handle:\n                            _handle.write(_message + "\\n")\n                    except OSError:\n                        pass\n                logger.critical(_message)\n                os._exit(78)\n            return None'
+    if "PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR" not in llm_text:
+        if "import os\n" not in llm_text:
+            llm_text = llm_text.replace("import sys\n", "import os\nimport sys\n", 1)
+        if fail_fast_old in llm_text:
+            llm_text = llm_text.replace(fail_fast_old, fail_fast_new)
     llm_py.write_text(llm_text)
 rag_py = root / "src/llm/rag.py"
 utils_py = root / "src/utils.py"
@@ -631,7 +643,9 @@ PY_PROME_API_COUNT
     reason="PromeFuzz $failed_stage stage exited $code"
     stage_log="$workspace/logs/${failed_stage}.log"
     if [[ -f "$stage_log" ]]; then
-      if grep -qi 'localhost.*11434\|port=11434\|/api/embeddings.*Connection refused' "$stage_log"; then
+      if grep -qi 'hgb_llm_nonretryable\|Insufficient Balance\|Error code: 402' "$stage_log" "$workspace/logs/provider_error.log" 2>/dev/null; then
+        reason='PromeFuzz provider rejected a non-retryable request (such as exhausted credit, invalid credentials, or unavailable model); generation stopped without retrying indefinitely'
+      elif grep -qi 'localhost.*11434\|port=11434\|/api/embeddings.*Connection refused' "$stage_log"; then
         reason='PromeFuzz embedding service is unavailable at localhost:11434; start Ollama or set PROME_FUZZ_EMBEDDING_LLM_TYPE/base/model/API key'
       elif grep -q 'openai.NotFoundError: Error code: 404\|Error code: 404' "$stage_log"; then
         reason='PromeFuzz embedding API returned 404; set PROME_FUZZ_EMBEDDING_MODEL and embedding base/API key to a compatible embeddings endpoint'

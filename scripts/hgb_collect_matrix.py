@@ -83,6 +83,7 @@ REMEDIATIONS = (
     ('PromeFuzz PDF document parsing failed', 'Rebuild the PromeFuzz image with pdfminer.six or remove unsupported PDFs from /target/docs.'),
     ('promefuzz_no_usable_docs', 'Filter or replace empty/invalid target docs; PROME_FUZZ_SKIP_BAD_DOCS=1 skips bad docs but at least one usable document is needed for comprehension.'),
     ('promefuzz_no_api_candidates', 'Improve PromeFuzz API extraction/compile_commands for this target; generation is skipped when preprocess finds zero APIs.'),
+    ('PromeFuzz provider rejected a non-retryable request', 'The OpenAI-compatible provider rejected the request (for example, insufficient balance, invalid credentials, or an unavailable model). Restore provider access and rerun; HGB stops PromeFuzz instead of retrying indefinitely.'),
     ('CKGFuzzer fuzzing stage exited 124', 'Reduce CKGFUZZER_MAX_SUMMARY_APIS/CKGFUZZER_MAX_PLANNER_APIS or keep deterministic local summaries enabled.'),
     ('CKGFuzzer repo stage exited', 'Inspect CKGFuzzer repo.log; common fixes are Docker socket access, CodeQL wrapper build replay, and target package source layout.'),
     ('ckg_no_compilable_sources', 'Fix target build replay for CKGFuzzer or inspect the CodeQL wrapper fallback compile log; CodeQL needs at least one compiled C/C++ translation unit.'),

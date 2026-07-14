@@ -3,6 +3,9 @@ set -euo pipefail
 
 artifact=/opt/hgb/artifacts/ckgfuzzer
 workspace=/workspace
+# shellcheck source=/opt/hgb/bin/llm_provider.sh
+source /opt/hgb/bin/llm_provider.sh
+hgb_resolve_llm_provider
 
 fix_workspace_permissions() {
   if [[ -n "${HGB_HOST_UID:-}" && -n "${HGB_HOST_GID:-}" ]] && command -v chown >/dev/null 2>&1; then

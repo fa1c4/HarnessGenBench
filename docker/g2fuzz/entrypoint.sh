@@ -5,6 +5,9 @@ artifact=/opt/hgb/artifacts/g2fuzz
 data_artifact=/opt/hgb/artifacts/g2fuzz-data
 python=/opt/hgb/venv/bin/python
 workspace=/workspace
+# shellcheck source=/opt/hgb/bin/llm_provider.sh
+source /opt/hgb/bin/llm_provider.sh
+hgb_resolve_llm_provider
 
 fix_workspace_permissions() {
   if [[ -n "${HGB_HOST_UID:-}" && -n "${HGB_HOST_GID:-}" ]] && command -v chown >/dev/null 2>&1; then
@@ -89,7 +92,8 @@ OPENAI_KEY = key
 
 def _client():
     timeout = float(os.environ.get(\"G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS\", os.environ.get(\"HGB_LLM_REQUEST_TIMEOUT_SECONDS\", \"1200\")))
-    return OpenAI(api_key=OPENAI_KEY, timeout=timeout)
+    base_url = os.environ.get(\"OPENAI_BASE_URL\") or os.environ.get(\"BASE_URL\") or None
+    return OpenAI(api_key=OPENAI_KEY, base_url=base_url, timeout=timeout)
 
 
 def _create(model, messages, temperature):

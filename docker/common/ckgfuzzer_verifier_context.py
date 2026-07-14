@@ -19,7 +19,7 @@ from typing import Any
 
 
 _SYNTHETIC_BUILD_SCRIPT_MARKER = "FuzzBench benchmark did not include a top-level build.sh"
-_SHELL_SEPARATORS = re.compile(r"\s*(?:&&|;)\s*")
+_ARCHIVE_URL_RE = re.compile(r"https?://[^\s'\"]+(?:\.tar(?:\.[A-Za-z0-9]+)?|\.tgz|\.zip)(?:\?[^\s'\"]*)?")
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,7 @@ class VerificationContext:
     removed_acquisition_commands: int
     excluded_synthetic_build_script: bool
     captured_unpinned_source_count: int
+    build_tool_fallbacks: int
 
 
 class VerificationContextError(RuntimeError):
@@ -90,8 +91,12 @@ def _logical_dockerfile_lines(dockerfile: Path) -> list[str]:
         stripped = raw.strip()
         if not stripped:
             continue
-        if not current and stripped.startswith("#"):
-            logical.append(stripped)
+        if stripped.startswith("#"):
+            # A comment can appear in a continued RUN instruction. It must not
+            # terminate that instruction: doing so made the next `sed` line in
+            # the systemd Dockerfile look like a Dockerfile instruction.
+            if not current:
+                logical.append(stripped)
             continue
         if stripped.endswith("\\"):
             current += stripped[:-1].rstrip() + " "
@@ -113,19 +118,113 @@ def _is_source_acquisition(command: str) -> bool:
     )
 
 
+def _split_shell_commands(command: str) -> list[str]:
+    """Split top-level shell commands without breaking quoted semicolons.
+
+    Dockerfiles are shell-form instructions. ``str.split(';')`` corrupts
+    arguments such as systemd's ``sed -i '119d;126d'``; a small scanner is
+    sufficient for the command forms used by FuzzBench recipes.
+    """
+
+    pieces: list[str] = []
+    start = 0
+    quote = ""
+    escaped = False
+    parentheses = 0
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escaped:
+            escaped = False
+        elif char == "\\" and quote != "'":
+            escaped = True
+        elif quote:
+            if char == quote:
+                quote = ""
+        elif char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            parentheses += 1
+        elif char == ")" and parentheses:
+            parentheses -= 1
+        elif not parentheses and char == ";":
+            pieces.append(command[start:index].strip())
+            start = index + 1
+        elif not parentheses and command.startswith("&&", index):
+            pieces.append(command[start:index].strip())
+            start = index + 2
+            index += 1
+        index += 1
+    pieces.append(command[start:].strip())
+    return [piece for piece in pieces if piece]
+
+
+def _archive_names(command: str) -> set[str]:
+    names = {
+        Path(match.group(0).split("?", 1)[0]).name
+        for match in _ARCHIVE_URL_RE.finditer(command)
+    }
+    output = re.search(r"(?:^|\s)-o\s+([^\s]+)", command)
+    if output:
+        names.add(output.group(1).strip("'\""))
+    return {name for name in names if name}
+
+
+def _is_archive_download(command: str) -> bool:
+    return bool(re.match(r"^(?:curl|wget)\b", command.strip()) and _ARCHIVE_URL_RE.search(command))
+
+
+def _is_archive_extract(command: str) -> bool:
+    compact = command.strip()
+    return bool(re.match(r"^tar\b", compact) and ".tar" in compact)
+
+
+def _is_archive_cleanup(command: str, archive_names: set[str]) -> bool:
+    compact = command.strip()
+    if not re.match(r"^rm\b", compact):
+        return False
+    return ".tar" in compact or any(name in compact for name in archive_names)
+
+
+def _make_mkdir_idempotent(command: str) -> str:
+    """Allow source snapshots to pre-create a directory a recipe makes."""
+
+    compact = command.strip()
+    if not compact.startswith("mkdir ") or re.search(r"(?:^|\s)-p(?:\s|$)", compact):
+        return command
+    return re.sub(r"^\s*mkdir\s+", "mkdir -p ", command, count=1)
+
+
 def _rewrite_run_instruction(line: str) -> tuple[str, int]:
     if not line.upper().startswith("RUN "):
         return line, 0
     command = line[4:].strip()
-    # Keep the non-git setup portions of a compound RUN. Dockerfiles with
-    # shell OR/pipe control flow are intentionally left unchanged: silently
-    # changing that control flow would be less reproducible than rejecting the
-    # context at build time.
+    # A branch loop that only clones sources is replaced wholesale. Its branch
+    # inputs are captured into source_input by target packaging, so retaining
+    # the loop would both reintroduce a moving dependency and collide with the
+    # snapshot directory (libjpeg-turbo).
+    clone_count = len(re.findall(r"\bgit\s+(?:-[^\s]+\s+)?clone\b", command))
+    if clone_count and ("while " in command or "|" in command):
+        return "RUN true", clone_count
+    # Keep compound OR/pipe control flow unchanged unless it is the explicit
+    # source-only clone loop above. Rewriting it without a shell AST is unsafe.
     if "||" in command or "|" in command:
         return line, 0
-    pieces = _SHELL_SEPARATORS.split(command)
-    kept = [piece for piece in pieces if piece and not _is_source_acquisition(piece)]
-    removed = len(pieces) - len(kept)
+    archive_names: set[str] = set()
+    kept: list[str] = []
+    removed = 0
+    for piece in _split_shell_commands(command):
+        if _is_source_acquisition(piece):
+            removed += 1
+            continue
+        if _is_archive_download(piece):
+            archive_names.update(_archive_names(piece))
+            removed += 1
+            continue
+        if _is_archive_extract(piece) or _is_archive_cleanup(piece, archive_names):
+            removed += 1
+            continue
+        kept.append(_make_mkdir_idempotent(piece))
     if not removed:
         return line, 0
     return "RUN " + (" && ".join(kept) if kept else "true"), removed
@@ -145,7 +244,12 @@ def _rewrite_dockerfile(dockerfile: Path) -> tuple[str, int]:
                     "# HGB sealed verifier source snapshot.",
                     "ENV HGB_SEALED_VERIFIER=1",
                     "COPY source_input/ /src/",
-                    "COPY hgb_reference_harnesses/source_input/ /src/",
+                    "COPY hgb_reference_harnesses/ /src/",
+                    # HarfBuzz and Mbed TLS use historical Python 3.8/pip
+                    # bootstraps that can no longer resolve their dependencies
+                    # reliably. Supply the stable distro tools and patch only
+                    # those exact bootstraps in the copied build script below.
+                    "RUN apt-get update && apt-get install -y meson ninja-build python3-jinja2 python3-jsonschema",
                 ]
             )
             inserted_snapshot = True
@@ -158,16 +262,72 @@ def _copytree(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=False)
 
 
-def _copy_selected_source_references(target_root: Path, context: Path) -> None:
-    """Restore stripped native sources only in the verifier image context."""
+def _merge_copytree(source: Path, destination: Path) -> None:
+    shutil.copytree(source, destination, symlinks=True, dirs_exist_ok=True)
 
-    destination = context / "hgb_reference_harnesses" / "source_input"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    selected = target_root / "reference_harnesses" / "selected" / "source_input"
+
+def _copy_reference_harnesses(target_root: Path, context: Path) -> None:
+    """Restore all stripped source harnesses in the verifier-only context.
+
+    ``strip_reference_harnesses`` keeps files directly under
+    ``reference_harnesses``. The ``selected`` directory is only metadata for
+    choosing the candidate destination and is not a complete source backup.
+    Native builds such as Mbed TLS and OpenSSL compile their other fuzzers as
+    well, so they require every stripped file before the selected one is
+    overlaid with the candidate.
+    """
+
+    destination = context / "hgb_reference_harnesses"
+    destination.mkdir(parents=True, exist_ok=True)
+    references = target_root / "reference_harnesses"
+    if not references.is_dir():
+        return
+    for child in references.iterdir():
+        if child.name == "selected":
+            continue
+        target = destination / child.name
+        if child.is_dir() and not child.is_symlink():
+            _merge_copytree(child, target)
+        elif child.is_file() or child.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target, follow_symlinks=False)
+
+    # Packages created before stripping metadata existed may only have the
+    # selected copy. Merge it as a compatibility fallback without exposing the
+    # selection-directory name inside /src.
+    selected = references / "selected"
     if selected.is_dir():
-        _copytree(selected, destination)
-    else:
-        destination.mkdir()
+        for label in selected.iterdir():
+            if label.is_dir():
+                _merge_copytree(label, destination)
+
+
+def _patch_legacy_build_tool_bootstrap(context: Path) -> int:
+    """Use sealed-image dependencies when historical pip bootstraps fail."""
+
+    build_script = context / "build.sh"
+    if not build_script.is_file():
+        return 0
+    original = build_script.read_text(encoding="utf-8", errors="replace")
+    harfbuzz_legacy = "python3.8 -m pip install ninja meson==0.56.0"
+    harfbuzz_replacement = (
+        "# HGB sealed verifier: use distro Meson/Ninja; Python 3.8's bundled "
+        "pip cannot install modern Ninja.\n"
+        "command -v meson >/dev/null && command -v ninja >/dev/null"
+    )
+    mbedtls_legacy = "pip3 install -r $SRC/mbedtls/scripts/basic.requirements.txt"
+    mbedtls_replacement = (
+        "# HGB sealed verifier: generated Mbed TLS wrappers only require the "
+        "Ubuntu jsonschema package; avoid an unpinned pip/Rust bootstrap.\n"
+        "export PYTHONPATH=/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}\n"
+        "python3.8 -c 'import jsonschema'"
+    )
+    patched = original.replace(harfbuzz_legacy, harfbuzz_replacement)
+    patched = patched.replace(mbedtls_legacy, mbedtls_replacement)
+    if patched == original:
+        return 0
+    build_script.write_text(patched, encoding="utf-8")
+    return int(harfbuzz_legacy in original) + int(mbedtls_legacy in original)
 
 
 def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str, Any]:
@@ -189,7 +349,7 @@ def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str,
         shutil.rmtree(context)
     _copytree(benchmark, context)
     _copytree(target_root / "source_input", context / "source_input")
-    _copy_selected_source_references(target_root, context)
+    _copy_reference_harnesses(target_root, context)
 
     synthetic_build = context / "build.sh"
     excluded_synthetic_build = False
@@ -198,6 +358,8 @@ def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str,
     ):
         synthetic_build.unlink()
         excluded_synthetic_build = True
+
+    build_tool_fallbacks = _patch_legacy_build_tool_bootstrap(context)
 
     rewritten, removed = _rewrite_dockerfile(dockerfile)
     sealed_dockerfile = context / "Dockerfile"
@@ -209,5 +371,6 @@ def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str,
         removed_acquisition_commands=removed,
         excluded_synthetic_build_script=excluded_synthetic_build,
         captured_unpinned_source_count=captured_unpinned_source_count,
+        build_tool_fallbacks=build_tool_fallbacks,
     )
     return asdict(result)
