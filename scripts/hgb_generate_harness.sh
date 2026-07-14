@@ -125,6 +125,9 @@ if ! docker image inspect "$image" >/dev/null 2>&1; then
 elif [[ "$dry_run" != "1" && "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && test -x /opt/hgb/oss-fuzz-venv/bin/python && /opt/hgb/venv/bin/python -c "import pkg_resources; import google.cloud.logging" && /opt/hgb/oss-fuzz-venv/bin/python -c "import pkg_resources; import yaml" && grep -Fq "_chat_completion_kwargs" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "_copy_hgb_target_source" /opt/hgb/artifacts/oss-fuzz-gen/data_prep/project_src.py && grep -Fq "OFG_LOCAL_INTROSPECTOR_SHIM" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "ofg_benchmark_trim_failed" /opt/hgb/entrypoint.sh && grep -Fq "OFG_OSS_FUZZ_VENV" /opt/hgb/entrypoint.sh && grep -Fq "OFG_LLM_MAX_RETRIES" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "ofg_empty_llm_response" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/output_parser.py && grep -Fq "ofg_docker_pull_timeout" /opt/hgb/entrypoint.sh && test -f /opt/hgb/bin/ofg_api_rank.py && grep -Fq "OFG_SKIP_LOCAL_COVERAGE" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "OFG_ALLOW_TEST_BENCHMARKS" /opt/hgb/entrypoint.sh && grep -Fq "OFG_BUILD_IMAGE_PULL" /opt/hgb/artifacts/oss-fuzz-gen/experiment/oss_fuzz_checkout.py && grep -Fq "OFG_NONINTERACTIVE_BUILD_IMAGE" /opt/hgb/artifacts/oss-fuzz-gen/experiment/oss_fuzz_checkout.py && grep -Fq "OFG_LOCAL_PROJECT_EXAMPLES" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "ofg_oss_fuzz_helper_prompt_eof" /opt/hgb/entrypoint.sh && grep -Fq "ofg_coverage_artifact_missing" /opt/hgb/entrypoint.sh && grep -Fq "ofg_llm_rate_limited" /opt/hgb/entrypoint.sh && grep -Fq "OFG_MAX_ROUND" /opt/hgb/entrypoint.sh && grep -Fq "ofg_low_confidence_api_candidate" /opt/hgb/bin/ofg_trim_benchmark.py && grep -Fq "generic_runtime_or_io_api" /opt/hgb/bin/ofg_api_rank.py && grep -Fq "_shared_llm_request_slot" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "ofg_function_not_referenced" /opt/hgb/artifacts/oss-fuzz-gen/agent/one_prompt_prototyper.py' >/dev/null 2>&1; then
   log "rebuilding stale OSS-Fuzz-Gen image without current OSS-Fuzz-Gen runtime, ranking, coverage, or Docker-pressure fixes: $image"
   image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
+elif [[ "$dry_run" != "1" && "$generator" == "ckgfuzzer" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
+  log "rebuilding stale CKGFuzzer image without current LLM timeout/retry wiring: $image"
+  image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
 fi
 
 {
@@ -139,7 +142,9 @@ fi
 
 export HGB_DRY_RUN="$dry_run"
 export HGB_GENERATION_TIMEOUT_SECONDS="$timeout_seconds"
-export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900}"
+export CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS="${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
+export CKGFUZZER_LLM_MAX_RETRIES="${CKGFUZZER_LLM_MAX_RETRIES:-3}"
 export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
 export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
 export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"

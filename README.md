@@ -39,6 +39,11 @@ OpenAI-compatible chat request. The command never prints the credential.
 ELFuzz remains a local TGI/Hugging Face input-generation workflow; it receives
 profile metadata but does not use the remote chat API.
 
+CKGFuzzer defaults to a 900-second OpenAI-compatible request timeout and three
+SDK retries. These are built into the integration; set
+`CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS` or `CKGFUZZER_LLM_MAX_RETRIES` only to
+override them for an individual run.
+
 ## Artifact Refresh
 
 Upstream source checkouts live under ignored `artifacts/`. Refreshing artifacts fetches current upstream HEAD, overwrites `metadata/work_index.yaml`, and checks out the pinned commit recorded there:

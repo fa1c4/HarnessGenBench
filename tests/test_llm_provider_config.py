@@ -115,3 +115,21 @@ def test_g2fuzz_uses_resolved_base_url_and_promefuzz_fails_fast_on_provider_reje
     assert "PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR" in prome_entrypoint
     assert "hgb_llm_nonretryable" in prome_entrypoint
     assert "os._exit(78)" in prome_entrypoint
+
+
+def test_ckgfuzzer_timeout_retry_defaults_reach_the_client_and_containers() -> None:
+    entrypoint = (ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    common = (ROOT / "scripts/lib/common.sh").read_text(encoding="utf-8")
+    target_launcher = (ROOT / "scripts/hgb_generate_harness.sh").read_text(encoding="utf-8")
+    matrix_launcher = (ROOT / "scripts/hgb_generate_matrix.sh").read_text(encoding="utf-8")
+
+    assert "HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900" in entrypoint
+    assert "CKGFUZZER_LLM_MAX_RETRIES:-3" in entrypoint
+    assert entrypoint.count("max_retries: ${CKGFUZZER_LLM_MAX_RETRIES:-3}") == 2
+    assert r'timeout=float(llm_config.get(\"request_timeout\", 900))' in entrypoint
+    assert r'max_retries=int(llm_config.get(\"max_retries\", 3))' in entrypoint
+    assert "HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900" in common
+    assert common.count("-e CKGFUZZER_LLM_MAX_RETRIES") == 2
+    assert "CKGFUZZER_LLM_MAX_RETRIES:-3" in target_launcher
+    assert "rebuilding stale CKGFuzzer image" in target_launcher
+    assert "rebuilding stale CKGFuzzer image" in matrix_launcher

@@ -136,8 +136,9 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
-  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900}"
   export CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS="${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
+  export CKGFUZZER_LLM_MAX_RETRIES="${CKGFUZZER_LLM_MAX_RETRIES:-3}"
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
   export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
@@ -432,13 +433,15 @@ llm_coder:
   api_key: "${OPENAI_API_KEY:-}"
   base_url: "${OPENAI_BASE_URL:-}"
   temperature: 0.0
-  request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}
+  request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}
+  max_retries: ${CKGFUZZER_LLM_MAX_RETRIES:-3}
 llm_analyzer:
   model: "${OPENAI_MODEL:-gpt-4o-mini}"
   api_key: "${OPENAI_API_KEY:-}"
   base_url: "${OPENAI_BASE_URL:-}"
   temperature: 0.0
-  request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}
+  request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}
+  max_retries: ${CKGFUZZER_LLM_MAX_RETRIES:-3}
 llm_embedding:
   model: "${CKGFUZZER_EMBEDDING_MODEL:-mock}"
   api_key: "${CKGFUZZER_EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}"
@@ -928,6 +931,14 @@ class HGBOpenAILike(OpenAILike):
         )
 '''
         text = text.replace("import os\n", "import os\n" + trace_block, 1)
+    text = text.replace(
+        "temperature=llm_config[\"temperature\"] )",
+        "temperature=llm_config[\"temperature\"], timeout=float(llm_config.get(\"request_timeout\", 900)), max_retries=int(llm_config.get(\"max_retries\", 3)) )",
+    )
+    text = text.replace(
+        "temperature=llm_config[\"temperature\"])",
+        "temperature=llm_config[\"temperature\"], timeout=float(llm_config.get(\"request_timeout\", 900)), max_retries=int(llm_config.get(\"max_retries\", 3)))",
+    )
     text = text.replace("return OpenAILike(", "return HGBOpenAILike(")
     get_model_path.write_text(text)
 openai_path = root / "fuzzing_llm_engine/models/openai.py"
@@ -1652,6 +1663,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   "candidate_verification_exit_code": "%s",
   "candidate_verification_file": "%s",
   "llm_request_timeout_seconds": "%s",
+  "llm_max_retries": "%s",
   "api_selection_metadata": "%s",
   "command_file": "%s",
   "failed_stage": "%s",
@@ -1665,7 +1677,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   "ckgfuzzer_codeql_cache_status": "%s",
   "ckgfuzzer_codeql_cache_key": "%s",
   "ckgfuzzer_codeql_cache_path": "%s",
-  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-1200}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
+  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
