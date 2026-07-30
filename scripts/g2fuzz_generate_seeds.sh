@@ -4,25 +4,29 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
+usage() {
+  cat >&2 <<"EOF"
+Usage:
+  bash scripts/g2fuzz_generate_seeds.sh [TARGET]
+
+Compatibility wrapper around hgb_run_baseline.sh. The default target is
+libpng_libpng_read_fuzzer and the profile is compat-smoke unless overridden by
+HGB_BASELINE_PROFILE.
+EOF
+}
+
 main() {
-  local root image workspace code
-  root="$(repo_root)"
-  load_hgb_config
-  ensure_artifacts_present "$root" "g2fuzz" "g2fuzz-data"
-  image="$(hgb_image_name "g2fuzz" "g2fuzz" "$root")"
-  if ! docker image inspect "$image" >/dev/null 2>&1; then
-    bash "$SCRIPT_DIR/g2fuzz_setup.sh"
+  local target profile
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    usage
+    exit 0
   fi
-  workspace="$(workspace_run_dir "g2fuzz" "$(make_timestamp)" "$root")"
-  ensure_dir "$workspace/logs"
-  code=0
-  run_hgb_container "$image" "$workspace" "generate-seeds"  || code=$?
-  bash "$SCRIPT_DIR/g2fuzz_collect_report.sh" "$workspace" >/dev/null 2>&1 || true
-  if [[ "$code" -ne 0 ]]; then
-    printf 'G2FUZZ seed generation smoke recorded exit code %s. Run directory: %s
-' "$code" "$workspace" >&2
-    exit "$code"
-  fi
-  log "G2FUZZ seed generation smoke completed: $workspace"
+  target="${1:-libpng_libpng_read_fuzzer}"
+  profile="${HGB_BASELINE_PROFILE:-compat-smoke}"
+  bash "$SCRIPT_DIR/hgb_run_baseline.sh" \
+    --generator g2fuzz \
+    --target "$target" \
+    --profile "$profile" \
+    --protocol "${HGB_BASELINE_PROTOCOL:-paper-native}"
 }
 main "$@"

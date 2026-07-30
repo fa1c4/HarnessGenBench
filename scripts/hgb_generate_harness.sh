@@ -21,7 +21,7 @@ Options:
                              compact removes duplicate transient outputs; debug preserves them
       --timeout SECONDS      generation timeout passed into the container
       --allow-input-generator
-                             allow ELFuzz/G2FUZZ input-generation baselines to run
+                             legacy compatibility flag for input-generation baselines
 EOF
 }
 
@@ -94,9 +94,6 @@ load_hgb_config
 
 artifact_name="$(generator_artifact_name "$generator")"
 artifacts=(fuzzbench "$artifact_name")
-if [[ "$generator" == "g2fuzz" ]]; then
-  artifacts+=(g2fuzz-data)
-fi
 ensure_artifacts_present "$root" "${artifacts[@]}"
 
 run_id="${run_id:-$(make_timestamp)}"
@@ -156,7 +153,11 @@ export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}"
 export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
 export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
 export HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS="${HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS:-180}"
-export HGB_ALLOW_INPUT_GENERATOR_TO_RUN="$allow_input_generator"
+if [[ "$generator" == "g2fuzz" ]]; then
+  export HGB_ALLOW_INPUT_GENERATOR_TO_RUN=1
+else
+  export HGB_ALLOW_INPUT_GENERATOR_TO_RUN="$allow_input_generator"
+fi
 export HGB_SAVE_MODE="$save_mode"
 
 code=0

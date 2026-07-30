@@ -79,15 +79,14 @@ bash scripts/promefuzz_build_docker.sh
 bash scripts/promefuzz_smoke_pugixml.sh || true
 bash scripts/elfuzz_start_container.sh --smoke || true
 bash scripts/g2fuzz_setup.sh
-bash scripts/g2fuzz_generate_seeds.sh || true
-bash scripts/g2fuzz_smoke_afl.sh || true
+bash scripts/hgb_run_baseline.sh --generator g2fuzz --target libpng_libpng_read_fuzzer --profile alpha --protocol paper-native
 ```
 
 LLM-backed smoke runs may fail because credentials, quota, model access, Docker-in-Docker, or upstream CLIs are unavailable. They should still leave `metadata.json`, logs, and `HGB_SUMMARY.md` in `workspace/`.
 
 CKGFuzzer requires the CodeQL CLI for target-aware generation. The CKGFuzzer Docker image installs the CodeQL bundle during `bash scripts/ckgfuzzer_setup.sh` by default. Set `HGB_INSTALL_CODEQL=0` only when rebuilding a smaller image for dry runs or when mounting an external CodeQL checkout with `HGB_CODEQL_DIR`.
 
-G2FUZZ target `.afl` and `.cmp` binaries are not bundled by the upstream artifact. Missing target binaries soft-skip by default and produce `TARGET_BUILD_MISSING.md`; set `G2FUZZ_REQUIRE_TARGET_BINARIES=1` to make that condition fail.
+G2Fuzz is evaluated as an input-generator plus modified-AFL++ workflow. It requires a native target pair (`.afl` and `.cmp`) for the fixed FuzzBench harness; missing target binaries are reported as `infra_missing`, not as a successful or soft-skipped run. `g2fuzz-data` is optional comparison data and is mounted only when explicitly requested with `G2FUZZ_USE_DATA=1`.
 
 ## FuzzBench Target Integration
 
@@ -130,6 +129,6 @@ bash scripts/hgb_generate_matrix.sh \
   --dry-run
 ```
 
-ELFuzz and G2FUZZ are input-generation baselines, not source-level harness generators. Their target-aware runs soft-skip by default with `not_harness_generator`; pass `--allow-input-generator` to run them as input-generation baselines. The ELFuzz mappings exercised by `valuable` are `jsoncpp_jsoncpp_fuzzer`, `libxml2_xml`, `re2_fuzzer`, and `sqlite3_ossfuzz` (with optional cpython/librsvg and explicit override mappings); the matrix marks other targets as not applicable without preparing them, and serializes eligible runs because the upstream workflow starts a global `tgi-server` Docker container.
+ELFuzz and G2Fuzz are input-generation baselines, not source-level harness generators. G2Fuzz target-aware runs use `scripts/hgb_run_baseline.sh` directly and report `status=evaluated` only after target-pair discovery, generator synthesis, input validation, modified-AFL campaign execution, and coverage/queue metric collection. The ELFuzz mappings exercised by `valuable` are `jsoncpp_jsoncpp_fuzzer`, `libxml2_xml`, `re2_fuzzer`, and `sqlite3_ossfuzz` (with optional cpython/librsvg and explicit override mappings); the matrix marks other targets as not applicable without preparing them, and serializes eligible runs because the upstream workflow starts a global `tgi-server` Docker container.
 
 If Docker reports a layerdb collision during image preflight, HGB records a per-image guard and later runs fail quickly instead of repeating the image pull. Stop competing builds and have the Docker administrator repair the daemon storage; then retry explicitly with `HGB_RETRY_DOCKER_LAYERDB_BUILD=1`. HGB never prunes or modifies `/data/docker` automatically.

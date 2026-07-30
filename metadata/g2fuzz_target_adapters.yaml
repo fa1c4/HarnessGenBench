@@ -1,0 +1,182 @@
+schema_version: 1
+targets:
+  - target: bloaty_fuzz_target
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: bloaty_fuzz_target
+    formats: [ELF, Mach-O, WebAssembly]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/bloaty_fuzz_target.md
+  - target: curl_curl_fuzzer_http
+    applicability: applicable
+    method_profile: extension
+    program_id: curl_curl_fuzzer_http
+    formats: [HTTP response]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/curl_curl_fuzzer_http.md
+  - target: freetype2_ftfuzzer
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: freetype2_ftfuzzer
+    formats: [TTF, OTF, WOFF]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/freetype2_ftfuzzer.md
+  - target: harfbuzz_hb-shape-fuzzer
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: harfbuzz_hb-shape-fuzzer
+    formats: [TTF, OTF, TTC]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/harfbuzz_hb-shape-fuzzer.md
+  - target: jsoncpp_jsoncpp_fuzzer
+    applicability: applicable
+    method_profile: extension
+    program_id: jsoncpp_jsoncpp_fuzzer
+    formats: [JSON]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/jsoncpp_jsoncpp_fuzzer.md
+  - target: lcms_cms_transform_fuzzer
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: lcms_cms_transform_fuzzer
+    formats: [ICC profile]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/lcms_cms_transform_fuzzer.md
+  - target: libjpeg-turbo_libjpeg_turbo_fuzzer
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: libjpeg-turbo_libjpeg_turbo_fuzzer
+    formats: [JPEG]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/libjpeg-turbo_libjpeg_turbo_fuzzer.md
+  - target: libpcap_fuzz_both
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: libpcap_fuzz_both
+    formats: [PCAP]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/libpcap_fuzz_both.md
+  - target: libpng_libpng_read_fuzzer
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: libpng_libpng_read_fuzzer
+    formats: [PNG]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/libpng_libpng_read_fuzzer.md
+  - target: libxml2_xml
+    applicability: applicable
+    method_profile: extension
+    program_id: libxml2_xml
+    formats: [XML]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/libxml2_xml.md
+  - target: libxslt_xpath
+    applicability: applicable
+    method_profile: extension
+    program_id: libxslt_xpath
+    formats: [XPath, XML]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/libxslt_xpath.md
+  - target: mbedtls_fuzz_dtlsclient
+    applicability: applicable
+    method_profile: extension
+    program_id: mbedtls_fuzz_dtlsclient
+    formats: [DTLS client record/message sequence]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/mbedtls_fuzz_dtlsclient.md
+  - target: mruby_mruby_fuzzer_8c8bbd
+    applicability: applicable
+    method_profile: extension
+    program_id: mruby_mruby_fuzzer_8c8bbd
+    formats: [Ruby source]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/mruby_mruby_fuzzer_8c8bbd.md
+  - target: openh264_decoder_fuzzer
+    applicability: applicable
+    method_profile: extension
+    program_id: openh264_decoder_fuzzer
+    formats: [H.264 bitstream]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/openh264_decoder_fuzzer.md
+  - target: openssl_x509
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: openssl_x509
+    formats: [DER X.509 certificate]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/openssl_x509.md
+  - target: php_php-fuzz-parser_0dbedb
+    applicability: applicable
+    method_profile: extension
+    program_id: php_php-fuzz-parser_0dbedb
+    formats: [PHP source]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/php_php-fuzz-parser_0dbedb.md
+  - target: re2_fuzzer
+    applicability: applicable
+    method_profile: extension
+    program_id: re2_fuzzer
+    formats: [regular expression]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/re2_fuzzer.md
+  - target: sqlite3_ossfuzz
+    applicability: applicable
+    method_profile: extension
+    program_id: sqlite3_ossfuzz
+    formats: [SQL]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/sqlite3_ossfuzz.md
+  - target: systemd_fuzz-link-parser
+    applicability: applicable
+    method_profile: extension
+    program_id: systemd_fuzz-link-parser
+    formats: [systemd .link/INI text]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/systemd_fuzz-link-parser.md
+  - target: zlib_zlib_uncompress_fuzzer
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: zlib_zlib_uncompress_fuzzer
+    formats: [zlib stream]
+    input_mode: file
+    argv: ["@@"]
+    common_corpus: true
+    format_spec: repro/g2fuzz/specs/zlib_zlib_uncompress_fuzzer.md

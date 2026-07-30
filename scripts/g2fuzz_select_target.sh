@@ -8,7 +8,7 @@ main() {
   local root artifact data selected_json note_file requested
   root="$(repo_root)"
   load_hgb_config
-  ensure_artifacts_present "$root" "g2fuzz" "g2fuzz-data"
+  ensure_artifacts_present "$root" "g2fuzz"
   artifact="$(artifact_dir "g2fuzz" "$root")"
   data="$(artifact_dir "g2fuzz-data" "$root")"
   selected_json="$(hgb_workspace_dir "$root")/g2fuzz/selected_target.json"

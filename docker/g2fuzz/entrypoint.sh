@@ -4,6 +4,9 @@ set -euo pipefail
 artifact=/opt/hgb/artifacts/g2fuzz
 data_artifact=/opt/hgb/artifacts/g2fuzz-data
 python=/opt/hgb/venv/bin/python
+if [[ ! -x "$python" ]]; then
+  python="$(command -v python3)"
+fi
 workspace=/workspace
 # shellcheck source=/opt/hgb/bin/llm_provider.sh
 source /opt/hgb/bin/llm_provider.sh
@@ -58,11 +61,11 @@ path = Path(sys.argv[1])
 text = path.read_text()
 text = text.replace(
     'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, 3)',
-    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "1") or "1"))',
+    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "3") or "3"))',
 )
 text = text.replace(
     'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, 1)',
-    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "1") or "1"))',
+    'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "3") or "3"))',
 )
 llm_path = path.parent / "py_utils" / "llm_utils.py"
 if llm_path.exists():
@@ -241,6 +244,9 @@ if [[ "$mode" == "generate-target" ]]; then
   export HGB_GENERATOR="${HGB_GENERATOR:-g2fuzz}"
   export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
   export HGB_CAPABILITY=input_generator
+  export HGB_TASK_FAMILY=input_generator
+  export HGB_BASELINE_PROFILE="${HGB_BASELINE_PROFILE:-alpha}"
+  export HGB_BASELINE_PROTOCOL="${HGB_BASELINE_PROTOCOL:-paper-native}"
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
@@ -248,98 +254,21 @@ if [[ "$mode" == "generate-target" ]]; then
   export G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   mkdir -p "$workspace/logs" "$workspace/generated_inputs" "$workspace/config"
   hgb_require_target_package
-  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
-  if [[ "${HGB_ALLOW_INPUT_GENERATOR_TO_RUN:-0}" != "1" ]]; then
-    hgb_soft_skip not_harness_generator 'G2FUZZ generates inputs and AFL++ workflows, not source-level harnesses; set HGB_ALLOW_INPUT_GENERATOR_TO_RUN=1 to run it as an input generator baseline' input_generator
-  fi
-  safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
-  runtime=/run/hgb/g2fuzz-target
-  mkdir -p "$runtime"
-  formats="$(python3 - "$target_name" "$safe_target" /opt/hgb/metadata/fuzzbench_target_formats.json "$runtime/program_to_format.json" <<'PY_G2_FORMATS'
-import json, os, sys
-name, safe, mapping_path, out_path = sys.argv[1:]
-try:
-    mapping = json.load(open(mapping_path, encoding='utf-8'))
-except OSError:
-    mapping = {}
-formats = mapping.get(name) or ['custom']
-if 'harfbuzz' in name:
-    preferred = ['TTF', 'ttf', 'OTF', 'otf', 'TTC', 'ttc']
-    formats = sorted(formats, key=lambda item: preferred.index(item) if item in preferred else len(preferred))
-try:
-    max_formats = int(os.environ.get('G2FUZZ_MAX_FORMATS', '1') or '0')
-except ValueError:
-    max_formats = 1
-if max_formats > 0:
-    formats = formats[:max_formats]
-with open(out_path, 'w', encoding='utf-8') as f:
-    json.dump({safe: formats}, f, indent=2)
-    f.write('\n')
-print(','.join(formats))
-PY_G2_FORMATS
-)"
-  cp "$runtime/program_to_format.json" "$workspace/config/program_to_format.json"
-  model="${G2FUZZ_MODEL:-${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}}"
-  python3 - "$runtime/model_setting.json" "$model" <<'PY_G2_MODEL'
-import json, sys
-with open(sys.argv[1], 'w', encoding='utf-8') as f:
-    json.dump({'model': [sys.argv[2]]}, f, indent=2)
-    f.write('\n')
-PY_G2_MODEL
-  cp "$runtime/model_setting.json" "$workspace/config/model_setting.json"
-  output_dir="$workspace/g2fuzz_output"
-  write_g2fuzz_preseeds "$target_name" "$formats" "$output_dir/default/gen_seeds"
   patch_g2fuzz_program_gen
-  printf '%q ' "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  dry_run_arg=()
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
-    hgb_write_common_metadata dry_run_ok 'dry run prepared G2FUZZ target format mapping' 0 input_generator
-    hgb_write_common_summary dry_run_ok 'dry run prepared G2FUZZ target format mapping' input_generator
-    exit 0
+    dry_run_arg=(--dry-run)
   fi
-  if ! hgb_api_key_present; then
-    printf 'OPENAI_API_KEY is not set. No credential file was created.\n' >"$workspace/logs/program_gen.log"
-    hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 input_generator
-    hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' input_generator
-    exit 2
-  fi
-  printf '%s\n' "$OPENAI_API_KEY" >"$runtime/openai_key.txt"
-  chmod 600 "$runtime/openai_key.txt"
-  code=0
-  (cd "$runtime" && timeout "${G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS:-${HGB_GENERATION_TIMEOUT_SECONDS:-10800}}" "$python" "$artifact/program_gen.py" --output "$output_dir" --program "$safe_target") >"$workspace/logs/program_gen.log" 2>&1 || code=$?
-  rm -f "$runtime/openai_key.txt"
-  if [[ -d "$output_dir" ]]; then
-    cp -a "$output_dir/." "$workspace/generated_inputs/" 2>/dev/null || true
-  fi
-  generated_inputs="$(hgb_count_files "$workspace/generated_inputs" -type f)"
-  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-    rm -rf "$output_dir"
-  fi
-  program_gen_code="$code"
-  status=completed
-  reason=none
-  if [[ "$program_gen_code" -eq 124 && "$generated_inputs" -gt 0 ]]; then
-    status=partial_completed
-    reason="program_gen timed out after preserving $generated_inputs generated/preseeded inputs"
-    code=0
-  elif [[ "$program_gen_code" -ne 0 ]]; then
-    status=failed
-    reason="program_gen exited $program_gen_code"
-    if grep -qi 'AuthenticationError\|PermissionDeniedError\|Error code: 401\|Error code: 403\|invalid api key' "$workspace/logs/program_gen.log"; then
-      reason='G2Fuzz LLM API credentials were rejected; verify base URL, model, and API key before rerunning'
-    elif grep -qi 'ofg_empty_llm_response\|empty response\|NoneType.*split' "$workspace/logs/program_gen.log"; then
-      reason='G2Fuzz LLM API returned empty response content before saving generated inputs'
-    elif grep -qi 'APITimeoutError\|ReadTimeout\|The read operation timed out\|Request timed out' "$workspace/logs/program_gen.log"; then
-      reason='G2Fuzz LLM API request timed out before saving generated inputs; reduce G2FUZZ_MAX_FORMATS/G2FUZZ_TRY_NUM or increase G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS/HGB_LLM_REQUEST_TIMEOUT_SECONDS'
-    fi
-  fi
-  extra=$(printf '  "program": "%s",
-  "formats": "%s",
-  "output_dir": "%s",
-  "program_gen_exit_code": %s,
-  "command_file": "%s"' "$(hgb_json_escape "$safe_target")" "$(hgb_json_escape "$formats")" "$(hgb_json_escape "$output_dir")" "$program_gen_code" "$(hgb_json_escape "$workspace/command.txt")")
-  hgb_write_common_metadata "$status" "$reason" "$code" input_generator "$extra"
-  hgb_write_common_summary "$status" "$reason" input_generator
-  exit "$code"
+  exec "$python" /opt/hgb/bin/g2fuzz_target_pipeline.py full \
+    --workspace "$workspace" \
+    --target "$target_name" \
+    --target-package "${HGB_TARGET_PACKAGE:-/target}" \
+    --artifact-dir "$artifact" \
+    --metadata-root /opt/hgb/metadata \
+    --profile "$HGB_BASELINE_PROFILE" \
+    --protocol "$HGB_BASELINE_PROTOCOL" \
+    "${dry_run_arg[@]}"
 fi
 case "$mode" in
   generate-seeds|smoke)
@@ -401,52 +330,11 @@ PYMODEL
     exit "$code"
     ;;
   smoke-afl)
-    seed_run="${G2FUZZ_SEED_RUN:-/seed-run}"
-    program="${G2FUZZ_PROGRAM:-}"
-    if [[ -z "$program" && -f "$seed_run/metadata.json" ]]; then
-      program="$(extract_json_string program "$seed_run/metadata.json")"
+    if [[ -z "${HGB_TARGET:-}" || ! -d "${HGB_TARGET_PACKAGE:-/target}" ]]; then
+      echo "smoke-afl is now a compatibility alias for generate-target; set HGB_TARGET and HGB_TARGET_PACKAGE or use scripts/g2fuzz_smoke_afl.sh TARGET" >&2
+      exit 64
     fi
-    if [[ -z "$program" || "$program" == auto ]]; then
-      mapfile -t selected < <(select_program)
-      program="${selected[0]}"
-    fi
-    seed_src="$seed_run/${program}_output/default/gen_seeds"
-    mkdir -p "$workspace/initial_seeds" "$workspace/afl_out"
-    if [[ -d "$seed_src" ]]; then cp -a "$seed_src/." "$workspace/initial_seeds/" 2>/dev/null || true; fi
-    if [[ "$(count_files "$workspace/initial_seeds" -type f)" == "0" ]]; then printf 'empty\n' >"$workspace/initial_seeds/empty"; fi
-    pair=()
-    mapfile -t pair < <(find_target_pair "$program" || true)
-    if [[ "${#pair[@]}" -lt 2 ]]; then
-      cat >"$workspace/TARGET_BUILD_MISSING.md" <<EOF
-# G2FUZZ Target Build Missing
-
-AFL smoke was not run because target binaries were not found.
-
-- Program: \`$program\`
-- Missing AFL binary: \`$program.afl\`
-- Missing CMPLOG binary: \`$program.cmp\`
-- Searched: \`\$G2FUZZ_TARGET_DIR\`, \`/workspace/targets/$program/\`, and \`/opt/hgb/artifacts/g2fuzz/\`
-
-Upstream requires compiling the target program twice, once in AFL default mode and once in cmplog mode, producing \`program.afl\` and \`program.cmp\`.
-EOF
-      printf 'Target binaries missing; soft-skip.\n' >"$workspace/logs/afl.log"
-      printf 'soft-skip missing target binaries\n' >"$workspace/command.txt"
-      write_afl_metadata soft_skip_target_binaries_missing 0 'target .afl/.cmp binaries missing' "$program" 0 0 0 "$seed_run"
-      write_afl_summary soft_skip_target_binaries_missing 0 'target .afl/.cmp binaries missing' "$program" 0 0 0
-      [[ "${G2FUZZ_REQUIRE_TARGET_BINARIES:-0}" == "1" ]] && exit 127 || exit 0
-    fi
-    afl="${pair[0]}"; cmp="${pair[1]}"
-    printf '%q ' "$artifact/afl-fuzz" -i "$workspace/initial_seeds" -o "$workspace/afl_out" -c "$cmp" -m "${G2FUZZ_MEMORY_MB:-1024}" -k "$artifact" -- "$afl" @@ >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
-    code=0
-    AFL_NO_UI=1 AFL_SKIP_CPUFREQ=1 AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES=1 timeout "${G2FUZZ_AFL_TIMEOUT_SECONDS:-300}" "$artifact/afl-fuzz" -i "$workspace/initial_seeds" -o "$workspace/afl_out" -c "$cmp" -m "${G2FUZZ_MEMORY_MB:-1024}" -k "$artifact" -- "$afl" @@ >"$workspace/logs/afl.log" 2>&1 || code=$?
-    queue="$(count_files "$workspace/afl_out/default/queue" -type f)"
-    crashes="$(count_files "$workspace/afl_out/default/crashes" -type f ! -name README.txt)"
-    hangs="$(count_files "$workspace/afl_out/default/hangs" -type f ! -name README.txt)"
-    status=completed; reason=none
-    [[ "$code" -eq 0 || "$code" -eq 124 ]] || { status=failed; reason="afl-fuzz exited $code"; }
-    write_afl_metadata "$status" "$code" "$reason" "$program" "$queue" "$crashes" "$hangs" "$seed_run"
-    write_afl_summary "$status" "$code" "$reason" "$program" "$queue" "$crashes" "$hangs"
-    exit "$code"
+    exec "$0" generate-target
     ;;
   *) echo "unknown mode: $mode" >&2; exit 64 ;;
 esac

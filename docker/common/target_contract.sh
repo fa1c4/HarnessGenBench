@@ -133,7 +133,7 @@ hgb_write_common_metadata() {
   local extra_json="${5:-}"
   local workspace="${workspace:-/workspace}"
   local manifest="${HGB_TARGET_MANIFEST:-/target/target_manifest.json}"
-  local harness_count build_script_count log_candidate_count input_count api_key_bool llm_provider llm_base_url trace_path trace_file trace_rate trace_total trace_sample
+  local harness_count build_script_count log_candidate_count input_count api_key_bool llm_provider llm_base_url trace_path trace_file trace_rate trace_total trace_sample task_family
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/generated_inputs"
   harness_count="$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
   build_script_count="$(hgb_count_generated_build_scripts "$workspace/generated_harnesses")"
@@ -141,6 +141,7 @@ hgb_write_common_metadata() {
   input_count="$(hgb_count_files "$workspace/generated_inputs" -type f)"
   if hgb_api_key_present; then api_key_bool=true; else api_key_bool=false; fi
   llm_provider="${HGB_LLM_PROVIDER_RESOLVED:-${HGB_LLM_PROVIDER:-custom}}"
+  task_family="${HGB_TASK_FAMILY:-$capability}"
   llm_base_url="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   trace_path="${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"
   trace_file="$(hgb_trace_summary_string trace_file "$trace_path" "$trace_path/llm_api_samples.jsonl")"
@@ -155,6 +156,7 @@ hgb_write_common_metadata() {
     printf '  "run_type": "generate-target",\n'
     printf '  "save_mode": "%s",\n' "$(hgb_json_escape "${HGB_SAVE_MODE:-compact}")"
     printf '  "capability": "%s",\n' "$(hgb_json_escape "$capability")"
+    printf '  "task_family": "%s",\n' "$(hgb_json_escape "$task_family")"
     printf '  "status": "%s",\n' "$(hgb_json_escape "$status")"
     printf '  "reason": "%s",\n' "$(hgb_json_escape "$reason")"
     printf '  "exit_code": %s,\n' "$exit_code"
@@ -199,6 +201,7 @@ hgb_write_common_summary() {
     printf -- '- Project: `%s`\n' "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
     printf -- '- Fuzz target: `%s`\n' "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
     printf -- '- Capability: `%s`\n' "$capability"
+    printf -- '- Task family: `%s`\n' "${HGB_TASK_FAMILY:-$capability}"
     printf -- '- Status: `%s`\n' "$status"
     printf -- '- API key present: `%s`\n' "$(hgb_api_key_present && printf true || printf false)"
     printf -- '- LLM provider: `%s`\n' "${HGB_LLM_PROVIDER_RESOLVED:-${HGB_LLM_PROVIDER:-custom}}"

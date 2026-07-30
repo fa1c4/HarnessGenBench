@@ -33,7 +33,7 @@ SOFT_STATUSES = {
 }
 PARTIAL_STATUSES = {"partial_completed"}
 NOT_APPLICABLE_STATUSES = {"not_applicable", "target_not_supported_by_elfuzz"}
-COMPLETED_STATUSES = {"completed", "dry_run_ok"}
+COMPLETED_STATUSES = {"completed", "dry_run_ok", "evaluated"}
 TRANSIENT_DIR_NAMES = {
     "g2fuzz_output",
     "ofg-work",
@@ -204,7 +204,7 @@ def storage_report(matrix_dir: Path, records: list[dict[str, Any]]) -> dict[str,
                     target_dir = Path(host_target_package)
                     if target_dir.exists():
                         target_dirs.add(target_dir)
-                for name in ("generated_harnesses", "generated_inputs"):
+                for name in ("generated_harnesses", "generated_inputs", "seeds/g2_generated", "generators/source"):
                     candidate = workspace / name
                     if candidate.exists():
                         generated_dirs.add(candidate)
@@ -258,6 +258,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
     build_script_counts: collections.Counter[str] = collections.Counter()
     log_candidate_counts: collections.Counter[str] = collections.Counter()
     input_counts: collections.Counter[str] = collections.Counter()
+    task_family_counts: collections.Counter[str] = collections.Counter()
+    status_counts_by_task_family: dict[str, collections.Counter[str]] = collections.defaultdict(collections.Counter)
     reasons: collections.Counter[str] = collections.Counter()
     remediation_counts: collections.Counter[str] = collections.Counter()
     api_trace_total_count = 0
@@ -265,6 +267,10 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
     for record in records:
         meta = record["metadata"]
         gen = meta.get("generator") or meta.get("fuzzer") or record["row"].get("generator") or "unknown"
+        status_s = str(meta.get("status") or record["row"].get("status") or "missing_metadata")
+        family = str(meta.get("task_family") or meta.get("capability") or ("input_generator" if gen in {"g2fuzz", "elfuzz"} else "harness_generator"))
+        task_family_counts[family] += 1
+        status_counts_by_task_family[family][status_s] += 1
         harness_counts[gen] += int(meta.get("generated_harness_count") or meta.get("generated_driver_count") or 0)
         build_script_counts[gen] += int(meta.get("generated_build_script_count") or 0)
         log_candidate_counts[gen] += int(meta.get("generated_log_candidate_count") or 0)
@@ -274,7 +280,6 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         reason = meta.get("reason") or record["row"].get("status") or "unknown"
         if reason and reason != "none":
             reason_s = str(reason)
-            status_s = str(meta.get("status") or record["row"].get("status") or "")
             reasons[reason_s] += 1
             if status_s not in COMPLETED_STATUSES:
                 remediation_counts[remediation_for(status_s, reason_s)] += 1
@@ -292,6 +297,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         "generated_build_script_counts_by_generator": dict(build_script_counts),
         "generated_log_candidate_counts_by_generator": dict(log_candidate_counts),
         "generated_input_counts_by_generator": dict(input_counts),
+        "task_family_counts": dict(task_family_counts),
+        "status_counts_by_task_family": {family: dict(counter) for family, counter in status_counts_by_task_family.items()},
         "api_trace_total_count": api_trace_total_count,
         "api_trace_sample_count": api_trace_sample_count,
         "top_failure_reasons": reasons.most_common(10),
@@ -348,6 +355,14 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
     ]
     for status, count in sorted(summary["statuses"].items()):
         lines.append(f"- `{status}`: {count}")
+    if summary.get("task_family_counts"):
+        lines.extend(["", "## Task Families", ""])
+        by_family = summary.get("status_counts_by_task_family", {})
+        for family, count in sorted(summary["task_family_counts"].items()):
+            statuses = by_family.get(family, {})
+            evaluated = statuses.get("evaluated", 0)
+            completed_family = sum(statuses.get(status, 0) for status in COMPLETED_STATUSES)
+            lines.append(f"- `{family}`: {count} pairs, {completed_family} completed/evaluated, {evaluated} evaluated")
     storage = summary.get("storage", {})
     if storage:
         lines.extend(["", "## Storage", ""])

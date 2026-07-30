@@ -1,0 +1,9 @@
+schema_version: 1
+baselines:
+  - name: g2fuzz
+    task_family: input_generator
+    profiles: [alpha, paper-faithful, extension, compat-smoke]
+    default_profile: alpha
+    default_protocol: paper-native
+    strict_success_status: evaluated
+    notes: G2Fuzz generates input generators and seeds for a fixed native target pair; it is not a harness generator.

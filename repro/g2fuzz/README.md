@@ -1,16 +1,42 @@
-# G2FUZZ Reproduction
+# G2Fuzz Reproduction
+
+G2Fuzz is tracked as an HGB `input_generator`: it creates executable input
+generators and generated seeds for an existing native FuzzBench target, then
+runs the pinned modified AFL++ workflow against a target pair built as `.afl`
+and `.cmp`/CmpLog binaries. It does not generate `LLVMFuzzerTestOneInput` and
+is not part of the harness-generator leaderboard.
 
 ```bash
 make artifacts
 bash scripts/g2fuzz_setup.sh
-bash scripts/g2fuzz_select_target.sh
-bash scripts/g2fuzz_generate_seeds.sh || true
-bash scripts/g2fuzz_smoke_afl.sh || true
-bash scripts/g2fuzz_collect_report.sh workspace/g2fuzz/<run-id>
+bash scripts/hgb_run_baseline.sh \
+  --generator g2fuzz \
+  --target libpng_libpng_read_fuzzer \
+  --profile alpha \
+  --protocol paper-native \
+  --strict
 ```
 
-The HGB Docker image copies `artifacts/g2fuzz` and `artifacts/g2fuzz-data` into `/opt/hgb/artifacts/`, installs `openai==1.63.2`, and builds G2FUZZ with `make source-only`.
+The target-aware workflow writes `target/`, `generators/source/`, separated
+seed provenance directories, `campaign/`, `coverage/`, `metadata.json`,
+`result.json`, and `HGB_SUMMARY.md` under `workspace/g2fuzz/<target>/<run-id>/`.
 
-Seed generation uses a runtime-only `openai_key.txt` under `/run/hgb` inside the container, not in the mounted workspace. Config copies and outputs are written under `workspace/g2fuzz/<run-id>/`.
+`metadata/g2fuzz_target_adapters.yaml` is the committed target contract. It
+records each valuable target format, input mode, argv placement, and whether the
+row is `paper-faithful` or an HGB `extension`. Extension rows remain excluded
+from paper-only aggregates.
 
-G2FUZZ AFL target binaries are not bundled. `g2fuzz_smoke_afl.sh` searches `$G2FUZZ_TARGET_DIR`, `/workspace/targets/<program>/`, and `/opt/hgb/artifacts/g2fuzz/`. Missing `.afl` and `.cmp` binaries soft-skip by default and produce `TARGET_BUILD_MISSING.md`; set `G2FUZZ_REQUIRE_TARGET_BINARIES=1` to make that condition fail.
+`g2fuzz-data` is optional comparison data. Normal image builds and runs do not
+require it; set `G2FUZZ_USE_DATA=1` only when you want to mount a local
+`artifacts/g2fuzz-data` checkout read-only for comparison reporting.
+
+Compatibility wrappers remain available:
+
+```bash
+bash scripts/g2fuzz_generate_seeds.sh libpng_libpng_read_fuzzer
+bash scripts/g2fuzz_smoke_afl.sh libpng_libpng_read_fuzzer
+```
+
+Both wrappers call the same staged baseline runner. If `G2FUZZ_TARGET_DIR`
+points at host-built `.afl`/`.cmp` binaries, the runner mounts it at
+`/g2fuzz-target-pair` inside the container before launching the pipeline.

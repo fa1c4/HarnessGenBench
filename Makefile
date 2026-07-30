@@ -44,8 +44,7 @@ docker-build-g2fuzz:
 	bash scripts/g2fuzz_setup.sh
 
 smoke-g2fuzz:
-	bash scripts/g2fuzz_generate_seeds.sh || true
-	bash scripts/g2fuzz_smoke_afl.sh || true
+	bash scripts/g2fuzz_smoke_afl.sh
 
 targets:
 	bash scripts/hgb_targets.sh list

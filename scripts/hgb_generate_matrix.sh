@@ -14,7 +14,7 @@ Options:
   --parallel-worker N        Run up to N targets concurrently for each generator (default: 5).
   --targets VALUE            Comma list, all, or a named set from scripts/hgb_targets.sh list --sets.
   --jobs N                   Backward-compatible alias for --parallel-worker.
-  --allow-input-generators   Allow generators that require input corpus/source material.
+  --allow-input-generators   Legacy flag for input-generation baselines that still require opt-in.
   --target-package-mode MODE Prepare targets once per matrix run with shared, or once per pair with per-pair (default: shared).
   --layout compact|full      Target package layout for prepared packages (default: compact).
   --save-mode compact|debug  Compact removes duplicate transient outputs; debug preserves them (default: compact).
@@ -190,9 +190,6 @@ preflight_generator() {
   valid_hgb_generator "$generator" || die "unknown generator: $generator"
   artifact_name="$(generator_artifact_name "$generator")"
   artifacts=(fuzzbench "$artifact_name")
-  if [[ "$generator" == "g2fuzz" ]]; then
-    artifacts+=(g2fuzz-data)
-  fi
   ensure_artifacts_present "$root" "${artifacts[@]}"
 
   if [[ "$dry_run" == "1" ]]; then

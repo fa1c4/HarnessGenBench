@@ -474,6 +474,13 @@ run_hgb_container() {
     -e G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
     -e G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS \
     -e G2FUZZ_MAX_PRESEEDED_CORPUS_FILES \
+    -e G2FUZZ_AFL_TIMEOUT_SECONDS \
+    -e G2FUZZ_MEMORY_MB \
+    -e G2FUZZ_AFL_FUZZ \
+    -e G2FUZZ_PROGRAM_GEN \
+    -e G2FUZZ_USE_DATA \
+    -e HGB_BASELINE_PROFILE \
+    -e HGB_BASELINE_PROTOCOL \
     -e PROME_FUZZ_SKIP_BAD_DOCS \
     -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
@@ -502,8 +509,17 @@ run_hgb_target_container() {
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
   ensure_dir "$workspace"
-  if [[ "$generator" != "promefuzz" && "$generator" != "ckgfuzzer" && "$generator" != "oss-fuzz-gen" ]]; then
+  if [[ "$generator" == "elfuzz" ]]; then
     extra_docker_args+=(-v "$root/artifacts:/opt/hgb/artifacts:ro")
+  elif [[ "$generator" == "g2fuzz" ]]; then
+    extra_docker_args+=(-v "$root/artifacts/g2fuzz:/opt/hgb/artifacts/g2fuzz:ro")
+    extra_docker_args+=(-v "$root/repro:/opt/hgb/repro:ro")
+    if [[ -n "${G2FUZZ_TARGET_DIR:-}" ]]; then
+      extra_docker_args+=(-v "${G2FUZZ_TARGET_DIR}:/g2fuzz-target-pair:ro" -e G2FUZZ_TARGET_DIR=/g2fuzz-target-pair)
+    fi
+    if [[ "${G2FUZZ_USE_DATA:-0}" == "1" && -d "$root/artifacts/g2fuzz-data/.git" ]]; then
+      extra_docker_args+=(-v "$root/artifacts/g2fuzz-data:/opt/hgb/artifacts/g2fuzz-data:ro" -e G2FUZZ_DATA_DIR=/opt/hgb/artifacts/g2fuzz-data)
+    fi
   fi
   if [[ -n "${HGB_CODEQL_DIR:-}" ]]; then
     extra_docker_args+=(-v "${HGB_CODEQL_DIR}:/opt/hgb/codeql-host:ro" -e HGB_CODEQL_DIR=/opt/hgb/codeql-host)
@@ -649,6 +665,13 @@ run_hgb_target_container() {
     -e G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
     -e G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS \
     -e G2FUZZ_MAX_PRESEEDED_CORPUS_FILES \
+    -e G2FUZZ_AFL_TIMEOUT_SECONDS \
+    -e G2FUZZ_MEMORY_MB \
+    -e G2FUZZ_AFL_FUZZ \
+    -e G2FUZZ_PROGRAM_GEN \
+    -e G2FUZZ_USE_DATA \
+    -e HGB_BASELINE_PROFILE \
+    -e HGB_BASELINE_PROTOCOL \
     -e PROME_FUZZ_SKIP_BAD_DOCS \
     -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
