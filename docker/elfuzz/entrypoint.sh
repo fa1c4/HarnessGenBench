@@ -27,6 +27,17 @@ elfuzz_target_for_hgb_target() {
     *) printf '' ;;
   esac
 }
+find_elfuzz_project_root() {
+  local candidate
+  for candidate in "${ELFUZZ_PROJECT_ROOT:-}" /home/appuser/elmfuzz /elfuzz /opt/hgb/artifacts/elfuzz; do
+    [[ -n "$candidate" && -f "$candidate/cli/main.py" ]] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+ELFUZZ_PROJECT_ROOT="$(find_elfuzz_project_root || true)"
+export ELFUZZ_PROJECT_ROOT
 stage_exit() { [[ -f "$workspace/logs/$1.exit" ]] && cat "$workspace/logs/$1.exit" || printf not_run; }
 run_stage() {
   local stage="$1"; shift
@@ -71,7 +82,7 @@ metadata() {
 }
 
 patch_elfuzz_trace() {
-  local py=/opt/hgb/artifacts/elfuzz/genvariants_parallel.py
+  local py="$ELFUZZ_PROJECT_ROOT/genvariants_parallel.py"
   [[ -f "$py" ]] || return 0
   python3 - "$py" <<'PY_ELFUZZ_TRACE_PATCH'
 from pathlib import Path
@@ -104,7 +115,7 @@ PY_ELFUZZ_TRACE_PATCH
 }
 
 patch_elfuzz_cleanup() {
-  local py=/opt/hgb/artifacts/elfuzz/cli/pre_experiments.py
+  local py="$ELFUZZ_PROJECT_ROOT/cli/pre_experiments.py"
   [[ -f "$py" ]] || return 0
   python3 - "$py" <<'PY_ELFUZZ_CLEANUP_PATCH'
 from pathlib import Path
@@ -119,7 +130,60 @@ path.write_text(text)
 PY_ELFUZZ_CLEANUP_PATCH
 }
 elfuzz_configured_hf_token() {
-  elfuzz config --get tgi.huggingface_token 2>/dev/null | sed -n '1p' || true
+  local value
+  value="$(elfuzz config --get tgi.huggingface_token 2>/dev/null || true)"
+  value="$(printf '%s\n' "$value" | tail -n 1)"
+  value="${value##* == }"
+  case "$value" in
+    ''|None|null) return 0 ;;
+  esac
+  printf '%s\n' "$value"
+}
+patch_elfuzz_sibling_paths() {
+  local getcov="$ELFUZZ_PROJECT_ROOT/getcov_fuzzbench.py"
+  [[ -f "$getcov" ]] || return 0
+  python3 - "$getcov" "$ELFUZZ_PROJECT_ROOT/start_tgi_servers.sh" "$ELFUZZ_PROJECT_ROOT/start_tgi_servers_debug.sh" <<'PY_ELFUZZ_SIBLING_PATH_PATCH'
+from pathlib import Path
+import sys
+
+getcov = Path(sys.argv[1])
+text = getcov.read_text()
+old = "        prefix = '/tmp/host/fuzzdata/'"
+new = "        prefix = os.environ.get('ELFUZZ_HOST_SHARED_DIR', '/tmp/host/fuzzdata/')"
+if old in text:
+    getcov.write_text(text.replace(old, new, 1))
+
+for raw_path in sys.argv[2:]:
+    path = Path(raw_path)
+    if not path.is_file():
+        continue
+    text = path.read_text()
+    old = "volume=./tmp/fastdata/hfcache/transformers/"
+    new = "volume=${ELFUZZ_TGI_CACHE_DIR:-./tmp/fastdata/hfcache/transformers/}\\nmkdir -p \"$volume\""
+    if old in text:
+        path.write_text(text.replace(old, new, 1))
+PY_ELFUZZ_SIBLING_PATH_PATCH
+}
+collect_elfuzz_outputs() {
+  local benchmark="$1" marker="$2" seed_dir generator_dir archive
+  local archives=()
+
+  seed_dir="$ELFUZZ_PROJECT_ROOT/extradata/seeds/raw/$benchmark/elm"
+  generator_dir="$ELFUZZ_PROJECT_ROOT/evaluation/elmfuzzers"
+  mkdir -p "$workspace/generated_inputs" "$workspace/generated_generators"
+  if [[ -d "$generator_dir" ]]; then
+    while IFS= read -r -d '' archive; do
+      cp -a "$archive" "$workspace/generated_generators/"
+    done < <(find "$generator_dir" -maxdepth 1 -type f -name "${benchmark}_*.fuzzers.tar.xz" -newer "$marker" -print0 2>/dev/null)
+  fi
+  if [[ -d "$seed_dir" ]]; then
+    mapfile -d '' -t archives < <(find "$seed_dir" -maxdepth 1 -type f -name '*.tar.zst' -newer "$marker" -print0 2>/dev/null | sort -z)
+    for archive in "${archives[@]}"; do
+      if ! tar --zstd -xf "$archive" -C "$workspace/generated_inputs"; then
+        printf 'could not extract generated seed archive: %s\n' "$archive" >>"$workspace/logs/collect_outputs.log"
+      fi
+    done
+  fi
 }
 if [[ "$mode" == "generate-target" ]]; then
   # shellcheck source=/opt/hgb/bin/target_contract.sh
@@ -147,6 +211,15 @@ if [[ "$mode" == "generate-target" ]]; then
   if ! command -v elfuzz >/dev/null 2>&1; then
     hgb_soft_skip upstream_cli_not_found 'elfuzz CLI not found in image' input_generator
   fi
+  if [[ -z "$ELFUZZ_PROJECT_ROOT" ]]; then
+    hgb_soft_skip upstream_source_not_found 'ELFuzz CLI is installed but its live project source tree was not found in the image' input_generator
+  fi
+  if [[ ! -S /var/run/docker.sock ]]; then
+    hgb_soft_skip elfuzz_docker_socket_unavailable 'ELFuzz requires the Docker socket to start its TGI and benchmark sibling containers' input_generator
+  fi
+  if [[ "${ELFUZZ_REQUIRE_GPU:-1}" == "1" ]] && ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
+    hgb_soft_skip elfuzz_gpu_unavailable 'ELFuzz starts TGI with --gpus all; configure an NVIDIA Docker runtime and a usable GPU, or set ELFUZZ_REQUIRE_GPU=0 only for infrastructure debugging' input_generator
+  fi
   elfuzz_target="${ELFUZZ_TARGET_OVERRIDE:-$(elfuzz_target_for_hgb_target "$target_name")}"
   recognized=0
   elfuzz list >"$workspace/logs/elfuzz_list.log" 2>&1 || true
@@ -167,6 +240,7 @@ if [[ "$mode" == "generate-target" ]]; then
   fi
   patch_elfuzz_cleanup
   patch_elfuzz_trace
+  patch_elfuzz_sibling_paths
   configured_hf_token="$(elfuzz_configured_hf_token)"
   if [[ "${ELFUZZ_REQUIRE_HF_TOKEN:-1}" == "1" && -z "${HF_TOKEN:-}" && -z "$configured_hf_token" && "${ELFUZZ_LOCAL_MODEL_CACHE_READY:-0}" != "1" ]]; then
     hgb_soft_skip elfuzz_missing_hf_token_or_model_access 'ELFuzz TGI synthesis requires HF_TOKEN, a configured Hugging Face token, or ELFUZZ_LOCAL_MODEL_CACHE_READY=1 for an already-cached model' input_generator
@@ -188,15 +262,18 @@ if [[ "$mode" == "generate-target" ]]; then
   fi
   code=0
   failed_stage=synth
-  (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${synth_args[@]}") >"$workspace/logs/synth.log" 2>&1 || code=$?
+  marker="$workspace/.elfuzz_generation_started"
+  touch "$marker"
+  timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${synth_args[@]}" >"$workspace/logs/synth.log" 2>&1 || code=$?
   if [[ "$code" == "0" ]]; then
     failed_stage=produce
-    (cd "$workspace" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${produce_args[@]}") >"$workspace/logs/produce.log" 2>&1 || code=$?
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${produce_args[@]}" >"$workspace/logs/produce.log" 2>&1 || code=$?
   fi
-  find "$workspace" -type f \( -path '*/seeds/*' -o -path '*/inputs/*' -o -name '*.seed' -o -name '*.bin' \) -exec cp {} "$workspace/generated_inputs/" \; 2>/dev/null || true
+  collect_elfuzz_outputs "$elfuzz_target" "$marker"
   status=completed
   reason=none
   generated_input_count="$(count_files "$workspace/generated_inputs" -type f)"
+  generated_generator_count="$(count_files "$workspace/generated_generators" -type f)"
   if [[ "$code" -ne 0 ]]; then
     status=failed
     reason="ELFuzz $failed_stage stage exited $code"
@@ -216,7 +293,12 @@ if [[ "$mode" == "generate-target" ]]; then
       reason="ELFuzz $failed_stage stage exited $code after producing $generated_input_count input candidates"
     fi
   fi
-  extra=$(printf '  "elfuzz_target": "%s",\n  "failed_stage": "%s",\n  "tgi_waiting_seconds": "%s",\n  "evolution_iterations": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$elfuzz_target")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "${ELFUZZ_TGI_WAITING_SECONDS:-120}")" "$(hgb_json_escape "${ELFUZZ_EVOLUTION_ITERATIONS:-1}")" "$(hgb_json_escape "$workspace/command.txt")")
+  if [[ "$code" == "0" && "$generated_input_count" -eq 0 ]]; then
+    code=70
+    status=failed
+    reason='ELFuzz completed without a newly generated seed archive'
+  fi
+  extra=$(printf '  "elfuzz_target": "%s",\n  "project_root": "%s",\n  "generated_input_count": %s,\n  "generated_generator_count": %s,\n  "failed_stage": "%s",\n  "tgi_waiting_seconds": "%s",\n  "evolution_iterations": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$elfuzz_target")" "$(hgb_json_escape "$ELFUZZ_PROJECT_ROOT")" "$generated_input_count" "$generated_generator_count" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "${ELFUZZ_TGI_WAITING_SECONDS:-120}")" "$(hgb_json_escape "${ELFUZZ_EVOLUTION_ITERATIONS:-1}")" "$(hgb_json_escape "$workspace/command.txt")")
   hgb_write_common_metadata "$status" "$reason" "$code" input_generator "$extra"
   hgb_write_common_summary "$status" "$reason" input_generator
   exit "$code"

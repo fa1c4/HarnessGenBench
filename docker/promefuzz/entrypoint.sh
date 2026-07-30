@@ -128,6 +128,42 @@ stage_fuzzbench_source() {
   done < <(find "$benchmark" -mindepth 1 -maxdepth 1 -print0)
 }
 
+fuzzbench_build_workdir() {
+  local dockerfile="${1:-/target/fuzzbench_benchmark/Dockerfile}" raw workdir=""
+  [[ -f "$dockerfile" ]] || return 0
+  while IFS= read -r raw; do
+    [[ -n "$raw" ]] || continue
+    case "$raw" in
+      /src) workdir="" ;;
+      /src/*) workdir="${raw#/src/}" ;;
+      '$SRC'|'${SRC}') workdir="" ;;
+      '${SRC}/'*) workdir="${raw#'${SRC}/'}" ;;
+      /*) return 0 ;;
+      ..|../*|*/../*|*/..) return 0 ;;
+      '$SRC/'*) workdir="${raw#'$SRC/'}" ;;
+      *) workdir="${workdir:+$workdir/}$raw" ;;
+    esac
+  done < <(awk '
+    toupper($1) == "WORKDIR" {
+      $1 = ""
+      sub(/^[[:space:]]+/, "")
+      sub(/[[:space:]]+#.*/, "")
+      print
+    }
+  ' "$dockerfile")
+  printf '%s\n' "$workdir"
+}
+
+fuzzbench_target_build_available() {
+  local build_script="${1:-/target/fuzzbench_benchmark/build.sh}"
+  [[ -f "$build_script" ]] || return 1
+  ! grep -Fq 'FuzzBench benchmark did not include a top-level build.sh; target build is unavailable for this package.' "$build_script"
+}
+
+is_positive_integer() {
+  [[ "$1" =~ ^[1-9][0-9]*$ ]]
+}
+
 write_config() {
   local cfg=/run/hgb/promefuzz_config.toml
   if [[ -f "$artifact/config.template.toml" ]]; then
@@ -218,7 +254,23 @@ if [[ "$mode" == "generate-target" ]]; then
   native_template="$native_build_root/template"
   native_harness_json=""
   native_harness_destination=""
+  native_harness_reference=""
   native_build_json=false
+  fuzzbench_build_workdir="$(fuzzbench_build_workdir)"
+  promefuzz_pool_size="${PROME_FUZZ_POOL_SIZE:-1}"
+  if ! is_positive_integer "$promefuzz_pool_size"; then
+    hgb_write_common_metadata failed "invalid PROME_FUZZ_POOL_SIZE: $promefuzz_pool_size" 64 harness_generator
+    hgb_write_common_summary failed "invalid PROME_FUZZ_POOL_SIZE: $promefuzz_pool_size" harness_generator
+    exit 64
+  fi
+
+  if [[ "$native_build_enabled" == "1" ]]; then
+    if ! fuzzbench_target_build_available; then
+      printf 'FuzzBench provides no reproducible top-level build.sh for this target; using PromeFuzz compiler validation instead.\n' >"$workspace/logs/native_build.log"
+      native_build_enabled=0
+    fi
+  fi
+
   if [[ "$native_build_enabled" == "1" ]]; then
     if ! native_harness_json="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" 2>&1)"; then
       printf 'Could not resolve the manifest-selected native harness: %s\n' "$native_harness_json" >"$workspace/logs/native_build.log"
@@ -227,8 +279,20 @@ if [[ "$mode" == "generate-target" ]]; then
       exit 65
     fi
     native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination)"
+    native_harness_reference="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field reference)"
     language="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field language)"
     stage_fuzzbench_source "$native_template"
+    native_reference_source="$selected_reference_dir/$native_harness_reference"
+    native_reference_destination="$native_template/${native_harness_destination#/src/}"
+    if [[ ! -f "$native_reference_source" ]]; then
+      printf 'Missing manifest-selected reference harness: %s\n' "$native_harness_reference" >"$workspace/logs/native_build.log"
+      hgb_write_common_metadata failed 'PromeFuzz could not restore the manifest-selected reference harness required for target build verification' 65 harness_generator
+      hgb_write_common_summary failed 'PromeFuzz could not restore the manifest-selected reference harness required for target build verification' harness_generator
+      exit 65
+    fi
+    mkdir -p "$(dirname "$native_reference_destination")"
+    cp "$native_reference_source" "$native_reference_destination"
+
     printf '%s\n' "$native_harness_json" >"$workspace/promefuzz_native_harness.json"
     export PROME_FUZZ_DRIVER_BUILD_WRAPPER=/opt/hgb/bin/promefuzz_target_build.sh
     export PROME_FUZZ_NATIVE_SOURCE_TEMPLATE="$native_template"
@@ -236,6 +300,19 @@ if [[ "$mode" == "generate-target" ]]; then
     export PROME_FUZZ_NATIVE_HARNESS_DESTINATION="$native_harness_destination"
     export PROME_FUZZ_NATIVE_FUZZ_TARGET="$fuzz_target"
     native_build_json=true
+    export PROME_FUZZ_NATIVE_BUILD_WORKDIR_RELATIVE="$fuzzbench_build_workdir"
+    export PROME_FUZZ_NATIVE_BUILD_LOG_DIR="$workspace/logs/native-build"
+    export PROME_FUZZ_NATIVE_RUN_LOG_DIR="$workspace/logs/native-run"
+
+    if [[ "${HGB_PROMEFUZZ_VALIDATE_TARGET_BASELINE:-1}" == "1" ]]; then
+      baseline_source="$native_template/${native_harness_destination#/src/}"
+      baseline_binary="$native_build_root/baseline/$fuzz_target"
+      if ! bash /opt/hgb/bin/promefuzz_target_build.sh "$baseline_source" "$baseline_binary" >"$workspace/logs/baseline-build.log" 2>&1; then
+        hgb_write_common_metadata failed 'PromeFuzz native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget' 65 harness_generator
+        hgb_write_common_summary failed 'PromeFuzz native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget' harness_generator
+        exit 65
+      fi
+    fi
   fi
 
   libraries=/run/hgb/promefuzz/libraries.toml
@@ -289,7 +366,7 @@ EOF_PROMEFUZZ_CONFIG
   if ! compile_db_has_entries "$compile_db" && [[ "${HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD:-1}" == "1" ]] && command -v bear >/dev/null 2>&1; then
     mkdir -p "$workspace/promefuzz_build/src" "$workspace/promefuzz_build/out" "$workspace/promefuzz_build/work"
     stage_fuzzbench_source "$workspace/promefuzz_build/src"
-    (cd "$workspace/promefuzz_build" && SRC="$workspace/promefuzz_build/src" OUT="$workspace/promefuzz_build/out" WORK="$workspace/promefuzz_build/work" bear -- bash "$workspace/promefuzz_build/src/build.sh") >"$workspace/logs/bear.log" 2>&1 || true
+    (cd "$workspace/promefuzz_build/src/$fuzzbench_build_workdir" && SRC="$workspace/promefuzz_build/src" OUT="$workspace/promefuzz_build/out" WORK="$workspace/promefuzz_build/work" CC="${CC:-clang}" CXX="${CXX:-clang++}" FUZZER="${FUZZER:-libfuzzer}" FUZZER_LIB="${FUZZER_LIB:--fsanitize=fuzzer}" LIB_FUZZING_ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}" CFLAGS="${CFLAGS:-} -pthread" CXXFLAGS="${CXXFLAGS:-} -pthread -Wno-register" bear -- bash "$workspace/promefuzz_build/src/build.sh") >"$workspace/logs/bear.log" 2>&1 || true
     if [[ -f "$workspace/promefuzz_build/compile_commands.json" && "$workspace/promefuzz_build/compile_commands.json" != "$compile_db" ]]; then
       cp "$workspace/promefuzz_build/compile_commands.json" "$compile_db" 2>/dev/null || true
     fi
@@ -386,7 +463,7 @@ if llm_py.exists():
     if old in llm_text and "hgb_llm_trace.trace_call" not in llm_text:
         llm_text = llm_text.replace(old, new)
     fail_fast_old = '        except Exception as e:\n            logger.error(f"OpenAI API exception: {e}")\n            return None'
-    fail_fast_new = '        except Exception as e:\n            error_text = str(e)\n            for _secret in (os.environ.get("OPENAI_API_KEY", ""), os.environ.get("API_KEY", "")):\n                if _secret:\n                    error_text = error_text.replace(_secret, "[REDACTED]")\n            logger.error(f"OpenAI API exception: {error_text}")\n            _nonretryable = (\n                "Error code: 400", "Error code: 401", "Error code: 402",\n                "Error code: 403", "Error code: 404", "Error code: 422",\n                "Insufficient Balance", "invalid api key", "invalid_request_error",\n                "model_not_found",\n            )\n            if (os.environ.get("PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR", "1") != "0"\n                    and any(_marker.lower() in error_text.lower() for _marker in _nonretryable)):\n                _message = "hgb_llm_nonretryable: " + error_text\n                _error_file = os.environ.get("PROME_FUZZ_PROVIDER_ERROR_FILE", "")\n                if _error_file:\n                    try:\n                        with open(_error_file, "w", encoding="utf-8") as _handle:\n                            _handle.write(_message + "\\n")\n                    except OSError:\n                        pass\n                logger.critical(_message)\n                os._exit(78)\n            return None'
+    fail_fast_new = '        except Exception as e:\n            error_text = str(e)\n            for _secret in (os.environ.get("OPENAI_API_KEY", ""), os.environ.get("API_KEY", "")):\n                if _secret:\n                    error_text = error_text.replace(_secret, "[REDACTED]")\n            logger.error(f"OpenAI API exception: {error_text}")\n            _nonretryable = (\n                "Error code: 400", "Error code: 401", "Error code: 402",\n                "Error code: 403", "Error code: 404", "Error code: 422",\n                "Insufficient Balance", "ExceededBudget", "budget_exceeded",\n                "invalid api key", "invalid_request_error", "model_not_found",\n            )\n            if (os.environ.get("PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR", "1") != "0"\n                    and any(_marker.lower() in error_text.lower() for _marker in _nonretryable)):\n                _message = "hgb_llm_nonretryable: " + error_text\n                _error_file = os.environ.get("PROME_FUZZ_PROVIDER_ERROR_FILE", "")\n                if _error_file:\n                    try:\n                        with open(_error_file, "w", encoding="utf-8") as _handle:\n                            _handle.write(_message + "\\n")\n                    except OSError:\n                        pass\n                logger.critical(_message)\n                os._exit(78)\n            return None'
     if "PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR" not in llm_text:
         if "import os\n" not in llm_text:
             llm_text = llm_text.replace("import sys\n", "import os\nimport sys\n", 1)
@@ -478,7 +555,7 @@ if driver_py.exists():
                 build_cmd, stderr=subprocess.STDOUT, shell=True, text=True
             )'''
         new = '''        build_wrapper = os.environ.get("PROME_FUZZ_DRIVER_BUILD_WRAPPER", "").strip()
-        wrapper_cmd = [build_wrapper, str(src_path), str(bin_path)] if build_wrapper else []
+        wrapper_cmd = ["bash", build_wrapper, str(src_path), str(bin_path)] if build_wrapper else []
         logger.debug(
             f"Building fuzz driver {self.id} with "
             f"{'target build wrapper: ' + ' '.join(wrapper_cmd) if wrapper_cmd else 'command: ' + build_cmd}"
@@ -585,6 +662,7 @@ PY_PROMEFUZZ_LLM_TRACE_PATCH
   failed_stage=none
   for stage in "${stages[@]}"; do
     stage_args=("$python" PromeFuzz.py "$cfg_flag" "$config" -F "$libraries" "$stage")
+    stage_args+=(--pool-size "$promefuzz_pool_size")
     if [[ "$stage" == "comprehend" ]]; then
       stage_args+=(--task "${PROME_FUZZ_COMPREHEND_TASK:-funcpurp}")
     fi
@@ -643,7 +721,7 @@ PY_PROME_API_COUNT
     reason="PromeFuzz $failed_stage stage exited $code"
     stage_log="$workspace/logs/${failed_stage}.log"
     if [[ -f "$stage_log" ]]; then
-      if grep -qi 'hgb_llm_nonretryable\|Insufficient Balance\|Error code: 402' "$stage_log" "$workspace/logs/provider_error.log" 2>/dev/null; then
+      if grep -qi 'hgb_llm_nonretryable\|Insufficient Balance\|ExceededBudget\|budget_exceeded\|Error code: 402' "$stage_log" "$workspace/logs/provider_error.log" 2>/dev/null; then
         reason='PromeFuzz provider rejected a non-retryable request (such as exhausted credit, invalid credentials, or unavailable model); generation stopped without retrying indefinitely'
       elif grep -qi 'localhost.*11434\|port=11434\|/api/embeddings.*Connection refused' "$stage_log"; then
         reason='PromeFuzz embedding service is unavailable at localhost:11434; start Ollama or set PROME_FUZZ_EMBEDDING_LLM_TYPE/base/model/API key'

@@ -227,18 +227,66 @@ hgb_image_name() {
   printf 'hgb-%s:%s\n' "$fuzzer" "$short"
 }
 
+hgb_docker_layerdb_collision() {
+  local log_file="$1"
+  [[ -f "$log_file" ]] || return 1
+  grep -Fq 'failed to register layer:' "$log_file" &&
+    grep -Fq 'layerdb' "$log_file" &&
+    grep -Fq 'file exists' "$log_file"
+}
+
+hgb_docker_layerdb_guard_file() {
+  local fuzzer="$1" image="$2" root="$3" safe_image
+  safe_image="${image//[^A-Za-z0-9._-]/_}"
+  printf '%s/%s/build_guards/%s.layerdb_collision\n' "$(hgb_workspace_dir "$root")" "$fuzzer" "$safe_image"
+}
+
+hgb_record_docker_layerdb_guard() {
+  local guard_file="$1" image="$2" log_file="$3"
+  ensure_dir "$(dirname "$guard_file")"
+  {
+    printf 'image=%s\n' "$image"
+    printf 'recorded_at=%s\n' "$(make_timestamp)"
+    printf 'source_log=%s\n' "$log_file"
+  } >"$guard_file"
+}
+
+hgb_previous_docker_layerdb_collision_log() {
+  local fuzzer="$1" image="$2" root="$3"
+  local build_root metadata candidate_image candidate_log index
+  local metadata_files=()
+  build_root="$(hgb_workspace_dir "$root")/$fuzzer"
+  metadata_files=("$build_root"/build_*/metadata.json)
+  for ((index=${#metadata_files[@]} - 1; index >= 0; index--)); do
+    metadata="${metadata_files[$index]}"
+    [[ -f "$metadata" ]] || continue
+    candidate_image="$(extract_json_string image "$metadata")"
+    [[ "$candidate_image" == "$image" ]] || continue
+    candidate_log="$(extract_json_string log_file "$metadata")"
+    [[ -n "$candidate_log" ]] || candidate_log="$(dirname "$metadata")/logs/docker_build.log"
+    if hgb_docker_layerdb_collision "$candidate_log"; then
+      printf '%s\n' "$candidate_log"
+      return 0
+    fi
+  done
+  return 1
+}
+
 hgb_build_image() {
   local fuzzer="$1"
   local artifact_name="$2"
   local root="${3:-$(repo_root)}"
-  local image latest dockerfile log_file out_dir code image_id
+  local image latest dockerfile log_file out_dir code image_id guard_file previous_collision_log skip_reason
   local build_args=()
+  HGB_LAST_IMAGE_BUILD_FAILURE=""
   image="$(hgb_image_name "$fuzzer" "$artifact_name" "$root")"
   latest="hgb-$fuzzer:latest"
   dockerfile="$root/docker/$fuzzer/Dockerfile"
   out_dir="$(hgb_workspace_dir "$root")/$fuzzer/build_$(make_timestamp)"
   ensure_dir "$out_dir/logs"
   log_file="$out_dir/logs/docker_build.log"
+  HGB_LAST_IMAGE_BUILD_LOG="$log_file"
+  guard_file="$(hgb_docker_layerdb_guard_file "$fuzzer" "$image" "$root")"
   require_docker
   [[ -f "$dockerfile" ]] || die "Missing Dockerfile: $dockerfile"
   if [[ "$fuzzer" == "oss-fuzz-gen" ]]; then
@@ -256,8 +304,29 @@ hgb_build_image() {
       build_args+=(--build-arg "CODEQL_BUNDLE_URL=${CODEQL_BUNDLE_URL}")
     fi
   fi
+
   code=0
-  docker build "${build_args[@]}" -f "$dockerfile" -t "$image" -t "$latest" "$root" >"$log_file" 2>&1 || code=$?
+  skip_reason=""
+  if [[ "${HGB_RETRY_DOCKER_LAYERDB_BUILD:-0}" != "1" ]]; then
+    if [[ ! -f "$guard_file" ]]; then
+      previous_collision_log="$(hgb_previous_docker_layerdb_collision_log "$fuzzer" "$image" "$root" || true)"
+      if [[ -n "$previous_collision_log" ]]; then
+        hgb_record_docker_layerdb_guard "$guard_file" "$image" "$previous_collision_log"
+      fi
+    fi
+    if [[ -f "$guard_file" ]]; then
+      skip_reason="docker_layerdb_collision"
+      code=75
+      {
+        printf 'HGB skipped Docker build after a previously detected layerdb collision.\n'
+        printf 'Guard file: %s\n' "$guard_file"
+        sed -n '1,20p' "$guard_file"
+      } >"$log_file"
+    fi
+  fi
+  if [[ -z "$skip_reason" ]]; then
+    docker build "${build_args[@]}" -f "$dockerfile" -t "$image" -t "$latest" "$root" >"$log_file" 2>&1 || code=$?
+  fi
   image_id="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
   {
     printf '{\n'
@@ -267,11 +336,26 @@ hgb_build_image() {
     printf '  "image_id": "%s",\n' "$(json_escape "$image_id")"
     printf '  "artifact_commit": "%s",\n' "$(json_escape "$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")")"
     printf '  "build_exit_code": %s,\n' "$code"
+    if [[ -n "$skip_reason" ]]; then
+      printf '  "skip_reason": "%s",\n' "$(json_escape "$skip_reason")"
+      printf '  "guard_file": "%s",\n' "$(json_escape "$guard_file")"
+    fi
     printf '  "log_file": "%s"\n' "$(json_escape "$log_file")"
     printf '}\n'
   } >"$out_dir/metadata.json"
   if [[ "$code" -ne 0 ]]; then
-    die "Docker build failed for $image. Inspect $log_file"
+    if [[ "$skip_reason" == "docker_layerdb_collision" ]]; then
+      HGB_LAST_IMAGE_BUILD_FAILURE="docker_layerdb_collision"
+      printf 'ERROR: Docker build for %s was skipped after a prior layerdb collision. Inspect %s. After the Docker administrator repairs the daemon storage, retry explicitly with HGB_RETRY_DOCKER_LAYERDB_BUILD=1; HGB will not prune or alter /data/docker automatically.\n' "$image" "$log_file" >&2
+      return "$code"
+    fi
+    printf 'ERROR: Docker build failed for %s. Inspect %s\n' "$image" "$log_file" >&2
+    if hgb_docker_layerdb_collision "$log_file"; then
+      hgb_record_docker_layerdb_guard "$guard_file" "$image" "$log_file"
+      HGB_LAST_IMAGE_BUILD_FAILURE="docker_layerdb_collision"
+      printf 'ERROR: Docker image storage has a layerdb collision. Stop competing Docker builds, then have the Docker administrator restart or repair the daemon storage before retrying; HGB will not prune or alter /data/docker automatically.\n' >&2
+    fi
+    return "$code"
   fi
   printf '%s\n' "$image"
 }
@@ -441,6 +525,14 @@ run_hgb_target_container() {
   if [[ "$generator" == "elfuzz" && -S /var/run/docker.sock ]]; then
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
+  if [[ "$generator" == "elfuzz" ]]; then
+    # ELFuzz starts sibling containers. Their bind-mount sources must be visible
+    # at the same absolute path to both this container and the host daemon.
+    elfuzz_shared_dir="${ELFUZZ_HOST_SHARED_DIR:-$workspace/elfuzz_shared}"
+    ensure_dir "$elfuzz_shared_dir"
+    ensure_dir "$elfuzz_shared_dir/hf-cache"
+    extra_docker_args+=(--add-host host.docker.internal:host-gateway -v "$elfuzz_shared_dir:$elfuzz_shared_dir" -e "ELFUZZ_HOST_SHARED_DIR=$elfuzz_shared_dir" -e "ELFUZZ_TGI_CACHE_DIR=$elfuzz_shared_dir/hf-cache")
+  fi
   docker run --rm --init \
     --entrypoint /opt/hgb/entrypoint.sh \
     -e API_KEY \
@@ -508,7 +600,9 @@ run_hgb_target_container() {
     -e ELFUZZ_HELP_ONLY \
     -e ELFUZZ_SKIP_DOWNLOAD \
     -e ELFUZZ_REQUIRE_HF_TOKEN \
+    -e ELFUZZ_REQUIRE_GPU \
     -e ELFUZZ_LOCAL_MODEL_CACHE_READY \
+    -e ELFUZZ_PROJECT_ROOT \
     -e CKGFUZZER_EMBEDDING_MODEL \
     -e CKGFUZZER_EMBEDDING_BASE_URL \
     -e CKGFUZZER_EMBEDDING_API_KEY \
@@ -541,11 +635,15 @@ run_hgb_target_container() {
     -e PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
     -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
+    -e PROME_FUZZ_POOL_SIZE \
     -e PROME_FUZZ_COMPREHEND_TASK \
     -e HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD \
     -e HGB_PROMEFUZZ_NATIVE_BUILD \
+    -e HGB_PROMEFUZZ_VALIDATE_TARGET_BASELINE \
     -e PROME_FUZZ_NATIVE_BUILD_TIMEOUT_SECONDS \
     -e PROME_FUZZ_NATIVE_LOCK_TIMEOUT_SECONDS \
+    -e PROME_FUZZ_NATIVE_SMOKE_RUN \
+    -e PROME_FUZZ_NATIVE_RUN_TIMEOUT_SECONDS \
     -e G2FUZZ_MAX_FORMATS \
     -e G2FUZZ_TRY_NUM \
     -e G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \

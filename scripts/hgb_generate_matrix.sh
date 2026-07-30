@@ -162,10 +162,16 @@ declare -A shared_target_packages=()
 
 prepare_shared_target_packages() {
   local target output
+  local selected_targets=()
   if [[ "$target_package_mode" != "shared" ]]; then
     return 0
   fi
-  for target in "${target_list[@]}"; do
+  if [[ "$#" -gt 0 ]]; then
+    selected_targets=("$@")
+  else
+    selected_targets=("${target_list[@]}")
+  fi
+  for target in "${selected_targets[@]}"; do
     if [[ -n "${shared_target_packages[$target]:-}" ]]; then
       continue
     fi
@@ -203,8 +209,70 @@ preflight_generator() {
   elif [[ "$generator" == "ckgfuzzer" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
     log "rebuilding stale CKGFuzzer image without current LLM timeout/retry wiring: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
+  elif [[ "$generator" == "promefuzz" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "test -f /opt/hgb/bin/promefuzz_target_build.sh && command -v wget >/dev/null && command -v autoreconf >/dev/null && command -v nasm >/dev/null && command -v tclsh >/dev/null && test -x /usr/local/bin/python3.8 && test -f /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.ubsan_standalone-x86_64.a && dpkg-query -W -f='\${db:Status-Status}' zlib1g-dev 2>/dev/null | grep -qx installed && grep -Fq 'fuzzbench_target_build_available' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
+    log "rebuilding stale PromeFuzz image without current target-build validation: $image"
+    hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
   fi
 }
+generator_supports_target() {
+  local generator="$1" target="$2"
+  case "$generator" in
+    elfuzz)
+      # Explicit ELFuzz target controls deliberately allow experimental
+      # mappings beyond the maintained native preset list.
+      [[ -n "${ELFUZZ_TARGET_OVERRIDE:-}" || "${ELFUZZ_TRUST_FUZZBENCH_TARGET:-0}" == "1" ]] && return 0
+      [[ ",${ELFUZZ_SUPPORTED_TARGETS:-}," == *",$target,"* ]] && return 0
+      case "$target" in
+        jsoncpp_jsoncpp_fuzzer|libxml2_xml|libxml2_xml_e85b9b|re2_fuzzer|sqlite3_ossfuzz|cpython3_*|librsvg_*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *) return 0 ;;
+  esac
+}
+
+record_not_applicable_target() {
+  local generator="$1" target="$2" index="$3"
+  local safe_generator safe_target index_label metadata_dir metadata
+  safe_generator="$(safe_name "$generator")"
+  safe_target="$(safe_name "$target")"
+  index_label="$(printf '%06d' "$index")"
+  metadata_dir="$matrix_dir/not_applicable"
+  metadata="$metadata_dir/${index_label}_${safe_generator}_${safe_target}.json"
+  ensure_dir "$metadata_dir"
+  {
+    printf '{\n'
+    printf '  "generator": "%s",\n' "$(json_escape "$generator")"
+    printf '  "target": "%s",\n' "$(json_escape "$target")"
+    printf '  "status": "target_not_supported_by_elfuzz",\n'
+    printf '  "reason": "ELFuzz has no maintained native preset for this target; use ELFUZZ_TARGET_OVERRIDE, ELFUZZ_SUPPORTED_TARGETS, or ELFUZZ_TRUST_FUZZBENCH_TARGET=1 only when an upstream mapping is known",\n'
+    printf '  "capability": "input_generator"\n'
+    printf '}\n'
+  } >"$metadata"
+  printf '%s\t%s\ttarget_not_supported_by_elfuzz\t\t%s\t\n' "$generator" "$target" "$metadata" >>"$matrix_file"
+}
+
+record_preflight_failure() {
+  local generator="$1" failure_code="$2" status="$3" target failure_log failure_metadata
+  shift 3
+  failure_log="$matrix_dir/$(safe_name "$generator")_preflight.log"
+  failure_metadata="$matrix_dir/$(safe_name "$generator")_preflight_metadata.json"
+  printf 'generator preflight failed: generator=%s exit_code=%s status=%s build_log=%s\n' "$generator" "$failure_code" "$status" "${HGB_LAST_IMAGE_BUILD_LOG:-}" >"$failure_log"
+  {
+    printf '{\n'
+    printf '  "generator": "%s",\n' "$(json_escape "$generator")"
+    printf '  "status": "%s",\n' "$(json_escape "$status")"
+    printf '  "reason": "generator preflight failed before target preparation (exit %s)",\n' "$(json_escape "$failure_code")"
+    printf '  "build_log": "%s",\n' "$(json_escape "${HGB_LAST_IMAGE_BUILD_LOG:-}")"
+    printf '  "preflight_log": "%s"\n' "$(json_escape "$failure_log")"
+    printf '}\n'
+  } >"$failure_metadata"
+  for target in "$@"; do
+    pair_index=$((pair_index + 1))
+    printf '%s\t%s\t%s\t\t%s\t\n' "$generator" "$target" "$status" "$failure_metadata" >>"$matrix_file"
+  done
+}
+
 
 run_pair() {
   local generator="$1"
@@ -245,6 +313,7 @@ run_pair() {
 active_count=0
 generator_failed=0
 first_failure_code=0
+active_parallel_worker="$parallel_worker"
 
 wait_for_one() {
   local code=0
@@ -264,7 +333,7 @@ wait_for_one() {
 }
 
 wait_for_slot() {
-  while [[ "$active_count" -ge "$parallel_worker" ]]; do
+  while [[ "$active_count" -ge "$active_parallel_worker" ]]; do
     wait_for_one
   done
 }
@@ -275,17 +344,51 @@ wait_for_generator() {
   done
 }
 
-prepare_shared_target_packages
-
 pair_index=0
 for generator in "${generator_list[@]}"; do
-  preflight_generator "$generator"
+  eligible_targets=()
+  for target in "${target_list[@]}"; do
+    if generator_supports_target "$generator" "$target"; then
+      eligible_targets+=("$target")
+    else
+      pair_index=$((pair_index + 1))
+      record_not_applicable_target "$generator" "$target" "$pair_index"
+    fi
+  done
+
+  if [[ "${#eligible_targets[@]}" -eq 0 ]]; then
+    log "no eligible targets for $generator after capability filtering"
+    continue
+  fi
+
+  if preflight_generator "$generator"; then
+    :
+  else
+    preflight_code=$?
+    preflight_status="generator_preflight_failed"
+    if [[ "${HGB_LAST_IMAGE_BUILD_FAILURE:-}" == "docker_layerdb_collision" ]]; then
+      preflight_status="generator_preflight_docker_layerdb_collision"
+    fi
+    log "generator preflight failed for $generator (exit $preflight_code)"
+    record_preflight_failure "$generator" "$preflight_code" "$preflight_status" "${eligible_targets[@]}"
+    if [[ "$continue_on_error" != "1" ]]; then
+      python3 "$SCRIPT_DIR/hgb_collect_matrix.py" "$matrix_dir"
+      exit "$preflight_code"
+    fi
+    continue
+  fi
+  prepare_shared_target_packages "${eligible_targets[@]}"
   active_count=0
   generator_failed=0
   first_failure_code=0
+  active_parallel_worker="$parallel_worker"
+  if [[ "$generator" == "elfuzz" && "$active_parallel_worker" -gt 1 ]]; then
+    active_parallel_worker=1
+    log "serializing ELFuzz targets: its upstream TGI server uses the global container name tgi-server"
+  fi
   generator_row_files=()
 
-  for target in "${target_list[@]}"; do
+  for target in "${eligible_targets[@]}"; do
     if [[ "$generator_failed" == "1" && "$continue_on_error" != "1" ]]; then
       break
     fi

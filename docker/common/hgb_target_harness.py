@@ -120,7 +120,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-root", required=True, type=Path)
     parser.add_argument("--fuzz-target", default="")
-    parser.add_argument("--field", choices=("json", "language", "destination"), default="json")
+    parser.add_argument("--field", choices=("json", "language", "destination", "reference"), default="json")
     args = parser.parse_args()
     try:
         result = select_native_harness(args.target_root, args.fuzz_target)
@@ -128,6 +128,8 @@ def main() -> int:
         parser.error(str(exc))
     if args.field == "language":
         print(result.language)
+    elif args.field == "reference":
+        print(result.selected_reference)
     elif args.field == "destination":
         print(result.container_destination)
     else:

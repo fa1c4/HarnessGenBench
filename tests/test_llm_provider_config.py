@@ -115,6 +115,8 @@ def test_g2fuzz_uses_resolved_base_url_and_promefuzz_fails_fast_on_provider_reje
     assert "PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR" in prome_entrypoint
     assert "hgb_llm_nonretryable" in prome_entrypoint
     assert "os._exit(78)" in prome_entrypoint
+    assert "ExceededBudget" in prome_entrypoint
+    assert "budget_exceeded" in prome_entrypoint
 
 
 def test_ckgfuzzer_timeout_retry_defaults_reach_the_client_and_containers() -> None:

@@ -130,4 +130,6 @@ bash scripts/hgb_generate_matrix.sh \
   --dry-run
 ```
 
-ELFuzz and G2FUZZ are input-generation baselines, not source-level harness generators. Their target-aware runs soft-skip by default with `not_harness_generator`; pass `--allow-input-generator` to run them as input-generation baselines.
+ELFuzz and G2FUZZ are input-generation baselines, not source-level harness generators. Their target-aware runs soft-skip by default with `not_harness_generator`; pass `--allow-input-generator` to run them as input-generation baselines. The ELFuzz mappings exercised by `valuable` are `jsoncpp_jsoncpp_fuzzer`, `libxml2_xml`, `re2_fuzzer`, and `sqlite3_ossfuzz` (with optional cpython/librsvg and explicit override mappings); the matrix marks other targets as not applicable without preparing them, and serializes eligible runs because the upstream workflow starts a global `tgi-server` Docker container.
+
+If Docker reports a layerdb collision during image preflight, HGB records a per-image guard and later runs fail quickly instead of repeating the image pull. Stop competing builds and have the Docker administrator repair the daemon storage; then retry explicitly with `HGB_RETRY_DOCKER_LAYERDB_BUILD=1`. HGB never prunes or modifies `/data/docker` automatically.

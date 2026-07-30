@@ -128,6 +128,9 @@ elif [[ "$dry_run" != "1" && "$generator" == "oss-fuzz-gen" ]] && ! docker run -
 elif [[ "$dry_run" != "1" && "$generator" == "ckgfuzzer" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
   log "rebuilding stale CKGFuzzer image without current LLM timeout/retry wiring: $image"
   image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
+elif [[ "$dry_run" != "1" && "$generator" == "promefuzz" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "test -f /opt/hgb/bin/promefuzz_target_build.sh && command -v wget >/dev/null && command -v autoreconf >/dev/null && command -v nasm >/dev/null && command -v tclsh >/dev/null && test -x /usr/local/bin/python3.8 && test -f /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.ubsan_standalone-x86_64.a && dpkg-query -W -f='\${db:Status-Status}' zlib1g-dev 2>/dev/null | grep -qx installed && grep -Fq 'fuzzbench_target_build_available' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
+  log "rebuilding stale PromeFuzz image without current target-build validation: $image"
+  image="$(hgb_build_image "$generator" "$artifact_name" "$root")"
 fi
 
 {
