@@ -1,0 +1,25 @@
+{
+  "adapter_class": "extension",
+  "adapter_id": "libxslt_xpath",
+  "argv": [
+    "@@"
+  ],
+  "build_mode": "fuzzbench_native",
+  "coverage_extraction_hook": "elfuzz getcov_fuzzbench against the pinned native binary",
+  "description": "libxslt XPath fuzzer; inputs are XML documents evaluated via XPath expressions.",
+  "dictionary_policy": "format dictionary derived from public grammar; optional for text evolution",
+  "format": "XPath/XML",
+  "format_spec": "format.md",
+  "initial_corpus_policy": "common FuzzBench corpus, capped and deduplicated",
+  "input_mode": "file",
+  "native_harness": "unchanged",
+  "resource_limits": {
+    "campaign_memory_mb": 1024,
+    "timeout_seconds": 5
+  },
+  "seed_template": "seed_fuzzer.py",
+  "target": "libxslt_xpath",
+  "timeout_seconds": 5,
+  "upstream_benchmark": "libxml2",
+  "validity_check": "xml"
+}

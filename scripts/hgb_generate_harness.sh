@@ -70,6 +70,7 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --allow-input-generator|--allow-input-generators)
+      printf 'WARNING: --allow-input-generator is a deprecated no-op; input-generator baselines run from metadata/baseline_contracts.yaml.\n' >&2
       allow_input_generator=1
       shift
       ;;
@@ -91,6 +92,25 @@ valid_hgb_generator "$generator" || die "unknown generator: $generator"
 
 root="$(repo_root)"
 load_hgb_config
+
+# Host-side ELFuzz classification gate: contractually Invalid (non-text) targets
+# are resolved from the committed manifest before artifact checkout, Docker
+# build, TGI, or model access. They write a not_applicable/Invalid result and
+# exit 0 so matrix execution may continue.
+if [[ "$generator" == "elfuzz" ]]; then
+  elfuzz_cls="$(python3 "$root/docker/common/elfuzz_target_pipeline.py" classify --target "$target" --metadata-root "$root/metadata" 2>/dev/null || true)"
+  elfuzz_applicability="$(printf '%s' "$elfuzz_cls" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("applicability",""))' 2>/dev/null || true)"
+  if [[ "$elfuzz_applicability" == "Invalid" ]]; then
+    run_id="${run_id:-$(make_timestamp)}"
+    workspace="$(workspace_generator_target_run_dir "$generator" "$target" "$run_id" "$root")"
+    ensure_dir "$workspace/logs"
+    python3 "$root/docker/common/elfuzz_target_pipeline.py" write-invalid --target "$target" --metadata-root "$root/metadata" --out "$workspace/result.json" >/dev/null
+    cp "$workspace/result.json" "$workspace/metadata.json"
+    printf 'Invalid: ELFuzz supports text-input targets only\n' >&2
+    printf '%s\n' "$workspace"
+    exit 0
+  fi
+fi
 
 artifact_name="$(generator_artifact_name "$generator")"
 artifacts=(fuzzbench "$artifact_name")
@@ -153,7 +173,7 @@ export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}"
 export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
 export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
 export HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS="${HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS:-180}"
-if [[ "$generator" == "g2fuzz" ]]; then
+if [[ "$generator" == "g2fuzz" || "$generator" == "elfuzz" ]]; then
   export HGB_ALLOW_INPUT_GENERATOR_TO_RUN=1
 else
   export HGB_ALLOW_INPUT_GENERATOR_TO_RUN="$allow_input_generator"

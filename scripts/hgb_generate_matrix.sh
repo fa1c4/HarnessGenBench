@@ -20,6 +20,9 @@ Options:
   --save-mode compact|debug  Compact removes duplicate transient outputs; debug preserves them (default: compact).
   --continue-on-error        Record every pair and continue after failures (default).
   --fail-fast                Stop launching new jobs after a failure; wait for active jobs.
+  --profile NAME             Baseline profile passed to each pair (e.g. alpha, paper-native).
+  --protocol NAME            Baseline protocol passed to each pair (e.g. paper-native).
+  --strict                   Exit nonzero if any applicable pair fails to reach evaluated/Invalid.
   --run-id ID                Use ID for the matrix workspace.
 EOF
 }
@@ -34,6 +37,9 @@ target_package_mode="shared"
 target_layout="compact"
 save_mode="compact"
 run_id=""
+profile=""
+protocol=""
+strict=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -58,6 +64,7 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     --allow-input-generators|--allow-input-generator)
+      printf 'WARNING: --allow-input-generators is a deprecated no-op; input-generator baselines run from metadata/baseline_contracts.yaml.\n' >&2
       allow_input=1
       shift
       ;;
@@ -84,6 +91,18 @@ while [[ $# -gt 0 ]]; do
     --run-id)
       run_id="${2:-}"
       shift 2
+      ;;
+    --profile)
+      profile="${2:-}"
+      shift 2
+      ;;
+    --protocol)
+      protocol="${2:-}"
+      shift 2
+      ;;
+    --strict)
+      strict=1
+      shift
       ;;
     -h|--help)
       usage
@@ -127,6 +146,8 @@ for generator in "${generator_list[@]}"; do
 done
 
 run_id="${run_id:-$(make_timestamp)}"
+if [[ -n "$profile" ]]; then export HGB_BASELINE_PROFILE="$profile"; fi
+if [[ -n "$protocol" ]]; then export HGB_BASELINE_PROTOCOL="$protocol"; fi
 matrix_dir="$(hgb_workspace_dir "$root")/matrix/$run_id"
 row_dir="$matrix_dir/rows"
 ensure_dir "$matrix_dir"
@@ -188,6 +209,10 @@ preflight_generator() {
   local artifacts=()
 
   valid_hgb_generator "$generator" || die "unknown generator: $generator"
+  if [[ "$generator" == "elfuzz" ]]; then
+    python3 "$root/docker/common/elfuzz_target_pipeline.py" validate-adapters --metadata-root "$root/metadata" \
+      || die "ELFuzz adapter manifest does not cover the current valuable set; classify every new target in metadata/elfuzz_target_adapters.yaml"
+  fi
   artifact_name="$(generator_artifact_name "$generator")"
   artifacts=(fuzzbench "$artifact_name")
   ensure_artifacts_present "$root" "${artifacts[@]}"
@@ -215,14 +240,11 @@ generator_supports_target() {
   local generator="$1" target="$2"
   case "$generator" in
     elfuzz)
-      # Explicit ELFuzz target controls deliberately allow experimental
-      # mappings beyond the maintained native preset list.
-      [[ -n "${ELFUZZ_TARGET_OVERRIDE:-}" || "${ELFUZZ_TRUST_FUZZBENCH_TARGET:-0}" == "1" ]] && return 0
-      [[ ",${ELFUZZ_SUPPORTED_TARGETS:-}," == *",$target,"* ]] && return 0
-      case "$target" in
-        jsoncpp_jsoncpp_fuzzer|libxml2_xml|libxml2_xml_e85b9b|re2_fuzzer|sqlite3_ossfuzz|cpython3_*|librsvg_*) return 0 ;;
-        *) return 1 ;;
-      esac
+      local cls applicability
+      cls="$(python3 "$root/docker/common/elfuzz_target_pipeline.py" classify --target "$target" --metadata-root "$root/metadata" 2>/dev/null || true)"
+      applicability="$(printf '%s' "$cls" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("applicability",""))' 2>/dev/null || true)"
+      [[ "$applicability" == "applicable" ]] && return 0
+      return 1
       ;;
     *) return 0 ;;
   esac
@@ -230,23 +252,29 @@ generator_supports_target() {
 
 record_not_applicable_target() {
   local generator="$1" target="$2" index="$3"
-  local safe_generator safe_target index_label metadata_dir metadata
+  local safe_generator safe_target index_label metadata_dir metadata status
   safe_generator="$(safe_name "$generator")"
   safe_target="$(safe_name "$target")"
   index_label="$(printf '%06d' "$index")"
   metadata_dir="$matrix_dir/not_applicable"
   metadata="$metadata_dir/${index_label}_${safe_generator}_${safe_target}.json"
   ensure_dir "$metadata_dir"
-  {
-    printf '{\n'
-    printf '  "generator": "%s",\n' "$(json_escape "$generator")"
-    printf '  "target": "%s",\n' "$(json_escape "$target")"
-    printf '  "status": "target_not_supported_by_elfuzz",\n'
-    printf '  "reason": "ELFuzz has no maintained native preset for this target; use ELFUZZ_TARGET_OVERRIDE, ELFUZZ_SUPPORTED_TARGETS, or ELFUZZ_TRUST_FUZZBENCH_TARGET=1 only when an upstream mapping is known",\n'
-    printf '  "capability": "input_generator"\n'
-    printf '}\n'
-  } >"$metadata"
-  printf '%s\t%s\ttarget_not_supported_by_elfuzz\t\t%s\t\n' "$generator" "$target" "$metadata" >>"$matrix_file"
+  if [[ "$generator" == "elfuzz" ]]; then
+    python3 "$root/docker/common/elfuzz_target_pipeline.py" write-invalid --target "$target" --metadata-root "$root/metadata" --out "$metadata" >/dev/null
+    status="not_applicable"
+  else
+    status="target_not_supported_by_elfuzz"
+    {
+      printf '{\n'
+      printf '  "generator": "%s",\n' "$(json_escape "$generator")"
+      printf '  "target": "%s",\n' "$(json_escape "$target")"
+      printf '  "status": "target_not_supported_by_elfuzz",\n'
+      printf '  "reason": "ELFuzz has no maintained native preset for this target; use ELFUZZ_TARGET_OVERRIDE, ELFUZZ_SUPPORTED_TARGETS, or ELFUZZ_TRUST_FUZZBENCH_TARGET=1 only when an upstream mapping is known",\n'
+      printf '  "capability": "input_generator"\n'
+      printf '}\n'
+    } >"$metadata"
+  fi
+  printf '%s\t%s\t%s\t\t%s\t\n' "$generator" "$target" "$status" "$metadata" >>"$matrix_file"
 }
 
 record_preflight_failure() {
@@ -414,4 +442,14 @@ for generator in "${generator_list[@]}"; do
 done
 
 python3 "$SCRIPT_DIR/hgb_collect_matrix.py" "$matrix_dir"
+if [[ "$strict" == "1" ]]; then
+  strict_violation=0
+  while IFS=$'\t' read -r g t status ws metadata summary; do
+    case "$status" in
+      evaluated|not_applicable|dry_run_ok|completed|target_not_supported_by_elfuzz|generator_preflight_failed|generator_preflight_docker_layerdb_collision) ;;
+      *) strict_violation=1; printf 'Matrix strict violation: generator=%s target=%s status=%s\n' "$g" "$t" "$status" >&2 ;;
+    esac
+  done < <(tail -n +2 "$matrix_file")
+  if [[ "$strict_violation" == "1" ]]; then exit 1; fi
+fi
 printf '%s\n' "$matrix_dir"

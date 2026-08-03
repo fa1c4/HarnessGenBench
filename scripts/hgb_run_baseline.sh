@@ -91,7 +91,7 @@ done
 valid_hgb_generator "$generator" || die "unknown generator: $generator"
 
 case "$generator" in
-  g2fuzz)
+  g2fuzz|elfuzz)
     profile="${profile:-alpha}"
     protocol="${protocol:-paper-native}"
     strict_success="evaluated"
@@ -125,6 +125,11 @@ fi
 
 if [[ "$strict" == "1" ]]; then
   if [[ "$dry_run" == "1" && "$status" == "dry_run_ok" ]]; then
+    printf '%s\n' "$workspace"
+    exit 0
+  fi
+  applicability="$(extract_json_string applicability "$metadata")"
+  if [[ "$status" == "not_applicable" && "$applicability" == "Invalid" ]]; then
     printf '%s\n' "$workspace"
     exit 0
   fi

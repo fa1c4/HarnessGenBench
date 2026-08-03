@@ -1,0 +1,25 @@
+{
+  "adapter_class": "extension",
+  "adapter_id": "mruby",
+  "argv": [
+    "@@"
+  ],
+  "build_mode": "fuzzbench_native",
+  "coverage_extraction_hook": "elfuzz getcov_fuzzbench against the pinned native binary",
+  "description": "mruby parser fuzzer; inputs are Ruby source programs.",
+  "dictionary_policy": "format dictionary derived from public grammar; optional for text evolution",
+  "format": "Ruby source",
+  "format_spec": "format.md",
+  "initial_corpus_policy": "common FuzzBench corpus, capped and deduplicated",
+  "input_mode": "file",
+  "native_harness": "unchanged",
+  "resource_limits": {
+    "campaign_memory_mb": 1024,
+    "timeout_seconds": 5
+  },
+  "seed_template": "seed_fuzzer.py",
+  "target": "mruby_mruby_fuzzer_8c8bbd",
+  "timeout_seconds": 5,
+  "upstream_benchmark": "jsoncpp",
+  "validity_check": "ruby"
+}

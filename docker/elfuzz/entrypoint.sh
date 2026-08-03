@@ -16,17 +16,7 @@ mode="${1:-smoke-jsoncpp}"
 mkdir -p "$workspace/logs" "$workspace/artifacts"
 json_escape() { local v="${1:-}"; v="${v//\\/\\\\}"; v="${v//\"/\\\"}"; v="${v//$'\n'/\\n}"; printf '%s' "$v"; }
 count_files() { local d="$1"; shift || true; [[ -d "$d" ]] || { printf '0'; return 0; }; find "$d" "$@" 2>/dev/null | wc -l | tr -d ' '; }
-elfuzz_target_for_hgb_target() {
-  case "$1" in
-    jsoncpp|jsoncpp_jsoncpp_fuzzer) printf 'jsoncpp' ;;
-    libxml2|libxml2_xml|libxml2_xml_e85b9b) printf 'libxml2' ;;
-    re2|re2_fuzzer) printf 're2' ;;
-    sqlite3|sqlite3_ossfuzz) printf 'sqlite3' ;;
-    cpython3|cpython3_*) printf 'cpython3' ;;
-    librsvg|librsvg_*) printf 'librsvg' ;;
-    *) printf '' ;;
-  esac
-}
+
 find_elfuzz_project_root() {
   local candidate
   for candidate in "${ELFUZZ_PROJECT_ROOT:-}" /home/appuser/elmfuzz /elfuzz /opt/hgb/artifacts/elfuzz; do
@@ -38,48 +28,6 @@ find_elfuzz_project_root() {
 }
 ELFUZZ_PROJECT_ROOT="$(find_elfuzz_project_root || true)"
 export ELFUZZ_PROJECT_ROOT
-stage_exit() { [[ -f "$workspace/logs/$1.exit" ]] && cat "$workspace/logs/$1.exit" || printf not_run; }
-run_stage() {
-  local stage="$1"; shift
-  local code=0
-  printf '%q ' "$@" >"$workspace/logs/$stage.cmd"; printf '\n' >>"$workspace/logs/$stage.cmd"
-  timeout "${ELFUZZ_STAGE_TIMEOUT_SECONDS:-900}" "$@" >"$workspace/logs/$stage.log" 2>&1 || code=$?
-  printf '%s\n' "$code" >"$workspace/logs/$stage.exit"
-  return 0
-}
-summary() {
-  local status="$1" reason="$2"
-  {
-    printf '# HarnessGenBench ELFuzz Summary\n\n'
-    printf -- '- Run directory: `%s`\n' "$workspace"
-    printf -- '- Target: `%s`\n' "${ELFUZZ_TARGET:-jsoncpp}"
-    printf -- '- Status: `%s`\n' "$status"
-    printf -- '- Setup status: `%s`\n' "$(stage_exit setup)"
-    printf -- '- Synthesis status: `%s`\n' "$(stage_exit synth)"
-    printf -- '- Seed production status: `%s`\n' "$(stage_exit produce)"
-    printf -- '- AFL++ status: `%s`\n' "$(stage_exit afl)"
-    printf -- '- Top failure reason: %s\n' "$reason"
-    printf '\n## Logs\n\n'
-    find "$workspace/logs" -type f 2>/dev/null | sort | sed "s#^$workspace/##" | sed 's/^/- `/' | sed 's/$/`/'
-  } >"$workspace/HGB_SUMMARY.md"
-}
-metadata() {
-  local status="$1" reason="$2"
-  {
-    printf '{\n'
-    printf '  "fuzzer": "elfuzz",\n'
-    printf '  "status": "%s",\n' "$(json_escape "$status")"
-    printf '  "target": "%s",\n' "$(json_escape "${ELFUZZ_TARGET:-jsoncpp}")"
-    printf '  "setup": "%s",\n' "$(json_escape "$(stage_exit setup)")"
-    printf '  "synth": "%s",\n' "$(json_escape "$(stage_exit synth)")"
-    printf '  "produce": "%s",\n' "$(json_escape "$(stage_exit produce)")"
-    printf '  "afl": "%s",\n' "$(json_escape "$(stage_exit afl)")"
-    printf '  "reason": "%s",\n' "$(json_escape "$reason")"
-    printf '  "command_file": "%s",\n' "$(json_escape "$workspace/command.txt")"
-    printf '  "log_dir": "%s"\n' "$(json_escape "$workspace/logs")"
-    printf '}\n'
-  } >"$workspace/metadata.json"
-}
 
 patch_elfuzz_trace() {
   local py="$ELFUZZ_PROJECT_ROOT/genvariants_parallel.py"
@@ -125,20 +73,10 @@ text = path.read_text()
 old = '        subprocess.run(["sudo", "docker", "stop", "tgi-server"], check=True, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'
 new = '        try:\n            subprocess.run(["sudo", "docker", "stop", "tgi-server"], check=False, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n        except Exception as exc:\n            print(f"[HGB] ignoring tgi-server cleanup failure: {exc}")'
 if old in text and "ignoring tgi-server cleanup failure" not in text:
-    text = text.replace(old, new, 1)
-path.write_text(text)
+    path.write_text(text.replace(old, new, 1))
 PY_ELFUZZ_CLEANUP_PATCH
 }
-elfuzz_configured_hf_token() {
-  local value
-  value="$(elfuzz config --get tgi.huggingface_token 2>/dev/null || true)"
-  value="$(printf '%s\n' "$value" | tail -n 1)"
-  value="${value##* == }"
-  case "$value" in
-    ''|None|null) return 0 ;;
-  esac
-  printf '%s\n' "$value"
-}
+
 patch_elfuzz_sibling_paths() {
   local getcov="$ELFUZZ_PROJECT_ROOT/getcov_fuzzbench.py"
   [[ -f "$getcov" ]] || return 0
@@ -164,158 +102,92 @@ for raw_path in sys.argv[2:]:
         path.write_text(text.replace(old, new, 1))
 PY_ELFUZZ_SIBLING_PATH_PATCH
 }
-collect_elfuzz_outputs() {
-  local benchmark="$1" marker="$2" seed_dir generator_dir archive
-  local archives=()
 
-  seed_dir="$ELFUZZ_PROJECT_ROOT/extradata/seeds/raw/$benchmark/elm"
-  generator_dir="$ELFUZZ_PROJECT_ROOT/evaluation/elmfuzzers"
-  mkdir -p "$workspace/generated_inputs" "$workspace/generated_generators"
-  if [[ -d "$generator_dir" ]]; then
-    while IFS= read -r -d '' archive; do
-      cp -a "$archive" "$workspace/generated_generators/"
-    done < <(find "$generator_dir" -maxdepth 1 -type f -name "${benchmark}_*.fuzzers.tar.xz" -newer "$marker" -print0 2>/dev/null)
-  fi
-  if [[ -d "$seed_dir" ]]; then
-    mapfile -d '' -t archives < <(find "$seed_dir" -maxdepth 1 -type f -name '*.tar.zst' -newer "$marker" -print0 2>/dev/null | sort -z)
-    for archive in "${archives[@]}"; do
-      if ! tar --zstd -xf "$archive" -C "$workspace/generated_inputs"; then
-        printf 'could not extract generated seed archive: %s\n' "$archive" >>"$workspace/logs/collect_outputs.log"
-      fi
-    done
-  fi
-}
 if [[ "$mode" == "generate-target" ]]; then
   # shellcheck source=/opt/hgb/bin/target_contract.sh
   source /opt/hgb/bin/target_contract.sh
   export HGB_GENERATOR="${HGB_GENERATOR:-elfuzz}"
   export HGB_GENERATOR_ARTIFACT_DIR="/opt/hgb/artifacts/elfuzz"
+  export HGB_CAPABILITY=input_generator
+  export HGB_TASK_FAMILY=input_generator
+  export HGB_BASELINE_PROFILE="${HGB_BASELINE_PROFILE:-alpha}"
+  export HGB_BASELINE_PROTOCOL="${HGB_BASELINE_PROTOCOL:-paper-native}"
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
-  export HGB_CAPABILITY=input_generator
-  mkdir -p "$workspace/logs" "$workspace/generated_inputs"
+  mkdir -p "$workspace/logs"
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
-  if [[ "${HGB_ALLOW_INPUT_GENERATOR_TO_RUN:-0}" != "1" ]]; then
-    hgb_soft_skip not_harness_generator 'ELFuzz synthesizes input generators/fuzzer-space workflows, not source-level harnesses; set HGB_ALLOW_INPUT_GENERATOR_TO_RUN=1 to run it as an input generator baseline' input_generator
-  fi
-  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
-    printf 'elfuzz generate-target dry-run target=%s\n' "$target_name" >"$workspace/command.txt"
-    hgb_write_common_metadata dry_run_ok 'dry run validated ELFuzz input-generator target package' 0 input_generator
-    hgb_write_common_summary dry_run_ok 'dry run validated ELFuzz input-generator target package' input_generator
-    exit 0
-  fi
-  if ! command -v elfuzz >/dev/null 2>&1; then
-    hgb_soft_skip upstream_cli_not_found 'elfuzz CLI not found in image' input_generator
-  fi
-  if [[ -z "$ELFUZZ_PROJECT_ROOT" ]]; then
-    hgb_soft_skip upstream_source_not_found 'ELFuzz CLI is installed but its live project source tree was not found in the image' input_generator
-  fi
-  if [[ ! -S /var/run/docker.sock ]]; then
-    hgb_soft_skip elfuzz_docker_socket_unavailable 'ELFuzz requires the Docker socket to start its TGI and benchmark sibling containers' input_generator
-  fi
-  if [[ "${ELFUZZ_REQUIRE_GPU:-1}" == "1" ]] && ! docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'; then
-    hgb_soft_skip elfuzz_gpu_unavailable 'ELFuzz starts TGI with --gpus all; configure an NVIDIA Docker runtime and a usable GPU, or set ELFUZZ_REQUIRE_GPU=0 only for infrastructure debugging' input_generator
-  fi
-  elfuzz_target="${ELFUZZ_TARGET_OVERRIDE:-$(elfuzz_target_for_hgb_target "$target_name")}"
-  recognized=0
-  elfuzz list >"$workspace/logs/elfuzz_list.log" 2>&1 || true
-  if [[ "${ELFUZZ_TRUST_FUZZBENCH_TARGET:-0}" == "1" ]]; then
-    recognized=1
-    elfuzz_target="${elfuzz_target:-$target_name}"
-  elif [[ -n "$elfuzz_target" ]]; then
-    recognized=1
-  elif [[ ",${ELFUZZ_SUPPORTED_TARGETS:-}," == *",$target_name,"* ]]; then
-    recognized=1
-    elfuzz_target="$target_name"
-  elif grep -Fq "$target_name" "$workspace/logs/elfuzz_list.log"; then
-    recognized=1
-    elfuzz_target="$target_name"
-  fi
-  if [[ "$recognized" != "1" || -z "$elfuzz_target" ]]; then
-    hgb_soft_skip target_not_supported_by_elfuzz 'ELFuzz supports a small fixed target set; no mapping exists for this HGB/FuzzBench target name' input_generator
-  fi
   patch_elfuzz_cleanup
   patch_elfuzz_trace
   patch_elfuzz_sibling_paths
-  configured_hf_token="$(elfuzz_configured_hf_token)"
-  if [[ "${ELFUZZ_REQUIRE_HF_TOKEN:-1}" == "1" && -z "${HF_TOKEN:-}" && -z "$configured_hf_token" && "${ELFUZZ_LOCAL_MODEL_CACHE_READY:-0}" != "1" ]]; then
-    hgb_soft_skip elfuzz_missing_hf_token_or_model_access 'ELFuzz TGI synthesis requires HF_TOKEN, a configured Hugging Face token, or ELFUZZ_LOCAL_MODEL_CACHE_READY=1 for an already-cached model' input_generator
+  python=/opt/hgb/venv/bin/python
+  if [[ ! -x "$python" ]]; then
+    python="$(command -v python3)"
   fi
-  synth_args=(elfuzz synth -T fuzzer.elfuzz --use-small-model --tgi-waiting "${ELFUZZ_TGI_WAITING_SECONDS:-120}" --evolution-iterations "${ELFUZZ_EVOLUTION_ITERATIONS:-1}" "$elfuzz_target")
-  produce_args=(elfuzz produce -T elfuzz --time "${ELFUZZ_PRODUCE_SECONDS:-60}" "$elfuzz_target")
-  {
-    printf 'elfuzz synth/produce for HGB target %s as ELFuzz target %s\n' "$target_name" "$elfuzz_target"
-    printf 'synth command: '
-    printf '%q ' "${synth_args[@]}"
-    printf '\nproduce command: '
-    printf '%q ' "${produce_args[@]}"
-    printf '\n'
-  } >"$workspace/command.txt"
-  if [[ -n "${HF_TOKEN:-}" ]]; then
-    elfuzz config --set tgi.huggingface_token "$HF_TOKEN" >/dev/null 2>"$workspace/logs/hf_config.log" || true
-  else
-    printf 'HF_TOKEN is not set; TGI model startup may fail if no Hugging Face token file exists.\n' >"$workspace/logs/hf_config.log"
+  dry_run_arg=()
+  if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
+    dry_run_arg=(--dry-run)
   fi
-  code=0
-  failed_stage=synth
-  marker="$workspace/.elfuzz_generation_started"
-  touch "$marker"
-  timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${synth_args[@]}" >"$workspace/logs/synth.log" 2>&1 || code=$?
-  if [[ "$code" == "0" ]]; then
-    failed_stage=produce
-    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${produce_args[@]}" >"$workspace/logs/produce.log" 2>&1 || code=$?
-  fi
-  collect_elfuzz_outputs "$elfuzz_target" "$marker"
-  status=completed
-  reason=none
-  generated_input_count="$(count_files "$workspace/generated_inputs" -type f)"
-  generated_generator_count="$(count_files "$workspace/generated_generators" -type f)"
-  if [[ "$code" -ne 0 ]]; then
-    status=failed
-    reason="ELFuzz $failed_stage stage exited $code"
-    if [[ -f "$workspace/logs/synth.log" ]]; then
-      if grep -qi 'huggingface/token\|HF_TOKEN\|Hugging Face token\|401\|403\|gated repo\|access token' "$workspace/logs/synth.log"; then
-        reason='elfuzz_missing_hf_token_or_model_access: ELFuzz TGI startup is missing a valid Hugging Face token or model access; set HF_TOKEN or use an already-cached accessible model'
-      elif grep -qi 'Cannot connect to the Docker daemon' "$workspace/logs/synth.log"; then
-        reason='ELFuzz TGI startup cannot access Docker daemon; mount /var/run/docker.sock or run with Docker available'
-      elif [[ "$code" == "124" ]] && grep -qi 'TGI server started' "$workspace/logs/synth.log"; then
-        reason='ELFuzz synthesis timed out after TGI started; lower ELFUZZ_EVOLUTION_ITERATIONS, lower ELFUZZ_TGI_WAITING_SECONDS when the model is cached, or increase HGB_GENERATION_TIMEOUT_SECONDS'
-      elif [[ "$code" == "124" ]] && grep -qi 'text-gneration-inference\|TGI' "$workspace/logs/synth.log"; then
-        reason='ELFuzz TGI startup timed out; set HF_TOKEN if model access requires it, ensure Docker/TGI can download the model, lower ELFUZZ_TGI_WAITING_SECONDS when cached, or increase HGB_GENERATION_TIMEOUT_SECONDS'
-      fi
-    fi
-    if [[ "${generated_input_count:-0}" -gt 0 ]]; then
-      status=partial_completed
-      reason="ELFuzz $failed_stage stage exited $code after producing $generated_input_count input candidates"
-    fi
-  fi
-  if [[ "$code" == "0" && "$generated_input_count" -eq 0 ]]; then
-    code=70
-    status=failed
-    reason='ELFuzz completed without a newly generated seed archive'
-  fi
-  extra=$(printf '  "elfuzz_target": "%s",\n  "project_root": "%s",\n  "generated_input_count": %s,\n  "generated_generator_count": %s,\n  "failed_stage": "%s",\n  "tgi_waiting_seconds": "%s",\n  "evolution_iterations": "%s",\n  "command_file": "%s"' "$(hgb_json_escape "$elfuzz_target")" "$(hgb_json_escape "$ELFUZZ_PROJECT_ROOT")" "$generated_input_count" "$generated_generator_count" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "${ELFUZZ_TGI_WAITING_SECONDS:-120}")" "$(hgb_json_escape "${ELFUZZ_EVOLUTION_ITERATIONS:-1}")" "$(hgb_json_escape "$workspace/command.txt")")
-  hgb_write_common_metadata "$status" "$reason" "$code" input_generator "$extra"
-  hgb_write_common_summary "$status" "$reason" input_generator
-  exit "$code"
+  exec "$python" /opt/hgb/bin/elfuzz_target_pipeline.py full \
+    --workspace "$workspace" \
+    --target "$target_name" \
+    --target-package "${HGB_TARGET_PACKAGE:-/target}" \
+    --artifact-dir /opt/hgb/artifacts/elfuzz \
+    --metadata-root /opt/hgb/metadata \
+    --profile "$HGB_BASELINE_PROFILE" \
+    --protocol "$HGB_BASELINE_PROTOCOL" \
+    "${dry_run_arg[@]}"
 fi
+
+# Legacy smoke mode (compatibility only; not the alpha matrix path).
+stage_exit() { [[ -f "$workspace/logs/$1.exit" ]] && cat "$workspace/logs/$1.exit" || printf not_run; }
+run_stage() {
+  local stage="$1"; shift
+  local code=0
+  printf '%q ' "$@" >"$workspace/logs/$stage.cmd"; printf '\n' >>"$workspace/logs/$stage.cmd"
+  timeout "${ELFUZZ_STAGE_TIMEOUT_SECONDS:-900}" "$@" >"$workspace/logs/$stage.log" 2>&1 || code=$?
+  printf '%s\n' "$code" >"$workspace/logs/$stage.exit"
+  return 0
+}
+smoke_metadata() {
+  local status="$1" reason="$2"
+  {
+    printf '{\n'
+    printf '  "fuzzer": "elfuzz",\n'
+    printf '  "task_family": "input_generator",\n'
+    printf '  "status": "%s",\n' "$(json_escape "$status")"
+    printf '  "target": "%s",\n' "$(json_escape "${ELFUZZ_TARGET:-jsoncpp}")"
+    printf '  "setup": "%s",\n' "$(json_escape "$(stage_exit setup)")"
+    printf '  "synth": "%s",\n' "$(json_escape "$(stage_exit synth)")"
+    printf '  "produce": "%s",\n' "$(json_escape "$(stage_exit produce)")"
+    printf '  "afl": "%s",\n' "$(json_escape "$(stage_exit afl)")"
+    printf '  "reason": "%s",\n' "$(json_escape "$reason")"
+    printf '  "log_dir": "%s"\n' "$(json_escape "$workspace/logs")"
+    printf '}\n'
+  } >"$workspace/metadata.json"
+  {
+    printf '# HarnessGenBench ELFuzz Summary\n\n'
+    printf -- '- Run directory: `%s`\n' "$workspace"
+    printf -- '- Target: `%s`\n' "${ELFUZZ_TARGET:-jsoncpp}"
+    printf -- '- Status: `%s`\n' "$status"
+    printf -- '- Top failure reason: %s\n' "$reason"
+  } >"$workspace/HGB_SUMMARY.md"
+}
+
 [[ "$mode" == "smoke-jsoncpp" || "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }
 target="${ELFUZZ_TARGET:-jsoncpp}"
 printf 'elfuzz smoke-jsoncpp target=%s\n' "$target" >"$workspace/command.txt"
 if ! command -v elfuzz >/dev/null 2>&1; then
   printf 'elfuzz CLI not found in image.\n' >"$workspace/logs/help.txt"
-  metadata missing_cli 'elfuzz CLI not found in image'
-  summary missing_cli 'elfuzz CLI not found in image'
+  smoke_metadata missing_cli 'elfuzz CLI not found in image'
   exit 127
 fi
 elfuzz --help >"$workspace/logs/help.txt" 2>&1 || true
 if [[ "${ELFUZZ_HELP_ONLY:-0}" == "1" ]]; then
-  metadata help_only none
-  summary help_only none
+  smoke_metadata help_only none
   exit 0
 fi
 run_stage setup bash -lc 'printf "y\n" | elfuzz setup'
@@ -338,6 +210,5 @@ for s in setup synth produce afl; do
   c="$(stage_exit "$s")"
   if [[ "$c" != "0" ]]; then status=failed; reason="stage $s exited $c"; break; fi
 done
-metadata "$status" "$reason"
-summary "$status" "$reason"
+smoke_metadata "$status" "$reason"
 [[ "$status" == completed ]]

@@ -7,3 +7,10 @@ baselines:
     default_protocol: paper-native
     strict_success_status: evaluated
     notes: G2Fuzz generates input generators and seeds for a fixed native target pair; it is not a harness generator.
+  - name: elfuzz
+    task_family: input_generator
+    profiles: [alpha, paper-faithful, compat-smoke]
+    default_profile: alpha
+    default_protocol: paper-native
+    strict_success_status: evaluated
+    notes: ELFuzz synthesizes and evolves input-producing fuzzer programs against a fixed native FuzzBench target, then runs a final AFL++ campaign. It is an input generator, not a harness generator, and supports only the explicit text-input target set in metadata/elfuzz_target_adapters.yaml. Non-text targets are contractually Invalid (not_applicable) and must not start Docker/model download, TGI, synthesis, or fuzzing.

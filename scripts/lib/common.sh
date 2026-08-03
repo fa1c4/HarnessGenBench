@@ -548,6 +548,9 @@ run_hgb_target_container() {
     ensure_dir "$elfuzz_shared_dir"
     ensure_dir "$elfuzz_shared_dir/hf-cache"
     extra_docker_args+=(--add-host host.docker.internal:host-gateway -v "$elfuzz_shared_dir:$elfuzz_shared_dir" -e "ELFUZZ_HOST_SHARED_DIR=$elfuzz_shared_dir" -e "ELFUZZ_TGI_CACHE_DIR=$elfuzz_shared_dir/hf-cache")
+    # Adapter overlays live under repro/elfuzz/targets and are resolved by the
+    # pipeline relative to /opt/hgb (the metadata mount parent).
+    extra_docker_args+=(-v "$root/repro:/opt/hgb/repro:ro")
   fi
   docker run --rm --init \
     --entrypoint /opt/hgb/entrypoint.sh \
@@ -619,6 +622,12 @@ run_hgb_target_container() {
     -e ELFUZZ_REQUIRE_GPU \
     -e ELFUZZ_LOCAL_MODEL_CACHE_READY \
     -e ELFUZZ_PROJECT_ROOT \
+    -e ELFUZZ_CLI \
+    -e ELFUZZ_TARGET_BINARY \
+    -e ELFUZZ_FUZZER_PROGRAMS_DIR \
+    -e ELFUZZ_PRODUCED_INPUTS_DIR \
+    -e ELFUZZ_CAMPAIGN_OUTPUT_DIR \
+    -e ELFUZZ_MODEL \
     -e CKGFUZZER_EMBEDDING_MODEL \
     -e CKGFUZZER_EMBEDDING_BASE_URL \
     -e CKGFUZZER_EMBEDDING_API_KEY \

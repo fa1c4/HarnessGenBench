@@ -3,17 +3,21 @@ import subprocess
 from pathlib import Path
 
 
-def test_elfuzz_target_adapter_uses_live_source_and_retains_seed_archives() -> None:
+def test_elfuzz_target_adapter_uses_live_source_and_manifest_driven_workflow() -> None:
     entrypoint = Path("docker/elfuzz/entrypoint.sh").read_text(encoding="utf-8")
+    pipeline = Path("docker/common/elfuzz_target_pipeline.py").read_text(encoding="utf-8")
 
     assert "find_elfuzz_project_root" in entrypoint
     assert "/home/appuser/elmfuzz" in entrypoint
     assert "patch_elfuzz_sibling_paths" in entrypoint
     assert "ELFUZZ_HOST_SHARED_DIR" in entrypoint
-    assert "collect_elfuzz_outputs" in entrypoint
-    assert "generated_input_count" in entrypoint
-    assert "elfuzz_gpu_unavailable" in entrypoint
-    assert "completed without a newly generated seed archive" in entrypoint
+    assert "elfuzz_target_pipeline.py full" in entrypoint
+    assert "task_family" in pipeline
+    assert "input_generator" in pipeline
+    assert "rq1.afl" in pipeline
+    assert "synthesis/fuzzer_programs" in pipeline
+    assert "generated_inputs/produced" in pipeline
+    assert "campaign/queue" in pipeline
 
 
 def test_elfuzz_runner_mounts_a_private_sibling_container_directory() -> None:

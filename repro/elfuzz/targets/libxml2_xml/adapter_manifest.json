@@ -1,0 +1,25 @@
+{
+  "adapter_class": "upstream-native",
+  "adapter_id": "libxml2",
+  "argv": [
+    "@@"
+  ],
+  "build_mode": "fuzzbench_native",
+  "coverage_extraction_hook": "elfuzz getcov_fuzzbench against the pinned native binary",
+  "description": "libxml2 XML parser fuzzer; inputs are XML documents.",
+  "dictionary_policy": "format dictionary derived from public grammar; optional for text evolution",
+  "format": "XML",
+  "format_spec": "format.md",
+  "initial_corpus_policy": "common FuzzBench corpus, capped and deduplicated",
+  "input_mode": "file",
+  "native_harness": "unchanged",
+  "resource_limits": {
+    "campaign_memory_mb": 1024,
+    "timeout_seconds": 5
+  },
+  "seed_template": "seed_fuzzer.py",
+  "target": "libxml2_xml",
+  "timeout_seconds": 5,
+  "upstream_benchmark": "libxml2",
+  "validity_check": "xml"
+}
