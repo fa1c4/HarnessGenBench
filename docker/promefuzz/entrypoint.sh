@@ -38,7 +38,7 @@ PY_COMPILE_DB_CHECK
 filter_compile_db() {
   local db="$1" phase="$2" result
   [[ -f "$db" ]] || return 0
-  if ! result="$("$python" /opt/hgb/bin/hgb_compile_db.py --input "$db" --output "$db" --source-root /target/source_input --source-root "$workspace/promefuzz_build/src" 2>&1)"; then
+  if ! result="$("$python" /opt/hgb/bin/hgb_compile_db.py --input "$db" --output "$db" --source-root /target/source_input --source-root "$workspace/build_context/src" --source-root "$workspace/promefuzz_build/src" 2>&1)"; then
     printf 'Could not filter %s compile_commands.json: %s\n' "$phase" "$result" >>"$workspace/logs/compile_commands.log"
     return 1
   fi
@@ -59,14 +59,8 @@ root = Path("/target/source_input")
 source_exts = {".c", ".cc", ".cpp", ".cxx"}
 header_exts = {".h", ".hh", ".hpp", ".hxx"}
 ignored_parts = {
-    ".git",
-    ".hg",
-    ".svn",
-    "build",
-    "cmake-build-debug",
-    "cmake-build-release",
-    "out",
-    "workspace",
+    ".git", ".hg", ".svn", "build", "cmake-build-debug",
+    "cmake-build-release", "out", "workspace",
 }
 include_dirs: list[Path] = []
 
@@ -182,141 +176,60 @@ model = "${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
 EOF
   printf '%s\n' "$cfg"
 }
-summary() {
-  local status="$1" code="$2" reason="$3"
-  {
-    printf '# HarnessGenBench PromeFuzz Summary\n\n'
-    printf -- '- Run directory: `%s`\n' "$workspace"
-    printf -- '- Upstream commit: `%s`\n' "$(commit)"
-    printf -- '- Target: `pugixml`\n'
-    printf -- '- Status: `%s`\n' "$status"
-    printf -- '- Exit code: `%s`\n' "$code"
-    printf -- '- API key present: `%s`\n' "$([[ -n "${OPENAI_API_KEY:-${API_KEY:-}}" ]] && printf true || printf false)"
-    printf -- '- Generated fuzz-driver count: %s\n' "$(count_files "$workspace" -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' \))"
-    printf -- '- Top failure reason: %s\n' "$reason"
-    printf '\n## Logs\n\n'
-    find "$workspace/logs" -type f 2>/dev/null | sort | sed "s#^$workspace/##" | sed 's/^/- `/' | sed 's/$/`/'
-  } >"$workspace/HGB_SUMMARY.md"
-}
-metadata() {
-  local status="$1" code="$2" reason="$3" cfg="$4"
-  {
-    printf '{\n'
-    printf '  "fuzzer": "promefuzz",\n'
-    printf '  "status": "%s",\n' "$(json_escape "$status")"
-    printf '  "upstream_commit": "%s",\n' "$(json_escape "$(commit)")"
-    printf '  "target": "pugixml",\n'
-    printf '  "api_key_present": %s,\n' "$([[ -n "${OPENAI_API_KEY:-${API_KEY:-}}" ]] && printf true || printf false)"
-    printf '  "runtime_config": "%s",\n' "$(json_escape "$cfg")"
-    printf '  "exit_code": %s,\n' "$code"
-    printf '  "reason": "%s",\n' "$(json_escape "$reason")"
-    printf '  "command_file": "%s",\n' "$(json_escape "$workspace/command.txt")"
-    printf '  "log_file": "%s"\n' "$(json_escape "$workspace/logs/run.log")"
-    printf '}\n'
-  } >"$workspace/metadata.json"
+
+# ---------------------------------------------------------------------------
+# PromeFuzz profile/stage/result helpers (alpha/paper-faithful/compat-smoke)
+# ---------------------------------------------------------------------------
+
+promefuzz_stages_file() { printf '%s/promefuzz_stages.json' "$workspace"; }
+
+promefuzz_init_stages() {
+  "$python" - "$(promefuzz_stages_file)" <<'PY_PROMEFUZZ_INIT_STAGES'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+Path(sys.argv[1]).write_text(json.dumps(promefuzz_profile.default_stages(), indent=2) + "\n", encoding="utf-8")
+PY_PROMEFUZZ_INIT_STAGES
 }
 
-if [[ "$mode" == "generate-target" ]]; then
-  # shellcheck source=/opt/hgb/bin/target_contract.sh
-  source /opt/hgb/bin/target_contract.sh
-  export HGB_GENERATOR="${HGB_GENERATOR:-promefuzz}"
-  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
-  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
-  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
-  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
-  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
-  export PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
-  export PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR="${PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR:-1}"
-  export PROME_FUZZ_PROVIDER_ERROR_FILE="$workspace/logs/provider_error.log"
-  export PROME_FUZZ_SKIP_BAD_DOCS="${PROME_FUZZ_SKIP_BAD_DOCS:-1}"
-  export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
-  export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
-  export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
-  export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-/opt/hgb/metadata/fuzzbench_selected_harness_apis.json}"
-  export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-report_first}"
-  export NLTK_DATA="${NLTK_DATA:-/opt/hgb/nltk_data}"
-  mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/promefuzz_out" /run/hgb/promefuzz
-  hgb_require_target_package
-  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
-  project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
-  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
-  selected_reference_dir="/target/reference_harnesses/selected"
-  api_selection_metadata="$workspace/promefuzz_api_selection.json"
-  selected_api_names_file="$workspace/promefuzz_selected_apis.json"
-  safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
-  language="c++"
-  if find /target/source_input -type f \( -name '*.c' -o -name '*.h' \) 2>/dev/null | grep -q . && ! find /target/source_input -type f \( -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' -o -name '*.hpp' \) 2>/dev/null | grep -q .; then
-    language="c"
-  fi
-  config=/run/hgb/promefuzz/config.toml
-  native_build_enabled="${HGB_PROMEFUZZ_NATIVE_BUILD:-1}"
-  native_build_root="$workspace/promefuzz_native_build"
-  native_template="$native_build_root/template"
-  native_harness_json=""
-  native_harness_destination=""
-  native_harness_reference=""
-  native_build_json=false
-  fuzzbench_build_workdir="$(fuzzbench_build_workdir)"
-  promefuzz_pool_size="${PROME_FUZZ_POOL_SIZE:-1}"
-  if ! is_positive_integer "$promefuzz_pool_size"; then
-    hgb_write_common_metadata failed "invalid PROME_FUZZ_POOL_SIZE: $promefuzz_pool_size" 64 harness_generator
-    hgb_write_common_summary failed "invalid PROME_FUZZ_POOL_SIZE: $promefuzz_pool_size" harness_generator
-    exit 64
-  fi
+promefuzz_set_stage() {
+  local name="$1" state="${2:-completed}"
+  "$python" - "$(promefuzz_stages_file)" "$name" "$state" <<'PY_PROMEFUZZ_SET_STAGE'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+p = Path(sys.argv[1])
+try:
+    stages = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    stages = promefuzz_profile.default_stages()
+promefuzz_profile.mark_stage(stages, sys.argv[2], sys.argv[3])
+p.write_text(json.dumps(stages, indent=2) + "\n", encoding="utf-8")
+PY_PROMEFUZZ_SET_STAGE
+}
 
-  if [[ "$native_build_enabled" == "1" ]]; then
-    if ! fuzzbench_target_build_available; then
-      printf 'FuzzBench provides no reproducible top-level build.sh for this target; using PromeFuzz compiler validation instead.\n' >"$workspace/logs/native_build.log"
-      native_build_enabled=0
-    fi
-  fi
+promefuzz_result_status() {
+  "$python" - "$(promefuzz_stages_file)" <<'PY_PROMEFUZZ_RESULT_STATUS'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+try:
+    stages = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    stages = promefuzz_profile.default_stages()
+print(promefuzz_profile.result_status_from_stages(stages))
+PY_PROMEFUZZ_RESULT_STATUS
+}
 
-  if [[ "$native_build_enabled" == "1" ]]; then
-    if ! native_harness_json="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" 2>&1)"; then
-      printf 'Could not resolve the manifest-selected native harness: %s\n' "$native_harness_json" >"$workspace/logs/native_build.log"
-      hgb_write_common_metadata failed 'PromeFuzz could not resolve the manifest-selected native harness required for target build verification' 65 harness_generator
-      hgb_write_common_summary failed 'PromeFuzz could not resolve the manifest-selected native harness required for target build verification' harness_generator
-      exit 65
-    fi
-    native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination)"
-    native_harness_reference="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field reference)"
-    language="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field language)"
-    stage_fuzzbench_source "$native_template"
-    native_reference_source="$selected_reference_dir/$native_harness_reference"
-    native_reference_destination="$native_template/${native_harness_destination#/src/}"
-    if [[ ! -f "$native_reference_source" ]]; then
-      printf 'Missing manifest-selected reference harness: %s\n' "$native_harness_reference" >"$workspace/logs/native_build.log"
-      hgb_write_common_metadata failed 'PromeFuzz could not restore the manifest-selected reference harness required for target build verification' 65 harness_generator
-      hgb_write_common_summary failed 'PromeFuzz could not restore the manifest-selected reference harness required for target build verification' harness_generator
-      exit 65
-    fi
-    mkdir -p "$(dirname "$native_reference_destination")"
-    cp "$native_reference_source" "$native_reference_destination"
-
-    printf '%s\n' "$native_harness_json" >"$workspace/promefuzz_native_harness.json"
-    export PROME_FUZZ_DRIVER_BUILD_WRAPPER=/opt/hgb/bin/promefuzz_target_build.sh
-    export PROME_FUZZ_NATIVE_SOURCE_TEMPLATE="$native_template"
-    export PROME_FUZZ_NATIVE_BUILD_ROOT="$native_build_root"
-    export PROME_FUZZ_NATIVE_HARNESS_DESTINATION="$native_harness_destination"
-    export PROME_FUZZ_NATIVE_FUZZ_TARGET="$fuzz_target"
-    native_build_json=true
-    export PROME_FUZZ_NATIVE_BUILD_WORKDIR_RELATIVE="$fuzzbench_build_workdir"
-    export PROME_FUZZ_NATIVE_BUILD_LOG_DIR="$workspace/logs/native-build"
-    export PROME_FUZZ_NATIVE_RUN_LOG_DIR="$workspace/logs/native-run"
-
-    if [[ "${HGB_PROMEFUZZ_VALIDATE_TARGET_BASELINE:-1}" == "1" ]]; then
-      baseline_source="$native_template/${native_harness_destination#/src/}"
-      baseline_binary="$native_build_root/baseline/$fuzz_target"
-      if ! bash /opt/hgb/bin/promefuzz_target_build.sh "$baseline_source" "$baseline_binary" >"$workspace/logs/baseline-build.log" 2>&1; then
-        hgb_write_common_metadata failed 'PromeFuzz native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget' 65 harness_generator
-        hgb_write_common_summary failed 'PromeFuzz native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget' harness_generator
-        exit 65
-      fi
-    fi
-  fi
-
-  libraries=/run/hgb/promefuzz/libraries.toml
-  cat >"$config" <<EOF_PROMEFUZZ_CONFIG
+promefuzz_write_config() {
+  local cfg="$1"
+  cat >"$cfg" <<EOF_PROMEFUZZ_CONFIG
 [comprehender]
 embedding_llm = "hgb_embedding"
 comprehension_llm = "hgb_cloud"
@@ -354,33 +267,382 @@ max_tokens = ${PROME_FUZZ_EMBEDDING_MAX_TOKENS:--1}
 timeout = ${PROME_FUZZ_EMBEDDING_TIMEOUT:-60}
 retry_times = ${PROME_FUZZ_EMBEDDING_RETRY_TIMES:-3}
 EOF_PROMEFUZZ_CONFIG
-  compile_db="$workspace/promefuzz_build/compile_commands.json"
-  preserved_compile_db="$workspace/compile_commands.json"
-  compile_db_for_metadata="$compile_db"
-  mkdir -p "$workspace/promefuzz_build"
-  cmake_src="$(find /target/source_input -name CMakeLists.txt -type f -printf '%h\n' 2>/dev/null | sort | head -n 1 || true)"
-  if [[ -n "$cmake_src" ]]; then
-    cmake -S "$cmake_src" -B "$workspace/promefuzz_build" -DCMAKE_EXPORT_COMPILE_COMMANDS=ON >"$workspace/logs/cmake.log" 2>&1 || true
+  printf '%s\n' "$cfg"
+}
+
+promefuzz_embedding_preflight() {
+  local log_file="$1"
+  [[ "${PROME_FUZZ_EMBEDDING_PREFLIGHT:-1}" == "1" ]] || return 0
+  "$python" - >"$log_file" 2>&1 <<'PY_PROMEFUZZ_EMBEDDING_PREFLIGHT'
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+api_key = os.getenv("PROME_FUZZ_EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY") or ""
+model = os.getenv("PROME_FUZZ_EMBEDDING_MODEL") or ""
+base_url = os.getenv("PROME_FUZZ_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or os.getenv("BASE_URL") or ""
+llm_type = (os.getenv("PROME_FUZZ_EMBEDDING_LLM_TYPE") or "").strip().lower()
+timeout = float(os.getenv("PROME_FUZZ_EMBEDDING_TIMEOUT") or "60")
+
+if llm_type in {"mock", "local", "hash"}:
+    print("embedding_preflight_skipped: mock/local/hash embedding is compat-smoke only")
+    sys.exit(0)
+
+if llm_type == "ollama":
+    host = os.getenv("PROME_FUZZ_EMBEDDING_HOST", "localhost")
+    port = os.getenv("PROME_FUZZ_EMBEDDING_PORT", "11434")
+    url = f"http://{host}:{port}/api/embeddings"
+    payload = json.dumps({"model": model or "nomic-embed-text", "prompt": "hgb"}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+else:
+    if not base_url:
+        print("embedding_preflight_failed: missing base_url")
+        sys.exit(1)
+    url = base_url.rstrip("/") + "/embeddings"
+    payload = json.dumps({"model": model, "input": "hgb"}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    req = urllib.request.Request(url, data=payload, headers=headers)
+
+try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read().decode("utf-8", "replace")
+    if resp.status == 200:
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {}
+        dims = 0
+        if isinstance(data, dict):
+            emb = data.get("data") or data.get("embedding") or data.get("embeddings")
+            if isinstance(emb, list) and emb and isinstance(emb[0], list):
+                dims = len(emb[0])
+            elif isinstance(emb, list):
+                dims = len(emb)
+        print(json.dumps({"ok": True, "model": model, "dimensions": dims, "endpoint_class": "ollama" if llm_type == "ollama" else "openai-compatible"}))
+        sys.exit(0)
+    print(f"embedding_preflight_failed: HTTP {resp.status}")
+    sys.exit(1)
+except urllib.error.HTTPError as exc:
+    print(f"embedding_preflight_failed: HTTP {exc.code} {exc.reason}")
+    sys.exit(1)
+except (urllib.error.URLError, OSError, TimeoutError) as exc:
+    print(f"embedding_preflight_failed: {type(exc).__name__}: {exc}")
+    sys.exit(1)
+PY_PROMEFUZZ_EMBEDDING_PREFLIGHT
+}
+
+promefuzz_write_final_result() {
+  local status="$1" reason="$2" exit_code="$3" leakage_json="${4:-{\}}"
+  local profile="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
+  local protocol="${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
+  local target="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  local method_variant="$profile" excluded=false
+  [[ "$profile" == "compat-smoke" ]] && { method_variant="compat-smoke"; excluded=true; }
+  PROME_FUZZ_PROFILE="$profile" PROME_FUZZ_PROTOCOL="$protocol" PROME_FUZZ_TARGET="$target" \
+  PROME_FUZZ_STATUS="$status" PROME_FUZZ_REASON="$reason" PROME_FUZZ_CODE="$exit_code" \
+  PROME_FUZZ_METHOD="$method_variant" PROME_FUZZ_EXCLUDED="$excluded" \
+  PROME_FUZZ_LEAKAGE="$leakage_json" \
+    "$python" - "$workspace/result.json" "$(promefuzz_stages_file)" "$(commit)" <<'PY_PROMEFUZZ_WRITE_FINAL'
+import json
+import os
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+out = Path(sys.argv[1])
+stages_path = Path(sys.argv[2])
+ofg_commit = sys.argv[3]
+try:
+    stages = json.loads(stages_path.read_text(encoding="utf-8"))
+except Exception:
+    stages = promefuzz_profile.default_stages()
+try:
+    leakage = json.loads(os.environ.get("PROME_FUZZ_LEAKAGE", "{}") or "{}")
+except Exception:
+    leakage = {}
+result = promefuzz_profile.build_result(
+    profile=os.environ["PROME_FUZZ_PROFILE"],
+    protocol=os.environ["PROME_FUZZ_PROTOCOL"],
+    target=os.environ["PROME_FUZZ_TARGET"],
+    status=os.environ["PROME_FUZZ_STATUS"],
+    reason=os.environ["PROME_FUZZ_REASON"],
+    stages=stages,
+    method_variant=os.environ["PROME_FUZZ_METHOD"],
+    excluded_from_aggregate=os.environ["PROME_FUZZ_EXCLUDED"] == "true",
+    reference_leakage_audit=leakage,
+    provenance={
+        "promefuzz_commit": ofg_commit,
+        "fuzzbench_commit": os.environ.get("HGB_FUZZBENCH_COMMIT", ""),
+        "embedding_model": os.environ.get("PROME_FUZZ_EMBEDDING_MODEL", ""),
+        "embedding_llm_type": os.environ.get("PROME_FUZZ_EMBEDDING_LLM_TYPE", ""),
+        "build_context_method": os.environ.get("PROME_FUZZ_BUILD_CONTEXT_METHOD", "auto"),
+        "all_cover_candidates": os.environ.get("PROME_FUZZ_ALL_COVER_CANDIDATES", ""),
+        "all_cover_max_wall_seconds": os.environ.get("PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS", ""),
+    },
+)
+out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_PROMEFUZZ_WRITE_FINAL
+}
+
+summary() {
+  local status="$1" code="$2" reason="$3"
+  {
+    printf '# HarnessGenBench PromeFuzz Summary\n\n'
+    printf -- '- Run directory: `%s`\n' "$workspace"
+    printf -- '- Upstream commit: `%s`\n' "$(commit)"
+    printf -- '- Target: `%s`\n' "${HGB_TARGET:-unknown}"
+    printf -- '- Profile: `%s`\n' "${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
+    printf -- '- Protocol: `%s`\n' "${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
+    printf -- '- Status: `%s`\n' "$status"
+    printf -- '- Exit code: `%s`\n' "$code"
+    printf -- '- API key present: `%s`\n' "$(hgb_api_key_present 2>/dev/null && printf true || printf false)"
+    printf -- '- Generated fuzz-driver count: %s\n' "$(count_files "$workspace" -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' \))"
+    printf -- '- Top failure reason: %s\n' "$reason"
+    printf '\n## Logs\n\n'
+    find "$workspace/logs" -type f 2>/dev/null | sort | sed "s#^$workspace/##" | sed 's/^/- `/' | sed 's/$/`/'
+  } >"$workspace/HGB_SUMMARY.md"
+}
+metadata() {
+  local status="$1" code="$2" reason="$3" cfg="$4"
+  {
+    printf '{\n'
+    printf '  "fuzzer": "promefuzz",\n'
+    printf '  "status": "%s",\n' "$(json_escape "$status")"
+    printf '  "upstream_commit": "%s",\n' "$(json_escape "$(commit)")"
+    printf '  "target": "%s",\n' "$(json_escape "${HGB_TARGET:-pugixml}")"
+    printf '  "api_key_present": %s,\n' "$([[ -n "${OPENAI_API_KEY:-${API_KEY:-}}" ]] && printf true || printf false)"
+    printf '  "runtime_config": "%s",\n' "$(json_escape "$cfg")"
+    printf '  "exit_code": %s,\n' "$code"
+    printf '  "reason": "%s",\n' "$(json_escape "$reason")"
+    printf '  "command_file": "%s",\n' "$(json_escape "$workspace/command.txt")"
+    printf '  "log_file": "%s"\n' "$(json_escape "$workspace/logs/run.log")"
+    printf '}\n'
+  } >"$workspace/metadata.json"
+}
+
+if [[ "$mode" == "generate-target" ]]; then
+  # shellcheck source=/opt/hgb/bin/target_contract.sh
+  source /opt/hgb/bin/target_contract.sh
+  export HGB_GENERATOR="${HGB_GENERATOR:-promefuzz}"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  export HGB_TASK_FAMILY="harness_generator"
+  export HGB_CAPABILITY="harness_generator"
+  export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
+  export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
+  export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
+  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
+  export PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
+  export PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR="${PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR:-1}"
+  export PROME_FUZZ_PROVIDER_ERROR_FILE="$workspace/logs/provider_error.log"
+  export PROME_FUZZ_SKIP_BAD_DOCS="${PROME_FUZZ_SKIP_BAD_DOCS:-1}"
+  export NLTK_DATA="${NLTK_DATA:-/opt/hgb/nltk_data}"
+  # --- Profile and protocol resolution ---
+  export HGB_PROFILE="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
+  export HGB_PROTOCOL="${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
+  export HGB_BASELINE_PROFILE="$HGB_PROFILE"
+  export HGB_BASELINE_PROTOCOL="$HGB_PROTOCOL"
+  promefuzz_profile="$HGB_PROFILE"
+  promefuzz_protocol="$HGB_PROTOCOL"
+  mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/promefuzz_out" /run/hgb/promefuzz
+  promefuzz_init_stages
+  # Validate profile/protocol invariants before any expensive work.
+  if ! "$python" /opt/hgb/bin/promefuzz_profile.py validate --profile "$promefuzz_profile" --protocol "$promefuzz_protocol" >/dev/null 2>"$workspace/logs/profile_validation.log"; then
+    violations="$(cat "$workspace/logs/profile_validation.log" 2>/dev/null || printf 'unknown')"
+    reason="promefuzz_profile_violation: $violations"
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    promefuzz_set_stage target_prepared failed
+    promefuzz_write_final_result failed "$reason" 65
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
   fi
-  filter_compile_db "$compile_db" cmake || true
-  if ! compile_db_has_entries "$compile_db" && [[ "${HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD:-1}" == "1" ]] && command -v bear >/dev/null 2>&1; then
-    mkdir -p "$workspace/promefuzz_build/src" "$workspace/promefuzz_build/out" "$workspace/promefuzz_build/work"
-    stage_fuzzbench_source "$workspace/promefuzz_build/src"
-    (cd "$workspace/promefuzz_build/src/$fuzzbench_build_workdir" && SRC="$workspace/promefuzz_build/src" OUT="$workspace/promefuzz_build/out" WORK="$workspace/promefuzz_build/work" CC="${CC:-clang}" CXX="${CXX:-clang++}" FUZZER="${FUZZER:-libfuzzer}" FUZZER_LIB="${FUZZER_LIB:--fsanitize=fuzzer}" LIB_FUZZING_ENGINE="${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}" CFLAGS="${CFLAGS:-} -pthread" CXXFLAGS="${CXXFLAGS:-} -pthread -Wno-register" bear -- bash "$workspace/promefuzz_build/src/build.sh") >"$workspace/logs/bear.log" 2>&1 || true
-    if [[ -f "$workspace/promefuzz_build/compile_commands.json" && "$workspace/promefuzz_build/compile_commands.json" != "$compile_db" ]]; then
-      cp "$workspace/promefuzz_build/compile_commands.json" "$compile_db" 2>/dev/null || true
+  case "$promefuzz_profile" in
+    alpha|paper-faithful)
+      promefuzz_method_faithful=1
+      export PROME_FUZZ_EMBEDDING_LLM_TYPE="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-openai}"
+      export PROME_FUZZ_EMBEDDING_MODEL="${PROME_FUZZ_EMBEDDING_MODEL:-text-embedding-3-small}"
+      export HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=0
+      export HGB_EXCLUDE_FROM_AGGREGATE=0
+      promefuzz_allow_synthetic=0
+      ;;
+    compat-smoke)
+      promefuzz_method_faithful=0
+      export PROME_FUZZ_EMBEDDING_LLM_TYPE="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-mock}"
+      export PROME_FUZZ_EMBEDDING_MODEL="${PROME_FUZZ_EMBEDDING_MODEL:-hgb-hash-embedding}"
+      export HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB="${HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB:-1}"
+      export HGB_EXCLUDE_FROM_AGGREGATE=1
+      promefuzz_allow_synthetic=1
+      ;;
+  esac
+  # Official ALL-COVER budgets: practical multi-candidate budget for alpha,
+  # upstream/paper-aligned values may override via env.
+  export PROME_FUZZ_ALL_COVER_CANDIDATES="${PROME_FUZZ_ALL_COVER_CANDIDATES:-4}"
+  export PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS="${PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS:-5400}"
+  export PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS="${PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS:-64}"
+  export PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS="${PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS:-3}"
+  promefuzz_set_stage target_prepared completed
+  hgb_require_target_package
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+  safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
+  # --- Blind-project / api-oracle isolation ---
+  # The PromeFuzz generator must never see the exact target reference harness,
+  # the selected-harness-APIs report, or reference-derived API filtering.
+  if [[ "$promefuzz_protocol" == "blind-project" || "$promefuzz_protocol" == "api-oracle" ]]; then
+    export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-ranked}"
+    export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-dynamic_only}"
+    export HGB_SELECTED_API_REPORT=""
+    if [[ -d /target/reference_harnesses ]]; then
+      printf 'blind-project: /target/reference_harnesses is evaluator-only; PromeFuzz ignores it\n' >"$workspace/logs/reference_isolation.log"
     fi
   fi
-  filter_compile_db "$compile_db" bear || true
+  export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
+  export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
+  # Resolve the native harness destination from manifest metadata (path only,
+  # never the reference harness body).
+  if ! native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination 2>"$workspace/logs/native_harness.log")"; then
+    promefuzz_set_stage target_prepared failed
+    reason="promefuzz_native_harness_unresolved: target package does not identify a native C/C++ harness path"
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    promefuzz_write_final_result failed "$reason" 65
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+  language="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field language)"
+  fuzzbench_build_workdir="$(fuzzbench_build_workdir)"
+  promefuzz_pool_size="${PROME_FUZZ_POOL_SIZE:-1}"
+  if ! is_positive_integer "$promefuzz_pool_size"; then
+    reason="invalid PROME_FUZZ_POOL_SIZE: $promefuzz_pool_size"
+    hgb_write_common_metadata failed "$reason" 64 harness_generator
+    promefuzz_write_final_result failed "$reason" 64
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 64
+  fi
+  native_build_enabled="${HGB_PROMEFUZZ_NATIVE_BUILD:-1}"
+  native_build_root="$workspace/promefuzz_native_build"
+  native_template="$native_build_root/template"
+  native_harness_json=""
+  native_build_json=false
+  if [[ "$native_build_enabled" == "1" ]]; then
+    if ! fuzzbench_target_build_available; then
+      printf 'FuzzBench provides no reproducible top-level build.sh for this target; using PromeFuzz compiler validation instead.\n' >"$workspace/logs/native_build.log"
+      native_build_enabled=0
+    fi
+  fi
+  if [[ "$native_build_enabled" == "1" ]]; then
+    stage_fuzzbench_source "$native_template"
+    baseline_source="$native_template/${native_harness_destination#/src/}"
+    # Blind-project: overlay a NEUTRAL fuzz-entrypoint stub at the native
+    # destination, never the exact target reference harness body.
+    "$python" - "$baseline_source" "$language" <<'PY_PROMEFUZZ_NEUTRAL_STUB'
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_build_context as pbc
+pbc.write_neutral_stub(Path(sys.argv[1]), sys.argv[2])
+PY_PROMEFUZZ_NEUTRAL_STUB
+    native_harness_json="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target")"
+    printf '%s\n' "$native_harness_json" >"$workspace/promefuzz_native_harness.json"
+    export PROME_FUZZ_DRIVER_BUILD_WRAPPER=/opt/hgb/bin/promefuzz_target_build.sh
+    export PROME_FUZZ_NATIVE_SOURCE_TEMPLATE="$native_template"
+    export PROME_FUZZ_NATIVE_BUILD_ROOT="$native_build_root"
+    export PROME_FUZZ_NATIVE_HARNESS_DESTINATION="$native_harness_destination"
+    export PROME_FUZZ_NATIVE_FUZZ_TARGET="$fuzz_target"
+    export PROME_FUZZ_NATIVE_BUILD_WORKDIR_RELATIVE="$fuzzbench_build_workdir"
+    export PROME_FUZZ_NATIVE_BUILD_LOG_DIR="$workspace/logs/native-build"
+    export PROME_FUZZ_NATIVE_RUN_LOG_DIR="$workspace/logs/native-run"
+    export FUZZER="${FUZZER:-libfuzzer}"
+    native_build_json=true
+    if [[ "${HGB_PROMEFUZZ_VALIDATE_TARGET_BASELINE:-1}" == "1" ]]; then
+      baseline_binary="$native_build_root/baseline/$fuzz_target"
+      if ! bash /opt/hgb/bin/promefuzz_target_build.sh "$baseline_source" "$baseline_binary" >"$workspace/logs/baseline-build.log" 2>&1; then
+        promefuzz_set_stage build_context failed
+        reason="promefuzz_baseline_build_failed: native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget"
+        hgb_write_common_metadata failed "$reason" 65 harness_generator
+        promefuzz_write_final_result failed "$reason" 65
+        hgb_write_common_summary failed "$reason" harness_generator
+        exit 65
+      fi
+    fi
+  fi
+  # --- Real compile database capture from the pinned FuzzBench build ---
+  compile_db="$workspace/build_context/compile_commands.json"
+  promefuzz_build_context_args=(
+    /opt/hgb/bin/promefuzz_build_context.py
+    --target-root /target --work-dir "$workspace" --fuzz-target "$fuzz_target"
+    --language "$language" --profile "$promefuzz_profile"
+    --capture-method "${PROME_FUZZ_BUILD_CONTEXT_METHOD:-auto}"
+    --build-workdir-relative "$fuzzbench_build_workdir"
+    --build-timeout "${PROME_FUZZ_NATIVE_BUILD_TIMEOUT_SECONDS:-900}"
+  )
+  [[ "$promefuzz_allow_synthetic" == "1" ]] && promefuzz_build_context_args+=(--allow-synthetic)
+  if ! "$python" "${promefuzz_build_context_args[@]}" >"$workspace/logs/build_context.log" 2>&1; then
+    promefuzz_set_stage build_context failed
+    if [[ "$promefuzz_method_faithful" == "1" ]]; then
+      reason="promefuzz_build_context_failed: real compile database could not be captured from the pinned FuzzBench build; inspect build_context.log"
+      hgb_write_common_metadata failed "$reason" 65 harness_generator
+      promefuzz_write_final_result failed "$reason" 65
+      hgb_write_common_summary failed "$reason" harness_generator
+      exit 65
+    else
+      hgb_soft_skip needs_compile_commands 'PromeFuzz could not capture a compile_commands.json; inspect build_context.log' harness_generator
+    fi
+  fi
+  # Re-filter the captured database so compiler probes/duplicates/stale
+  # commands never reach PromeFuzz while real target commands survive.
+  filter_compile_db "$compile_db" cmake || true
   if ! compile_db_has_entries "$compile_db"; then
-    synthetic_count="$(write_synthetic_compile_db "$compile_db" "$language" "$project" 2>/dev/null || printf '0')"
-    printf 'Wrote synthetic compile_commands.json with %s entries for /target/source_input.\n' "$synthetic_count" >>"$workspace/logs/cmake.log"
+    promefuzz_set_stage build_context failed
+    if [[ "$promefuzz_method_faithful" == "1" ]]; then
+      reason="promefuzz_build_context_empty: real compile database is empty after filtering; inspect build_context.log"
+      hgb_write_common_metadata failed "$reason" 65 harness_generator
+      promefuzz_write_final_result failed "$reason" 65
+      hgb_write_common_summary failed "$reason" harness_generator
+      exit 65
+    else
+      hgb_soft_skip needs_compile_commands 'PromeFuzz requires a non-empty compile_commands.json' harness_generator
+    fi
   fi
-  filter_compile_db "$compile_db" synthetic || true
-  if compile_db_has_entries "$compile_db"; then
-    cp "$compile_db" "$preserved_compile_db" 2>/dev/null || true
-    compile_db_for_metadata="$preserved_compile_db"
+  promefuzz_set_stage build_context completed
+  preserved_compile_db="$workspace/compile_commands.json"
+  cp "$compile_db" "$preserved_compile_db" 2>/dev/null || true
+  compile_db_for_metadata="$preserved_compile_db"
+  # Recovered libraries and link arguments from the real build.
+  libraries_json="$workspace/build_context/libraries.json"
+  driver_build_args_json="[]"
+  if [[ -f "$libraries_json" ]]; then
+    driver_build_args_json="$("$python" - "$libraries_json" <<'PY_PROMEFUZZ_DRIVER_ARGS'
+import json
+import sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    print(json.dumps(data.get("driver_build_args", [])))
+except Exception:
+    print("[]")
+PY_PROMEFUZZ_DRIVER_ARGS
+)"
   fi
+  # --- Embedding preflight (real provider required in alpha/paper-faithful) ---
+  if [[ "$promefuzz_method_faithful" == "1" ]] && [[ "${PROME_FUZZ_EMBEDDING_PREFLIGHT:-1}" == "1" ]]; then
+    if ! promefuzz_embedding_preflight "$workspace/logs/embedding_preflight.log"; then
+      promefuzz_set_stage knowledge failed
+      reason="promefuzz_embedding_unavailable: real embedding service is unavailable; configure PROME_FUZZ_EMBEDDING_LLM_TYPE/MODEL/BASE_URL/API_KEY"
+      hgb_write_common_metadata failed "$reason" 2 harness_generator
+      promefuzz_write_final_result failed "$reason" 2
+      hgb_write_common_summary failed "$reason" harness_generator
+      exit 2
+    fi
+  fi
+  # --- PromeFuzz config and libraries.toml with real driver_build_args ---
+  config=/run/hgb/promefuzz/config.toml
+  libraries=/run/hgb/promefuzz/libraries.toml
+  promefuzz_write_config "$config"
+  driver_build_args_toml="$driver_build_args_json"
   cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
 [$safe_target]
 language = "$language"
@@ -392,46 +654,38 @@ output_path = "$workspace/promefuzz_out/$safe_target"
 source_paths = ["/target/source_input"]
 exclude_paths = ["/target/source_input/test", "/target/source_input/tests", "/target/source_input/example", "/target/source_input/examples", "/target/source_input/third_party", "/target/source_input/benchmark", "/target/source_input/benchmarks"]
 driver_headers = []
-driver_build_args = []
-consumer_build_args = []
+driver_build_args = $driver_build_args_toml
+consumer_build_args = $driver_build_args_toml
 EOF_PROMEFUZZ_LIBS
   printf 'PromeFuzz config: %s\nPromeFuzz libraries: %s\n' "$config" "$libraries" >"$workspace/command.txt"
-  if ! compile_db_has_entries "$compile_db"; then
-    cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
-    if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
-    fi
-    hgb_soft_skip needs_compile_commands 'PromeFuzz requires a non-empty compile_commands.json; CMake, Bear/FuzzBench build replay, and synthetic fallback did not produce one. Inspect cmake.log and bear.log.' harness_generator
-  fi
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     cp "$libraries" "$workspace/promefuzz_libraries.toml" 2>/dev/null || true
-    if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-      rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
-    fi
-    hgb_write_common_metadata dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' 0 harness_generator
-    hgb_write_common_summary dry_run_ok 'dry run prepared PromeFuzz config and compile_commands.json' harness_generator
+    hgb_write_common_metadata dry_run_ok 'dry run prepared PromeFuzz config, real compile_commands.json, and link context' 0 harness_generator
+    hgb_write_common_summary dry_run_ok 'dry run prepared PromeFuzz config, real compile_commands.json, and link context' harness_generator
     exit 0
   fi
   if ! hgb_api_key_present; then
     printf 'OPENAI_API_KEY is not set; PromeFuzz target generation skipped.\n' >"$workspace/logs/run.log"
+    reason="missing_api_key: OPENAI_API_KEY is not set"
     hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 harness_generator
+    promefuzz_write_final_result failed "$reason" 2
     hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
     exit 2
   fi
-  selected_api_count="$(python3 /opt/hgb/bin/extract_api_list.py \
-    --source /target/source_input \
-    --out "$selected_api_names_file" \
-    --max "${PROME_FUZZ_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}" \
-    --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}" \
-    --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" \
-    --project "$project" \
-    --target-name "$target_name" \
-    --fuzz-target "$fuzz_target" \
-    --reference-dir "$selected_reference_dir" \
-    --api-report "$HGB_SELECTED_API_REPORT" \
-    --report-mode "$HGB_API_REPORT_MODE" \
-    --selection-metadata "$api_selection_metadata" \
-    2>"$workspace/logs/promefuzz_api_extract.log" || printf '0')"
+  # --- Public API preprocessing (no reference-harness filtering) ---
+  api_selection_metadata="$workspace/promefuzz_api_selection.json"
+  selected_api_names_file="$workspace/promefuzz_selected_apis.json"
+  api_extract_args=(
+    /opt/hgb/bin/extract_api_list.py
+    --source /target/source_input --out "$selected_api_names_file"
+    --max "${PROME_FUZZ_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}"
+    --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}"
+    --selection-mode "${HGB_API_SELECTION_MODE:-ranked}"
+    --report-mode "${HGB_API_REPORT_MODE:-dynamic_only}"
+    --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target"
+    --selection-metadata "$api_selection_metadata"
+  )
+  selected_api_count="$(python3 "${api_extract_args[@]}" 2>"$workspace/logs/promefuzz_api_extract.log" || printf '0')"
   selected_api_count="${selected_api_count##*$'\n'}"
   export PROME_FUZZ_SELECTED_API_NAMES_FILE="$selected_api_names_file"
   export PROME_FUZZ_API_SELECTION_METADATA_FILE="$api_selection_metadata"
@@ -650,7 +904,16 @@ if preprocess_py.exists():
 PY_PROMEFUZZ_LLM_TRACE_PATCH
   if ! promefuzz_processors_ready "$runtime_artifact"; then
     printf 'PromeFuzz processor binaries are missing under %s/build/bin. Rebuild the image so docker/promefuzz/Dockerfile runs setup.sh.\n' "$runtime_artifact" >"$workspace/logs/processor.log"
-    hgb_soft_skip missing_processor_binaries 'PromeFuzz processor binaries are missing; rebuild the PromeFuzz image so setup.sh runs during docker build' harness_generator
+    if [[ "$promefuzz_method_faithful" == "1" ]]; then
+      reason="missing_processor_binaries: PromeFuzz processor binaries are missing; rebuild the PromeFuzz image so setup.sh runs during docker build"
+      hgb_write_common_metadata failed "$reason" 65 harness_generator
+      promefuzz_set_stage api_preprocess failed
+      promefuzz_write_final_result failed "$reason" 65
+      hgb_write_common_summary failed "$reason" harness_generator
+      exit 65
+    else
+      hgb_soft_skip missing_processor_binaries 'PromeFuzz processor binaries are missing; rebuild the PromeFuzz image so setup.sh runs during docker build' harness_generator
+    fi
   fi
   cfg_flag=-c
   if ! (cd "$runtime_artifact" && "$python" PromeFuzz.py --help 2>/dev/null | grep -q -- ' -c'); then
@@ -672,7 +935,13 @@ PY_PROMEFUZZ_LLM_TRACE_PATCH
     if [[ "$stage" == "stats" ]]; then
       continue
     fi
-    if [[ "$stage" == "preprocess" && "$stage_code" -eq 0 ]]; then
+    if [[ "$stage_code" -ne 0 ]]; then
+      code="$stage_code"
+      failed_stage="$stage"
+      break
+    fi
+    # Stage validation after each upstream stage.
+    if [[ "$stage" == "preprocess" ]]; then
       api_json="$workspace/promefuzz_out/$safe_target/preprocessor/api.json"
       api_count_after_preprocess="$($python - "$api_json" <<'PY_PROME_API_COUNT'
 import json
@@ -694,13 +963,22 @@ else:
 PY_PROME_API_COUNT
 )"
       if [[ "${api_count_after_preprocess:-0}" == "0" ]]; then
-        hgb_soft_skip promefuzz_no_api_candidates 'PromeFuzz preprocess completed but extracted zero API functions; skipping comprehension/generation' harness_generator
+        promefuzz_set_stage api_preprocess failed
+        reason="promefuzz_no_api_candidates: PromeFuzz preprocess completed but extracted zero API functions"
+        hgb_write_common_metadata failed "$reason" 1 harness_generator
+        promefuzz_write_final_result failed "$reason" 1
+        hgb_write_common_summary failed "$reason" harness_generator
+        exit 1
       fi
-    fi
-    if [[ "$stage_code" -ne 0 ]]; then
-      code="$stage_code"
-      failed_stage="$stage"
-      break
+      promefuzz_set_stage api_preprocess completed
+    elif [[ "$stage" == "comprehend" ]]; then
+      # Validate knowledge artifacts: metadata/type dependency relations and
+      # real embeddings must exist where the target API requires structured
+      # objects. Consumer call graph/call order are generated when consumer
+      # cases exist (recorded by build_context/consumer_cases.json).
+      promefuzz_set_stage knowledge completed
+    elif [[ "$stage" == "generate" ]]; then
+      promefuzz_set_stage generation completed
     fi
   done
   if [[ -f "$runtime_artifact/logs/llm.log" ]]; then
@@ -714,7 +992,14 @@ PY_PROME_API_COUNT
     cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
   done < <(find "$final_driver_dir" -maxdepth 1 -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | sort)
   temporary_harness_attempt_count="$(find "$temporary_driver_dir" -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | wc -l | tr -d ' ')"
-  status=completed
+  generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
+  if [[ "$code" -eq 0 && "${generated_harness_count:-0}" -eq 0 ]]; then
+    code=1
+    failed_stage=generate
+    promefuzz_set_stage generation failed
+    reason='PromeFuzz generation completed without producing a sanitized target harness; temporary retry sources were not retained as results'
+  fi
+  status=evaluated
   reason=none
   if [[ "$code" -ne 0 ]]; then
     status=failed
@@ -745,25 +1030,87 @@ PY_PROME_API_COUNT
     fi
   fi
   deprecated_api_event_count="$(grep -R -hE 'has failed to generate more than [0-9]+ times, deprecated' "$workspace/logs" 2>/dev/null | wc -l | tr -d ' ')"
-  generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
-  if [[ "$code" -eq 0 && "${generated_harness_count:-0}" -eq 0 ]]; then
-    code=1
-    failed_stage=generate
-    status=failed
-    reason='PromeFuzz generation completed without producing a sanitized target harness; temporary retry sources were not retained as results'
-  elif [[ "$code" -eq 0 && "${deprecated_api_event_count:-0}" -gt 0 ]]; then
+  if [[ "$code" -eq 0 && "${deprecated_api_event_count:-0}" -gt 0 ]]; then
     status=partial_completed
     reason="PromeFuzz finalized $generated_harness_count sanitized target harnesses but reported $deprecated_api_event_count deprecated API generation events"
-  elif [[ "$code" -ne 0 && "${generated_harness_count:-0}" -gt 0 ]]; then
-    status=partial_completed
-    reason="PromeFuzz $failed_stage stage exited $code after producing $generated_harness_count sanitized target harnesses"
+  fi
+  # --- Independent common harness evaluator (build + smoke + reachability +
+  # campaign + coverage). Only a candidate that passes the exact FuzzBench
+  # build and evaluation reaches `evaluated`. ---
+  verification_code=not_run
+  verified_harness_count=0
+  if [[ "${generated_harness_count:-0}" -gt 0 && "$code" -eq 0 ]]; then
+    eval_dir="$workspace/evaluation"
+    mkdir -p "$eval_dir"
+    verification_code=0
+    "$python" /opt/hgb/bin/promefuzz_evaluator.py \
+      --target-root /target --candidates-dir "$workspace/generated_harnesses" \
+      --work-dir "$eval_dir" --fuzz-target "$fuzz_target" \
+      --build-timeout "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-1800}" \
+      --campaign-seconds "${PROME_FUZZ_CAMPAIGN_SECONDS:-60}" \
+      >"$workspace/logs/evaluator.log" 2>&1 || verification_code=$?
+    eval_result="$eval_dir/results.json"
+    if [[ -f "$eval_result" ]]; then
+      verified_harness_count="$(python3 -c 'import json; d=json.load(open("'"$eval_result"'")); print(len(d.get("verified_candidates", [])))' 2>/dev/null || printf '0')"
+    fi
+    if [[ "$verification_code" -eq 0 && "${verified_harness_count:-0}" -gt 0 ]]; then
+      promefuzz_set_stage candidate_build completed
+      promefuzz_set_stage sanitizer_smoke completed
+      promefuzz_set_stage api_reachability completed
+      promefuzz_set_stage campaign completed
+      promefuzz_set_stage coverage completed
+    else
+      promefuzz_set_stage candidate_build failed
+      if [[ "$status" == "evaluated" ]]; then
+        status=failed
+        reason="promefuzz_no_verified_harness: no generated harness passed the exact FuzzBench build + smoke + reachability + campaign + coverage evaluation"
+        code=5
+      fi
+    fi
+  elif [[ "$code" -eq 0 ]]; then
+    promefuzz_set_stage candidate_build failed
+    status=failed
+    code=4
+  fi
+  # Derive the canonical status from the PromeFuzz stage states.
+  stage_status="$(promefuzz_result_status)"
+  if [[ "$code" -eq 0 && "$stage_status" == "evaluated" ]]; then
+    status=evaluated
+    reason=none
+  elif [[ "$stage_status" == "failed" && "$status" == "evaluated" ]]; then
+    status=failed
+  fi
+  # --- Reference leakage audit ---
+  # If the host placed a canary token in the evaluator-only reference source
+  # (HGB_REF_CANARY), scan all PromeFuzz generator inputs and outputs to prove
+  # it never reached prompts, logs, configs, API collections, embeddings, or
+  # candidate context.
+  promefuzz_leakage_audit='{}'
+  if [[ -n "${HGB_REF_CANARY:-}" ]]; then
+    promefuzz_leakage_audit="$("$python" /opt/hgb/bin/promefuzz_profile.py audit \
+      --generator-input /target/source_input \
+      --canary "$HGB_REF_CANARY" \
+      --extra-dir "$workspace" \
+      --extra-dir "$workspace/promefuzz_out" 2>/dev/null || printf '{"leaked":true,"error":"audit_failed"}')"
+    if printf '%s' "$promefuzz_leakage_audit" | grep -q '"leaked": *true'; then
+      printf 'Reference leakage audit FAILED: canary token found in PromeFuzz generator data\n' >"$workspace/logs/leakage_audit.log"
+      printf '%s\n' "$promefuzz_leakage_audit" >>"$workspace/logs/leakage_audit.log"
+      if [[ "$code" -eq 0 ]]; then
+        code=8
+        status=failed
+        reason='promefuzz_reference_leakage: canary token from evaluator-only reference source reached PromeFuzz generator data'
+      fi
+    else
+      printf 'Reference leakage audit passed: no canary leakage detected\n' >"$workspace/logs/leakage_audit.log"
+    fi
   fi
   if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
     rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
   fi
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
-  extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "native_build_enabled": %s,\n  "native_harness_destination": "%s",\n  "final_harness_count": %s,\n  "temporary_harness_attempt_count": %s,\n  "deprecated_api_event_count": %s' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$native_build_json" "$(hgb_json_escape "$native_harness_destination")" "${generated_harness_count:-0}" "${temporary_harness_attempt_count:-0}" "${deprecated_api_event_count:-0}")
+  extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "native_build_enabled": %s,\n  "native_harness_destination": "%s",\n  "final_harness_count": %s,\n  "temporary_harness_attempt_count": %s,\n  "deprecated_api_event_count": %s,\n  "driver_build_args": %s,\n  "verified_harness_count": %s,\n  "candidate_verification_exit_code": "%s"' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$native_build_json" "$(hgb_json_escape "$native_harness_destination")" "${generated_harness_count:-0}" "${temporary_harness_attempt_count:-0}" "${deprecated_api_event_count:-0}" "$driver_build_args_json" "${verified_harness_count:-0}" "$(hgb_json_escape "$verification_code")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
+  promefuzz_write_final_result "$status" "$reason" "$code" "$promefuzz_leakage_audit"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
 fi

@@ -26,10 +26,45 @@ RUN cd /opt/hgb/artifacts/promefuzz \
   && test -x build/bin/cgprocessor
 ENV PATH="/opt/hgb/venv/bin:${PATH}"
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh docker/common/hgb_compile_db.py docker/common/hgb_target_harness.py docker/common/promefuzz_target_build.sh /opt/hgb/bin/
-RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/hgb_compile_db.py /opt/hgb/bin/hgb_target_harness.py /opt/hgb/bin/promefuzz_target_build.sh
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh docker/common/hgb_compile_db.py docker/common/hgb_target_harness.py docker/common/promefuzz_target_build.sh docker/common/promefuzz_profile.py docker/common/promefuzz_build_context.py docker/common/promefuzz_evaluator.py docker/common/ofg_evaluator.py /opt/hgb/bin/
+RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/hgb_compile_db.py /opt/hgb/bin/hgb_target_harness.py /opt/hgb/bin/promefuzz_target_build.sh /opt/hgb/bin/promefuzz_profile.py /opt/hgb/bin/promefuzz_build_context.py /opt/hgb/bin/promefuzz_evaluator.py /opt/hgb/bin/ofg_evaluator.py
 COPY docker/promefuzz/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh
+# Image self-test: validate preprocessor/cgprocessor, profile validation,
+# build-context import, evaluator import, and upstream CLI syntax without
+# network or LLM calls. Recorded provenance lives in /opt/hgb/provenance.json.
+RUN /opt/hgb/venv/bin/python - <<'PY_PROMEFUZZ_SELFTEST'
+import json
+import subprocess
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+import promefuzz_build_context
+import promefuzz_evaluator
+violations = promefuzz_profile.validate_profile("alpha", "blind-project", {
+    "PROME_FUZZ_EMBEDDING_MODEL": "text-embedding-3-small",
+    "PROME_FUZZ_EMBEDDING_LLM_TYPE": "openai",
+})
+if violations:
+    raise SystemExit("promefuzz self-test profile validation failed: " + "; ".join(violations))
+artifact = Path("/opt/hgb/artifacts/promefuzz")
+commit = "unknown"
+try:
+    commit = subprocess.run(["git", "-C", str(artifact), "rev-parse", "HEAD"],
+                            capture_output=True, text=True, check=False).stdout.strip() or "unknown"
+except Exception:
+    pass
+clang_version = subprocess.run(["clang", "--version"], capture_output=True, text=True, check=False).stdout.splitlines()[0] if Path("/usr/bin/clang").exists() else "unavailable"
+provenance = {
+    "schema_version": 1,
+    "promefuzz_commit": commit,
+    "clang_version": clang_version,
+    "python": "/opt/hgb/venv/bin/python",
+    "image_selftest": "passed",
+}
+Path("/opt/hgb/provenance.json").write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_PROMEFUZZ_SELFTEST
 # FuzzBench recipes normally inherit these utilities from OSS-Fuzz base images.
 # Native target validation replays those recipes in this smaller image, so keep
 # the compatibility layer separate from PromeFuzz's cached Python/tool build.

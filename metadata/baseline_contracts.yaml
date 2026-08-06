@@ -1,5 +1,29 @@
 schema_version: 1
 baselines:
+  - name: oss-fuzz-gen
+    task_family: harness_generator
+    profiles: [alpha, paper-faithful, compat-smoke]
+    default_profile: alpha
+    default_protocol: blind-project
+    strict_success_status: evaluated
+    notes: >
+      OSS-Fuzz-Gen is a harness generator. alpha and paper-faithful require a
+      real Fuzz Introspector build (all_functions.json/calltree.json/
+      type_info.json/report_manifest.json), a target-aware benchmark YAML
+      synthesized from that introspector output, real coverage, automatic
+      compile/build repair, and an independent exact-FuzzBench evaluator that
+      overlays each candidate, replays the native build, runs sanitizer smoke,
+      API reachability, a fixed-budget campaign, and real coverage. The local
+      introspector shim, OFG_SKIP_COVERAGE_GAINS=1, empty coverage shims,
+      no-op processes, tiny 1/1/1 budgets, reference-harness examples, and
+      reference-derived API ranking are forbidden in alpha and paper-faithful.
+      Missing benchmark YAML must synthesize or fail; it is never a soft skip.
+      The OSS-Fuzz checkout is pinned and immutable; cloning floating master is
+      forbidden. compat-smoke may use the local shim, 1/1/1 budgets, and
+      coverage skip but must set excluded_from_aggregate=true and is never the
+      default. Exact FuzzBench reference harnesses are evaluator-only and must
+      never reach the generator in blind-project. Only status=evaluated counts
+      as a successful alpha matrix row.
   - name: g2fuzz
     task_family: input_generator
     profiles: [alpha, paper-faithful, extension, compat-smoke]
@@ -14,3 +38,47 @@ baselines:
     default_protocol: paper-native
     strict_success_status: evaluated
     notes: ELFuzz synthesizes and evolves input-producing fuzzer programs against a fixed native FuzzBench target, then runs a final AFL++ campaign. It is an input generator, not a harness generator, and supports only the explicit text-input target set in metadata/elfuzz_target_adapters.yaml. Non-text targets are contractually Invalid (not_applicable) and must not start Docker/model download, TGI, synthesis, or fuzzing.
+  - name: promefuzz
+    task_family: harness_generator
+    profiles: [alpha, paper-faithful, compat-smoke]
+    default_profile: alpha
+    default_protocol: blind-project
+    strict_success_status: evaluated
+    notes: >
+      PromeFuzz is a harness generator. alpha and paper-faithful require a real
+      compile database captured from the pinned FuzzBench build (never a
+      synthetic one), real link/library context with non-empty
+      driver_build_args, legitimate consumer knowledge when available, a real
+      semantic embedding provider (never mock/hash), the official ALL-COVER
+      generation path with practical multi-candidate budgets, iterative native
+      target build validation against the exact pinned FuzzBench build, and the
+      common harness evaluator (build + sanitizer smoke + API reachability +
+      fixed-budget campaign + coverage). Synthetic compile databases, hash/mock
+      embeddings, selected-reference-harness API filtering, empty
+      driver_build_args, and method-changing fallbacks are forbidden in alpha
+      and paper-faithful; a missing real build context is a concrete failure,
+      not a soft skip. compat-smoke may use the synthetic compile database and
+      local hash embeddings for offline wiring tests only, must set
+      excluded_from_aggregate=true and method_variant=compat-smoke, and is never
+      selected by default. Exact FuzzBench reference harnesses are
+      evaluator-only and must never reach the PromeFuzz generator in
+      blind-project. Only status=evaluated counts as a successful alpha matrix
+      row.
+  - name: ckgfuzzer
+    task_family: harness_generator
+    profiles: [alpha, paper-faithful, compat-smoke]
+    default_profile: alpha
+    default_protocol: blind-project
+    strict_success_status: evaluated
+    notes: >
+      CKGFuzzer is a harness generator. alpha and paper-faithful require a real
+      CodeQL database, a real embedding service, upstream LLM API summaries, the
+      upstream API-combination planner, and the upstream compilation-check/repair
+      loop. Mock/hash embeddings, local deterministic API summaries, local
+      deterministic API combinations, source-only graph fallback, and
+      --skip_check_compilation are forbidden in alpha and paper-faithful. A
+      failed or empty CodeQL graph is a failed run, not a successful source
+      fallback. compat-smoke may retain deterministic/mock fallbacks but must set
+      excluded_from_aggregate=true and is never selected by default. Exact
+      FuzzBench reference harnesses are evaluator-only and must never reach the
+      generator in blind-project.

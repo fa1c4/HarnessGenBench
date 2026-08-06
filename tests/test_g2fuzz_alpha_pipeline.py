@@ -290,19 +290,21 @@ def test_matrix_summary_separates_input_and_harness_families(tmp_path: Path) -> 
         encoding="utf-8",
     )
     (h_ws / "metadata.json").write_text(
-        json.dumps({"generator": "ckgfuzzer", "status": "completed", "task_family": "harness_generator", "generated_harness_count": 1}),
+        json.dumps({"generator": "ckgfuzzer", "status": "evaluated", "task_family": "harness_generator", "profile": "alpha", "generated_harness_count": 1}),
         encoding="utf-8",
     )
     (matrix_dir / "matrix.tsv").write_text(
         "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
         f"g2fuzz\tlibpng_libpng_read_fuzzer\tevaluated\t{g2_ws}\t{g2_ws / 'metadata.json'}\t{g2_ws / 'HGB_SUMMARY.md'}\n"
-        f"ckgfuzzer\tjsoncpp_jsoncpp_fuzzer\tcompleted\t{h_ws}\t{h_ws / 'metadata.json'}\t{h_ws / 'HGB_SUMMARY.md'}\n",
+        f"ckgfuzzer\tjsoncpp_jsoncpp_fuzzer\tevaluated\t{h_ws}\t{h_ws / 'metadata.json'}\t{h_ws / 'HGB_SUMMARY.md'}\n",
         encoding="utf-8",
     )
 
     summary = matrix_collector.collect(matrix_dir)
     matrix_collector.write_outputs(matrix_dir, summary)
 
+    # g2fuzz (input_generator) "evaluated" counts as completed;
+    # ckgfuzzer (harness_generator alpha) only "evaluated" counts as completed.
     assert summary["completed_pairs"] == 2
     assert summary["task_family_counts"] == {"input_generator": 1, "harness_generator": 1}
     assert summary["status_counts_by_task_family"]["input_generator"]["evaluated"] == 1

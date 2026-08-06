@@ -157,6 +157,9 @@ hgb_write_common_metadata() {
     printf '  "save_mode": "%s",\n' "$(hgb_json_escape "${HGB_SAVE_MODE:-compact}")"
     printf '  "capability": "%s",\n' "$(hgb_json_escape "$capability")"
     printf '  "task_family": "%s",\n' "$(hgb_json_escape "$task_family")"
+    printf '  "profile": "%s",\n' "$(hgb_json_escape "${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}")"
+    printf '  "protocol": "%s",\n' "$(hgb_json_escape "${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}")"
+    printf '  "applicability": "applicable",\n'
     printf '  "status": "%s",\n' "$(hgb_json_escape "$status")"
     printf '  "reason": "%s",\n' "$(hgb_json_escape "$reason")"
     printf '  "exit_code": %s,\n' "$exit_code"
@@ -177,7 +180,7 @@ hgb_write_common_metadata() {
     printf '  "api_trace_dir": "%s",\n' "$(hgb_json_escape "$trace_path")"
     printf '  "api_trace_file": "%s",\n' "$(hgb_json_escape "$trace_file")"
     printf '  "api_trace_sample_rate": "%s",\n' "$(hgb_json_escape "$trace_rate")"
-    printf '  "api_trace_total_count": %s,\n' "${trace_total:-0}"
+    printf '  "api_trace_total_count": %s' "${trace_total:-0}"
     printf '  "api_trace_sample_count": %s' "${trace_sample:-0}"
     if [[ -n "$extra_json" ]]; then
       printf ',\n%s\n' "$extra_json"
@@ -186,6 +189,10 @@ hgb_write_common_metadata() {
     fi
     printf '}\n'
   } >"$workspace/metadata.json"
+  # Derive result.json (schema v2) from the same data so statuses never diverge.
+  if [[ "$capability" == "harness_generator" ]]; then
+    hgb_write_result_json "$status" "$reason" "$exit_code" ""
+  fi
 }
 
 hgb_write_common_summary() {
@@ -279,5 +286,148 @@ emit("api_report_target", data.get("api_report_target", ""))
 emit("api_selection_fallback_used", bool(data.get("fallback_used")))
 emit("api_candidate_names", selected if isinstance(selected, list) else [])
 PY_HGB_API_SELECTION_METADATA
+}
+
+# ---------------------------------------------------------------------------
+# Normalized result schema (schema_version 2) and stage tracking
+# ---------------------------------------------------------------------------
+
+hgb_stage_names() {
+  printf '%s\n' target_prepared codeql_database knowledge_graph generation compilation_repair candidate_build sanitizer_smoke api_reachability campaign coverage
+}
+
+hgb_result_init_stages() {
+  local stage_file="${1:-$workspace/stages.json}"
+  mkdir -p "$(dirname "$stage_file")"
+  python3 - "$stage_file" <<'PY_HGB_STAGES_INIT'
+import json
+import sys
+from pathlib import Path
+stages = {
+    "target_prepared": "pending",
+    "codeql_database": "pending",
+    "knowledge_graph": "pending",
+    "generation": "pending",
+    "compilation_repair": "pending",
+    "candidate_build": "pending",
+    "sanitizer_smoke": "pending",
+    "api_reachability": "pending",
+    "campaign": "pending",
+    "coverage": "pending",
+}
+Path(sys.argv[1]).write_text(json.dumps(stages, indent=2) + "\n", encoding="utf-8")
+PY_HGB_STAGES_INIT
+}
+
+hgb_result_set_stage() {
+  local stage_file="${1:-$workspace/stages.json}"
+  local name="$2"
+  local state="${3:-completed}"
+  python3 - "$stage_file" "$name" "$state" <<'PY_HGB_STAGES_SET'
+import json
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+try:
+    stages = json.loads(path.read_text(encoding="utf-8"))
+except Exception:
+    stages = {}
+stages[sys.argv[2]] = sys.argv[3]
+path.write_text(json.dumps(stages, indent=2) + "\n", encoding="utf-8")
+PY_HGB_STAGES_SET
+}
+
+hgb_result_read_stages() {
+  local stage_file="${1:-$workspace/stages.json}"
+  [[ -f "$stage_file" ]] || { printf '{}'; return 0; }
+  cat "$stage_file"
+}
+
+hgb_result_status_from_stages() {
+  local stage_file="${1:-$workspace/stages.json}"
+  python3 - "$stage_file" <<'PY_HGB_STAGES_STATUS'
+import json
+import sys
+from pathlib import Path
+try:
+    stages = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    stages = {}
+stage_names = [
+    "target_prepared", "codeql_database", "knowledge_graph", "generation",
+    "compilation_repair", "candidate_build", "sanitizer_smoke",
+    "api_reachability", "campaign", "coverage",
+]
+if any(stages.get(n) == "failed" for n in stage_names):
+    print("failed")
+elif all(stages.get(n) == "completed" for n in stage_names):
+    print("evaluated")
+else:
+    print("failed")
+PY_HGB_STAGES_STATUS
+}
+
+hgb_write_result_json() {
+  local status="$1"
+  local reason="$2"
+  local exit_code="${3:-0}"
+  local extra_json="${4:-}"
+  local workspace="${workspace:-/workspace}"
+  local profile="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
+  local protocol="${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
+  local target="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  local generator="${HGB_GENERATOR:-unknown}"
+  local stage_file="$workspace/stages.json"
+  local excluded=false
+  local method_variant="$profile"
+  case "$profile" in
+    compat-smoke) excluded=true; method_variant="compat-smoke" ;;
+  esac
+  local stages_json
+  stages_json="$(hgb_result_read_stages "$stage_file")"
+  python3 - "$workspace/result.json" "$generator" "$profile" "$protocol" "$target" "$status" "$reason" "$stages_json" "$excluded" "$method_variant" "$extra_json" <<'PY_HGB_RESULT_WRITE'
+import json
+import sys
+from pathlib import Path
+out = Path(sys.argv[1])
+generator = sys.argv[2]
+profile = sys.argv[3]
+protocol = sys.argv[4]
+target = sys.argv[5]
+status = sys.argv[6]
+reason = sys.argv[7]
+try:
+    stages = json.loads(sys.argv[8])
+except Exception:
+    stages = {}
+excluded = sys.argv[9] == "true"
+method_variant = sys.argv[10]
+extra_json = sys.argv[11] if len(sys.argv) > 11 else ""
+result = {
+    "schema_version": 2,
+    "generator": generator,
+    "task_family": "harness_generator",
+    "profile": profile,
+    "protocol": protocol,
+    "target": target,
+    "applicability": "applicable",
+    "status": status,
+    "reason": reason,
+    "stages": stages,
+    "artifacts": {},
+    "metrics": {},
+    "provenance": {},
+    "reference_leakage_audit": {},
+    "method_variant": method_variant,
+    "excluded_from_aggregate": excluded,
+}
+if extra_json:
+    try:
+        extra = json.loads("{" + extra_json + "}")
+        result.update(extra)
+    except Exception:
+        pass
+out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_HGB_RESULT_WRITE
 }
 

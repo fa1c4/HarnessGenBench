@@ -33,7 +33,14 @@ SOFT_STATUSES = {
 }
 PARTIAL_STATUSES = {"partial_completed"}
 NOT_APPLICABLE_STATUSES = {"not_applicable", "target_not_supported_by_elfuzz"}
+# For harness generators with strict evaluated semantics (CKGFuzzer alpha),
+# only "evaluated" counts as completed. "completed" and "dry_run_ok" are not
+# successful evaluations for harness-generator rows.
+HARNESS_GENERATOR_STRICT_COMPLETED = {"evaluated"}
+# For input generators and non-strict harness runs, the broader set applies.
 COMPLETED_STATUSES = {"completed", "dry_run_ok", "evaluated"}
+# Statuses that must never be counted as successful.
+NEVER_SUCCESS_STATUSES = {"dry_run", "partial_completed", "soft_skip", "generation_completed"}
 TRANSIENT_DIR_NAMES = {
     "g2fuzz_output",
     "ofg-work",
@@ -248,12 +255,44 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         records.append({"row": row, "metadata": metadata})
     total = len(records)
     statuses = collections.Counter((r["metadata"].get("status") or r["row"].get("status") or "missing_metadata") for r in records)
-    completed = sum(statuses[s] for s in COMPLETED_STATUSES)
-    partial_completed = sum(statuses[s] for s in PARTIAL_STATUSES)
-    not_applicable = sum(statuses[s] for s in NOT_APPLICABLE_STATUSES)
-    soft_skipped = sum(count for status, count in statuses.items() if status in SOFT_STATUSES)
-    missing_api_key = statuses.get("missing_api_key", 0)
-    failed = total - completed - partial_completed - not_applicable - soft_skipped - missing_api_key
+    # Determine which records are excluded from aggregate (compat-smoke or
+    # explicitly flagged). Excluded rows are still counted in total and
+    # per-status, but never in completed/failed scientific aggregates.
+    aggregate_records: list[dict[str, Any]] = []
+    excluded_records: list[dict[str, Any]] = []
+    for record in records:
+        meta = record["metadata"]
+        excluded = bool(meta.get("excluded_from_aggregate"))
+        profile = str(meta.get("profile") or meta.get("ckgfuzzer_profile") or "")
+        if profile == "compat-smoke":
+            excluded = True
+        if excluded:
+            excluded_records.append(record)
+        else:
+            aggregate_records.append(record)
+    agg_statuses = collections.Counter(
+        (r["metadata"].get("status") or r["row"].get("status") or "missing_metadata")
+        for r in aggregate_records
+    )
+    completed = 0
+    for r in aggregate_records:
+        meta = r["metadata"]
+        status_s = str(meta.get("status") or r["row"].get("status") or "missing_metadata")
+        family = str(meta.get("task_family") or meta.get("capability") or "harness_generator")
+        # For harness generators, only "evaluated" counts as completed.
+        # "completed", "dry_run_ok" are not successful evaluations.
+        if family == "harness_generator":
+            if status_s in HARNESS_GENERATOR_STRICT_COMPLETED:
+                completed += 1
+        else:
+            if status_s in COMPLETED_STATUSES:
+                completed += 1
+    partial_completed = sum(agg_statuses[s] for s in PARTIAL_STATUSES)
+    not_applicable = sum(agg_statuses[s] for s in NOT_APPLICABLE_STATUSES)
+    soft_skipped = sum(count for status, count in agg_statuses.items() if status in SOFT_STATUSES)
+    missing_api_key = agg_statuses.get("missing_api_key", 0)
+    excluded_count = len(excluded_records)
+    failed = len(aggregate_records) - completed - partial_completed - not_applicable - soft_skipped - missing_api_key
     harness_counts: collections.Counter[str] = collections.Counter()
     build_script_counts: collections.Counter[str] = collections.Counter()
     log_candidate_counts: collections.Counter[str] = collections.Counter()
@@ -271,6 +310,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         family = str(meta.get("task_family") or meta.get("capability") or ("input_generator" if gen in {"g2fuzz", "elfuzz"} else "harness_generator"))
         task_family_counts[family] += 1
         status_counts_by_task_family[family][status_s] += 1
+        # Aggregate artifact counts by task family so harness and input
+        # generators never share a single counter.
         harness_counts[gen] += int(meta.get("generated_harness_count") or meta.get("generated_driver_count") or 0)
         build_script_counts[gen] += int(meta.get("generated_build_script_count") or 0)
         log_candidate_counts[gen] += int(meta.get("generated_log_candidate_count") or 0)
@@ -286,6 +327,8 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
     return {
         "matrix_dir": str(matrix_dir),
         "total_pairs": total,
+        "aggregate_pairs": len(aggregate_records),
+        "excluded_pairs": excluded_count,
         "completed_pairs": completed,
         "failed_pairs": failed,
         "partial_completed_pairs": partial_completed,
@@ -293,6 +336,7 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         "not_applicable_pairs": not_applicable,
         "missing_api_key_count": missing_api_key,
         "statuses": dict(statuses),
+        "aggregate_statuses": dict(agg_statuses),
         "generated_harness_counts_by_generator": dict(harness_counts),
         "generated_build_script_counts_by_generator": dict(build_script_counts),
         "generated_log_candidate_counts_by_generator": dict(log_candidate_counts),
@@ -314,6 +358,8 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
         writer.writerow(["metric", "value"])
         for key in (
             "total_pairs",
+            "aggregate_pairs",
+            "excluded_pairs",
             "completed_pairs",
             "partial_completed_pairs",
             "failed_pairs",
@@ -338,6 +384,8 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
         "# HarnessGenBench Matrix Summary",
         "",
         f"- Total pairs: `{summary['total_pairs']}`",
+        f"- Aggregate pairs (scientific): `{summary.get('aggregate_pairs', summary['total_pairs'])}`",
+        f"- Excluded pairs (compat-smoke): `{summary.get('excluded_pairs', 0)}`",
         f"- Completed pairs: `{summary['completed_pairs']}`",
         f"- Partial completed pairs: `{summary['partial_completed_pairs']}`",
         f"- Failed pairs: `{summary['failed_pairs']}`",
@@ -361,7 +409,10 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
         for family, count in sorted(summary["task_family_counts"].items()):
             statuses = by_family.get(family, {})
             evaluated = statuses.get("evaluated", 0)
-            completed_family = sum(statuses.get(status, 0) for status in COMPLETED_STATUSES)
+            if family == "harness_generator":
+                completed_family = evaluated
+            else:
+                completed_family = sum(statuses.get(status, 0) for status in COMPLETED_STATUSES)
             lines.append(f"- `{family}`: {count} pairs, {completed_family} completed/evaluated, {evaluated} evaluated")
     storage = summary.get("storage", {})
     if storage:

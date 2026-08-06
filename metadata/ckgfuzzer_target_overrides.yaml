@@ -1,0 +1,151 @@
+# CKGFuzzer target build overrides for the FuzzBench valuable target set.
+#
+# This file contains ONLY legitimate build facts: generated-header
+# directories, required packages, neutral stub destination, language,
+# compiler, and timeout. It MUST NOT contain target harness source, call
+# sequences, or API names extracted from the target harness.
+#
+# The stub_destination is the path where a neutral LLVMFuzzerTestOneInput
+# boilerplate stub is placed during CodeQL database creation so the build
+# does not require the native target harness body.
+
+targets:
+  bloaty_fuzz_target:
+    language: c++
+    compiler: clang++
+    stub_destination: src/fuzz_target.cc
+    generated_headers: [build]
+    timeout: 1800
+
+  curl_curl_fuzzer_http:
+    language: c++
+    compiler: clang++
+    stub_destination: ossfuzz/curl_fuzzer_http.cc
+    generated_headers: [include]
+    timeout: 1800
+
+  freetype2_ftfuzzer:
+    language: c++
+    compiler: clang++
+    stub_destination: fttester.cc
+    generated_headers: [objs]
+    timeout: 1800
+
+  harfbuzz_hb-shape-fuzzer:
+    language: c++
+    compiler: clang++
+    stub_destination: test/fuzzing/hb-shape-fuzzer.cc
+    generated_headers: [src]
+    timeout: 1800
+
+  jsoncpp_jsoncpp_fuzzer:
+    language: c++
+    compiler: clang++
+    stub_destination: fuzz.cpp
+    generated_headers: [build]
+    timeout: 1200
+
+  lcms_cms_transform_fuzzer:
+    language: c
+    compiler: clang
+    stub_destination: cms_transform_fuzzer.c
+    generated_headers: [include]
+    timeout: 1200
+
+  libjpeg-turbo_libjpeg_turbo_fuzzer:
+    language: c
+    compiler: clang
+    stub_destination: libjpeg_turbo_fuzzer.cc
+    generated_headers: [build]
+    timeout: 1800
+
+  libpcap_fuzz_both:
+    language: c
+    compiler: clang
+    stub_destination: fuzz_both.c
+    generated_headers: []
+    timeout: 1200
+
+  libpng_libpng_read_fuzzer:
+    language: c
+    compiler: clang
+    stub_destination: libpng_read_fuzzer.c
+    generated_headers: [build]
+    timeout: 1200
+
+  libxml2_xml:
+    language: c
+    compiler: clang
+    stub_destination: xml.c
+    generated_headers: [config.h]
+    timeout: 1800
+
+  libxslt_xpath:
+    language: c
+    compiler: clang
+    stub_destination: xpath.c
+    generated_headers: [libxslt]
+    timeout: 1800
+
+  mbedtls_fuzz_dtlsclient:
+    language: c
+    compiler: clang
+    stub_destination: fuzz_dtlsclient.c
+    generated_headers: [include]
+    timeout: 1800
+
+  mruby_mruby_fuzzer_8c8bbd:
+    language: c
+    compiler: clang
+    stub_destination: mruby_fuzzer.c
+    generated_headers: [build]
+    timeout: 1800
+
+  openh264_decoder_fuzzer:
+    language: c++
+    compiler: clang++
+    stub_destination: decoder_fuzzer.cpp
+    generated_headers: [build]
+    timeout: 1800
+
+  openssl_x509:
+    language: c
+    compiler: clang
+    stub_destination: x509.c
+    generated_headers: [include]
+    timeout: 1800
+
+  php_php-fuzz-parser_0dbedb:
+    language: c
+    compiler: clang
+    stub_destination: sapi/fuzzer/fuzzer-parser.c
+    generated_headers: [main]
+    timeout: 2400
+
+  re2_fuzzer:
+    language: c++
+    compiler: clang++
+    stub_destination: re2/fuzzer/fuzzer.cc
+    generated_headers: [build]
+    timeout: 1800
+
+  sqlite3_ossfuzz:
+    language: c
+    compiler: clang
+    stub_destination: ossfuzz.c
+    generated_headers: []
+    timeout: 1800
+
+  systemd_fuzz-link-parser:
+    language: c
+    compiler: clang
+    stub_destination: fuzz-link-parser.c
+    generated_headers: [build]
+    timeout: 2400
+
+  zlib_zlib_uncompress_fuzzer:
+    language: c
+    compiler: clang
+    stub_destination: zlib_uncompress_fuzzer.c
+    generated_headers: []
+    timeout: 1200

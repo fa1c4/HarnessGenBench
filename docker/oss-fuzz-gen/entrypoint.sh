@@ -36,6 +36,83 @@ else:
 PY_JSON_VALUE
 }
 commit() { git -C "$artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
+
+# ---------------------------------------------------------------------------
+# Profile configuration: alpha/paper-faithful require real Introspector and
+# real coverage; compat-smoke may use the local shim, 1/1/1 budgets, and skip
+# coverage. Legacy env must never silently force alpha into compat behavior.
+# ---------------------------------------------------------------------------
+
+hgb_profile="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
+hgb_protocol="${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
+
+apply_profile_defaults() {
+  case "$hgb_profile" in
+    alpha)
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-remote}"
+      export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
+      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-3}"
+      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+      export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+      export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
+      export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
+      export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+      export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+      ;;
+    paper-faithful)
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-remote}"
+      export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
+      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-3}"
+      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+      export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+      export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
+      export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
+      export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+      export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+      ;;
+    compat-smoke)
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
+      export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
+      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
+      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+      export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-300}"
+      export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-1}"
+      export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-1}"
+      export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+      export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+      ;;
+    *) ;;
+  esac
+  export HGB_BASELINE_PROFILE="$hgb_profile"
+  export HGB_BASELINE_PROTOCOL="$hgb_protocol"
+  export HGB_TASK_FAMILY="harness_generator"
+  export HGB_GENERATOR="${HGB_GENERATOR:-oss-fuzz-gen}"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
+  export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}}"
+  export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
+  export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
+  export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
+  export HGB_LLM_LOCK_DIR="${HGB_LLM_LOCK_DIR:-/tmp/hgb-llm-locks}"
+  export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
+  export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
+}
+
+validate_profile_invariants() {
+  "$python" /opt/hgb/bin/ofg_profile.py validate --profile "$hgb_profile" --protocol "$hgb_protocol" >/dev/null 2>"$workspace/logs/profile_validation.log" || {
+    local violations
+    violations="$(cat "$workspace/logs/profile_validation.log")"
+    printf 'ofg_profile_violation: %s\n' "$violations" >&2
+    return 1
+  }
+}
+
 oss_fuzz_checkout_ready() {
   local dir="$1"
   [[ -d "$dir/.git" && -f "$dir/infra/helper.py" ]]
@@ -61,8 +138,7 @@ prepare_oss_fuzz_venv() {
     ln -s "$venv_target" "$oss_fuzz_dir/venv"
     return 0
   fi
-  printf 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv at %s
-' "$venv_target" >&2
+  printf 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv at %s\n' "$venv_target" >&2
   return 1
 }
 ofg_llm_preflight() {
@@ -205,12 +281,16 @@ PY_OFG_REDACT
 classify_ofg_failure() {
   local code="$1" log_file="$2"
   if [[ -f "$log_file" ]]; then
+    if grep -Eiq 'ofg_profile_violation' "$log_file"; then
+      printf 'ofg_profile_violation: alpha/paper profile invariants were violated'
+      return 0
+    fi
     if grep -Eiq 'ModuleNotFoundError: No module named .pkg_resources.|No module named .pkg_resources.|pkg_resources' "$log_file"; then
       printf 'ofg_oss_fuzz_dependency_setup_failed: OSS-Fuzz-Gen Python environment is missing pkg_resources'
       return 0
     fi
-    if grep -Eiq 'ofg_benchmark_trim_failed|ModuleNotFoundError: No module named .yaml.|benchmark trim failed' "$log_file"; then
-      printf 'ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed'
+    if grep -Eiq 'introspector_validation_failed|ofg_introspector_build_failed' "$log_file"; then
+      printf 'ofg_introspector_build_failed: real Fuzz Introspector build did not produce valid reports'
       return 0
     fi
     if grep -Eiq 'AuthenticationError|Authentication Fails|401 Authorization Required|HTTP/1\.1 401|Error code: 401|PermissionDeniedError|Error code: 403|invalid api key' "$log_file"; then
@@ -221,32 +301,8 @@ classify_ofg_failure() {
       printf 'ofg_llm_rate_limited: OpenAI-compatible API rate limit was reached; reduce HGB_LLM_PARALLELISM or increase HGB_LLM_MIN_INTERVAL_SECONDS'
       return 0
     fi
-    if grep -Eiq 'ofg_empty_unit_test_prompt' "$log_file"; then
-      printf 'ofg_empty_unit_test_prompt: selected benchmark would produce an empty unit-test prompt'
-      return 0
-    fi
-    if grep -Eiq 'ofg_bad_api_candidate' "$log_file"; then
-      printf 'ofg_bad_api_candidate: selected benchmark APIs were rejected by HGB target-aware filtering'
-      return 0
-    fi
     if grep -Eiq 'ofg_empty_llm_response|LLM returned empty response|NoneType.*split|expected non-empty LLM response' "$log_file"; then
       printf 'ofg_empty_llm_response: OpenAI-compatible endpoint returned empty response content'
-      return 0
-    fi
-    if grep -Eiq 'textcov_reports/.+\.covreport|No such file or directory:.+covreport|coverage artifact missing' "$log_file"; then
-      printf 'ofg_coverage_artifact_missing: generated harness reached coverage extraction but no textcov report was produced'
-      return 0
-    fi
-    if grep -Eiq 'Pull latest base images.*EOF|EOFError: EOF when reading a line|EOF when reading a line' "$log_file"; then
-      printf 'ofg_oss_fuzz_helper_prompt_eof: OSS-Fuzz helper.py prompted for base-image pull policy in a noninteractive row'
-      return 0
-    fi
-    if grep -Eiq 'TLS handshake timeout|net/http: TLS handshake timeout|docker pull.*timed out|Client\.Timeout exceeded|context deadline exceeded' "$log_file"; then
-      printf 'ofg_docker_pull_timeout: Docker image pull timed out while preparing the OSS-Fuzz project image'
-      return 0
-    fi
-    if grep -Eiq 'ofg_project_image_build_failed|Failed to build image for|Failed to build project image' "$log_file"; then
-      printf 'ofg_project_image_build_failed: OSS-Fuzz project image build failed during harness validation'
       return 0
     fi
     if [[ "$code" == "124" ]] && grep -Eiq 'OnePromptPrototyper succeded|Final fuzz target function referenced: True' "$log_file"; then
@@ -269,48 +325,12 @@ classify_ofg_failure() {
       printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out after the configured request timeout'
       return 0
     fi
-    if grep -Eiq 'Invalid n value' "$log_file"; then
-      printf 'deepseek_invalid_n: DeepSeek rejected the OpenAI n parameter'
-      return 0
-    fi
-    if grep -Eiq 'invalid_request_error' "$log_file"; then
-      printf 'ofg_nonretryable_llm_request: OpenAI-compatible endpoint rejected the request'
-      return 0
-    fi
-    if grep -Eiq 'Bad model type' "$log_file"; then
-      printf 'OSS-Fuzz-Gen unsupported model type'
-      return 0
-    fi
-    if grep -Eiq 'docker\.sock: connect: no such file or directory|Cannot connect to the Docker daemon|failed to connect to the docker API' "$log_file"; then
-      printf 'ofg_docker_unavailable: Docker socket is unavailable and source fallback did not satisfy OSS-Fuzz-Gen'
-      return 0
-    fi
-    if grep -Eiq 'permission denied|read-only file system|cannot create' "$log_file"; then
-      printf 'OSS-Fuzz-Gen workspace write/setup failed'
-      return 0
-    fi
-    if grep -Eiq 'ofg_oss_fuzz_dependency_setup_failed|pip install|requirements\.txt|subprocess\.CalledProcessError.*pip|No matching distribution|Failed building wheel|error: subprocess-exited-with-error' "$log_file"; then
-      printf 'ofg_oss_fuzz_dependency_setup_failed: OSS-Fuzz helper dependency setup failed'
-      return 0
-    fi
-    if grep -Eiq 'docker.*not found' "$log_file"; then
-      printf 'ofg_docker_unavailable: Docker command is unavailable and source fallback did not satisfy OSS-Fuzz-Gen'
-      return 0
-    fi
     if grep -Eiq 'missing_oss_fuzz_checkout|OSS-Fuzz checkout is unavailable|no valid OSS-Fuzz checkout|No such file or directory.*infra/helper\.py|FileNotFoundError.*infra/helper\.py' "$log_file"; then
       printf 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
       return 0
     fi
-    if grep -Eiq 'Querying FuzzIntrospector API' "$log_file" && [[ "$code" == "124" ]]; then
-      printf 'ofg_introspector_timeout: OSS-Fuzz-Gen timed out while querying Fuzz Introspector'
-      return 0
-    fi
-    if grep -Eiq 'one_prompt_prototyper|chat.completions|LLM API Error' "$log_file" && [[ "$code" == "124" ]]; then
-      printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out or exceeded row budget'
-      return 0
-    fi
-    if grep -Eiq 'Exception while running experiment|Traceback' "$log_file"; then
-      printf 'OSS-Fuzz-Gen experiment exception before harness generation'
+    if [[ "$code" == "124" ]]; then
+      printf 'OSS-Fuzz-Gen timed out'
       return 0
     fi
   fi
@@ -320,322 +340,349 @@ classify_ofg_failure() {
   fi
   printf 'run_all_experiments exited %s' "$code"
 }
-summary() {
-  local status="$1" exit_code="$2" reason="$3"
-  {
-    printf '# HarnessGenBench OSS-Fuzz-Gen Summary\n\n'
-    printf -- '- Run directory: `%s`\n' "$workspace"
-    printf -- '- Upstream commit: `%s`\n' "$(commit)"
-    printf -- '- Status: `%s`\n' "$status"
-    printf -- '- Exit code: `%s`\n' "$exit_code"
-    printf -- '- Benchmark: `%s`\n' "${OFG_BENCHMARK:-tinyxml2}"
-    printf -- '- Model: `%s`\n' "${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
-    printf -- '- Generated harness candidates: %s\n' "$(count_files "$workspace" -type f \( -name '*fuzz*.cc' -o -name '*fuzz*.cpp' -o -name '*fuzz*.c' \))"
-    printf -- '- Top failure reason: %s\n' "$reason"
-    printf '\n## Logs\n\n'
-    find "$workspace/logs" -type f 2>/dev/null | sort | sed "s#^$workspace/##" | sed 's/^/- `/' | sed 's/$/`/'
-  } >"$workspace/HGB_SUMMARY.md"
+
+# ---------------------------------------------------------------------------
+# Stage helpers (schema v2 result.json via target_contract.sh)
+# ---------------------------------------------------------------------------
+hgb_ofg_set_stage() {
+  hgb_result_set_stage "$workspace/stages.json" "$1" "${2:-completed}"
 }
-metadata() {
-  local status="$1" exit_code="$2" reason="$3" command_file="$4" log_file="$5" benchmark_yaml="$6"
-  {
-    printf '{\n'
-    printf '  "fuzzer": "oss-fuzz-gen",\n'
-    printf '  "status": "%s",\n' "$(json_escape "$status")"
-    printf '  "upstream_commit": "%s",\n' "$(json_escape "$(commit)")"
-    printf '  "benchmark": "%s",\n' "$(json_escape "${OFG_BENCHMARK:-tinyxml2}")"
-    printf '  "benchmark_yaml": "%s",\n' "$(json_escape "$benchmark_yaml")"
-    printf '  "model": "%s",\n' "$(json_escape "${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}")"
-    printf '  "api_key_present": %s,\n' "$([[ -n "${OPENAI_API_KEY:-${API_KEY:-}}" ]] && printf true || printf false)"
-    printf '  "exit_code": %s,\n' "$exit_code"
-    printf '  "reason": "%s",\n' "$(json_escape "$reason")"
-    printf '  "command_file": "%s",\n' "$(json_escape "$command_file")"
-    printf '  "log_file": "%s"\n' "$(json_escape "$log_file")"
-    printf '}\n'
-  } >"$workspace/metadata.json"
+hgb_ofg_result_status() {
+  hgb_result_status_from_stages "$workspace/stages.json"
 }
 
+# ---------------------------------------------------------------------------
+# Real Fuzz Introspector build: produces all_functions.json, calltree.json,
+# type_info.json, report_manifest.json under $workspace/introspector/.
+# In alpha/paper this MUST be real; compat-smoke may use the local shim.
+# ---------------------------------------------------------------------------
+run_introspector() {
+  local introspector_dir="$workspace/introspector"
+  mkdir -p "$introspector_dir"
+  if [[ "$hgb_profile" == "compat-smoke" ]]; then
+    # compat-smoke: emit a minimal stub from the benchmark/project source so
+    # the local introspector shim has something to read. This is NOT a
+    # substitute for real Introspector in alpha/paper.
+    "$python" - "$introspector_dir" "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" "${HGB_TARGET_PROJECT:-}" <<'PY_OFG_STUB'
+import json
+import os
+import re
+import sys
+from pathlib import Path
+out_dir, source_dir, project = sys.argv[1:4]
+out = Path(out_dir)
+out.mkdir(parents=True, exist_ok=True)
+functions = []
+src = Path(source_dir)
+if src.is_dir():
+    for p in sorted(src.rglob('*')):
+        if not p.is_file() or p.suffix.lower() not in {'.c', '.h', '.cc', '.cpp', '.cxx', '.hpp', '.hh'}:
+            continue
+        try:
+            text = p.read_text(encoding='utf-8', errors='replace')
+        except OSError:
+            continue
+        for m in re.finditer(r'\b([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*\{', text):
+            name = m.group(1)
+            if name in {'if', 'for', 'while', 'switch', 'return', 'main'}:
+                continue
+            functions.append({"name": name, "function_signature": f"int {name}()",
+                              "source_file": str(p), "return-type": "int",
+                              "function_arguments": []})
+(out / "all_functions.json").write_text(json.dumps(functions[:200], indent=2), encoding='utf-8')
+(out / "calltree.json").write_text(json.dumps({}, indent=2), encoding='utf-8')
+(out / "type_info.json").write_text(json.dumps({}, indent=2), encoding='utf-8')
+(out / "report_manifest.json").write_text(json.dumps({"project": project, "compat_shim": True}, indent=2), encoding='utf-8')
+PY_OFG_STUB
+    return 0
+  fi
+  # alpha/paper: run the pinned Fuzz Introspector sanitizer/build path. This
+  # is delegated to the OSS-Fuzz infra introspector helper against an isolated
+  # project overlay with a neutral temporary fuzz-entrypoint stub. The real
+  # implementation requires Docker; if it is unavailable we fail truthfully.
+  local oss_fuzz_dir="$1"
+  local project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  local fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+  local source_dir="${HGB_TARGET_SOURCE_DIR:-/target/source_input}"
+  local overlay_dir="$workspace/introspector_overlay"
+  mkdir -p "$overlay_dir"
+  # Stage source into the overlay so Introspector sees complete project source.
+  rsync -a --delete "$source_dir/" "$overlay_dir/src/" 2>/dev/null || true
+  # Neutral stub fuzz target (linking only; never used as generation context).
+  cat >"$overlay_dir/hgb_introspector_stub.c" <<'EOF'
+int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
+    return 0;
+}
+EOF
+  local introspector_log="$workspace/logs/introspector_build.log"
+  if [[ -x "$oss_fuzz_dir/infra/helper.py" ]]; then
+    (cd "$oss_fuzz_dir" && python3 infra/helper.py build_fuzzers --sanitizer address \
+        --engine introspector --architecture x86_64 \
+        "$project" "$overlay_dir" >"$introspector_log" 2>&1) || {
+      printf 'ofg_introspector_build_failed: introspector helper exited non-zero\n' >>"$introspector_log"
+      return 1
+    }
+  else
+    printf 'ofg_introspector_build_failed: no infra/helper.py in %s\n' "$oss_fuzz_dir" >>"$introspector_log"
+    return 1
+  fi
+  # Locate and copy real report files into introspector_dir.
+  local report_root
+  report_root="$(find "$oss_fuzz_dir/build/out" -type d -name 'inspector' 2>/dev/null | head -n1 || true)"
+  if [[ -z "$report_root" || ! -d "$report_root" ]]; then
+    printf 'ofg_introspector_build_failed: no inspector output directory found\n' >>"$introspector_log"
+    return 1
+  fi
+  for f in all_functions.json calltree.json type_info.json report_manifest.json; do
+    [[ -f "$report_root/$f" ]] && cp "$report_root/$f" "$introspector_dir/$f"
+  done
+  return 0
+}
 
+# ---------------------------------------------------------------------------
+# Synthesize target-aware benchmark YAML from real Introspector data.
+# Missing benchmark YAML must synthesize or fail, never soft-skip.
+# ---------------------------------------------------------------------------
+synthesize_benchmark_from_introspector() {
+  local out_yaml="$1" selection_json="$2"
+  local introspector_dir="$workspace/introspector"
+  "$python" /opt/hgb/bin/ofg_benchmark_synthesis.py \
+    --report-dir "$introspector_dir" \
+    --source-dir "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" \
+    --project "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}" \
+    --target-name "${HGB_TARGET:-$(hgb_target_manifest_value target)}" \
+    --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
+    --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-3}" \
+    --benchmark-out "$out_yaml" \
+    --selection-out "$selection_json" >"$workspace/logs/benchmark_synthesis.log" 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Independent evaluator: overlay candidate, replay FuzzBench build, smoke,
+# reachability, campaign, coverage.
+# ---------------------------------------------------------------------------
+run_evaluator() {
+  local eval_dir="$workspace/evaluation"
+  mkdir -p "$eval_dir"
+  local selected_functions
+  selected_functions="$(json_file_value "$workspace/benchmark/selection.json" selected)"
+  selected_functions="$(printf '%s' "$selected_functions" | "$python" -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(r.get("name","") for r in d))' 2>/dev/null || true)"
+  "$python" /opt/hgb/bin/ofg_evaluator.py \
+    --target-root "${HGB_TARGET_PACKAGE:-/target}" \
+    --candidates-dir "$workspace/generated_harnesses" \
+    --work-dir "$eval_dir" \
+    --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
+    --selected-functions $selected_functions \
+    --build-timeout "${OFG_EVAL_BUILD_TIMEOUT:-1800}" \
+    --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}" \
+    >"$workspace/logs/evaluator.log" 2>&1 || true
+}
+
+write_final_result() {
+  local status="$1" reason="$2" exit_code="$3"
+  local leakage_audit="$workspace/leakage_audit.json"
+  "$python" /opt/hgb/bin/ofg_profile.py audit \
+    --generator-input "$workspace" \
+    --canary "${HGB_REF_CANARY:-HGB_REF_CANARY_none}" \
+    --extra-dir "$workspace/generated_harnesses" \
+    --extra-dir "$workspace/benchmark" >"$leakage_audit" 2>/dev/null || true
+  local method_variant excluded
+  if [[ "$hgb_profile" == "compat-smoke" ]]; then
+    method_variant="compat-smoke"; excluded=true
+  else
+    method_variant="$hgb_profile"; excluded=false
+  fi
+  "$python" - "$workspace/result.json" "$status" "$reason" "$exit_code" \
+    "$(commit)" "${OFG_OSS_FUZZ_COMMIT:-unknown}" \
+    "$(hgb_target_manifest_value fuzzbench_commit)" "$OFG_INTROSPECTOR_MODE" \
+    "${OFG_NUM_SAMPLES:-3}" "${OFG_MAX_ROUND:-5}" "${OFG_RUN_TIMEOUT:-900}" \
+    "$method_variant" "$excluded" "$leakage_audit" "$hgb_profile" "$hgb_protocol" \
+    "${HGB_TARGET:-$(hgb_target_manifest_value target)}" <<'PY_HGB_RESULT'
+import json
+import os
+import sys
+from pathlib import Path
+(out, status, reason, exit_code, ofg_commit, oss_commit, fb_commit, intro_mode,
+ num_samples, max_round, run_timeout, method_variant, excluded, leakage_path,
+ profile, protocol, target) = sys.argv[1:]
+try:
+    stages = json.loads(Path(os.environ.get("workspace", "/workspace") + "/stages.json").read_text(encoding="utf-8"))
+except Exception:
+    stages = {}
+leakage = {}
+try:
+    leakage = json.loads(Path(leakage_path).read_text(encoding="utf-8"))
+except Exception:
+    leakage = {}
+result = {
+    "schema_version": 2,
+    "generator": "oss-fuzz-gen",
+    "task_family": "harness_generator",
+    "profile": profile,
+    "protocol": protocol,
+    "target": target,
+    "applicability": "applicable",
+    "status": status,
+    "reason": reason,
+    "stages": stages,
+    "artifacts": {},
+    "metrics": {},
+    "provenance": {
+        "oss_fuzz_gen_commit": ofg_commit,
+        "oss_fuzz_commit": oss_commit,
+        "fuzzbench_commit": fb_commit,
+        "introspector_mode": intro_mode,
+        "ofg_num_samples": int(num_samples),
+        "ofg_max_round": int(max_round),
+        "ofg_run_timeout": int(run_timeout),
+    },
+    "reference_leakage_audit": leakage,
+    "method_variant": method_variant,
+    "excluded_from_aggregate": excluded == "true",
+}
+Path(out).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_HGB_RESULT
+}
+
+# ===========================================================================
+# generate-target mode
+# ===========================================================================
 if [[ "$mode" == "generate-target" ]]; then
   # shellcheck source=/opt/hgb/bin/target_contract.sh
   source /opt/hgb/bin/target_contract.sh
-  export HGB_GENERATOR="${HGB_GENERATOR:-oss-fuzz-gen}"
-  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  apply_profile_defaults
   export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
   export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
-  export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
-  export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
-  export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
-  export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-  export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
-  export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
-  export OFG_REQUIRE_BENCHMARK_TRIM="${OFG_REQUIRE_BENCHMARK_TRIM:-1}"
-  export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
-  export OFG_ALLOW_TEST_BENCHMARKS="${OFG_ALLOW_TEST_BENCHMARKS:-0}"
-  export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
-  export OFG_BUILD_IMAGE_PULL="${OFG_BUILD_IMAGE_PULL:-1}"
-  export OFG_PROJECT_IMAGE_BUILD_PARALLELISM="${OFG_PROJECT_IMAGE_BUILD_PARALLELISM:-2}"
-  export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
-  export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
-  export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
-  export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-/opt/hgb/metadata/fuzzbench_selected_harness_apis.json}"
-  export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-report_first}"
-  export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-$HGB_SELECTED_API_MAX}"
-  export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
-  export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
-  export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
-  export OFG_MIN_BENCHMARK_SCORE="${OFG_MIN_BENCHMARK_SCORE:-1}"
-  export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}"
-  export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
-  export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
-  export HGB_LLM_LOCK_DIR="${HGB_LLM_LOCK_DIR:-/tmp/hgb-llm-locks}"
-  export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
-  export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
-  mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
+  mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/benchmark" \
+           "$workspace/generation" "$workspace/introspector"
+  hgb_result_init_stages "$workspace/stages.json"
   hgb_require_target_package
-  project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
-  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
-  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
-  selected_reference_dir="/target/reference_harnesses/selected"
-  api_selection_metadata="$workspace/ofg_api_selection.json"
-
-  synthesize_benchmark_yaml() {
-    local out_yaml="$1"
-    local api_json="$workspace/ofg_api_candidates.json"
-    local api_count
-    api_count="$(python3 /opt/hgb/bin/extract_api_list.py --details \
-      --source /target/source_input \
-      --out "$api_json" \
-      --max "${OFG_SYNTH_CANDIDATE_POOL:-${HGB_SELECTED_API_MAX:-8}}" \
-      --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}" \
-      --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" \
-      --project "$project" \
-      --target-name "$target_name" \
-      --fuzz-target "$fuzz_target" \
-      --reference-dir "$selected_reference_dir" \
-      --api-report "$HGB_SELECTED_API_REPORT" \
-      --report-mode "$HGB_API_REPORT_MODE" \
-      --selection-metadata "$api_selection_metadata" \
-      2>"$workspace/logs/ofg_api_extract.log" || printf '0')"
-    api_count="${api_count##*$'\n'}"
-    if [[ "${api_count:-0}" == "0" ]]; then
-      return 1
-    fi
-    python3 - "$api_json" "$out_yaml" "$project" "$fuzz_target" "$target_name" <<'PY_OFG_YAML'
-import json
-import sys
-from pathlib import Path
-api_json, out_yaml, project, fuzz_target, target_name = sys.argv[1:]
-max_functions = int(__import__('os').environ.get('OFG_MAX_BENCHMARK_FUNCTIONS', '1'))
-records = json.loads(Path(api_json).read_text(encoding='utf-8'))[:max(1, max_functions)]
-source = Path('/target/source_input')
-cpp_exts = {'.cc', '.cpp', '.cxx', '.hpp', '.hh', '.hxx'}
-c_exts = {'.c', '.h'}
-cpp_count = sum(1 for p in source.rglob('*') if p.suffix.lower() in cpp_exts)
-c_count = sum(1 for p in source.rglob('*') if p.suffix.lower() in c_exts)
-language = 'c++' if cpp_count >= c_count else 'c'
-ref = None
-if __import__('os').environ.get('HGB_ALLOW_REFERENCE_USAGE', '0') == '1':
-    ref_root = Path('/target/reference_harnesses/selected')
-    if ref_root.exists():
-        for candidate in sorted(ref_root.rglob('*')):
-            if candidate.is_file() and candidate.suffix.lower() in {'.c', '.cc', '.cpp', '.cxx'}:
-                ref = candidate
-                break
-target_path = str(ref) if ref else f'/src/{project}/{fuzz_target or target_name}.cc'
-functions = []
-for record in records:
-    name = record.get('name')
-    signature = record.get('signature') or f"{record.get('return_type', 'int')} {name}()"
-    if not name or name in {'void', 'main'}:
-        continue
-    functions.append({
-        'name': name,
-        'params': record.get('params') or [],
-        'return_type': record.get('return_type') or 'int',
-        'signature': signature,
-    })
-if not functions:
-    raise SystemExit(1)
-with open(out_yaml, 'w', encoding='utf-8') as f:
-    json.dump({
-        'functions': functions,
-        'language': language,
-        'project': project,
-        'target_name': fuzz_target or target_name,
-        'target_path': target_path,
-        'use_project_examples': False,
-    }, f, indent=2)
-    f.write('\n')
-PY_OFG_YAML
-  }
+  hgb_ofg_set_stage target_prepared completed
 
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
-    printf 'oss-fuzz-gen generate-target dry-run for %s\n' "$target_name" >"$workspace/command.txt"
+    printf 'oss-fuzz-gen generate-target dry-run for %s\n' "${HGB_TARGET:-unknown}" >"$workspace/command.txt"
     hgb_write_common_metadata dry_run_ok 'dry run validated target package' 0 harness_generator
     hgb_write_common_summary dry_run_ok 'dry run validated target package' harness_generator
     exit 0
   fi
 
+  if ! validate_profile_invariants; then
+    hgb_ofg_set_stage target_prepared failed
+    reason="ofg_profile_violation: profile invariants failed for $hgb_profile/$hgb_protocol"
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+
   if ! hgb_api_key_present; then
     printf 'OPENAI_API_KEY is not set; OSS-Fuzz-Gen target generation skipped.\n' >"$workspace/logs/run.log"
+    hgb_ofg_set_stage generation failed
+    reason="missing_api_key: OPENAI_API_KEY is not set"
+    write_final_result failed "$reason" 2
     hgb_write_common_metadata missing_api_key 'OPENAI_API_KEY is not set' 2 harness_generator
     hgb_write_common_summary missing_api_key 'OPENAI_API_KEY is not set' harness_generator
     exit 2
   fi
 
-  benchmark_yaml="${OFG_BENCHMARK_YAML:-}"
-  benchmark_original_function_count=0
-  benchmark_trimmed_function_count=0
-  benchmark_original_test_file_count=0
-  benchmark_trimmed_test_file_count=0
-  benchmark_match_kind="none"
-  selected_yaml_project=""
-  selected_yaml_target_name=""
-  benchmark_candidate_count=0
-  if [[ -n "$benchmark_yaml" ]]; then
-    if [[ ! -f "$benchmark_yaml" ]]; then
-      printf 'Provided OFG_BENCHMARK_YAML does not exist: %s\n' "$benchmark_yaml" >"$workspace/logs/benchmark_yaml.log"
-      extra=$(printf '  "benchmark_yaml": "%s",\n  "benchmark_match_kind": "explicit_missing",\n  "offline_coverage_mode": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")")
-      hgb_write_common_metadata failed 'Provided OFG_BENCHMARK_YAML does not exist' 66 harness_generator "$extra"
-      hgb_write_common_summary failed 'Provided OFG_BENCHMARK_YAML does not exist' harness_generator
-      exit 66
-    fi
-    benchmark_match_kind="explicit_override"
-  elif [[ -d "$artifact/benchmark-sets" ]]; then
-    selection_json="$workspace/ofg_benchmark_selection.json"
-    selector_args=(--benchmark-sets-dir "$artifact/benchmark-sets" --project "$project" --fuzz-target "$fuzz_target" --target-name "$target_name" --out "$selection_json")
-    if [[ "${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}" == "1" ]]; then
-      selector_args+=(--allow-project-fallback)
-    fi
-    if [[ "${OFG_ALLOW_TEST_BENCHMARKS:-0}" == "1" ]]; then
-      selector_args+=(--allow-test-benchmarks)
-    fi
-    if python3 /opt/hgb/bin/ofg_select_benchmark.py "${selector_args[@]}" >"$workspace/logs/benchmark_yaml.log" 2>&1; then
-      benchmark_yaml="$(json_file_value "$selection_json" path)"
-    fi
-    if [[ -f "$selection_json" ]]; then
-      benchmark_match_kind="$(json_file_value "$selection_json" benchmark_match_kind)"
-      selected_yaml_project="$(json_file_value "$selection_json" selected_yaml_project)"
-      selected_yaml_target_name="$(json_file_value "$selection_json" selected_yaml_target_name)"
-      benchmark_candidate_count="$(json_file_value "$selection_json" candidate_count)"
-      benchmark_candidate_count="${benchmark_candidate_count:-0}"
-    fi
-  fi
-  if [[ -z "$benchmark_yaml" ]]; then
-    generated_yaml="$workspace/ofg_benchmark.yaml"
-    if synthesize_benchmark_yaml "$generated_yaml"; then
-      benchmark_yaml="$generated_yaml"
-      benchmark_match_kind="synthesized"
-      selected_yaml_project="$project"
-      selected_yaml_target_name="${fuzz_target:-$target_name}"
-      printf 'Generated OSS-Fuzz-Gen benchmark YAML for project=%s target=%s: %s\n' "$project" "$target_name" "$benchmark_yaml" >"$workspace/logs/benchmark_yaml.log"
-    else
-      printf 'No compatible OSS-Fuzz-Gen benchmark YAML found for project=%s target=%s, and no API candidates could be extracted.\n' "$project" "$target_name" >"$workspace/logs/benchmark_yaml.log"
-      hgb_soft_skip no_api_candidates 'OSS-Fuzz-Gen could not find or synthesize a benchmark YAML because no API candidates were extracted' harness_generator
-    fi
-  fi
+  project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
 
-  if [[ -n "$benchmark_yaml" && "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" != "0" ]]; then
-    trimmed_yaml="$workspace/ofg_benchmark.trimmed.yaml"
-    trim_metadata="$workspace/ofg_benchmark_trim.json"
-    trim_benchmark_once() {
-      local source_yaml="$1" out_yaml="$2" metadata_json="$3"
-      local trim_args
-      trim_args=(/opt/hgb/bin/ofg_trim_benchmark.py --in "$source_yaml" --out "$out_yaml" --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-1}" --metadata "$metadata_json" --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" --reference-dir "$selected_reference_dir" --api-report "$HGB_SELECTED_API_REPORT" --report-mode "$HGB_API_REPORT_MODE" --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" --min-score "${OFG_MIN_BENCHMARK_SCORE:-1}")
-      if [[ "${OFG_ALLOW_TEST_BENCHMARKS:-0}" == "1" ]]; then
-        trim_args+=(--allow-test-files)
-      fi
-      "$python" "${trim_args[@]}" >>"$workspace/logs/benchmark_yaml.log" 2>&1
-    }
-    trim_reason=""
-    if trim_benchmark_once "$benchmark_yaml" "$trimmed_yaml" "$trim_metadata"; then
-      benchmark_yaml="$trimmed_yaml"
-      benchmark_original_function_count="$(json_file_value "$trim_metadata" original_function_count)"
-      benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
-      benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
-      benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
-      api_selection_metadata="$trim_metadata"
-    else
-      trim_reason='ofg_benchmark_trim_failed: OSS-Fuzz-Gen benchmark YAML trimming failed'
-      if grep -Eq 'ofg_empty_unit_test_prompt' "$workspace/logs/benchmark_yaml.log"; then
-        trim_reason='ofg_empty_unit_test_prompt: selected benchmark YAML has only test files and would create an empty prompt; use synthesized APIs or set OFG_ALLOW_TEST_BENCHMARKS=1'
-      elif grep -Eq 'ofg_low_confidence_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
-        trim_reason='ofg_low_confidence_api_candidate: selected benchmark APIs scored below HGB target-aware threshold'
-      elif grep -Eq 'ofg_bad_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
-        trim_reason='ofg_bad_api_candidate: selected benchmark APIs were rejected by HGB target-aware filtering'
-      fi
-      if [[ "${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}" == "1" && "$benchmark_match_kind" != "synthesized" && "$benchmark_match_kind" != "explicit_override" ]] && grep -Eq 'ofg_bad_api_candidate|ofg_low_confidence_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
-        generated_yaml="$workspace/ofg_benchmark.synthesized.yaml"
-        printf 'Falling back to synthesized target-aware benchmark YAML after rejected/low-confidence upstream YAML: %s\n' "$benchmark_yaml" >>"$workspace/logs/benchmark_yaml.log"
-        if synthesize_benchmark_yaml "$generated_yaml"; then
-          benchmark_yaml="$generated_yaml"
-          benchmark_match_kind="synthesized_after_bad_benchmark"
-          selected_yaml_project="$project"
-          selected_yaml_target_name="${fuzz_target:-$target_name}"
-          trim_metadata="$workspace/ofg_benchmark_trim.synthesized.json"
-          if trim_benchmark_once "$benchmark_yaml" "$trimmed_yaml" "$trim_metadata"; then
-            benchmark_yaml="$trimmed_yaml"
-            benchmark_original_function_count="$(json_file_value "$trim_metadata" original_function_count)"
-            benchmark_trimmed_function_count="$(json_file_value "$trim_metadata" trimmed_function_count)"
-            benchmark_original_test_file_count="$(json_file_value "$trim_metadata" original_test_file_count)"
-            benchmark_trimmed_test_file_count="$(json_file_value "$trim_metadata" trimmed_test_file_count)"
-            api_selection_metadata="$trim_metadata"
-            trim_reason=""
-          else
-            trim_reason='ofg_benchmark_trim_failed: synthesized benchmark YAML trimming failed after upstream YAML was rejected'
-            if grep -Eq 'ofg_bad_api_candidate' "$workspace/logs/benchmark_yaml.log"; then
-              trim_reason='ofg_bad_api_candidate: synthesized benchmark APIs were rejected by HGB target-aware filtering'
-            fi
-          fi
-        fi
-      fi
-      if [[ -n "$trim_reason" && "${OFG_REQUIRE_BENCHMARK_TRIM:-1}" == "1" ]]; then
-        printf 'ofg_benchmark_trim_failed: failed to trim %s\n' "$benchmark_yaml" >>"$workspace/logs/benchmark_yaml.log"
-        extra=$(printf '  "benchmark_yaml": "%s",\n  "benchmark_match_kind": "%s",\n  "benchmark_trim_log": "%s"' "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$workspace/logs/benchmark_yaml.log")")
-        hgb_write_common_metadata failed "$trim_reason" 65 harness_generator "$extra"
-        hgb_write_common_summary failed "$trim_reason" harness_generator
-        exit 65
-      fi
-    fi
-  fi
-
+  # --- OSS-Fuzz checkout (pinned, never floating master) ---
   oss_fuzz_dir=""
   if ! oss_fuzz_dir="$(materialize_oss_fuzz_checkout)"; then
-    printf 'missing_oss_fuzz_checkout: no valid OSS-Fuzz checkout at OFG_OSS_FUZZ_DIR=%s and runtime clone is disabled or failed.
-' "${OFG_OSS_FUZZ_DIR:-/opt/hgb/oss-fuzz}" >"$workspace/logs/oss_fuzz_checkout.log"
-    hgb_write_common_metadata missing_oss_fuzz_checkout 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' 2 harness_generator
-    hgb_write_common_summary missing_oss_fuzz_checkout 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' harness_generator
+    printf 'missing_oss_fuzz_checkout: no valid pinned OSS-Fuzz checkout\n' >"$workspace/logs/oss_fuzz_checkout.log"
+    reason="missing_oss_fuzz_checkout: rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR"
+    hgb_ofg_set_stage introspector_build failed
+    write_final_result failed "$reason" 2
+    hgb_write_common_metadata missing_oss_fuzz_checkout "$reason" 2 harness_generator
+    hgb_write_common_summary missing_oss_fuzz_checkout "$reason" harness_generator
     exit 2
   fi
   if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 2>&1; then
-    hgb_write_common_metadata failed 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv' 65 harness_generator
-    hgb_write_common_summary failed 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv' harness_generator
-    exit 65
-  fi
-  if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
-    redact_log_file "$workspace/logs/llm_preflight.log"
-    reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
+    reason="ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv"
+    hgb_ofg_set_stage introspector_build failed
+    write_final_result failed "$reason" 65
     hgb_write_common_metadata failed "$reason" 65 harness_generator
     hgb_write_common_summary failed "$reason" harness_generator
     exit 65
   fi
-  mkdir -p "$workspace/pip-cache"
-  cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --max-round "${OFG_MAX_ROUND:-5}" --work-dir "$workspace/ofg-work")
+
+  # --- LLM preflight (before any paid request) ---
+  if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
+    redact_log_file "$workspace/logs/llm_preflight.log"
+    reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
+    hgb_ofg_set_stage generation failed
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+
+  # --- Real Fuzz Introspector build ---
+  if ! run_introspector "$oss_fuzz_dir"; then
+    reason="$(classify_ofg_failure 1 "$workspace/logs/introspector_build.log")"
+    [[ -z "$reason" ]] && reason="ofg_introspector_build_failed: real Fuzz Introspector build did not produce valid reports"
+    hgb_ofg_set_stage introspector_build failed
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+  # Validate reports are non-empty and project-sourced.
+  if ! "$python" /opt/hgb/bin/ofg_introspector_adapter.py --report-dir "$workspace/introspector" \
+        --source-root "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" \
+        --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target" \
+        --max-functions 1 >/dev/null 2>>"$workspace/logs/introspector_build.log"; then
+    reason="ofg_introspector_build_failed: introspector reports are empty or stub-only"
+    hgb_ofg_set_stage introspector_build failed
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+  hgb_ofg_set_stage introspector_build completed
+
+  # --- Synthesize target-aware benchmark YAML (no answer leakage) ---
+  generated_yaml="$workspace/benchmark/generated.yaml"
+  selection_json="$workspace/benchmark/selection.json"
+  if ! synthesize_benchmark_from_introspector "$generated_yaml" "$selection_json"; then
+    reason="ofg_benchmark_synthesis_failed: could not synthesize benchmark YAML from introspector data"
+    hgb_ofg_set_stage benchmark_synthesized failed
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+  benchmark_yaml="$generated_yaml"
+  benchmark_match_kind="synthesized"
+  hgb_ofg_set_stage benchmark_synthesized completed
+
+  # --- Generation + automatic build repair via upstream wrapper ---
+  export HGB_GENERATION_WORK_DIR="$workspace/generation/work"
+  mkdir -p "$HGB_GENERATION_WORK_DIR"
+  cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- \
+        --model "$OPENAI_MODEL" -y "$benchmark_yaml" --oss-fuzz-dir "$oss_fuzz_dir" \
+        --run-timeout "${OFG_RUN_TIMEOUT:-900}" --num-samples "${OFG_NUM_SAMPLES:-3}" \
+        --max-round "${OFG_MAX_ROUND:-5}" --work-dir "$HGB_GENERATION_WORK_DIR")
   printf '%q ' "${cmd[@]}" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
   code=0
-  (cd "$artifact" && PIP_CACHE_DIR="$workspace/pip-cache" timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
+  (cd "$artifact" && PIP_CACHE_DIR="$workspace/generation/pip-cache" \
+      timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
   redact_log_file "$workspace/logs/run.log"
-  if [[ -d "$workspace/ofg-work" ]]; then
+
+  # --- Preserve compiling candidates ---
+  if [[ -d "$HGB_GENERATION_WORK_DIR" ]]; then
     n=0
     while IFS= read -r generated; do
       n=$((n + 1))
       cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-    done < <(find "$workspace/ofg-work" -type f \( -path '*/fixed_targets/*' -o -path '*/raw_targets/*' -o -path '*/fuzz_targets/*' \) 2>/dev/null | sort)
+    done < <(find "$HGB_GENERATION_WORK_DIR" -type f \( -path '*/fixed_targets/*' -o -path '*/raw_targets/*' -o -path '*/fuzz_targets/*' \) 2>/dev/null | sort)
   fi
   if [[ "$(hgb_count_files "$workspace/generated_harnesses" -type f)" == "0" && -f "$workspace/logs/run.log" ]]; then
-    python3 - "$workspace/logs/run.log" "$workspace/generated_harnesses" <<'PY_OFG_LOG_HARNESS' || true
+    "$python" - "$workspace/logs/run.log" "$workspace/generated_harnesses" <<'PY_OFG_LOG_HARNESS' || true
 import re
 import sys
 from pathlib import Path
@@ -654,96 +701,66 @@ for block in blocks:
 print(count)
 PY_OFG_LOG_HARNESS
   fi
-  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-    rm -rf "$workspace/ofg-work" "$workspace/pip-cache" "$workspace/oss-fuzz"
-  fi
-  status=completed
-  reason=none
+
   if [[ "$code" -ne 0 ]]; then
-    status=failed
     reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
-  elif grep -Eiq 'ofg_function_not_referenced|ofg_empty_fix_prompt' "$workspace/logs/run.log"; then
-    code=65
-    status=failed
-    reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
-  elif [[ "$(hgb_count_generated_harness_files "$workspace/generated_harnesses")" == "0" ]] && grep -Eiq 'Bad model type|Exception while running experiment|Traceback' "$workspace/logs/run.log"; then
-    code=1
-    status=failed
-    reason="$(classify_ofg_failure "$code" "$workspace/logs/run.log")"
+    hgb_ofg_set_stage generation failed
+    write_final_result failed "$reason" "$code"
+    hgb_write_common_metadata failed "$reason" "$code" harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit "$code"
   fi
+  hgb_ofg_set_stage generation completed
+  hgb_ofg_set_stage compilation_repair completed
+
   generated_harness_count="$(hgb_count_generated_harness_files "$workspace/generated_harnesses")"
-  if [[ "$status" == "failed" && "${generated_harness_count:-0}" -gt 0 ]] && grep -Eiq 'LLVMFuzzerTestOneInput|OnePromptPrototyper succeded|Fuzz target compiles: True|Final fuzz target function referenced: True' "$workspace/logs/run.log"; then
-    status=partial_completed
-    reason="OSS-Fuzz-Gen preserved $generated_harness_count generated harness candidate(s) before validation/execution failure: $reason"
-    code=0
+  if [[ "${generated_harness_count:-0}" -eq 0 ]]; then
+    reason="ofg_no_compiling_candidate: OSS-Fuzz-Gen produced no harness candidate"
+    hgb_ofg_set_stage candidate_build failed
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
   fi
-  if [[ "$status" == "failed" && "$benchmark_match_kind" == "exact_project" && -n "$selected_yaml_target_name" && "$selected_yaml_target_name" != "$fuzz_target" && "$selected_yaml_target_name" != "$target_name" ]]; then
-    case "$reason" in
-      'OSS-Fuzz-Gen timed out'|'OSS-Fuzz-Gen experiment exception before harness generation')
-        reason="ofg_bad_benchmark_fallback: selected project-level YAML target $selected_yaml_target_name for requested target ${fuzz_target:-$target_name}"
-        ;;
-    esac
+  hgb_ofg_set_stage candidate_build completed
+
+  # --- Independent evaluator: build, smoke, reachability, campaign, coverage ---
+  run_evaluator
+  eval_results="$workspace/evaluation/results.json"
+  eval_verified="$(json_file_value "$eval_results" verification_ran 2>/dev/null || printf false)"
+  if [[ "$eval_verified" != "true" ]]; then
+    reason="ofg_evaluation_failed: independent evaluator did not reach evaluated (see evaluation/results.json)"
+    for s in sanitizer_smoke api_reachability campaign coverage; do hgb_ofg_set_stage "$s" failed; done
+    write_final_result failed "$reason" 65
+    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
   fi
-  target_source_status="$(hgb_target_manifest_value source_status)"
-  target_source_file_count="$(hgb_target_manifest_value source_file_count)"
-  target_source_file_count="${target_source_file_count:-0}"
-  target_source_fallback_statuses="$(hgb_target_manifest_value source_fallback_statuses)"
-  target_source_fallback_statuses="${target_source_fallback_statuses:-[]}"
-  api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
-  extra=$(printf '%s  "benchmark_yaml": "%s",
-  "benchmark_match_kind": "%s",
-  "selected_yaml_project": "%s",
-  "selected_yaml_target_name": "%s",
-  "benchmark_candidate_count": %s,
-  "api_selection_metadata": "%s",
-  "benchmark_original_function_count": %s,
-  "benchmark_trimmed_function_count": %s,
-  "benchmark_original_test_file_count": %s,
-  "benchmark_trimmed_test_file_count": %s,
-  "offline_coverage_mode": "%s",
-  "introspector_mode": "%s",
-  "ofg_num_samples": %s,
-  "ofg_num_exp": %s,
-  "ofg_num_eva": %s,
-  "ofg_max_round": %s,
-  "target_source_status": "%s",
-  "target_source_file_count": %s,
-  "target_source_fallback_statuses": %s,
-  "command_file": "%s",
-  "log_file": "%s",
-  "oss_fuzz_dir": "%s",
-  "pip_cache_dir": "%s"' "$api_selection_extra" "$(hgb_json_escape "$benchmark_yaml")" "$(hgb_json_escape "$benchmark_match_kind")" "$(hgb_json_escape "$selected_yaml_project")" "$(hgb_json_escape "$selected_yaml_target_name")" "$benchmark_candidate_count" "$(hgb_json_escape "$api_selection_metadata")" "${benchmark_original_function_count:-0}" "${benchmark_trimmed_function_count:-0}" "${benchmark_original_test_file_count:-0}" "${benchmark_trimmed_test_file_count:-0}" "$(hgb_json_escape "$OFG_SKIP_COVERAGE_GAINS")" "$(hgb_json_escape "$OFG_INTROSPECTOR_MODE")" "${OFG_NUM_SAMPLES:-1}" "${OFG_NUM_EXP:-1}" "${OFG_NUM_EVA:-1}" "${OFG_MAX_ROUND:-5}" "$(hgb_json_escape "$target_source_status")" "$target_source_file_count" "$target_source_fallback_statuses" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$workspace/logs/run.log")" "$(hgb_json_escape "$oss_fuzz_dir")" "$(hgb_json_escape "$workspace/pip-cache")")
-  hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
-  hgb_write_common_summary "$status" "$reason" harness_generator
-  exit "$code"
+  for s in sanitizer_smoke api_reachability campaign coverage; do hgb_ofg_set_stage "$s" completed; done
+
+  # --- Final status: only all-complete yields evaluated ---
+  final_status="$(hgb_ofg_result_status)"
+  final_code=0
+  [[ "$final_status" == "evaluated" ]] || final_code=65
+  reason="none"
+  [[ "$final_status" != "evaluated" ]] && reason="ofg_incomplete: one or more stages did not complete"
+  write_final_result "$final_status" "$reason" "$final_code"
+  hgb_write_common_metadata "$final_status" "$reason" "$final_code" harness_generator
+  hgb_write_common_summary "$final_status" "$reason" harness_generator
+  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+    rm -rf "$HGB_GENERATION_WORK_DIR" "$workspace/generation/pip-cache" "$workspace/oss-fuzz" "$workspace/introspector_overlay"
+  fi
+  exit "$final_code"
 fi
+
+# ===========================================================================
+# smoke mode (legacy compatibility)
+# ===========================================================================
 [[ "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }
+apply_profile_defaults
 export OPENAI_API_KEY="${OPENAI_API_KEY:-${API_KEY:-}}"
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${BASE_URL:-}}"
 export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
-export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
-export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
-export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
-export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
-export OFG_REQUIRE_BENCHMARK_TRIM="${OFG_REQUIRE_BENCHMARK_TRIM:-1}"
-export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
-export OFG_ALLOW_TEST_BENCHMARKS="${OFG_ALLOW_TEST_BENCHMARKS:-0}"
-export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
-export OFG_BUILD_IMAGE_PULL="${OFG_BUILD_IMAGE_PULL:-1}"
-export OFG_PROJECT_IMAGE_BUILD_PARALLELISM="${OFG_PROJECT_IMAGE_BUILD_PARALLELISM:-2}"
-export OFG_SYNTH_CANDIDATE_POOL="${OFG_SYNTH_CANDIDATE_POOL:-500}"
-export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
-export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
-export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
-export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
-export OFG_MIN_BENCHMARK_SCORE="${OFG_MIN_BENCHMARK_SCORE:-1}"
-export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-1}"
-export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
-export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
-export HGB_LLM_LOCK_DIR="${HGB_LLM_LOCK_DIR:-/tmp/hgb-llm-locks}"
-export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
-export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
 benchmark="${OFG_BENCHMARK:-tinyxml2}"
 benchmark_yaml=""
 if [[ -d "$artifact/benchmark-sets" ]]; then
@@ -756,44 +773,25 @@ command_file="$workspace/command.txt"
 if [[ -z "$benchmark_yaml" ]]; then
   printf 'Could not locate benchmark YAML for %s\n' "$benchmark" >"$run_log"
   printf 'locate benchmark yaml\n' >"$command_file"
-  metadata missing_benchmark 2 'benchmark YAML not found' "$command_file" "$run_log" "$benchmark_yaml"
-  summary missing_benchmark 2 'benchmark YAML not found'
   exit 2
 fi
 if [[ -z "$OPENAI_API_KEY" ]]; then
   printf 'OPENAI_API_KEY is not set; OSS-Fuzz-Gen smoke not launched.\n' >"$run_log"
-  printf 'python run_all_experiments.py -y %q --model %q --run-timeout %q --work-dir %q\n' "$benchmark_yaml" "$OPENAI_MODEL" "${OFG_RUN_TIMEOUT:-300}" "$workspace/ofg-work" >"$command_file"
-  metadata missing_api_key 2 'OPENAI_API_KEY is not set' "$command_file" "$run_log" "$benchmark_yaml"
-  summary missing_api_key 2 'OPENAI_API_KEY is not set'
   exit 2
 fi
 oss_fuzz_dir=""
 if ! oss_fuzz_dir="$(materialize_oss_fuzz_checkout)"; then
-  printf 'missing_oss_fuzz_checkout: no valid OSS-Fuzz checkout at OFG_OSS_FUZZ_DIR=%s and runtime clone is disabled or failed.
-' "${OFG_OSS_FUZZ_DIR:-/opt/hgb/oss-fuzz}" >"$run_log"
-  printf 'prepare oss-fuzz checkout
-' >"$command_file"
-  metadata missing_oss_fuzz_checkout 2 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR' "$command_file" "$run_log" "$benchmark_yaml"
-  summary missing_oss_fuzz_checkout 2 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
+  printf 'missing_oss_fuzz_checkout\n' >"$run_log"
   exit 2
 fi
 if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 2>&1; then
-  printf 'prepare oss-fuzz venv
-' >"$command_file"
-  metadata failed 65 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv' "$command_file" "$workspace/logs/oss_fuzz_venv.log" "$benchmark_yaml"
-  summary failed 65 'ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv'
   exit 65
 fi
 if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
   redact_log_file "$workspace/logs/llm_preflight.log"
-  reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
-  printf 'llm preflight
-' >"$command_file"
-  metadata failed 65 "$reason" "$command_file" "$workspace/logs/llm_preflight.log" "$benchmark_yaml"
-  summary failed 65 "$reason"
   exit 65
 fi
-cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-1}" --max-round "${OFG_MAX_ROUND:-5}" --work-dir "$workspace/ofg-work")
+cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- -y "$benchmark_yaml" --model "$OPENAI_MODEL" --oss-fuzz-dir "$oss_fuzz_dir" --run-timeout "${OFG_RUN_TIMEOUT:-300}" --num-samples "${OFG_NUM_SAMPLES:-3}" --max-round "${OFG_MAX_ROUND:-5}" --work-dir "$workspace/ofg-work")
 printf '%q ' "${cmd[@]}" >"$command_file"; printf '\n' >>"$command_file"
 code=0
 (cd "$artifact" && timeout "${OFG_TOTAL_TIMEOUT_SECONDS:-600}" "${cmd[@]}") >"$run_log" 2>&1 || code=$?
@@ -801,10 +799,15 @@ redact_log_file "$run_log"
 status=completed; reason=none
 if [[ "$code" -ne 0 ]]; then
   status=failed; reason="$(classify_ofg_failure "$code" "$run_log")"
-elif grep -Eiq 'Bad model type|Exception while running experiment|Traceback' "$run_log"; then
-  code=1
-  status=failed; reason="$(classify_ofg_failure "$code" "$run_log")"
 fi
-metadata "$status" "$code" "$reason" "$command_file" "$run_log" "$benchmark_yaml"
-summary "$status" "$code" "$reason"
+{
+  printf '{\n'
+  printf '  "fuzzer": "oss-fuzz-gen",\n'
+  printf '  "status": "%s",\n' "$(json_escape "$status")"
+  printf '  "upstream_commit": "%s",\n' "$(json_escape "$(commit)")"
+  printf '  "benchmark": "%s",\n' "$(json_escape "$benchmark")"
+  printf '  "exit_code": %s,\n' "$code"
+  printf '  "reason": "%s"\n' "$(json_escape "$reason")"
+  printf '}\n'
+} >"$workspace/metadata.json"
 exit "$code"

@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
-"""Ranking helpers for HGB OSS-Fuzz-Gen benchmark API selection."""
+"""Ranking helpers for HGB OSS-Fuzz-Gen benchmark API selection.
+
+Reference-harness-derived scoring is intentionally disabled outside an
+explicitly named diagnostic profile (``OFG_REFERENCE_DIAGNOSTIC=1``) that is
+excluded from the aggregate. In blind-project alpha/paper-faithful runs the
+generator must never rank functions by reference harness calls or text.
+"""
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any
+
+
+def _reference_diagnostic_enabled() -> bool:
+    return os.environ.get("OFG_REFERENCE_DIAGNOSTIC", "0").strip().lower() in {"1", "true", "yes"}
 
 BAD_PATH_PARTS = (
     '/test/', '/tests/', '/testing/', '/example/', '/examples/', '/sample/',
@@ -70,6 +81,14 @@ def strip_reference_noise(text: str) -> str:
 
 
 def load_reference_calls(reference_dir: str | Path | None, max_bytes: int = 1_000_000) -> set[str]:
+    """Reference-harness call extraction.
+
+    Disabled outside ``OFG_REFERENCE_DIAGNOSTIC=1``. In blind alpha/paper
+    runs this always returns an empty set so no reference-derived ranking
+    can influence selection.
+    """
+    if not _reference_diagnostic_enabled():
+        return set()
     if not reference_dir:
         return set()
     root = Path(reference_dir)
@@ -108,6 +127,14 @@ def split_hint_tokens(*values: str) -> list[str]:
 
 
 def load_reference_text(reference_dir: str | Path | None, max_bytes: int = 1_000_000) -> str:
+    """Reference-harness text extraction.
+
+    Disabled outside ``OFG_REFERENCE_DIAGNOSTIC=1``. In blind alpha/paper
+    runs this always returns an empty string so no reference-text score
+    bonus can be applied.
+    """
+    if not _reference_diagnostic_enabled():
+        return ''
     if not reference_dir:
         return ''
     root = Path(reference_dir)
@@ -205,7 +232,10 @@ def score_record(
     score = 0
     reasons: list[str] = []
 
-    if reference_text and name_l:
+    # Reference-text score bonuses are intentionally disabled outside an
+    # explicitly named diagnostic profile excluded from the aggregate. In
+    # blind alpha/paper runs reference_text is always empty.
+    if _reference_diagnostic_enabled() and reference_text and name_l:
         if re.search(rf'\b{re.escape(name_l)}\s*\(', reference_text):
             score += 300
             reasons.append('called_by_harness')

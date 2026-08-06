@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
-"""Run upstream OSS-Fuzz-Gen with HGB-local compatibility shims."""
+"""Run upstream OSS-Fuzz-Gen with HGB-local compatibility/observability shims.
+
+In method-faithful profiles (alpha, paper-faithful) this wrapper installs only
+compatibility/observability patches: it must never read the exact target
+reference harness, never replace coverage with empty results, never replace
+processes with no-ops, and never install the local introspector shim. Those
+compat-only behaviors are confined to ``compat-smoke`` (which is excluded from
+the aggregate).
+"""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import subprocess
 import sys
@@ -12,11 +21,53 @@ from typing import Any
 
 import yaml
 
-OFG_LOCAL_INTROSPECTOR_SHIM = "enabled"
-
 
 def env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def active_profile() -> str:
+    return (os.environ.get("HGB_BASELINE_PROFILE") or
+            os.environ.get("HGB_PROFILE") or "alpha").strip().lower()
+
+
+def active_protocol() -> str:
+    return (os.environ.get("HGB_BASELINE_PROTOCOL") or
+            os.environ.get("HGB_PROTOCOL") or "blind-project").strip().lower()
+
+
+def is_method_faithful() -> bool:
+    return active_profile() in {"alpha", "paper-faithful"}
+
+
+def is_compat_smoke() -> bool:
+    return active_profile() == "compat-smoke"
+
+
+def is_blind() -> bool:
+    return active_protocol() == "blind-project"
+
+
+# ---------------------------------------------------------------------------
+# Patch registry: record every monkey patch with a stable hash and reason so
+# the audit can prove only compatibility/observability patches are active.
+# ---------------------------------------------------------------------------
+
+PATCH_REGISTRY: list[dict[str, str]] = []
+
+
+def _record_patch(name: str, reason: str, enabled: bool) -> None:
+    digest = hashlib.sha256(f"{name}:{reason}:{enabled}".encode()).hexdigest()[:16]
+    PATCH_REGISTRY.append({
+        "patch": name,
+        "reason": reason,
+        "enabled": enabled,
+        "hash": digest,
+    })
+
+
+def patch_audit() -> list[dict[str, str]]:
+    return list(PATCH_REGISTRY)
 
 
 def _upstream_arg_value(args: list[str], *names: str) -> str:
@@ -68,8 +119,17 @@ def _benchmark_function_maps(data: dict[str, Any]) -> tuple[dict[str, str], list
     return signatures, functions_out
 
 
+# ---------------------------------------------------------------------------
+# Local introspector shim: compat-smoke ONLY. Forbidden in alpha/paper.
+# ---------------------------------------------------------------------------
+
+
 def _install_local_introspector_shim(upstream_args: list[str]) -> None:
-    if os.environ.get("OFG_INTROSPECTOR_MODE", "local").strip().lower() == "remote":
+    enabled = is_compat_smoke() and os.environ.get(
+        "OFG_INTROSPECTOR_MODE", "local").strip().lower() == "local"
+    _record_patch("local_introspector_shim",
+                  "compat-smoke local introspector shim", enabled)
+    if not enabled:
         return
 
     from data_prep import introspector  # pylint: disable=import-outside-toplevel
@@ -131,10 +191,17 @@ def _install_local_introspector_shim(upstream_args: list[str]) -> None:
         "_query_introspector": _query_introspector,
     }.items():
         setattr(introspector, name, value)
-    print("OFG_LOCAL_INTROSPECTOR_SHIM: enabled", file=sys.stderr)
+    print("OFG_LOCAL_INTROSPECTOR_SHIM: enabled (compat-smoke only)", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Observability patches (always enabled; they do not change method decisions).
+# ---------------------------------------------------------------------------
 
 
 def _patch_oss_fuzz_postprocess_logging() -> None:
+    _record_patch("oss_fuzz_postprocess_logging",
+                  "observability: surface OSS-Fuzz postprocess failures", True)
     from experiment import oss_fuzz_checkout  # pylint: disable=import-outside-toplevel
 
     original = oss_fuzz_checkout.postprocess_oss_fuzz
@@ -158,73 +225,34 @@ def _patch_oss_fuzz_postprocess_logging() -> None:
 
 
 def _patch_project_target_downloads() -> None:
-    if env_bool("OFG_ALLOW_GCS_TARGET_DOWNLOAD", "0"):
+    """Prevent GCS target downloads in blind-project.
+
+    This patch never reads the reference harness; it only redirects the
+    upstream GCS target download to a neutral, non-existent path so OSS-Fuzz-Gen
+    cannot fetch the current target answer.
+    """
+    allow = env_bool("OFG_ALLOW_GCS_TARGET_DOWNLOAD", "0")
+    enabled = not allow
+    _record_patch("project_target_download_redirect",
+                  "compatibility: block GCS target answer download", enabled)
+    if not enabled:
         return
 
     from data_prep import project_targets  # pylint: disable=import-outside-toplevel
 
-    reference_dir = Path(os.environ.get("HGB_TARGET_REFERENCE_DIR", "/target/reference_harnesses"))
-
     def _local_fuzz_target_dir(_project_name: str) -> str:
-        if reference_dir.is_dir():
-            return str(reference_dir)
+        # Never expose the reference harness to the generator. Use a neutral
+        # non-existent path so any accidental read fails loudly.
         return "/nonexistent-hgb-reference-harnesses"
 
     project_targets._get_fuzz_target_dir = _local_fuzz_target_dir  # pylint: disable=protected-access
-    print("OFG_SKIP_GCS_TARGET_DOWNLOAD: using HGB target references", file=sys.stderr)
-
-
-def _patch_project_examples(upstream_args: list[str]) -> None:
-    if env_bool("OFG_ALLOW_REMOTE_PROJECT_EXAMPLES", "0"):
-        return
-
-    from data_prep import project_targets  # pylint: disable=import-outside-toplevel
-
-    data = _load_benchmark_data(upstream_args)
-    signatures = [
-        str(item.get("signature") or item.get("name") or "")
-        for item in data.get("functions") or []
-        if isinstance(item, dict)
-    ]
-    signatures = [sig for sig in signatures if sig]
-    reference_dir = Path(os.environ.get("HGB_TARGET_REFERENCE_DIR", "/target/reference_harnesses"))
-    max_bytes = int(os.environ.get("OFG_PROJECT_EXAMPLE_MAX_BYTES", "20000") or "20000")
-
-    def _read_reference_targets() -> list[str]:
-        if not reference_dir.is_dir():
-            return []
-        contents: list[str] = []
-        for path in sorted(reference_dir.rglob("*")):
-            if not path.is_file() or path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
-                continue
-            try:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            text = project_targets.filter_target_lines(text)[:max_bytes]
-            if "LLVMFuzzerTestOneInput" in text:
-                contents.append(text)
-        return contents
-
-    def _local_generate_data(_project_name: str, _language: str,
-                             sig_per_target: int = 1, max_samples: int = 1,
-                             cloud_experiment_bucket: str = ""):
-        del _language, sig_per_target, cloud_experiment_bucket
-        contents = _read_reference_targets()
-        if not contents:
-            return []
-        examples = []
-        example_signature = signatures[0] if signatures else ""
-        for content in contents[-max(1, max_samples):]:
-            examples.append([example_signature, content])
-        return examples[-max(1, max_samples):]
-
-    project_targets.generate_data = _local_generate_data
-    print("OFG_LOCAL_PROJECT_EXAMPLES: using HGB reference harnesses", file=sys.stderr)
+    print("OFG_SKIP_GCS_TARGET_DOWNLOAD: target answer download blocked", file=sys.stderr)
 
 
 def _install_hgb_llm_trace() -> None:
     """Patch OSS-Fuzz-Gen LLM calls to save sampled HGB traces."""
+    _record_patch("hgb_llm_trace",
+                  "observability: sample LLM API traces", True)
     if "/opt/hgb/bin" not in sys.path:
         sys.path.insert(0, "/opt/hgb/bin")
     try:
@@ -276,8 +304,57 @@ def _install_hgb_llm_trace() -> None:
     print("HGB_LLM_TRACE: OSS-Fuzz-Gen hooks installed", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Repair iteration observability: retain each repair round without changing
+# upstream repair logic.
+# ---------------------------------------------------------------------------
+
+
+def _install_repair_observability() -> None:
+    _record_patch("repair_observability",
+                  "observability: retain each repair round", True)
+    try:
+        from agent import fix_agent_loop  # pylint: disable=import-outside-toplevel
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(fix_agent_loop, "_hgb_repair_obs_installed", False):
+        return
+
+    original_run = getattr(fix_agent_loop, "run", None)
+    if original_run is None:
+        return
+
+    def observed_run(*args: Any, **kwargs: Any) -> Any:
+        result = original_run(*args, **kwargs)
+        try:
+            work_dir = Path(os.environ.get("HGB_GENERATION_WORK_DIR", "/workspace/ofg-work"))
+            repair_dir = work_dir / "repair_iterations"
+            repair_dir.mkdir(parents=True, exist_ok=True)
+            existing = len(list(repair_dir.glob("round_*.txt")))
+            log_path = work_dir / "build.log"
+            if log_path.is_file():
+                (repair_dir / f"round_{existing + 1}.txt").write_text(
+                    log_path.read_text(encoding="utf-8", errors="replace")[-8192:],
+                    encoding="utf-8",
+                )
+        except OSError:
+            pass
+        return result
+
+    fix_agent_loop.run = observed_run
+    fix_agent_loop._hgb_repair_obs_installed = True
+
+
+# ---------------------------------------------------------------------------
+# Coverage skip: compat-smoke ONLY. Forbidden in alpha/paper.
+# ---------------------------------------------------------------------------
+
+
 def _patch_coverage_skip() -> None:
-    if not env_bool("OFG_SKIP_COVERAGE_GAINS", "1"):
+    enabled = is_compat_smoke() and env_bool("OFG_SKIP_COVERAGE_GAINS", "0")
+    _record_patch("coverage_skip",
+                  "compat-smoke coverage skip", enabled)
+    if not enabled:
         return
 
     from experiment import builder_runner, evaluator, textcov  # pylint: disable=import-outside-toplevel
@@ -291,7 +368,7 @@ def _patch_coverage_skip() -> None:
     def _skip_get_coverage_local(self, generated_project: str,
                                  benchmark_target_name: str):
         del self, generated_project, benchmark_target_name
-        print("OFG_SKIP_LOCAL_COVERAGE: returning empty coverage", file=sys.stderr)
+        print("OFG_SKIP_LOCAL_COVERAGE: returning empty coverage (compat-smoke)", file=sys.stderr)
         return textcov.Textcov(), {}
 
     builder_runner.BuilderRunner.get_coverage_local = _skip_get_coverage_local
@@ -302,7 +379,36 @@ def _patch_coverage_skip() -> None:
     evaluator.load_existing_coverage_summary = _empty_summary
     evaluator.Evaluator.load_existing_textcov = _empty_textcov
     evaluator.Evaluator._load_existing_coverage_summary = _empty_summary  # pylint: disable=protected-access
-    print("OFG_SKIP_LOCAL_COVERAGE: enabled", file=sys.stderr)
+    print("OFG_SKIP_LOCAL_COVERAGE: enabled (compat-smoke only)", file=sys.stderr)
+
+
+def _install_coverage_gains_noop() -> None:
+    enabled = is_compat_smoke() and env_bool("OFG_SKIP_COVERAGE_GAINS", "0")
+    _record_patch("coverage_gains_noop",
+                  "compat-smoke coverage-gains no-op process", enabled)
+    if not enabled:
+        return
+
+    import run_all_experiments  # pylint: disable=import-outside-toplevel,reimported
+
+    def _skip_coverage_gains(*_args, **_kwargs):
+        return None
+
+    class _NoopProcess:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def kill(self) -> None:
+            pass
+
+    run_all_experiments.extend_report_with_coverage_gains = _skip_coverage_gains
+    run_all_experiments.extend_report_with_coverage_gains_process = _skip_coverage_gains
+    run_all_experiments._process_total_coverage_gain = lambda: {}
+    run_all_experiments.Process = _NoopProcess
+    print("OFG_COVERAGE_GAINS_NOOP: enabled (compat-smoke only)", file=sys.stderr)
 
 
 def main() -> int:
@@ -326,30 +432,22 @@ def main() -> int:
 
     _patch_oss_fuzz_postprocess_logging()
     _patch_project_target_downloads()
-    _patch_project_examples(upstream_args)
     _patch_coverage_skip()
     _install_hgb_llm_trace()
+    _install_repair_observability()
     _install_local_introspector_shim(upstream_args)
+    _install_coverage_gains_noop()
 
-    if env_bool("OFG_SKIP_COVERAGE_GAINS", "1"):
-
-        def _skip_coverage_gains(*_args, **_kwargs):
-            return None
-
-        class _NoopProcess:
-            def __init__(self, *_args, **_kwargs):
-                pass
-
-            def start(self) -> None:
-                pass
-
-            def kill(self) -> None:
-                pass
-
-        run_all_experiments.extend_report_with_coverage_gains = _skip_coverage_gains
-        run_all_experiments.extend_report_with_coverage_gains_process = _skip_coverage_gains
-        run_all_experiments._process_total_coverage_gain = lambda: {}
-        run_all_experiments.Process = _NoopProcess
+    # Validate method-faithful invariants after patches are registered.
+    if is_method_faithful():
+        if env_bool("OFG_SKIP_COVERAGE_GAINS", "0"):
+            print("ofg_profile_violation: OFG_SKIP_COVERAGE_GAINS=1 is forbidden in "
+                  f"{active_profile()}", file=sys.stderr)
+            return 65
+        if os.environ.get("OFG_INTROSPECTOR_MODE", "remote").strip().lower() == "local":
+            print("ofg_profile_violation: OFG_INTROSPECTOR_MODE=local is forbidden in "
+                  f"{active_profile()}", file=sys.stderr)
+            return 65
 
     sys.argv = ["run_all_experiments.py", *upstream_args]
     result = run_all_experiments.main()

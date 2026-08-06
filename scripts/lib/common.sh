@@ -294,6 +294,14 @@ hgb_build_image() {
     if [[ -n "${OFG_OSS_FUZZ_REPO:-}" ]]; then
       build_args+=(--build-arg "OFG_OSS_FUZZ_REPO=${OFG_OSS_FUZZ_REPO}")
     fi
+    local oss_fuzz_artifact_dir oss_fuzz_commit
+    oss_fuzz_artifact_dir="$(artifact_dir oss-fuzz "$root")"
+    if [[ -d "$oss_fuzz_artifact_dir/.git" ]]; then
+      oss_fuzz_commit="$(git -C "$oss_fuzz_artifact_dir" rev-parse HEAD 2>/dev/null || true)"
+      if [[ -n "$oss_fuzz_commit" ]]; then
+        build_args+=(--build-arg "OFG_OSS_FUZZ_COMMIT=${oss_fuzz_commit}")
+      fi
+    fi
     if [[ -n "${OFG_OSS_FUZZ_REF:-}" ]]; then
       build_args+=(--build-arg "OFG_OSS_FUZZ_REF=${OFG_OSS_FUZZ_REF}")
     fi
@@ -456,6 +464,9 @@ run_hgb_container() {
     -e CKGFUZZER_SOURCE_FALLBACK_MAX_FILES \
     -e CKGFUZZER_CODEQL_CACHE \
     -e CKGFUZZER_CODEQL_CACHE_REFRESH \
+    -e CKGFUZZER_SKIP_CHECK_COMPILATION \
+    -e HGB_REF_CANARY \
+    -e HGB_EXCLUDE_FROM_AGGREGATE \
     -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
     -e PROME_FUZZ_EMBEDDING_HOST \
     -e PROME_FUZZ_EMBEDDING_PORT \
@@ -541,6 +552,13 @@ run_hgb_target_container() {
   if [[ "$generator" == "elfuzz" && -S /var/run/docker.sock ]]; then
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
+  # Generator/evaluator isolation: CKGFuzzer in blind-project must never see
+  # the evaluator-only reference harnesses. Other generators still receive
+  # HGB_TARGET_REFERENCE_DIR for their own verification paths.
+  local reference_dir_args=()
+  if ! hgb_generator_is_blind "$generator"; then
+    reference_dir_args+=(-e HGB_TARGET_REFERENCE_DIR=/target/reference_harnesses)
+  fi
   if [[ "$generator" == "elfuzz" ]]; then
     # ELFuzz starts sibling containers. Their bind-mount sources must be visible
     # at the same absolute path to both this container and the host daemon.
@@ -602,6 +620,11 @@ run_hgb_target_container() {
     -e OFG_MAX_ROUND \
     -e OFG_MIN_BENCHMARK_SCORE \
     -e OFG_SYNTHESIZE_ON_BAD_BENCHMARK \
+    -e OFG_EVAL_BUILD_TIMEOUT \
+    -e OFG_CAMPAIGN_SECONDS \
+    -e OFG_OSS_FUZZ_COMMIT \
+    -e OFG_OSS_FUZZ_RUN_DIR \
+    -e OFG_REFERENCE_DIAGNOSTIC \
     -e HGB_LLM_PARALLELISM \
     -e HGB_LLM_MIN_INTERVAL_SECONDS \
     -e HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS \
@@ -648,6 +671,9 @@ run_hgb_target_container() {
     -e CKGFUZZER_CACHE_MAX_BYTES \
     -e CKGFUZZER_CACHE_MAX_CSV_BYTES \
     -e CKGFUZZER_SOURCE_FALLBACK_MAX_FILES \
+    -e CKGFUZZER_SKIP_CHECK_COMPILATION \
+    -e HGB_REF_CANARY \
+    -e HGB_EXCLUDE_FROM_AGGREGATE \
     -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
     -e PROME_FUZZ_EMBEDDING_HOST \
     -e PROME_FUZZ_EMBEDDING_PORT \
@@ -662,6 +688,16 @@ run_hgb_target_container() {
     -e PROME_FUZZ_MAX_APIS \
     -e PROME_FUZZ_POOL_SIZE \
     -e PROME_FUZZ_COMPREHEND_TASK \
+    -e PROME_FUZZ_ALL_COVER_CANDIDATES \
+    -e PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS \
+    -e PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS \
+    -e PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS \
+    -e PROME_FUZZ_EMBEDDING_PREFLIGHT \
+    -e PROME_FUZZ_BUILD_CONTEXT_METHOD \
+    -e PROME_FUZZ_CAMPAIGN_SECONDS \
+    -e HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT \
+    -e HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB \
+    -e HGB_PROMEFUZZ_ALLOW_REFERENCE_HARNESS \
     -e HGB_PROMEFUZZ_TRY_FUZZBENCH_BUILD \
     -e HGB_PROMEFUZZ_NATIVE_BUILD \
     -e HGB_PROMEFUZZ_VALIDATE_TARGET_BASELINE \
@@ -691,7 +727,6 @@ run_hgb_target_container() {
     -e HGB_TARGET_PACKAGE_HOST="$target_package" \
     -e HGB_TARGET_MANIFEST=/target/target_manifest.json \
     -e HGB_TARGET_SOURCE_DIR=/target/source_input \
-    -e HGB_TARGET_REFERENCE_DIR=/target/reference_harnesses \
     -e HGB_TARGET_PROJECT="$project" \
     -e HGB_TARGET_FUZZ_TARGET="$fuzz_target" \
     -e HGB_DRY_RUN="${HGB_DRY_RUN:-0}" \
@@ -700,6 +735,7 @@ run_hgb_target_container() {
     -e HGB_SAVE_MODE="${HGB_SAVE_MODE:-compact}" \
     -e HGB_HOST_UID="$(id -u)" \
     -e HGB_HOST_GID="$(id -g)" \
+    "${reference_dir_args[@]}" \
     -v "$workspace:/workspace" \
     -v "$target_package:/target:ro" \
     -v "$root/docker/$generator/entrypoint.sh:/opt/hgb/entrypoint.sh:ro" \
@@ -708,4 +744,20 @@ run_hgb_target_container() {
     "${extra_docker_args[@]}" \
     "$@" \
     "$image" generate-target
+}
+
+# Determine whether a generator/protocol pair must be isolated from the
+# evaluator-only reference harnesses. In blind-project, CKGFuzzer and
+# OSS-Fuzz-Gen must never receive HGB_TARGET_REFERENCE_DIR or the
+# selected-harness-APIs metadata.
+hgb_generator_is_blind() {
+  local generator="${1:-}"
+  local protocol="${2:-${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-}}}"
+  case "$generator" in
+    ckgfuzzer|oss-fuzz-gen|promefuzz)
+      [[ "$protocol" == "blind-project" ]]
+      return $?
+      ;;
+  esac
+  return 1
 }

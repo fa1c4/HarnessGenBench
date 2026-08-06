@@ -1,0 +1,176 @@
+# PromeFuzz target build overrides for the FuzzBench valuable target set.
+#
+# This file contains ONLY legitimate build facts: language/standard, required
+# generated-source step, compile DB capture method, library output glob, exact
+# candidate destination, and build/generation timeouts. It MUST NOT contain
+# target harness source, reference-derived API names, call sequences, or
+# snippets extracted from the target harness. Exact FuzzBench reference
+# harnesses are evaluator-only in blind-project.
+#
+# candidate_destination is the exact native harness path inside the FuzzBench
+# project build context that the independent evaluator overlays each PromeFuzz
+# candidate onto. compile_db_capture_method selects the real capture strategy
+# (bear_replay replays build.sh under bear; cmake_export uses
+# -DCMAKE_EXPORT_COMPILE_COMMANDS). library_output_glob is where the build
+# produces archives/shared libraries for link-context recovery.
+
+targets:
+  bloaty_fuzz_target:
+    language: c++
+    candidate_destination: /src/fuzz_target.cc
+    compile_db_capture_method: bear_replay
+    library_output_glob: [build, src/libbloaty.a]
+    build_timeout: 2400
+    generation_timeout: 7200
+
+  curl_curl_fuzzer_http:
+    language: c++
+    candidate_destination: /src/curl_fuzzer_http.cc
+    compile_db_capture_method: bear_replay
+    library_output_glob: [lib, libcurl.a]
+    build_timeout: 2400
+    generation_timeout: 7200
+
+  freetype2_ftfuzzer:
+    language: c++
+    candidate_destination: /src/ftfuzzer.cc
+    compile_db_capture_method: bear_replay
+    library_output_glob: [objs, libfreetype.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  harfbuzz_hb-shape-fuzzer:
+    language: c++
+    candidate_destination: /src/hb-shape-fuzzer.cc
+    compile_db_capture_method: bear_replay
+    library_output_glob: [src, libharfbuzz.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  jsoncpp_jsoncpp_fuzzer:
+    language: c++
+    candidate_destination: /src/jsoncpp_fuzzer.cc
+    compile_db_capture_method: cmake_export
+    library_output_glob: [build, libjsoncpp.a]
+    build_timeout: 1200
+    generation_timeout: 5400
+
+  lcms_cms_transform_fuzzer:
+    language: c
+    candidate_destination: /src/cms_transform_fuzzer.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [lib, liblcms2.a]
+    build_timeout: 1200
+    generation_timeout: 5400
+
+  libjpeg-turbo_libjpeg_turbo_fuzzer:
+    language: c
+    candidate_destination: /src/libjpeg_turbo_fuzzer.cc
+    compile_db_capture_method: cmake_export
+    library_output_glob: [build, libjpeg.a, libturbojpeg.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  libpcap_fuzz_both:
+    language: c
+    candidate_destination: /src/fuzz_both.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [libpcap.a]
+    build_timeout: 1200
+    generation_timeout: 5400
+
+  libpng_libpng_read_fuzzer:
+    language: c
+    candidate_destination: /src/libpng_read_fuzzer.c
+    compile_db_capture_method: cmake_export
+    library_output_glob: [build, libpng.a]
+    build_timeout: 1200
+    generation_timeout: 5400
+
+  libxml2_xml:
+    language: c
+    candidate_destination: /src/xml.c
+    compile_db_capture_method: cmake_export
+    library_output_glob: [libxml2.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  libxslt_xpath:
+    language: c
+    candidate_destination: /src/xpath.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [libxslt, libxslt.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  mbedtls_fuzz_dtlsclient:
+    language: c
+    candidate_destination: /src/fuzz_dtlsclient.c
+    compile_db_capture_method: cmake_export
+    library_output_glob: [library, libmbedtls.a, libmbedcrypto.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  mruby_mruby_fuzzer_8c8bbd:
+    language: c
+    candidate_destination: /src/mruby_fuzzer.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [build, libmruby.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  openh264_decoder_fuzzer:
+    language: c++
+    candidate_destination: /src/decoder_fuzzer.cpp
+    compile_db_capture_method: bear_replay
+    library_output_glob: [libopenh264.a]
+    build_timeout: 2400
+    generation_timeout: 7200
+
+  openssl_x509:
+    language: c
+    candidate_destination: /src/x509.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [libssl.a, libcrypto.a]
+    build_timeout: 2400
+    generation_timeout: 7200
+
+  php_php-fuzz-parser_0dbedb:
+    language: c
+    candidate_destination: /src/fuzzer-parser.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [libphp.a]
+    build_timeout: 3000
+    generation_timeout: 9000
+
+  re2_fuzzer:
+    language: c++
+    candidate_destination: /src/re2/fuzzer/fuzzer.cc
+    compile_db_capture_method: cmake_export
+    library_output_glob: [build, libre2.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  sqlite3_ossfuzz:
+    language: c
+    candidate_destination: /src/ossfuzz.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [libsqlite3.a]
+    build_timeout: 1800
+    generation_timeout: 7200
+
+  systemd_fuzz-link-parser:
+    language: c
+    candidate_destination: /src/fuzz-link-parser.c
+    compile_db_capture_method: bear_replay
+    library_output_glob: [build, libsystemd.a]
+    build_timeout: 2400
+    generation_timeout: 7200
+
+  zlib_zlib_uncompress_fuzzer:
+    language: c
+    candidate_destination: /src/zlib_uncompress_fuzzer.c
+    compile_db_capture_method: cmake_export
+    library_output_glob: [libz.a]
+    build_timeout: 1200
+    generation_timeout: 5400

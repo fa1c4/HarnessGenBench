@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -36,12 +37,23 @@ def _normalise_function(function: Any) -> dict[str, Any] | None:
     return item
 
 
+def _blind_mode(args: argparse.Namespace) -> bool:
+    if getattr(args, "blind", False):
+        return True
+    if os.environ.get("OFG_REFERENCE_DIAGNOSTIC", "0").strip().lower() in {"1", "true", "yes"}:
+        return False
+    protocol = os.environ.get("HGB_BASELINE_PROTOCOL") or os.environ.get("HGB_PROTOCOL") or ""
+    return protocol.strip().lower() == "blind-project"
+
+
 def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
     report_metadata: dict[str, Any] = {}
     if not isinstance(functions, list):
         return [], [], report_metadata
     normalised = [item for item in (_normalise_function(function) for function in functions) if item]
-    if args.report_mode != "dynamic_only":
+    # In blind-project the selected-reference API report (derived from the
+    # exact target harness) must not drive selection. Skip it entirely.
+    if not _blind_mode(args) and args.report_mode != "dynamic_only":
         report_names, report_metadata = select_report_api_names(
             report_path=args.api_report or default_api_report_path(),
             target_name=args.target_name,
@@ -69,9 +81,9 @@ def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict
         project=args.project,
         target_name=args.target_name,
         fuzz_target=args.fuzz_target,
-        reference_dir=args.reference_dir,
+        reference_dir=args.reference_dir if not _blind_mode(args) else None,
     )
-    reference_calls = load_reference_calls(args.reference_dir)
+    reference_calls = load_reference_calls(args.reference_dir if not _blind_mode(args) else None)
     direct = [
         item for item in ranked
         if str(item.get("name") or "").split("::")[-1].lower() in reference_calls
@@ -83,6 +95,7 @@ def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict
     for item in normalised:
         if id(item) not in ranked_ids and reject_reason(item):
             rejected.append({"name": item.get("name", ""), "signature": item.get("signature", ""), "reason": reject_reason(item)})
+    report_metadata["blind_mode"] = _blind_mode(args)
     return ranked, rejected, report_metadata
 
 
@@ -96,11 +109,13 @@ def main() -> int:
     parser.add_argument("--target-name", default="")
     parser.add_argument("--fuzz-target", default="")
     parser.add_argument("--reference-dir", default="")
-    parser.add_argument("--api-report", default=__import__("os").environ.get("HGB_SELECTED_API_REPORT", default_api_report_path()))
-    parser.add_argument("--report-mode", default=__import__("os").environ.get("HGB_API_REPORT_MODE", "report_first"), choices=("report_first", "report_only", "dynamic_only"))
+    parser.add_argument("--api-report", default=os.environ.get("HGB_SELECTED_API_REPORT", default_api_report_path()))
+    parser.add_argument("--report-mode", default=os.environ.get("HGB_API_REPORT_MODE", "report_first"), choices=("report_first", "report_only", "dynamic_only"))
     parser.add_argument("--allow-test-files", action="store_true")
     parser.add_argument("--min-score", type=int, default=0)
-    parser.add_argument("--selection-mode", default=__import__("os").environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"), choices=("ranked", "selected_harness", "selected_harness_fallback"))
+    parser.add_argument("--selection-mode", default=os.environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"), choices=("ranked", "selected_harness", "selected_harness_fallback"))
+    parser.add_argument("--blind", action="store_true",
+                        help="blind-project mode: skip reference/report-derived selection")
     args = parser.parse_args()
 
     src = Path(args.input_path)

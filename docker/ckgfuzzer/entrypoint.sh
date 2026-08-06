@@ -139,11 +139,69 @@ if [[ "$mode" == "generate-target" ]]; then
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900}"
   export CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS="${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   export CKGFUZZER_LLM_MAX_RETRIES="${CKGFUZZER_LLM_MAX_RETRIES:-3}"
+  # --- Profile and protocol resolution ---
+  export HGB_PROFILE="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
+  export HGB_PROTOCOL="${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
+  ckg_profile="$HGB_PROFILE"
+  ckg_protocol="$HGB_PROTOCOL"
+  case "$ckg_profile" in
+    alpha|paper-faithful|compat-smoke) ;;
+    *) hgb_write_common_metadata failed "invalid CKGFuzzer profile: $ckg_profile" 64 harness_generator; exit 64 ;;
+  esac
+  case "$ckg_protocol" in
+    blind-project|api-oracle) ;;
+    *) hgb_write_common_metadata failed "invalid CKGFuzzer protocol: $ckg_protocol" 64 harness_generator; exit 64 ;;
+  esac
+  # Method-faithful profiles forbid compat fallbacks even if legacy env is set.
+  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" ]]; then
+    if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
+      hgb_write_common_metadata failed "CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden in $ckg_profile" 64 harness_generator; exit 64
+    fi
+    if [[ "${CKGFUZZER_LOCAL_API_COMBINATION:-0}" == "1" ]]; then
+      hgb_write_common_metadata failed "CKGFUZZER_LOCAL_API_COMBINATION=1 is forbidden in $ckg_profile" 64 harness_generator; exit 64
+    fi
+    if [[ "${CKGFUZZER_SKIP_CHECK_COMPILATION:-0}" == "1" ]]; then
+      hgb_write_common_metadata failed "--skip_check_compilation is forbidden in $ckg_profile" 64 harness_generator; exit 64
+    fi
+    ckg_emb="${CKGFUZZER_EMBEDDING_MODEL:-}"
+    if [[ -z "$ckg_emb" || "$ckg_emb" == "mock" || "$ckg_emb" == "local" ]]; then
+      hgb_write_common_metadata failed "CKGFUZZER_EMBEDDING_MODEL must be a real embedding service in $ckg_profile, not mock/local/empty" 64 harness_generator; exit 64
+    fi
+    # Force upstream LLM paths in method-faithful profiles.
+    export CKGFUZZER_LOCAL_API_SUMMARY=0
+    export CKGFUZZER_LOCAL_API_COMBINATION=0
+    ckg_method_faithful=1
+  else
+    # compat-smoke: allow deterministic/mock fallbacks.
+    export CKGFUZZER_LOCAL_API_SUMMARY="${CKGFUZZER_LOCAL_API_SUMMARY:-1}"
+    export CKGFUZZER_LOCAL_API_COMBINATION="${CKGFUZZER_LOCAL_API_COMBINATION:-1}"
+    export HGB_EXCLUDE_FROM_AGGREGATE=1
+    ckg_method_faithful=0
+  fi
+  # Initialize stage tracking.
+  hgb_result_init_stages "$workspace/stages.json"
+  hgb_result_set_stage "$workspace/stages.json" target_prepared completed
+  # --- API selection defaults depend on protocol ---
+  if [[ "$ckg_protocol" == "blind-project" ]]; then
+    # In blind-project, APIs are discovered from public headers, source
+    # declarations, project docs, and protocol-allowed examples/tests.
+    # Never read the selected-harness-APIs report or reference harnesses.
+    export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-public_headers}"
+    export HGB_SELECTED_API_REPORT=""
+    export HGB_API_REPORT_MODE=""
+  elif [[ "$ckg_protocol" == "api-oracle" ]]; then
+    # In api-oracle, accept only independently declared API names/signatures
+    # from declared_api.json. The report is still not the reference harness.
+    export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-declared_api}"
+    export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-}"
+    export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-}"
+  else
+    export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-public_headers}"
+    export HGB_SELECTED_API_REPORT=""
+    export HGB_API_REPORT_MODE=""
+  fi
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
-  export HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-selected_harness_fallback}"
-  export HGB_SELECTED_API_REPORT="${HGB_SELECTED_API_REPORT:-/opt/hgb/metadata/fuzzbench_selected_harness_apis.json}"
-  export HGB_API_REPORT_MODE="${HGB_API_REPORT_MODE:-report_first}"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses"
   add_codeql_to_path "${HGB_CODEQL_DIR:-}"
   add_codeql_to_path /opt/codeql
@@ -374,8 +432,20 @@ EOF_CKG_DOCKERFILE
   if [[ "$(hgb_count_files "$ckg_proj" -type f)" == "0" ]]; then
     hgb_soft_skip source_input_missing 'target package does not contain source files for CKGFuzzer API extraction' harness_generator
   fi
-  if [[ "${HGB_ALLOW_REFERENCE_USAGE:-0}" == "1" && -d /target/reference_harnesses ]]; then
-    cp -a /target/reference_harnesses/. "$ckg_db/test/" 2>/dev/null || true
+  # Generator/evaluator isolation: in blind-project the CKGFuzzer process
+  # must never see the exact target reference harness. HGB_TARGET_REFERENCE_DIR
+  # is not exported by the host runner in blind-project; enforce the same
+  # contract inside the container regardless of legacy flags.
+  if [[ "$ckg_protocol" == "blind-project" || -z "${HGB_TARGET_REFERENCE_DIR:-}" ]]; then
+    if [[ -d /target/reference_harnesses ]]; then
+      printf 'WARNING: /target/reference_harnesses exists but blind-project isolation forbids reading it; ignoring\n' >"$workspace/logs/reference_isolation.log"
+    fi
+    cat >"$ckg_db/test/hgb_neutral_usage.c" <<'EOF_CKG_USAGE'
+#include <stdint.h>
+int main(void) { const uint8_t data[] = {0}; return (int)data[0]; }
+EOF_CKG_USAGE
+  elif [[ "${HGB_ALLOW_REFERENCE_USAGE:-0}" == "1" && -n "${HGB_TARGET_REFERENCE_DIR:-}" && -d "${HGB_TARGET_REFERENCE_DIR}" ]]; then
+    cp -a "${HGB_TARGET_REFERENCE_DIR}/." "$ckg_db/test/" 2>/dev/null || true
   else
     cat >"$ckg_db/test/hgb_neutral_usage.c" <<'EOF_CKG_USAGE'
 #include <stdint.h>
@@ -385,20 +455,31 @@ EOF_CKG_USAGE
 
   api_selection_metadata="$workspace/api_selection.json"
   selected_reference_dir="/target/reference_harnesses/selected"
+  ckg_api_extract_args=(
+    --source /target/source_input
+    --out "$ckg_db/api_list.json"
+    --max "${CKGFUZZER_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}"
+    --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}"
+    --selection-mode "${HGB_API_SELECTION_MODE:-public_headers}"
+    --project "$project"
+    --target-name "$target_name"
+    --fuzz-target "$fuzz_target"
+    --selection-metadata "$api_selection_metadata"
+  )
+  # In blind-project, do not pass reference-dir or api-report: APIs are
+  # discovered from public headers, source declarations, and docs only.
+  if [[ "$ckg_protocol" != "blind-project" ]]; then
+    ckg_api_extract_args+=(--reference-dir "$selected_reference_dir")
+    if [[ -n "${HGB_SELECTED_API_REPORT:-}" ]]; then
+      ckg_api_extract_args+=(--api-report "$HGB_SELECTED_API_REPORT")
+    fi
+    if [[ -n "${HGB_API_REPORT_MODE:-}" ]]; then
+      ckg_api_extract_args+=(--report-mode "$HGB_API_REPORT_MODE")
+    fi
+    ckg_api_extract_args+=(--allow-name-only-report-apis)
+  fi
   api_count="$(python3 /opt/hgb/bin/extract_api_list.py \
-    --source /target/source_input \
-    --out "$ckg_db/api_list.json" \
-    --max "${CKGFUZZER_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}" \
-    --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}" \
-    --selection-mode "${HGB_API_SELECTION_MODE:-selected_harness_fallback}" \
-    --project "$project" \
-    --target-name "$target_name" \
-    --fuzz-target "$fuzz_target" \
-    --reference-dir "$selected_reference_dir" \
-    --api-report "$HGB_SELECTED_API_REPORT" \
-    --report-mode "$HGB_API_REPORT_MODE" \
-    --allow-name-only-report-apis \
-    --selection-metadata "$api_selection_metadata" \
+    "${ckg_api_extract_args[@]}" \
     2>"$workspace/logs/api_extract.log" || printf '0')"
   api_count="${api_count##*$'\n'}"
   export CKGFUZZER_SELECTED_API_LIST="$ckg_db/api_list.json"
@@ -410,6 +491,11 @@ EOF_CKG_USAGE
     c|c++) ;;
     *) hgb_soft_skip ckg_native_harness_unresolved "unsupported native harness language: $ckg_program_language" harness_generator ;;
   esac
+  if [[ "$ckg_method_faithful" == "1" ]]; then
+    ckg_embedding_default="openai-text-embedding-3-small"
+  else
+    ckg_embedding_default="mock"
+  fi
   cat >"$ckg_db/config.yaml" <<EOF_CKG_CONFIG
 config:
   project_name: "$ckg_project"
@@ -443,11 +529,11 @@ llm_analyzer:
   request_timeout: ${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}
   max_retries: ${CKGFUZZER_LLM_MAX_RETRIES:-3}
 llm_embedding:
-  model: "${CKGFUZZER_EMBEDDING_MODEL:-mock}"
+  model: "${CKGFUZZER_EMBEDDING_MODEL:-$ckg_embedding_default}"
   api_key: "${CKGFUZZER_EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}"
   base_url: "${CKGFUZZER_EMBEDDING_BASE_URL:-${OPENAI_BASE_URL:-}}"
 llm_code_embedding:
-  model: "${CKGFUZZER_EMBEDDING_MODEL:-mock}"
+  model: "${CKGFUZZER_EMBEDDING_MODEL:-$ckg_embedding_default}"
   api_key: "${CKGFUZZER_EMBEDDING_API_KEY:-${OPENAI_API_KEY:-}}"
   base_url: "${CKGFUZZER_EMBEDDING_BASE_URL:-${OPENAI_BASE_URL:-}}"
 source_dir: "$ckg_analysis_src"
@@ -716,20 +802,50 @@ if fix_path.exists():
 PY_CKG_RUNTIME_DOCKER_PATCH
   get_model_py="$(find "$artifact" -path '*/models/get_model.py' -type f 2>/dev/null | head -n 1 || true)"
   if [[ -n "$get_model_py" ]]; then
-    python3 - "$get_model_py" <<'PY_CKG_MODEL_PATCH'
+    CKG_METHOD_FAITHFUL="$ckg_method_faithful" python3 - "$get_model_py" <<'PY_CKG_MODEL_PATCH'
 from pathlib import Path
+import os
 import sys
 path = Path(sys.argv[1])
 text = path.read_text()
-if "from llama_index.core.embeddings import MockEmbedding" not in text:
-    text = text.replace(
-        "from llama_index.embeddings.ollama import OllamaEmbedding\n",
-        "from llama_index.embeddings.ollama import OllamaEmbedding\nfrom llama_index.core.embeddings import MockEmbedding\n",
-        1,
-    )
+method_faithful = os.environ.get("CKG_METHOD_FAITHFUL", "0") == "1"
+if not method_faithful:
+    if "from llama_index.core.embeddings import MockEmbedding" not in text:
+        text = text.replace(
+            "from llama_index.embeddings.ollama import OllamaEmbedding\n",
+            "from llama_index.embeddings.ollama import OllamaEmbedding\nfrom llama_index.core.embeddings import MockEmbedding\n",
+            1,
+        )
 start = text.find("def get_embedding_model(")
 if start != -1:
-    replacement = 'def get_embedding_model(llm_config=None, device=\'cuda:1\'):\n    if llm_config is None:\n        return MockEmbedding(embed_dim=384)\n    model_name = llm_config[\'model\']\n    if model_name.startswith("mock") or model_name.startswith("local"):\n        return MockEmbedding(embed_dim=int(llm_config.get("dimensions", 384)))\n    if model_name.startswith("openai"):\n        model_name = model_name.replace("openai-", "").strip()\n        return OpenAIEmbedding(model=model_name, api_key=llm_config["api_key"], api_base=llm_config.get("base_url") or None)\n    if model_name.startswith("ollama"):\n        model_name = model_name.replace("ollama-", "").strip()\n        return OllamaEmbedding(model_name=model_name, base_url=llm_config["base_url"], ollama_additional_kwargs={"mirostat": 0})\n    assert False, f"Non-support Emb Model Name, The LLM config is {llm_config}. Please use mock/local, Ollama, or OpenAI embeddings"\n'
+    if method_faithful:
+        replacement = ('def get_embedding_model(llm_config=None, device=\'cuda:1\'):\n'
+            '    if llm_config is None:\n'
+            '        raise AssertionError("HGB alpha/paper-faithful requires a configured embedding service; MockEmbedding is forbidden")\n'
+            '    model_name = llm_config[\'model\']\n'
+            '    if model_name.startswith("mock") or model_name.startswith("local"):\n'
+            '        raise AssertionError(f"HGB alpha/paper-faithful forbids mock/local embedding model: {model_name}")\n'
+            '    if model_name.startswith("openai"):\n'
+            '        model_name = model_name.replace("openai-", "").strip()\n'
+            '        return OpenAIEmbedding(model=model_name, api_key=llm_config["api_key"], api_base=llm_config.get("base_url") or None)\n'
+            '    if model_name.startswith("ollama"):\n'
+            '        model_name = model_name.replace("ollama-", "").strip()\n'
+            '        return OllamaEmbedding(model_name=model_name, base_url=llm_config["base_url"], ollama_additional_kwargs={"mirostat": 0})\n'
+            '    assert False, f"Non-support Emb Model Name, The LLM config is {llm_config}. Please use Ollama, or OpenAI embeddings"\n')
+    else:
+        replacement = ('def get_embedding_model(llm_config=None, device=\'cuda:1\'):\n'
+            '    if llm_config is None:\n'
+            '        return MockEmbedding(embed_dim=384)\n'
+            '    model_name = llm_config[\'model\']\n'
+            '    if model_name.startswith("mock") or model_name.startswith("local"):\n'
+            '        return MockEmbedding(embed_dim=int(llm_config.get("dimensions", 384)))\n'
+            '    if model_name.startswith("openai"):\n'
+            '        model_name = model_name.replace("openai-", "").strip()\n'
+            '        return OpenAIEmbedding(model=model_name, api_key=llm_config["api_key"], api_base=llm_config.get("base_url") or None)\n'
+            '    if model_name.startswith("ollama"):\n'
+            '        model_name = model_name.replace("ollama-", "").strip()\n'
+            '        return OllamaEmbedding(model_name=model_name, base_url=llm_config["base_url"], ollama_additional_kwargs={"mirostat": 0})\n'
+            '    assert False, f"Non-support Emb Model Name, The LLM config is {llm_config}. Please use mock/local, Ollama, or OpenAI embeddings"\n')
     text = text[:start] + replacement
 path.write_text(text)
 PY_CKG_MODEL_PATCH
@@ -1412,12 +1528,21 @@ PY_CKG_CACHE_WRITE_METADATA
   else
     ckg_input_args+=(--skip_gen_input)
   fi
+  # In alpha/paper-faithful, use upstream compilation checking (no
+  # --skip_check_compilation). compat-smoke may skip it.
+  ckg_compilation_args=()
+  if [[ "$ckg_method_faithful" != "1" ]]; then
+    ckg_compilation_args+=(--skip_check_compilation)
+  fi
   {
     printf 'cd %q && python %q --project_name %q --shared_llm_dir %q --saved_dir %q --src_api --call_graph
 ' "$(dirname "$repo_py")" "$repo_py" "$ckg_project" "$ckg_shared" "$ckg_db/codebase"
     printf 'python %q --project_name %q --src_api_file_path %q
 ' "$preproc_py" "$ckg_project" "$ckg_db"
-    printf 'python %q --yaml %q --gen_driver --summary_api --skip_check_compilation' "$fuzzing_py" "$ckg_db/config.yaml"
+    printf 'python %q --yaml %q --gen_driver --summary_api' "$fuzzing_py" "$ckg_db/config.yaml"
+    if [[ "${#ckg_compilation_args[@]}" -gt 0 ]]; then
+      printf ' %q' "${ckg_compilation_args[@]}"
+    fi
     printf ' %q' "${ckg_input_args[@]}"
     printf '
 '
@@ -1454,21 +1579,49 @@ PY_CKG_CACHE_WRITE_METADATA
     elif [[ "${CKGFUZZER_SKIP_CODEQL:-0}" != "1" ]]; then
       call_graph_ok="$(find "$ckg_db/codebase/call_graph" -maxdepth 1 -type f -name '*.ok' -print -quit 2>/dev/null || true)"
       if [[ -z "$call_graph_ok" ]]; then
-        # CKGFuzzer can omit valid APIs whose definitions use syntax it does
-        # not parse (notably zlib's K&R-style uncompress). The preprocessor
-        # has a source-recovery path for this case, so let it run first.
-        # This is not a successful CodeQL result and is not cached below.
-        analysis_mode=source_fallback_only
-        analysis_fallback_reason='CodeQL produced no selected-API call-graph artifact; using source recovery with an empty graph'
-        mkdir -p "$ckg_db/codebase/call_graph"
-        printf '%s\n' 'caller,callee,caller_src,callee_src,start_body_start_line,start_body_end_line,end_body_start_line,end_body_end_line,caller_signature,caller_parameter_string,caller_return_type,caller_return_type_inferred,callee_signature,callee_parameter_string,callee_return_type,callee_return_type_inferred' >"$ckg_db/codebase/call_graph/hgb_source_fallback_call_graph.csv"
-        printf '%s\n' "$analysis_mode" >"$ckg_db/codebase/call_graph/hgb_analysis_mode"
-        printf 'CKGFuzzer: %s\n' "$analysis_fallback_reason" >>"$workspace/logs/repo.log"
+        if [[ "$ckg_method_faithful" == "1" ]]; then
+          # In alpha/paper-faithful, an empty CodeQL graph is a hard failure.
+          # Do not continue to generation with a source-only fallback.
+          code=2
+          failed_stage=repo
+          analysis_mode=source_fallback_only
+          analysis_fallback_reason='CodeQL produced no selected-API call-graph artifact; alpha/paper-faithful does not allow source-only fallback'
+          printf 'CKGFuzzer: %s\n' "$analysis_fallback_reason" >>"$workspace/logs/repo.log"
+          hgb_result_set_stage "$workspace/stages.json" knowledge_graph failed
+        else
+          # compat-smoke: CKGFuzzer can omit valid APIs whose definitions use
+          # syntax it does not parse. The preprocessor has a source-recovery
+          # path for this case, so let it run first.
+          analysis_mode=source_fallback_only
+          analysis_fallback_reason='CodeQL produced no selected-API call-graph artifact; using source recovery with an empty graph'
+          mkdir -p "$ckg_db/codebase/call_graph"
+          printf '%s\n' 'caller,callee,caller_src,callee_src,start_body_start_line,start_body_end_line,end_body_start_line,end_body_end_line,caller_signature,caller_parameter_string,caller_return_type,caller_return_type_inferred,callee_signature,callee_parameter_string,callee_return_type,callee_return_type_inferred' >"$ckg_db/codebase/call_graph/hgb_source_fallback_call_graph.csv"
+          printf '%s\n' "$analysis_mode" >"$ckg_db/codebase/call_graph/hgb_analysis_mode"
+          printf 'CKGFuzzer: %s\n' "$analysis_fallback_reason" >>"$workspace/logs/repo.log"
+        fi
       elif [[ -f "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" ]]; then
         compiled_units="$(cat "$ckg_shared/hgb_compiled_units_${ckg_project}.txt" 2>/dev/null || printf '0')"
         if [[ "${compiled_units:-0}" == "0" && ! -f "$ckg_shared/codeqldb/$ckg_project/.successfully_created" ]]; then
           code=2
           failed_stage=repo
+          hgb_result_set_stage "$workspace/stages.json" codeql_database failed
+        fi
+      fi
+      # Graph validation: require non-empty function and call-edge data.
+      if [[ "$code" == "0" && "$failed_stage" == "none" ]]; then
+        hgb_result_set_stage "$workspace/stages.json" codeql_database completed
+        ckg_graph_csv_size="$(find "$ckg_db/codebase/call_graph" -maxdepth 1 -type f -name '*.csv' -exec wc -c {} + 2>/dev/null | tail -n 1 | awk '{print $1}' || printf '0')"
+        ckg_src_api_size="$(wc -c < "$ckg_db/codebase/api/src_api.json" 2>/dev/null || printf '0')"
+        if [[ "${ckg_graph_csv_size:-0}" -le 1 || "${ckg_src_api_size:-0}" -le 2 ]]; then
+          if [[ "$ckg_method_faithful" == "1" ]]; then
+            code=2
+            failed_stage=repo
+            analysis_fallback_reason='ckg_graph_validation_failed: CodeQL graph has empty function or call-edge data'
+            printf 'CKGFuzzer: %s (csv_size=%s, src_api_size=%s)\n' "$analysis_fallback_reason" "$ckg_graph_csv_size" "$ckg_src_api_size" >>"$workspace/logs/repo.log"
+            hgb_result_set_stage "$workspace/stages.json" knowledge_graph failed
+          fi
+        else
+          hgb_result_set_stage "$workspace/stages.json" knowledge_graph completed
         fi
       fi
     fi
@@ -1531,11 +1684,16 @@ PY_CKG_SOURCE_FALLBACK_BODIES
     rm -f "$workspace/verified_harnesses.json"
     export HGB_CKG_EXTERNAL_VERIFIER=1
     cleanup_ckg_check_container
-    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api --skip_check_compilation "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
+    timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" python "$fuzzing_py" --yaml "$ckg_db/config.yaml" --gen_driver --summary_api "${ckg_compilation_args[@]}" "${ckg_input_args[@]}" >"$workspace/logs/fuzzing.log" 2>&1 || fuzzing_code=$?
     cleanup_ckg_check_container
     if [[ "$fuzzing_code" != "0" ]]; then
       code="$fuzzing_code"
       failed_stage=fuzzing
+      hgb_result_set_stage "$workspace/stages.json" generation failed
+      hgb_result_set_stage "$workspace/stages.json" compilation_repair failed
+    else
+      hgb_result_set_stage "$workspace/stages.json" generation completed
+      hgb_result_set_stage "$workspace/stages.json" compilation_repair completed
     fi
   fi
   if [[ "$fuzzing_code" != "not_run" ]]; then
@@ -1580,11 +1738,18 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       else
         failed_stage=verification
       fi
+      hgb_result_set_stage "$workspace/stages.json" candidate_build failed
+    else
+      hgb_result_set_stage "$workspace/stages.json" candidate_build completed
+      hgb_result_set_stage "$workspace/stages.json" sanitizer_smoke completed
+      hgb_result_set_stage "$workspace/stages.json" api_reachability completed
+      hgb_result_set_stage "$workspace/stages.json" campaign completed
+      hgb_result_set_stage "$workspace/stages.json" coverage completed
     fi
   else
     printf '[]\n' >"$workspace/verified_harnesses.json"
   fi
-  status=completed
+  status=evaluated
   reason=none
   if [[ "$code" -ne 0 ]]; then
     status=failed
@@ -1653,9 +1818,36 @@ PY_CKG_SOURCE_FALLBACK_BODIES
     fi
   fi
   compact_ckg_workspace
+  # --- Reference leakage audit ---
+  # If the host placed a canary token in the evaluator-only reference source
+  # (HGB_REF_CANARY), scan all CKG generator inputs and outputs to prove it
+  # never reached prompts, logs, API lists, summaries, or candidates.
+  ckg_leakage_audit='{}'
+  if [[ -n "${HGB_REF_CANARY:-}" ]]; then
+    ckg_leakage_audit="$(python3 /opt/hgb/bin/ckgfuzzer_profile.py audit \
+      --generator-input /target/source_input \
+      --canary "$HGB_REF_CANARY" \
+      --extra-dir "$workspace" \
+      --extra-dir "$ckg_db" 2>/dev/null || printf '{"leaked":true,"error":"audit_failed"}')"
+    if printf '%s' "$ckg_leakage_audit" | grep -q '"leaked": *true'; then
+      printf 'Reference leakage audit FAILED: canary token found in CKG generator data\n' >"$workspace/logs/leakage_audit.log"
+      printf '%s\n' "$ckg_leakage_audit" >>"$workspace/logs/leakage_audit.log"
+      if [[ "$code" -eq 0 ]]; then
+        code=8
+        status=failed
+        reason='ckg_reference_leakage: canary token from evaluator-only reference source reached CKG generator data'
+        failed_stage=leakage_audit
+      fi
+    else
+      printf 'Reference leakage audit passed: no canary leakage detected\n' >"$workspace/logs/leakage_audit.log"
+    fi
+  fi
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "ckgfuzzer_project": "%s",
   "ckgfuzzer_shared_dir": "%s",
+  "ckgfuzzer_profile": "%s",
+  "ckgfuzzer_protocol": "%s",
+  "ckgfuzzer_method_faithful": %s,
   "api_candidate_count": %s,
   "generated_harness_count": %s,
   "verified_harness_count": %s,
@@ -1677,7 +1869,8 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   "ckgfuzzer_codeql_cache_status": "%s",
   "ckgfuzzer_codeql_cache_key": "%s",
   "ckgfuzzer_codeql_cache_path": "%s",
-  "ckgfuzzer_codeql_cache_reason": "%s"' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")")
+  "ckgfuzzer_codeql_cache_reason": "%s",
+  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_leakage_audit")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

@@ -1,4 +1,4 @@
-generated_at: "2026-07-01T03:31:31Z"
+generated_at: "2026-08-04T02:38:47Z"
 artifact_root: "artifacts"
 works:
   fuzzbench:
@@ -15,6 +15,13 @@ works:
     checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "engineering_artifact"
     optional: false
+  oss-fuzz:
+    repo: "https://github.com/google/oss-fuzz.git"
+    path: "artifacts/oss-fuzz"
+    commit: "95272c1a23cb2d796afb1b3be0c2644bbab787f4"
+    checkout_mode: "detached-pinned-immutable"
+    reference_type: "engineering_artifact"
+    optional: false
   ckgfuzzer:
     repo: "https://github.com/security-pride/CKGFuzzer.git"
     path: "artifacts/ckgfuzzer"
@@ -25,7 +32,7 @@ works:
   promefuzz:
     repo: "https://github.com/pvz122/PromeFuzz.git"
     path: "artifacts/promefuzz"
-    commit: "427337fe7e220417ad8a93f42f3fc73edba19110"
+    commit: "655d2d98fc304d6ee1dbe26293d7bbcf115bec86"
     checkout_mode: "detached-pinned-current-upstream-head"
     reference_type: "paper_artifact"
     optional: false

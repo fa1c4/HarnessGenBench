@@ -39,9 +39,16 @@ RUN mkdir -p /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tre
   && git clone --depth 1 --branch v0.20.5 https://github.com/tree-sitter/tree-sitter-cpp.git /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tree-sitter/tree-sitter-cpp \
   && /opt/hgb/venv/bin/python -c "from tree_sitter import Language; Language.build_library('/opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tree-sitter/cpp.so', ['/opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/codetext/parser/tree-sitter/tree-sitter-cpp'])"
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/ckgfuzzer_stage_project.py docker/common/ckgfuzzer_cache.py docker/common/ckgfuzzer_runtime_patch.py docker/common/ckgfuzzer_candidate_verifier.py docker/common/ckgfuzzer_target_harness.py docker/common/ckgfuzzer_verifier_context.py docker/common/ckgfuzzer_api_recovery.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh /opt/hgb/bin/
-RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/ckgfuzzer_stage_project.py /opt/hgb/bin/ckgfuzzer_cache.py /opt/hgb/bin/ckgfuzzer_runtime_patch.py /opt/hgb/bin/ckgfuzzer_candidate_verifier.py /opt/hgb/bin/ckgfuzzer_target_harness.py /opt/hgb/bin/ckgfuzzer_verifier_context.py /opt/hgb/bin/ckgfuzzer_api_recovery.py
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/ckgfuzzer_stage_project.py docker/common/ckgfuzzer_cache.py docker/common/ckgfuzzer_runtime_patch.py docker/common/ckgfuzzer_candidate_verifier.py docker/common/ckgfuzzer_target_harness.py docker/common/ckgfuzzer_verifier_context.py docker/common/ckgfuzzer_api_recovery.py docker/common/ckgfuzzer_profile.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh /opt/hgb/bin/
+RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/ckgfuzzer_stage_project.py /opt/hgb/bin/ckgfuzzer_cache.py /opt/hgb/bin/ckgfuzzer_runtime_patch.py /opt/hgb/bin/ckgfuzzer_candidate_verifier.py /opt/hgb/bin/ckgfuzzer_target_harness.py /opt/hgb/bin/ckgfuzzer_verifier_context.py /opt/hgb/bin/ckgfuzzer_api_recovery.py /opt/hgb/bin/ckgfuzzer_profile.py
 COPY docker/ckgfuzzer/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh
+# Self-test: verify profile module, upstream CLI availability, and candidate checker.
+RUN /opt/hgb/venv/bin/python -c "import sys; sys.path.insert(0, '/opt/hgb/bin'); import ckgfuzzer_profile; print('ckgfuzzer_profile OK')" \
+  && test -f /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/repo/repo.py \
+  && test -f /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/repo/preproc.py \
+  && test -f /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/fuzzing.py \
+  && /opt/hgb/venv/bin/python -c "import sys; sys.path.insert(0, '/opt/hgb/bin'); import ckgfuzzer_profile; v = ckgfuzzer_profile.validate_profile('alpha', 'blind-project', {'CKGFUZZER_EMBEDDING_MODEL': 'openai-text-embedding-3-small'}); assert not v, v; print('alpha profile validation OK')" \
+  && /opt/hgb/venv/bin/python -c "import sys; sys.path.insert(0, '/opt/hgb/bin'); import ckgfuzzer_profile; v = ckgfuzzer_profile.validate_profile('compat-smoke', 'blind-project', {}); assert not v, v; print('compat-smoke profile validation OK')"
 WORKDIR /opt/hgb/artifacts/ckgfuzzer
 ENTRYPOINT ["/opt/hgb/entrypoint.sh"]

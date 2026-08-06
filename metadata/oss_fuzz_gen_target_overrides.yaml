@@ -1,0 +1,114 @@
+# OSS-Fuzz-Gen target overrides for HarnessGenBench.
+#
+# This file records ONLY legitimate integration facts: project/language
+# mapping, source/build dependencies, generated-source steps, Introspector
+# overlay details, exact candidate destination, and build/fuzz timeouts.
+# It must NEVER contain reference-derived API names or harness snippets.
+# Reference harnesses are evaluator-only in blind-project.
+#
+# Language defaults to c++ for C++ projects and c for C projects. The
+# candidate_destination is the exact native harness path inside the OSS-Fuzz
+# project build context that the independent evaluator overlays each
+# candidate onto. build_timeout/fuzz_timeout are per-target seconds.
+
+targets:
+  jsoncpp_jsoncpp_fuzzer:
+    language: c++
+    candidate_destination: /src/jsoncpp/jsoncpp_fuzzer.cc
+    build_timeout: 1800
+    fuzz_timeout: 600
+  libxml2_xml:
+    language: c
+    candidate_destination: /src/libxml2/xml.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  libpng_libpng_read_fuzzer:
+    language: c
+    candidate_destination: /src/libpng/libpng_read_fuzzer.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  sqlite3_ossfuzz:
+    language: c
+    candidate_destination: /src/sqlite3/ossfuzz.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  zlib_zlib_uncompress_fuzzer:
+    language: c
+    candidate_destination: /src/zlib/zlib_uncompress_fuzzer.c
+    build_timeout: 1200
+    fuzz_timeout: 600
+  openssl_x509:
+    language: c
+    candidate_destination: /src/openssl/fuzz/x509.c
+    build_timeout: 2400
+    fuzz_timeout: 600
+  re2_fuzzer:
+    language: c++
+    candidate_destination: /src/re2/fuzzer.cc
+    build_timeout: 1800
+    fuzz_timeout: 600
+  freetype2_ftfuzzer:
+    language: c
+    candidate_destination: /src/freetype2/ftfuzzer.cc
+    build_timeout: 1800
+    fuzz_timeout: 600
+  curl_curl_fuzzer_http:
+    language: c
+    candidate_destination: /src/curl/curl_fuzzer_http.cc
+    build_timeout: 2400
+    fuzz_timeout: 600
+  harfbuzz_hb-shape-fuzzer:
+    language: c++
+    candidate_destination: /src/harfbuzz/hb-shape-fuzzer.cc
+    build_timeout: 1800
+    fuzz_timeout: 600
+  lcms_cms_transform_fuzzer:
+    language: c
+    candidate_destination: /src/lcms/cms_transform_fuzzer.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  libjpeg-turbo_libjpeg_turbo_fuzzer:
+    language: c
+    candidate_destination: /src/libjpeg-turbo/libjpeg_turbo_fuzzer.cc
+    build_timeout: 1800
+    fuzz_timeout: 600
+  libpcap_fuzz_both:
+    language: c
+    candidate_destination: /src/libpcap/fuzz_both.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  libxslt_xpath:
+    language: c
+    candidate_destination: /src/libxslt/xpath.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  mbedtls_fuzz_dtlsclient:
+    language: c
+    candidate_destination: /src/mbedtls/programs/fuzz/fuzz_dtlsclient.c
+    build_timeout: 2400
+    fuzz_timeout: 600
+  mruby_mruby_fuzzer_8c8bbd:
+    language: c
+    candidate_destination: /src/mruby/mruby_fuzzer.c
+    build_timeout: 1800
+    fuzz_timeout: 600
+  openh264_decoder_fuzzer:
+    language: c++
+    candidate_destination: /src/openh264/decoder_fuzzer.cpp
+    build_timeout: 2400
+    fuzz_timeout: 600
+  php_php-fuzz-parser_0dbedb:
+    language: c
+    candidate_destination: /src/php-src/sapi/fuzzer/fuzzer-parser.c
+    build_timeout: 3000
+    fuzz_timeout: 600
+  systemd_fuzz-link-parser:
+    language: c
+    candidate_destination: /src/systemd/src/fuzz/fuzz-link-parser.c
+    build_timeout: 2400
+    fuzz_timeout: 600
+  bloaty_fuzz_target:
+    language: c++
+    candidate_destination: /src/bloaty/fuzz_target.cc
+    build_timeout: 2400
+    fuzz_timeout: 600

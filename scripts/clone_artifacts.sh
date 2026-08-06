@@ -65,6 +65,25 @@ upstream_head_commit() {
   git -C "$path" rev-parse HEAD
 }
 
+# Read a recorded commit for a work key from the existing work_index.yaml.
+recorded_commit() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || { printf ''; return 0; }
+  python3 - "$file" "$key" <<'PY_REC'
+import sys
+import yaml
+from pathlib import Path
+try:
+    data = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    print("", end="")
+    sys.exit(0)
+works = (data or {}).get("works") or {}
+entry = works.get(sys.argv[2]) or {}
+print(entry.get("commit") or "", end="")
+PY_REC
+}
+
 main() {
   local root artifacts_root metadata_dir tmp generated_at entry
   root="$(repo_root)"
@@ -73,9 +92,13 @@ main() {
   ensure_dir "$(resolve_path "$root" "$artifacts_root")"
   ensure_dir "$metadata_dir"
 
+  # Repos: key|url|dir|reference_type|optional
+  # oss-fuzz is pinned and must never be cloned as a floating branch; its
+  # recorded commit is reused without refreshing to upstream HEAD.
   local repos=(
     "fuzzbench|https://github.com/google/fuzzbench.git|fuzzbench|target_benchmark_suite|false"
     "oss-fuzz-gen|https://github.com/google/oss-fuzz-gen.git|oss-fuzz-gen|engineering_artifact|false"
+    "oss-fuzz|https://github.com/google/oss-fuzz.git|oss-fuzz|engineering_artifact|false"
     "ckgfuzzer|https://github.com/security-pride/CKGFuzzer.git|ckgfuzzer|paper_artifact|false"
     "promefuzz|https://github.com/pvz122/PromeFuzz.git|promefuzz|paper_artifact|false"
     "elfuzz|https://github.com/OSUSecLab/elfuzz.git|elfuzz|paper_artifact|false"
@@ -83,9 +106,10 @@ main() {
     "g2fuzz-data|https://github.com/G2FUZZ/G2FUZZ-DATA.git|g2fuzz-data|dataset|true"
   )
 
+  local existing_index="$metadata_dir/work_index.yaml"
   generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
   tmp="$(mktemp "$metadata_dir/work_index.yaml.XXXXXX")"
-  trap 'rm -f "$tmp"' EXIT
+  trap 'rm -f "${tmp:-}"' EXIT
 
   {
     printf 'generated_at: "%s"\n' "$generated_at"
@@ -94,14 +118,27 @@ main() {
   } >"$tmp"
 
   for entry in "${repos[@]}"; do
-    local key url dir reference_type optional rel_path abs_path commit
+    local key url dir reference_type optional rel_path abs_path commit pinned
     IFS='|' read -r key url dir reference_type optional <<<"$entry"
     rel_path="${artifacts_root%/}/$dir"
     abs_path="$(resolve_path "$root" "$rel_path")"
 
     clone_or_fetch "$key" "$url" "$abs_path"
     check_clean_or_force "$key" "$abs_path"
-    commit="$(upstream_head_commit "$abs_path")"
+    # Normal runs checkout the recorded commit without refreshing it, so the
+    # work_index.yaml stays stable and reproducible. Set HGB_REFRESH_ARTIFACTS=1
+    # to refresh non-pinned repos to the current upstream HEAD. oss-fuzz is
+    # always pinned (immutable) regardless of the refresh flag.
+    pinned="$(recorded_commit "$existing_index" "$key")"
+    if [[ "$key" == "oss-fuzz" || "${HGB_REFRESH_ARTIFACTS:-0}" != "1" ]]; then
+      if [[ -n "$pinned" && "$pinned" != "unknown" ]]; then
+        commit="$pinned"
+      else
+        commit="$(upstream_head_commit "$abs_path")"
+      fi
+    else
+      commit="$(upstream_head_commit "$abs_path")"
+    fi
     log "Checking out $key at $commit"
     git -C "$abs_path" checkout --detach "$commit"
     if [[ -f "$abs_path/.gitmodules" ]]; then
@@ -113,13 +150,45 @@ main() {
       printf '    repo: "%s"\n' "$url"
       printf '    path: "%s"\n' "$rel_path"
       printf '    commit: "%s"\n' "$commit"
-      printf '    checkout_mode: "detached-pinned-current-upstream-head"\n'
+      if [[ "$key" == "oss-fuzz" ]]; then
+        printf '    checkout_mode: "detached-pinned-immutable"\n'
+      else
+        printf '    checkout_mode: "detached-pinned-current-upstream-head"\n'
+      fi
       printf '    reference_type: "%s"\n' "$reference_type"
       printf '    optional: %s\n' "$optional"
     } >>"$tmp"
   done
 
-  mv "$tmp" "$metadata_dir/work_index.yaml"
+  # Idempotent update: only overwrite work_index.yaml when the works content
+  # (commits) actually changed. This keeps `diff` after a re-run empty and
+  # preserves the original generated_at when nothing changed.
+  if [[ -f "$existing_index" ]]; then
+    if python3 - "$existing_index" "$tmp" <<'PY_DIFF'; then
+import sys
+import yaml
+from pathlib import Path
+def works(path):
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}
+    out = {}
+    for key, entry in (data.get("works") or {}).items():
+        out[key] = {k: v for k, v in (entry or {}).items() if k != "checkout_mode"}
+    return out
+old = works(sys.argv[1])
+new = works(sys.argv[2])
+sys.exit(0 if old == new else 1)
+PY_DIFF
+      log "work_index.yaml unchanged (commits match); keeping existing file"
+      rm -f "$tmp"
+      trap - EXIT
+      return 0
+    fi
+  fi
+
+  mv "$tmp" "$existing_index"
   trap - EXIT
   log "Updated metadata/work_index.yaml"
 }
