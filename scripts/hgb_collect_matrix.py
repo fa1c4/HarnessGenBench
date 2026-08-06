@@ -7,6 +7,7 @@ import argparse
 import collections
 import csv
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -123,6 +124,35 @@ def remediation_for(status: str, reason: str) -> str:
         if needle in haystack:
             return remediation
     return "Inspect the pair workspace logs and metadata for the generator-specific failure."
+
+
+def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
+    """Return invariant violations for an ``evaluated`` harness-generator row.
+
+    Per the beta reproduction contract, an ``evaluated`` row must have a real
+    coverage report (non-null covered lines) and a campaign with
+    ``execs_done > 0``, plus a per-candidate evaluator JSON (selected_candidate).
+    """
+    if str(meta.get("status")) != "evaluated":
+        return []
+    violations: list[str] = []
+    family = str(meta.get("task_family") or meta.get("capability") or "")
+    if family and family != "harness_generator":
+        return []
+    cov = meta.get("metrics", {}).get("coverage") or meta.get("coverage") or {}
+    if not isinstance(cov, dict):
+        cov = {}
+    line_cov = cov.get("line_coverage", {}) if isinstance(cov, dict) else {}
+    if line_cov.get("covered") is None:
+        violations.append("evaluated row has coverage.line_coverage.covered == null")
+    campaign = meta.get("metrics", {}).get("campaign") or meta.get("campaign") or {}
+    if not isinstance(campaign, dict):
+        campaign = {}
+    if int(campaign.get("execs_done", 0) or 0) <= 0:
+        violations.append("evaluated row has campaign.execs_done <= 0")
+    if not meta.get("selected_candidate"):
+        violations.append("evaluated row has no per-candidate evaluator JSON")
+    return violations
 
 
 def read_rows(matrix_dir: Path) -> list[dict[str, str]]:
@@ -247,13 +277,28 @@ def storage_report(matrix_dir: Path, records: list[dict[str, Any]]) -> dict[str,
     }
 
 
-def collect(matrix_dir: Path) -> dict[str, Any]:
+def collect(matrix_dir: Path, *, strict: bool = False) -> dict[str, Any]:
     rows = read_rows(matrix_dir)
     records: list[dict[str, Any]] = []
     for row in rows:
         metadata = load_metadata(row.get("metadata", ""))
         records.append({"row": row, "metadata": metadata})
     total = len(records)
+    # Strict-mode validation: an evaluated harness-generator row must have a
+    # real coverage report and nonzero campaign execs.  Violations are reported
+    # and, in strict mode, the row is downgraded for counting so the aggregate
+    # never includes a build-only "evaluated" row.
+    evaluated_violations: list[dict[str, Any]] = []
+    if strict:
+        for record in records:
+            meta = record["metadata"]
+            v = evaluated_row_violations(meta)
+            if v:
+                evaluated_violations.append({
+                    "target": record["row"].get("target", ""),
+                    "generator": record["row"].get("generator", ""),
+                    "violations": v,
+                })
     statuses = collections.Counter((r["metadata"].get("status") or r["row"].get("status") or "missing_metadata") for r in records)
     # Determine which records are excluded from aggregate (compat-smoke or
     # explicitly flagged). Excluded rows are still counted in total and
@@ -348,6 +393,7 @@ def collect(matrix_dir: Path) -> dict[str, Any]:
         "top_failure_reasons": reasons.most_common(10),
         "top_remediations": remediation_counts.most_common(10),
         "storage": storage_report(matrix_dir, records),
+        "evaluated_row_violations": evaluated_violations,
     }
 
 
@@ -452,10 +498,20 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("matrix_dir")
+    parser.add_argument("--strict", action="store_true",
+                        help="validate evaluated rows have coverage and execs_done>0")
+    parser.add_argument("--generators", default="")
+    parser.add_argument("--targets", default="")
     args = parser.parse_args()
     matrix_dir = Path(args.matrix_dir).resolve()
     matrix_dir.mkdir(parents=True, exist_ok=True)
-    write_outputs(matrix_dir, collect(matrix_dir))
+    summary = collect(matrix_dir, strict=args.strict)
+    write_outputs(matrix_dir, summary)
+    if args.strict and summary.get("evaluated_row_violations"):
+        print(f"ERROR: {len(summary['evaluated_row_violations'])} evaluated row(s) lack coverage/execs:", file=sys.stderr)
+        for v in summary["evaluated_row_violations"]:
+            print(f"  {v['generator']}/{v['target']}: {'; '.join(v['violations'])}", file=sys.stderr)
+        return 2
     return 0
 
 

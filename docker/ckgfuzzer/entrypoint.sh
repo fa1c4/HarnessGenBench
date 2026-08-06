@@ -1741,16 +1741,68 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       hgb_result_set_stage "$workspace/stages.json" candidate_build failed
     else
       hgb_result_set_stage "$workspace/stages.json" candidate_build completed
-      hgb_result_set_stage "$workspace/stages.json" sanitizer_smoke completed
-      hgb_result_set_stage "$workspace/stages.json" api_reachability completed
-      hgb_result_set_stage "$workspace/stages.json" campaign completed
-      hgb_result_set_stage "$workspace/stages.json" coverage completed
+      # Beta plan §6: sanitizer_smoke, api_reachability, campaign, and coverage
+      # are set ONLY from the full harness evaluator output. A candidate that
+      # merely compiled must never mark these stages completed.
+      evaluator_root="${HGB_EVALUATOR_ROOT:-/target}"
+      evaluator_dir="$workspace/evaluation"
+      evaluator_code=0
+      timeout "${HGB_CKG_EVALUATOR_TIMEOUT_SECONDS:-14400}" \
+        python3 /opt/hgb/bin/hgb_harness_evaluator.py \
+          --generator ckgfuzzer \
+          --target-root /target \
+          --evaluator-root "$evaluator_root" \
+          --candidates "$workspace/generated_harnesses" \
+          --work-dir "$evaluator_dir" \
+          --project "$ckg_project" \
+          --fuzz-target "$fuzz_target" \
+          --profile "$ckg_profile" \
+          --campaign-seconds "${HGB_CAMPAIGN_SECONDS:-300}" \
+          --strict \
+          >"$workspace/logs/harness_evaluator.log" 2>&1 || evaluator_code=$?
+      evaluator_result="$evaluator_dir/result.json"
+      if [[ -f "$evaluator_result" ]]; then
+        for stage in sanitizer_smoke api_reachability campaign coverage; do
+          stage_state="$(jq -r --arg s "$stage" '.stages[$s] // "pending"' "$evaluator_result" 2>/dev/null || printf pending)"
+          hgb_result_set_stage "$workspace/stages.json" "$stage" "$stage_state"
+        done
+        evaluator_status="$(jq -r '.status // ""' "$evaluator_result" 2>/dev/null || printf '')"
+        evaluator_execs_done="$(jq -r '.metrics.campaign.execs_done // 0' "$evaluator_result" 2>/dev/null || printf 0)"
+        evaluator_cov_lines="$(jq -r '.metrics.coverage.line_coverage.covered // empty' "$evaluator_result" 2>/dev/null || true)"
+      else
+        for stage in sanitizer_smoke api_reachability campaign coverage; do
+          hgb_result_set_stage "$workspace/stages.json" "$stage" failed
+        done
+        evaluator_status=''
+        evaluator_execs_done=0
+        evaluator_cov_lines=''
+      fi
     fi
   else
     printf '[]\n' >"$workspace/verified_harnesses.json"
   fi
+  # Beta plan §7: status is derived from evaluator output. ``evaluated`` is
+  # only allowed when the evaluator produced a per-candidate JSON, overlaid the
+  # candidate, recorded execs_done > 0, and measured real coverage. A build-only
+  # success is never ``evaluated``.
   status=evaluated
   reason=none
+  if [[ -n "${evaluator_status:-}" ]]; then
+    case "$evaluator_status" in
+      evaluated)
+        if [[ -z "${evaluator_cov_lines:-}" || "${evaluator_execs_done:-0}" -le 0 ]]; then
+          status=quality_failure
+          reason='ckg_evaluator_incomplete: evaluated claimed without coverage or execs_done>0'
+        else
+          status=evaluated
+        fi
+        ;;
+      quality_failure) status=quality_failure; reason='ckg_quality_failure: no candidate passed build/smoke/reachability/campaign/coverage' ;;
+      infra_failure) status=infra_failure; reason='ckg_infra_failure: evaluator tooling failed' ;;
+      compat_smoke_completed) status=compat_smoke_completed; reason='compat-smoke completed (excluded from aggregate)' ;;
+      *) status=quality_failure; reason="ckg_evaluator_status=${evaluator_status}" ;;
+    esac
+  fi
   if [[ "$code" -ne 0 ]]; then
     status=failed
     reason="CKGFuzzer $failed_stage stage exited $code"

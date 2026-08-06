@@ -97,6 +97,23 @@ def find_repo_root(start: Path | None = None) -> Path:
     raise SystemExit("could not locate HarnessGenBench repository root")
 
 
+def _load_docker_common_module(name: str):
+    """Load a docker/common/<name>.py module by path (stdlib-only helper)."""
+    import importlib.util
+
+    root = find_repo_root()
+    path = root / "docker" / "common" / f"{name}.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    if not spec or not spec.loader:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def run(cmd: list[str], cwd: Path | None = None, check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True, capture_output=True, check=check)
 
@@ -1558,7 +1575,43 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     }
     (output / "target_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_summary(output, manifest)
+    _apply_package_split(output, manifest, target, resolved.get("fuzz_target", ""))
     return output
+
+
+def _apply_package_split(output: Path, manifest: dict[str, Any], target: str, fuzz_target: str) -> None:
+    """Create the generator_input/evaluator_only physical split (beta plan §3).
+
+    The monolithic layout is preserved for backwards compatibility; the split
+    is what blind-project generators mount.  ``target_manifest.generator.json``
+    omits every reference-harness field so a blind generator cannot read the
+    exact target harness answer.
+    """
+    if os.environ.get("HGB_TARGET_DISABLE_SPLIT", "0") == "1":
+        return
+    hgb_target_package = _load_docker_common_module("hgb_target_package")
+    if hgb_target_package is None:
+        return
+    native_harness: dict[str, Any] | None = None
+    target_harness_mod = _load_docker_common_module("ckgfuzzer_target_harness")
+    if target_harness_mod is not None:
+        try:
+            harness = target_harness_mod.select_native_harness(output, fuzz_target)
+            native_harness = {
+                "selected_reference": harness.selected_reference,
+                "container_destination": harness.container_destination,
+                "language": harness.language,
+                "source_suffix": harness.source_suffix,
+                "selection_reason": harness.selection_reason,
+            }
+        except Exception:
+            native_harness = None
+    try:
+        hgb_target_package.split_package(output, native_harness=native_harness)
+    except Exception as exc:  # pragma: no cover - split is best-effort at package time
+        (output / "logs" / "split_error.log").write_text(
+            f"target package split failed: {exc}\n", encoding="utf-8"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:

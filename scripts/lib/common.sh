@@ -559,6 +559,19 @@ run_hgb_target_container() {
   if ! hgb_generator_is_blind "$generator"; then
     reference_dir_args+=(-e HGB_TARGET_REFERENCE_DIR=/target/reference_harnesses)
   fi
+  # Beta plan §3: physical split.  In blind-project, mount only
+  # generator_input at /target so the generator cannot read reference_harnesses,
+  # selected_reference, or fuzzbench_selected_harness_apis.json.  The
+  # evaluator-only half is mounted at /evaluator for the independent evaluator.
+  # Old monolithic packages (no generator_input/) fall back to the package root.
+  local target_mount_src="$target_package"
+  local evaluator_mount_args=()
+  if hgb_generator_is_blind "$generator" && [[ -d "$target_package/generator_input" ]]; then
+    target_mount_src="$target_package/generator_input"
+    if [[ -d "$target_package/evaluator_only" ]]; then
+      evaluator_mount_args+=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator)
+    fi
+  fi
   if [[ "$generator" == "elfuzz" ]]; then
     # ELFuzz starts sibling containers. Their bind-mount sources must be visible
     # at the same absolute path to both this container and the host daemon.
@@ -717,6 +730,9 @@ run_hgb_target_container() {
     -e G2FUZZ_USE_DATA \
     -e HGB_BASELINE_PROFILE \
     -e HGB_BASELINE_PROTOCOL \
+    -e HGB_STRICT \
+    -e HGB_CAMPAIGN_SECONDS \
+    -e HGB_EVALUATOR_ROOT \
     -e PROME_FUZZ_SKIP_BAD_DOCS \
     -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
@@ -726,6 +742,7 @@ run_hgb_target_container() {
     -e HGB_TARGET_PACKAGE=/target \
     -e HGB_TARGET_PACKAGE_HOST="$target_package" \
     -e HGB_TARGET_MANIFEST=/target/target_manifest.json \
+    -e HGB_TARGET_GENERATOR_MANIFEST=/target/target_manifest.generator.json \
     -e HGB_TARGET_SOURCE_DIR=/target/source_input \
     -e HGB_TARGET_PROJECT="$project" \
     -e HGB_TARGET_FUZZ_TARGET="$fuzz_target" \
@@ -737,7 +754,8 @@ run_hgb_target_container() {
     -e HGB_HOST_GID="$(id -g)" \
     "${reference_dir_args[@]}" \
     -v "$workspace:/workspace" \
-    -v "$target_package:/target:ro" \
+    -v "$target_mount_src:/target:ro" \
+    "${evaluator_mount_args[@]}" \
     -v "$root/docker/$generator/entrypoint.sh:/opt/hgb/entrypoint.sh:ro" \
     -v "$root/docker/common:/opt/hgb/bin:ro" \
     -v "$root/metadata:/opt/hgb/metadata:ro" \

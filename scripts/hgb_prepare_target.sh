@@ -9,7 +9,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   bash scripts/hgb_prepare_target.sh TARGET
-  bash scripts/hgb_prepare_target.sh --target TARGET [--run-id ID] [--output PATH] [--layout compact|full]
+  bash scripts/hgb_prepare_target.sh --target TARGET [--run-id ID] [--output PATH] [--layout compact|full] [--force]
 EOF
 }
 
@@ -17,6 +17,7 @@ target=""
 run_id=""
 output=""
 layout="compact"
+force=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -35,6 +36,10 @@ while [[ $# -gt 0 ]]; do
     --layout)
       layout="${2:-}"
       shift 2
+      ;;
+    --force)
+      force=1
+      shift
       ;;
     -h|--help)
       usage

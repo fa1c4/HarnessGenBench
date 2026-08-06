@@ -96,7 +96,8 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
 
     # Reproduce Dockerfile COPY build.sh/*.dict/fuzzer sources to $SRC.  These
     # files are needed for build replay, but intentionally not copied to the
-    # analysis source directory so generators do not see the benchmark answer.
+    # distinct synthetic CKG project Docker context so generators do not see
+    # the benchmark answer.
     for child in benchmark.iterdir():
         # A package-only .dockerignore can intentionally hide a synthetic
         # top-level build.sh from native replay. It must not leak into the
@@ -121,8 +122,59 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
         "project_name": project_name,
         "source_input_dir": str(source_input),
         "workdir": workdir,
+        "build_context": "fuzzbench_replay",
     }
     return metadata
+
+
+def validate_codeql_context(
+    *,
+    codeql_database: str,
+    codeql_cli_version: str = "",
+    source_file_count: int = 0,
+    function_count: int = 0,
+    edge_count: int = 0,
+    build_context: str = "fuzzbench_replay",
+) -> dict[str, Any]:
+    """Validate a CodeQL/CKG context and return the codeql_context.json payload.
+
+    Per beta plan §4, alpha/paper-faithful require a real CodeQL database with
+    nonzero source files and nonzero functions. An empty graph is a hard
+    failure (``failed_stage=codeql_context``), not a silent source-only
+    fallback.
+    """
+
+    payload = {
+        "codeql_database": codeql_database,
+        "codeql_cli_version": codeql_cli_version,
+        "source_file_count": int(source_file_count),
+        "function_count": int(function_count),
+        "edge_count": int(edge_count),
+        "build_context": build_context,
+    }
+    if not codeql_database:
+        payload["valid"] = False
+        payload["failed_stage"] = "codeql_context"
+        payload["reason"] = "no CodeQL database was built"
+        return payload
+    if source_file_count <= 0 or function_count <= 0:
+        payload["valid"] = False
+        payload["failed_stage"] = "codeql_context"
+        payload["reason"] = (
+            "alpha/paper-faithful does not allow source-only fallback: "
+            "CodeQL database has zero source files or zero functions"
+        )
+        return payload
+    payload["valid"] = True
+    return payload
+
+
+def write_codeql_context(workspace_root: str | Path, payload: dict[str, Any]) -> Path:
+    """Write workspace/ckg/codeql_context.json and return its path."""
+    path = Path(workspace_root) / "ckg" / "codeql_context.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
 
 
 def main() -> int:
@@ -132,7 +184,30 @@ def main() -> int:
     parser.add_argument("--analysis-dir", required=True)
     parser.add_argument("--project-name", required=True)
     parser.add_argument("--metadata", default="")
+    parser.add_argument("--validate-codeql-context", action="store_true",
+                        help="validate a CodeQL context and write codeql_context.json")
+    parser.add_argument("--codeql-database", default="")
+    parser.add_argument("--codeql-cli-version", default="")
+    parser.add_argument("--source-file-count", type=int, default=0)
+    parser.add_argument("--function-count", type=int, default=0)
+    parser.add_argument("--edge-count", type=int, default=0)
+    parser.add_argument("--build-context", default="fuzzbench_replay")
+    parser.add_argument("--workspace-root", default="")
     args = parser.parse_args()
+
+    if args.validate_codeql_context:
+        payload = validate_codeql_context(
+            codeql_database=args.codeql_database,
+            codeql_cli_version=args.codeql_cli_version,
+            source_file_count=args.source_file_count,
+            function_count=args.function_count,
+            edge_count=args.edge_count,
+            build_context=args.build_context,
+        )
+        if args.workspace_root:
+            write_codeql_context(args.workspace_root, payload)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if payload.get("valid") else 1
 
     metadata = stage_project(
         Path(args.target_root),

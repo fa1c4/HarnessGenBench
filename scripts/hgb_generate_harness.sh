@@ -34,6 +34,8 @@ dry_run=0
 allow_input_generator=0
 target_layout="compact"
 save_mode="compact"
+strict=0
+force=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -68,6 +70,14 @@ while [[ $# -gt 0 ]]; do
     --timeout)
       timeout_seconds="${2:-}"
       shift 2
+      ;;
+    --strict)
+      strict=1
+      shift
+      ;;
+    --force)
+      force=1
+      shift
       ;;
     --allow-input-generator|--allow-input-generators)
       printf 'WARNING: --allow-input-generator is a deprecated no-op; input-generator baselines run from metadata/baseline_contracts.yaml.\n' >&2
@@ -118,7 +128,9 @@ ensure_artifacts_present "$root" "${artifacts[@]}"
 
 run_id="${run_id:-$(make_timestamp)}"
 if [[ -z "$target_package" ]]; then
-  target_package="$(bash "$SCRIPT_DIR/hgb_prepare_target.sh" --target "$target" --run-id "$run_id" --layout "$target_layout")"
+  prepare_args=(--target "$target" --run-id "$run_id" --layout "$target_layout")
+  [[ "$force" == "1" ]] && prepare_args+=(--force)
+  target_package="$(bash "$SCRIPT_DIR/hgb_prepare_target.sh" "${prepare_args[@]}")"
 fi
 target_package="$(cd "$target_package" && pwd)"
 manifest="$target_package/target_manifest.json"
@@ -179,6 +191,8 @@ else
   export HGB_ALLOW_INPUT_GENERATOR_TO_RUN="$allow_input_generator"
 fi
 export HGB_SAVE_MODE="$save_mode"
+export HGB_STRICT="$strict"
+export HGB_CAMPAIGN_SECONDS="${HGB_CAMPAIGN_SECONDS:-300}"
 
 code=0
 run_hgb_target_container "$image" "$workspace" "$generator" "$target" "$target_package" "$project" "$fuzz_target" || code=$?

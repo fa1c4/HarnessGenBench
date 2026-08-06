@@ -70,15 +70,30 @@ baselines:
     default_profile: alpha
     default_protocol: blind-project
     strict_success_status: evaluated
+    allowed_statuses: [evaluated, quality_failure, infra_failure, not_applicable, compat_smoke_completed]
     notes: >
       CKGFuzzer is a harness generator. alpha and paper-faithful require a real
-      CodeQL database, a real embedding service, upstream LLM API summaries, the
-      upstream API-combination planner, and the upstream compilation-check/repair
-      loop. Mock/hash embeddings, local deterministic API summaries, local
+      CodeQL database built from the exact FuzzBench target build context, a
+      real embedding service, upstream LLM API summaries, the upstream
+      API-combination planner, and the upstream compilation-check/repair loop.
+      Mock/hash embeddings, local deterministic API summaries, local
       deterministic API combinations, source-only graph fallback, and
       --skip_check_compilation are forbidden in alpha and paper-faithful. A
-      failed or empty CodeQL graph is a failed run, not a successful source
-      fallback. compat-smoke may retain deterministic/mock fallbacks but must set
+      failed or empty CodeQL graph is a hard failure
+      (failed_stage=codeql_context), not a successful source fallback. The
+      target package is physically split into generator_input (mounted at
+      /target for the blind generator, with no reference-harness fields in its
+      manifest) and evaluator_only (mounted at /evaluator for the independent
+      harness evaluator). The harness evaluator overlays each candidate at the
+      exact native FuzzBench harness path, runs sanitizer smoke, API
+      reachability, a fixed-budget libFuzzer campaign (execs_done > 0), and
+      real LLVM source-based coverage; a candidate that merely compiles never
+      marks campaign or coverage completed. status=evaluated requires a real
+      overlay, per-candidate evaluator JSON, execs_done > 0, and a real
+      coverage report. quality_failure means generation ran but no candidate
+      passed the full loop; infra_failure means tooling failed. compat-smoke
+      may retain deterministic/mock fallbacks but must set
       excluded_from_aggregate=true and is never selected by default. Exact
       FuzzBench reference harnesses are evaluator-only and must never reach the
-      generator in blind-project.
+      generator in blind-project. Only status=evaluated counts as a successful
+      alpha matrix row.

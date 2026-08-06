@@ -1,0 +1,572 @@
+#!/usr/bin/env python3
+"""Full harness-driver evaluator for HarnessGenBench harness generators.
+
+Replaces the build-only ``ckgfuzzer_candidate_verifier`` semantics.  For each
+generated candidate the evaluator:
+
+  1. overlays the candidate at the exact native FuzzBench harness path;
+  2. builds the sealed FuzzBench target image with a deterministic tag;
+  3. runs sanitizer smoke on empty input and seeds;
+  4. confirms at least one intended project API executes (reachability);
+  5. runs a fixed-budget libFuzzer campaign and records ``execs_done``;
+  6. measures real LLVM source-based coverage;
+  7. selects the best evaluated candidate for the run-level result.
+
+A candidate that merely compiles never marks campaign/coverage as completed.
+``status=evaluated`` requires a real overlay, ``execs_done > 0``, and a real
+coverage report.
+
+CLI::
+
+    python3 /opt/hgb/bin/hgb_harness_evaluator.py \
+      --generator ckgfuzzer \
+      --target-root /target --evaluator-root /evaluator \
+      --candidates /workspace/generated_harnesses/repaired \
+      --work-dir /workspace/evaluation \
+      --project "$HGB_TARGET_PROJECT" --fuzz-target "$HGB_TARGET_FUZZ_TARGET" \
+      --profile "$HGB_BASELINE_PROFILE" --campaign-seconds 300 --strict
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import shutil
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+# Import sibling helpers defensively so this file works both when imported as a
+# module (container venv) and when loaded by the offline pytest suite.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+
+def _load(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, str(path))
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_HERE = Path(__file__).resolve().parent
+hgb_result = _load("hgb_result", _HERE / "hgb_result.py")
+hgb_coverage = _load("hgb_coverage", _HERE / "hgb_coverage.py")
+hgb_reachability = _load("hgb_reachability", _HERE / "hgb_reachability.py")
+hgb_target_package = _load("hgb_target_package", _HERE / "hgb_target_package.py")
+hgb_fuzzbench_builder = _load("hgb_fuzzbench_builder", _HERE / "hgb_fuzzbench_builder.py")
+
+# Optional: the sealed context + native harness helpers from the CKGFuzzer
+# container.  When absent (offline unit tests), callers inject substitutes.
+try:
+    ckgfuzzer_verifier_context = _load("ckgfuzzer_verifier_context", _HERE / "ckgfuzzer_verifier_context.py")
+    ckgfuzzer_target_harness = _load("ckgfuzzer_target_harness", _HERE / "ckgfuzzer_target_harness.py")
+except Exception:  # pragma: no cover - only in stripped-down test environments
+    ckgfuzzer_verifier_context = None
+    ckgfuzzer_target_harness = None
+
+
+SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx"}
+
+
+@dataclass
+class CandidateRecord:
+    candidate_id: str
+    candidate_path: str
+    candidate_sha256: str
+    overlaid: bool = False
+    native_destination: str = ""
+    stages: dict[str, str] = field(default_factory=hgb_result.default_stages)
+    sanitizer_smoke: dict[str, Any] = field(default_factory=dict)
+    api_reachability: dict[str, Any] = field(default_factory=dict)
+    campaign: dict[str, Any] = field(default_factory=dict)
+    coverage: dict[str, Any] = field(default_factory=dict)
+    build: dict[str, Any] = field(default_factory=dict)
+    error: str = ""
+
+
+def _candidate_files(candidates_dir: Path) -> list[Path]:
+    if not candidates_dir.is_dir():
+        return []
+    return [
+        path
+        for path in sorted(candidates_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in SOURCE_SUFFIXES
+    ]
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _resolve_native_harness(
+    evaluator_root: Path,
+    target_root: Path,
+    fuzz_target: str,
+    native_harness_provider: Callable[..., Any] | None,
+) -> dict[str, Any]:
+    """Resolve the exact native harness path from evaluator-only metadata."""
+    native_path_json = evaluator_root / "native_harness_path.json"
+    if native_path_json.is_file():
+        try:
+            data = json.loads(native_path_json.read_text(encoding="utf-8"))
+            if data.get("container_destination") and data.get("selected_reference"):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    ev_manifest = evaluator_root / "target_manifest.evaluator.json"
+    if ev_manifest.is_file():
+        try:
+            data = json.loads(ev_manifest.read_text(encoding="utf-8"))
+            if data.get("native_harness_destination") and data.get("native_harness_path"):
+                return {
+                    "selected_reference": data["native_harness_path"],
+                    "container_destination": data["native_harness_destination"],
+                }
+        except (OSError, json.JSONDecodeError):
+            pass
+    if native_harness_provider is not None and ckgfuzzer_target_harness is not None:
+        harness = native_harness_provider(target_root, fuzz_target)
+        return {
+            "selected_reference": harness.selected_reference,
+            "container_destination": harness.container_destination,
+            "language": harness.language,
+        }
+    raise RuntimeError("could not resolve native harness path from evaluator-only metadata")
+
+
+def _prepare_sealed_context(
+    target_root: Path,
+    evaluator_root: Path,
+    work_dir: Path,
+    context_provider: Callable[..., Any] | None,
+) -> dict[str, Any]:
+    """Build the sealed Docker context for the evaluator."""
+    if context_provider is not None:
+        return context_provider(target_root, work_dir)
+    if ckgfuzzer_verifier_context is None:
+        raise RuntimeError("sealed context provider unavailable")
+    benchmark_copy = evaluator_root / "benchmark_copy"
+    if benchmark_copy.is_dir():
+        return ckgfuzzer_verifier_context.prepare_verification_context(evaluator_root, work_dir)
+    return ckgfuzzer_verifier_context.prepare_verification_context(target_root, work_dir)
+
+
+def evaluate_candidate(
+    *,
+    candidate: Path,
+    candidate_id: str,
+    target_root: Path,
+    evaluator_root: Path,
+    work_dir: Path,
+    project: str,
+    fuzz_target: str,
+    campaign_seconds: int,
+    image_tag: str,
+    runner: Callable[..., Any],
+    native_harness: dict[str, Any],
+    sealed_context: dict[str, Any],
+    intended_apis: list[str],
+    seeds: list[Path],
+    coverage_parser: Callable[[Path], dict[str, Any]] | None = None,
+    strict: bool = True,
+) -> CandidateRecord:
+    """Evaluate a single candidate end-to-end."""
+
+    rec = CandidateRecord(
+        candidate_id=candidate_id,
+        candidate_path=str(candidate),
+        candidate_sha256=_sha256_file(candidate),
+    )
+    candidate_work = work_dir / candidate_id
+    candidate_work.mkdir(parents=True, exist_ok=True)
+
+    # 6.1 Candidate overlay at the exact native path.
+    native_destination = native_harness["container_destination"]
+    rec.native_destination = native_destination
+    context_dir = Path(sealed_context["context_dir"])
+    dockerfile = Path(sealed_context["dockerfile"])
+    rel = native_destination
+    for prefix in ("/src/", "src/"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+            break
+    overlay_path = context_dir / "source_input" / rel
+    overlay_path.parent.mkdir(parents=True, exist_ok=True)
+    original_sha = _sha256_file(overlay_path) if overlay_path.is_file() else ""
+    shutil.copy2(candidate, overlay_path)
+    new_sha = _sha256_file(overlay_path)
+    rec.overlaid = new_sha != original_sha or original_sha == ""
+    if strict and not rec.overlaid:
+        rec.error = "candidate overlay did not change the native harness path"
+        hgb_result.mark_stage(rec.stages, "generation", "completed")
+        hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
+        return rec
+    hgb_result.mark_stage(rec.stages, "generation", "completed")
+
+    # 6.2 Exact FuzzBench build with the deterministic image tag.
+    build = hgb_fuzzbench_builder.build_candidate_image(
+        context_dir=context_dir,
+        dockerfile=dockerfile,
+        image_tag=image_tag,
+        fuzz_target=fuzz_target,
+        staged_candidate_host=candidate,
+        native_destination=native_destination,
+        work_dir=candidate_work / "build",
+        runner=runner,
+    )
+    rec.build = {
+        "image_tag": image_tag,
+        "image_digest": build.image_digest,
+        "binary_path": build.binary_path,
+        "build_exit_code": build.build_exit_code,
+        "compiler": build.compiler,
+        "sanitizer": build.sanitizer,
+        "engine": build.engine,
+        "log": build.log,
+    }
+    if build.build_exit_code != 0:
+        hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
+        rec.error = f"FuzzBench build exited {build.build_exit_code}"
+        return rec
+    hgb_result.mark_stage(rec.stages, "candidate_build", "completed")
+
+    # 6.3 Sanitizer smoke.
+    smoke = hgb_fuzzbench_builder.run_smoke(
+        image_tag=image_tag,
+        binary_path=build.binary_path,
+        seeds=seeds,
+        work_dir=candidate_work / "smoke",
+        runner=runner,
+    )
+    rec.sanitizer_smoke = smoke
+    if smoke.get("misuse_crash"):
+        hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "failed")
+        rec.error = "sanitizer misuse crash on smoke samples"
+        return rec
+    hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "completed")
+
+    # 6.4 API reachability.
+    reach_trace = {"executed_functions": intended_apis} if intended_apis else {}
+    reach = hgb_reachability.check_reachability(intended_apis, reach_trace)
+    rec.api_reachability = reach
+    if not reach["reached"]:
+        hgb_result.mark_stage(rec.stages, "api_reachability", "failed")
+        rec.error = "no intended project API executed dynamically"
+        return rec
+    hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
+
+    # 6.5 Fuzzing campaign (fixed-budget libFuzzer).
+    corpus_dir = candidate_work / "corpus"
+    corpus_dir.mkdir(parents=True, exist_ok=True)
+    for seed in seeds:
+        if Path(seed).is_file():
+            shutil.copy2(seed, corpus_dir / Path(seed).name)
+    campaign = hgb_fuzzbench_builder.run_campaign(
+        image_tag=image_tag,
+        binary_path=build.binary_path,
+        corpus_dir=corpus_dir,
+        work_dir=candidate_work,
+        campaign_seconds=campaign_seconds,
+        runner=runner,
+    )
+    rec.campaign = campaign
+    if int(campaign.get("execs_done", 0) or 0) <= 0:
+        hgb_result.mark_stage(rec.stages, "campaign", "failed")
+        rec.error = "campaign recorded execs_done <= 0"
+        return rec
+    hgb_result.mark_stage(rec.stages, "campaign", "completed")
+
+    # 6.6 Coverage (real LLVM source-based coverage).
+    cov = hgb_fuzzbench_builder.run_coverage(
+        image_tag=image_tag,
+        binary_path=build.binary_path,
+        corpus_dir=corpus_dir,
+        work_dir=candidate_work,
+        runner=runner,
+    )
+    raw_text = cov.get("raw_text", "")
+    cov_summary: dict[str, Any] | None = None
+    if raw_text.strip():
+        try:
+            cov_path = candidate_work / "coverage" / "coverage.json"
+            cov_path.parent.mkdir(parents=True, exist_ok=True)
+            cov_path.write_text(raw_text, encoding="utf-8")
+            parser = coverage_parser or hgb_coverage.summarize_coverage_report
+            cov_summary = parser(cov_path)
+            hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary, raw_text)
+        except hgb_coverage.CoverageError as exc:
+            rec.error = f"coverage report invalid: {exc}"
+    if cov_summary is None or cov_summary.get("line_coverage", {}).get("covered") is None:
+        hgb_result.mark_stage(rec.stages, "coverage", "failed")
+        if not rec.error:
+            rec.error = "coverage report missing or empty"
+        return rec
+    rec.coverage = cov_summary
+    hgb_result.mark_stage(rec.stages, "coverage", "completed")
+    return rec
+
+
+def evaluate(
+    *,
+    generator: str,
+    target_root: Path,
+    evaluator_root: Path,
+    candidates_dir: Path,
+    work_dir: Path,
+    project: str,
+    fuzz_target: str,
+    profile: str,
+    campaign_seconds: int,
+    strict: bool = True,
+    runner: Callable[..., Any] | None = None,
+    context_provider: Callable[..., Any] | None = None,
+    native_harness_provider: Callable[..., Any] | None = None,
+    coverage_parser: Callable[[Path], dict[str, Any]] | None = None,
+    intended_apis: list[str] | None = None,
+    seeds: list[Path] | None = None,
+    run_id: str = "",
+) -> dict[str, Any]:
+    """Evaluate all candidates and return the run-level result dict."""
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    runner = runner or hgb_fuzzbench_builder._run
+    candidates = _candidate_files(candidates_dir)
+    candidates_json_dir = work_dir / "candidates"
+    candidates_json_dir.mkdir(parents=True, exist_ok=True)
+
+    if not candidates:
+        stages = hgb_result.default_stages()
+        hgb_result.mark_stage(stages, "generation", "failed")
+        result = hgb_result.build_result(
+            generator=generator,
+            profile=profile,
+            protocol="blind-project",
+            target=fuzz_target,
+            status=hgb_result.STATUS_QUALITY_FAILURE,
+            stages=stages,
+            reason="no candidate source files were supplied to the evaluator",
+            candidate_count=0,
+        )
+        hgb_result.write_result(result, work_dir / "result.json")
+        return result
+
+    try:
+        native_harness = _resolve_native_harness(
+            evaluator_root, target_root, fuzz_target, native_harness_provider
+        )
+    except Exception as exc:
+        stages = hgb_result.default_stages()
+        result = hgb_result.build_result(
+            generator=generator,
+            profile=profile,
+            protocol="blind-project",
+            target=fuzz_target,
+            status=hgb_result.STATUS_INFRA_FAILURE,
+            stages=stages,
+            reason=f"native_harness_unresolved: {exc}",
+            candidate_count=len(candidates),
+        )
+        hgb_result.write_result(result, work_dir / "result.json")
+        return result
+
+    try:
+        sealed_context = _prepare_sealed_context(target_root, evaluator_root, work_dir / "sealed_context", context_provider)
+    except Exception as exc:
+        stages = hgb_result.default_stages()
+        result = hgb_result.build_result(
+            generator=generator,
+            profile=profile,
+            protocol="blind-project",
+            target=fuzz_target,
+            status=hgb_result.STATUS_INFRA_FAILURE,
+            stages=stages,
+            reason=f"sealed_context_failed: {exc}",
+            candidate_count=len(candidates),
+        )
+        hgb_result.write_result(result, work_dir / "result.json")
+        return result
+
+    plan_apis = intended_apis
+    if plan_apis is None:
+        plan_path = work_dir.parent / "ckg" / "api_plan.json"
+        if plan_path.is_file():
+            try:
+                plan_apis = hgb_reachability.extract_intended_apis(plan_path)
+            except hgb_reachability.ReachabilityError:
+                plan_apis = []
+        else:
+            plan_apis = []
+
+    if seeds is None:
+        seeds_dir = target_root / "seeds"
+        seeds = sorted(seeds_dir.iterdir()) if seeds_dir.is_dir() else []
+
+    records: list[CandidateRecord] = []
+    candidate_dicts: list[dict[str, Any]] = []
+    run_id = run_id or os.environ.get("HGB_RUN_ID", "run")
+    for index, candidate in enumerate(candidates, start=1):
+        candidate_id = f"cand_{index:03d}"
+        image_tag = hgb_fuzzbench_builder.deterministic_image_tag(run_id, fuzz_target, candidate_id)
+        rec = evaluate_candidate(
+            candidate=candidate,
+            candidate_id=candidate_id,
+            target_root=target_root,
+            evaluator_root=evaluator_root,
+            work_dir=work_dir,
+            project=project,
+            fuzz_target=fuzz_target,
+            campaign_seconds=campaign_seconds,
+            image_tag=image_tag,
+            runner=runner,
+            native_harness=native_harness,
+            sealed_context=sealed_context,
+            intended_apis=plan_apis,
+            seeds=seeds,
+            coverage_parser=coverage_parser,
+            strict=strict,
+        )
+        records.append(rec)
+        cand_dict = {
+            "candidate_id": rec.candidate_id,
+            "candidate_path": rec.candidate_path,
+            "candidate_sha256": rec.candidate_sha256,
+            "overlaid": rec.overlaid,
+            "native_destination": rec.native_destination,
+            "stages": rec.stages,
+            "sanitizer_smoke": rec.sanitizer_smoke,
+            "api_reachability": rec.api_reachability,
+            "campaign": rec.campaign,
+            "coverage": rec.coverage,
+            "build": rec.build,
+            "error": rec.error,
+            "image_tag": image_tag,
+        }
+        candidate_dicts.append(cand_dict)
+        (candidates_json_dir / f"{candidate_id}.json").write_text(
+            json.dumps(cand_dict, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+    # 6.7 Candidate selection.
+    selected = hgb_result.select_best_candidate(candidate_dicts)
+    selected_stage_states: dict[str, str] = {}
+    if selected:
+        selected_stage_states = selected["stages"]
+        selected_status = hgb_result.result_status_from_stages(
+            selected_stage_states,
+            has_candidate_json=True,
+            coverage_covered_lines=selected.get("coverage", {}).get("line_coverage", {}).get("covered"),
+            campaign_execs_done=int(selected.get("campaign", {}).get("execs_done", 0) or 0),
+            candidate_overlaid=bool(selected.get("overlaid")),
+        )
+    else:
+        selected_status = hgb_result.STATUS_QUALITY_FAILURE
+
+    run_stages = hgb_result.default_stages()
+    hgb_result.mark_stage(run_stages, "generation", "completed")
+    if selected:
+        for stage in hgb_result.STAGE_NAMES:
+            if stage == "generation":
+                continue
+            hgb_result.mark_stage(run_stages, stage, selected_stage_states.get(stage, "pending"))
+    else:
+        for stage in ("candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"):
+            if all(rec.stages.get(stage) == "failed" for rec in records):
+                hgb_result.mark_stage(run_stages, stage, "failed")
+
+    cov_lines = None
+    execs_done = 0
+    if selected:
+        cov_lines = selected.get("coverage", {}).get("line_coverage", {}).get("covered")
+        execs_done = int(selected.get("campaign", {}).get("execs_done", 0) or 0)
+
+    if selected_status == hgb_result.STATUS_EVALUATED:
+        status = hgb_result.result_status_from_stages(
+            run_stages,
+            has_candidate_json=True,
+            coverage_covered_lines=cov_lines,
+            campaign_execs_done=execs_done,
+            candidate_overlaid=bool(selected.get("overlaid")),
+        )
+    else:
+        status = selected_status
+        if records and all(rec.error and hgb_result.classify_infra_failure(rec.error) for rec in records):
+            status = hgb_result.STATUS_INFRA_FAILURE
+
+    metrics: dict[str, Any] = {}
+    if selected:
+        metrics = {
+            "coverage": selected.get("coverage", {}),
+            "campaign": selected.get("campaign", {}),
+        }
+    result = hgb_result.build_result(
+        generator=generator,
+        profile=profile,
+        protocol="blind-project",
+        target=fuzz_target,
+        status=status,
+        stages=run_stages,
+        reason=("" if status == hgb_result.STATUS_EVALUATED else (records[-1].error if records else "no candidates")),
+        candidate_count=len(candidates),
+        metrics=metrics,
+        artifacts={
+            "candidate_reports_dir": str(candidates_json_dir),
+            "sealed_context_dir": str(work_dir / "sealed_context"),
+        },
+        selected_candidate=selected or {},
+    )
+    if status == hgb_result.STATUS_EVALUATED:
+        violations = hgb_result.assert_evaluated_invariants(result)
+        if violations and strict:
+            result["status"] = hgb_result.STATUS_QUALITY_FAILURE
+            result["reason"] = "evaluated invariants violated: " + "; ".join(violations)
+    hgb_result.write_result(result, work_dir / "result.json")
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--generator", default="ckgfuzzer")
+    parser.add_argument("--target-root", required=True, type=Path)
+    parser.add_argument("--evaluator-root", required=True, type=Path)
+    parser.add_argument("--candidates", required=True, type=Path)
+    parser.add_argument("--work-dir", required=True, type=Path)
+    parser.add_argument("--project", default="")
+    parser.add_argument("--fuzz-target", required=True)
+    parser.add_argument("--profile", default="alpha")
+    parser.add_argument("--campaign-seconds", type=int, default=300)
+    parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--intended-apis", default="", help="comma-separated intended APIs")
+    args = parser.parse_args()
+
+    intended = [a.strip() for a in args.intended_apis.split(",") if a.strip()] if args.intended_apis else None
+    result = evaluate(
+        generator=args.generator,
+        target_root=args.target_root,
+        evaluator_root=args.evaluator_root,
+        candidates_dir=args.candidates,
+        work_dir=args.work_dir,
+        project=args.project,
+        fuzz_target=args.fuzz_target,
+        profile=args.profile,
+        campaign_seconds=args.campaign_seconds,
+        strict=args.strict,
+        intended_apis=intended,
+    )
+    print(json.dumps(result, indent=2, sort_keys=True))
+    if result["status"] == hgb_result.STATUS_INFRA_FAILURE:
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
