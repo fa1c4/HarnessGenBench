@@ -348,6 +348,10 @@ def collect(matrix_dir: Path, *, strict: bool = False) -> dict[str, Any]:
     remediation_counts: collections.Counter[str] = collections.Counter()
     api_trace_total_count = 0
     api_trace_sample_count = 0
+    applicable_evaluated = 0
+    applicable_quality_failure = 0
+    applicable_infra_failure = 0
+    coverage_by_applicable_evaluated: list[dict[str, Any]] = []
     for record in records:
         meta = record["metadata"]
         gen = meta.get("generator") or meta.get("fuzzer") or record["row"].get("generator") or "unknown"
@@ -369,6 +373,21 @@ def collect(matrix_dir: Path, *, strict: bool = False) -> dict[str, Any]:
             reasons[reason_s] += 1
             if status_s not in COMPLETED_STATUSES:
                 remediation_counts[remediation_for(status_s, reason_s)] += 1
+        # Applicable-row breakdown: Invalid (not_applicable) rows are excluded
+        # from the success/failure denominator and from coverage aggregates.
+        if status_s not in NOT_APPLICABLE_STATUSES and not bool(meta.get("excluded_from_aggregate")) and str(meta.get("applicability", "")) != "Invalid":
+            if status_s == "evaluated":
+                applicable_evaluated += 1
+                cov = meta.get("coverage") or {}
+                if isinstance(cov, dict) and cov:
+                    coverage_by_applicable_evaluated.append(
+                        {"target": meta.get("target", ""), "generator": gen, "coverage": cov}
+                    )
+            elif status_s == "quality_failure":
+                applicable_quality_failure += 1
+            elif status_s == "infra_failure":
+                applicable_infra_failure += 1
+    applicable_pairs = len(aggregate_records) - not_applicable
     return {
         "matrix_dir": str(matrix_dir),
         "total_pairs": total,
@@ -379,6 +398,11 @@ def collect(matrix_dir: Path, *, strict: bool = False) -> dict[str, Any]:
         "partial_completed_pairs": partial_completed,
         "soft_skipped_pairs": soft_skipped,
         "not_applicable_pairs": not_applicable,
+        "applicable_pairs": applicable_pairs,
+        "applicable_evaluated_pairs": applicable_evaluated,
+        "applicable_quality_failure_pairs": applicable_quality_failure,
+        "applicable_infra_failure_pairs": applicable_infra_failure,
+        "coverage_by_applicable_evaluated": coverage_by_applicable_evaluated,
         "missing_api_key_count": missing_api_key,
         "statuses": dict(statuses),
         "aggregate_statuses": dict(agg_statuses),

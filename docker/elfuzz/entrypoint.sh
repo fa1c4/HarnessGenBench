@@ -117,6 +117,9 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
+  export ELFUZZ_EVOLUTION_SECONDS="${ELFUZZ_EVOLUTION_SECONDS:-1800}"
+  export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-0}"
+  export ELFUZZ_SANITIZER="${ELFUZZ_SANITIZER:-address}"
   mkdir -p "$workspace/logs"
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"

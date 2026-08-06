@@ -1,0 +1,13 @@
+target: php_php-fuzz-parser_0dbedb
+adapter_id: php_parser
+adapter_class: extension
+hgb_adapter: true
+build_mode: fuzzbench_native
+input_mode: file
+argv: ["@@"]
+format: PHP source
+format_spec: format.md
+seed_fuzzer: seed_fuzzer.py
+validity_check: php
+upstream_benchmark: php
+timeout_seconds: 5

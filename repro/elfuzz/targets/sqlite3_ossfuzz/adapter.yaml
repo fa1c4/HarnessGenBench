@@ -1,0 +1,12 @@
+target: sqlite3_ossfuzz
+adapter_id: sqlite3
+adapter_class: upstream-native
+build_mode: fuzzbench_native
+input_mode: file
+argv: ["@@"]
+format: SQL
+format_spec: format.md
+seed_fuzzer: seed_fuzzer.py
+validity_check: sql
+upstream_benchmark: sqlite3
+timeout_seconds: 5

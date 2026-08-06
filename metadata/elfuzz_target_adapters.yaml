@@ -12,8 +12,9 @@ targets:
   - target: curl_curl_fuzzer_http
     applicability: applicable
     input_kind: text
-    upstream_benchmark: jsoncpp
+    upstream_benchmark: curl
     adapter_class: extension
+    hgb_adapter: true
     adapter_id: curl_http
     build_mode: fuzzbench_native
     input_mode: file
@@ -57,8 +58,9 @@ targets:
   - target: libxslt_xpath
     applicability: applicable
     input_kind: text
-    upstream_benchmark: libxml2
+    upstream_benchmark: libxslt
     adapter_class: extension
+    hgb_adapter: true
     adapter_id: libxslt_xpath
     build_mode: fuzzbench_native
     input_mode: file
@@ -72,8 +74,9 @@ targets:
   - target: mruby_mruby_fuzzer_8c8bbd
     applicability: applicable
     input_kind: text
-    upstream_benchmark: jsoncpp
+    upstream_benchmark: mruby
     adapter_class: extension
+    hgb_adapter: true
     adapter_id: mruby
     build_mode: fuzzbench_native
     input_mode: file
@@ -87,8 +90,9 @@ targets:
   - target: php_php-fuzz-parser_0dbedb
     applicability: applicable
     input_kind: text
-    upstream_benchmark: jsoncpp
+    upstream_benchmark: php
     adapter_class: extension
+    hgb_adapter: true
     adapter_id: php_parser
     build_mode: fuzzbench_native
     input_mode: file
@@ -132,8 +136,9 @@ targets:
   - target: systemd_fuzz-link-parser
     applicability: applicable
     input_kind: text
-    upstream_benchmark: jsoncpp
+    upstream_benchmark: systemd
     adapter_class: extension
+    hgb_adapter: true
     adapter_id: systemd_link
     build_mode: fuzzbench_native
     input_mode: file

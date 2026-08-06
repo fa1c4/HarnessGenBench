@@ -1,0 +1,13 @@
+target: mruby_mruby_fuzzer_8c8bbd
+adapter_id: mruby
+adapter_class: extension
+hgb_adapter: true
+build_mode: fuzzbench_native
+input_mode: file
+argv: ["@@"]
+format: Ruby source
+format_spec: format.md
+seed_fuzzer: seed_fuzzer.py
+validity_check: ruby
+upstream_benchmark: mruby
+timeout_seconds: 5

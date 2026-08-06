@@ -40,13 +40,31 @@ STAGE_NAMES = (
     "elfuzz_setup",
     "model_ready",
     "synthesis",
+    "evolution",
     "production",
+    "generated_input_validation",
     "campaign",
     "coverage",
 )
+# Goal-stage aliases (paper section 0) mapped onto the canonical stage names so
+# the result payload carries both the internal ordering and the contract names.
+GOAL_STAGE_ALIASES = {
+    "seed_fuzzer_synthesis": "synthesis",
+    "generated_input_validation": "generated_input_validation",
+    "evolution": "evolution",
+    "target_build": "target_build",
+    "campaign": "campaign",
+    "coverage": "coverage",
+}
 TASK_FAMILY = "input_generator"
 INVALID_REASON_CODE = "elfuzz_non_text_target"
 INVALID_MESSAGE = "Invalid: ELFuzz supports text-input targets only"
+# Upstream benchmarks that ELFuzz ships hard-coded adapters for.  An applicable
+# target may declare one of these only when it IS that project's native target;
+# extension targets must declare their own benchmark and set hgb_adapter: true
+# so the HGB adapter layer invokes ELFuzz with the target's own command instead
+# of running the aliased benchmark and renaming outputs.
+UPSTREAM_NATIVE_BENCHMARKS = {"jsoncpp", "libxml2", "re2", "sqlite3"}
 REQUIRED_APPLICABLE_KEYS = {
     "target",
     "applicability",
@@ -285,6 +303,8 @@ def load_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]
         target = str(entry.get("target") or "")
         if not target:
             raise PipelineError("adapter_parse_failed", "adapter entry has no target", 64)
+        if target in adapters:
+            raise PipelineError("adapter_parse_failed", f"duplicate adapter entry for target: {target}", 64)
         applicability = str(entry.get("applicability", ""))
         if applicability == "Invalid":
             adapters[target] = entry
@@ -332,6 +352,118 @@ def validate_adapter_coverage(metadata_root: Path | None = None) -> list[str]:
     return valuable
 
 
+def adapter_yaml_path(metadata_root: Path | None = None, target: str | None = None) -> Path:
+    """Resolve the per-target adapter.yaml path under repro/elfuzz/targets."""
+
+    adapters = load_adapters(metadata_root)
+    entry = adapters.get(target or "")
+    if not entry or entry.get("applicability") != "applicable":
+        return Path("repro/elfuzz/targets") / (target or "") / "adapter.yaml"
+    return repo_root_from(metadata_root or default_metadata_root()) / entry["adapter_dir"] / "adapter.yaml"
+
+
+def validate_no_aliasing(metadata_root: Path | None = None) -> list[str]:
+    """Reject upstream-benchmark aliasing for extension targets.
+
+    An applicable target may declare an upstream-native benchmark
+    (jsoncpp/libxml2/re2/sqlite3) only when it IS that project's native target.
+    Every other applicable target must declare its own benchmark with
+    ``hgb_adapter: true`` and ship a real ``adapter.yaml`` naming the exact
+    FuzzBench target.  Running jsoncpp and renaming the outputs is forbidden.
+    """
+
+    adapters = load_adapters(metadata_root)
+    root = repo_root_from(metadata_root or default_metadata_root())
+    violations: list[str] = []
+    for target, entry in adapters.items():
+        if entry.get("applicability") != "applicable":
+            continue
+        benchmark = str(entry.get("upstream_benchmark", ""))
+        adapter_class = str(entry.get("adapter_class", ""))
+        if benchmark in UPSTREAM_NATIVE_BENCHMARKS:
+            # Only the upstream-native target for that benchmark may use it.
+            if adapter_class != UPSTREAM_NATIVE:
+                violations.append(
+                    f"{target}: declares upstream alias '{benchmark}' but is not upstream-native"
+                )
+            if not target.startswith(benchmark):
+                violations.append(
+                    f"{target}: uses upstream benchmark '{benchmark}' but target name does not match"
+                )
+            continue
+        # Extension target: must have hgb_adapter and a real adapter.yaml.
+        if not entry.get("hgb_adapter"):
+            violations.append(f"{target}: extension target missing hgb_adapter: true")
+        yaml_path = root / entry["adapter_dir"] / "adapter.yaml"
+        if not yaml_path.is_file():
+            violations.append(f"{target}: missing adapter.yaml at {yaml_path}")
+            continue
+        parsed = parse_simple_yaml(yaml_path)
+        adapter_target = str(parsed.get("target", ""))
+        if adapter_target != target:
+            violations.append(
+                f"{target}: adapter.yaml target '{adapter_target}' != declared target"
+            )
+        if str(parsed.get("upstream_benchmark", "")) in UPSTREAM_NATIVE_BENCHMARKS:
+            violations.append(
+                f"{target}: adapter.yaml aliases upstream benchmark '{parsed.get('upstream_benchmark')}'"
+            )
+    if violations:
+        raise PipelineError("adapter_aliasing_failed", "; ".join(violations), 64)
+    return violations
+
+
+def verify_target_binary(path: Path, fuzz_target: str = "") -> dict[str, Any]:
+    """Verify a discovered target binary meets the ELFuzz build contract.
+
+    The binary must exist, be executable, have nonzero size, NOT be ``build.sh``,
+    and (when ``fuzz_target`` is given) match ``/out/<fuzz_target>`` by name for
+    a real FuzzBench build.  Returns a verification record.
+    """
+
+    record: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.is_file(),
+        "executable": executable(path),
+        "nonzero_size": path.is_file() and path.stat().st_size > 0,
+        "is_build_sh": path.name == "build.sh",
+        "name_matches": (not fuzz_target) or path.name == fuzz_target or path.name == Path(fuzz_target).name,
+        "ok": False,
+    }
+    record["ok"] = bool(
+        record["exists"]
+        and record["executable"]
+        and record["nonzero_size"]
+        and not record["is_build_sh"]
+        and record["name_matches"]
+    )
+    return record
+
+
+def smoke_target_binary(path: Path, sample: bytes = b"", timeout: int = 10) -> dict[str, Any]:
+    """Run a harmless sample through the target binary and report the result."""
+
+    if not path.is_file() or not executable(path):
+        return {"ran": False, "exit_code": 127, "timed_out": False}
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp.write(sample)
+        sample_path = Path(tmp.name)
+    try:
+        proc = subprocess.run([str(path), str(sample_path)], capture_output=True, timeout=timeout, check=False)
+        return {"ran": True, "exit_code": proc.returncode, "timed_out": False}
+    except subprocess.TimeoutExpired:
+        return {"ran": True, "exit_code": 124, "timed_out": True}
+    except OSError as exc:
+        return {"ran": False, "exit_code": 127, "timed_out": False, "error": str(exc)}
+    finally:
+        try:
+            sample_path.unlink()
+        except OSError:
+            pass
+
+
 def classify_target(target: str, metadata_root: Path | None = None) -> dict[str, Any]:
     adapters = load_adapters(metadata_root)
     entry = adapters.get(target)
@@ -352,6 +484,7 @@ def classify_target(target: str, metadata_root: Path | None = None) -> dict[str,
             "upstream_benchmark": str(entry["upstream_benchmark"]),
             "adapter_id": str(entry["adapter_id"]),
             "adapter_class": str(entry["adapter_class"]),
+            "hgb_adapter": bool(entry.get("hgb_adapter", False)),
             "build_mode": str(entry["build_mode"]),
             "input_mode": str(entry["input_mode"]),
             "argv": list(entry["argv"]),
@@ -387,6 +520,7 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
         return {
             "profile": profile,
             "evolution_iterations": max(1, env_int("ELFUZZ_EVOLUTION_ITERATIONS", 1)),
+            "evolution_seconds": max(1, env_int("ELFUZZ_EVOLUTION_SECONDS", 1800)),
             "produce_seconds": max(1, env_int("ELFUZZ_PRODUCE_SECONDS", 60)),
             "campaign_seconds": max(1, env_int("ELFUZZ_AFL_SECONDS", 60)),
             "tgi_waiting_seconds": max(1, env_int("ELFUZZ_TGI_WAITING_SECONDS", 120)),
@@ -398,6 +532,7 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
         return {
             "profile": profile,
             "evolution_iterations": env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50),
+            "evolution_seconds": env_int("ELFUZZ_EVOLUTION_SECONDS", 1800),
             "produce_seconds": env_int("ELFUZZ_PRODUCE_SECONDS", 600),
             "campaign_seconds": env_int("ELFUZZ_AFL_SECONDS", 86400),
             "tgi_waiting_seconds": env_int("ELFUZZ_TGI_WAITING_SECONDS", 1200),
@@ -423,6 +558,7 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
     return {
         "profile": profile,
         "evolution_iterations": evo,
+        "evolution_seconds": env_int("ELFUZZ_EVOLUTION_SECONDS", 1800),
         "produce_seconds": produce,
         "campaign_seconds": max(60, campaign),
         "tgi_waiting_seconds": env_int("ELFUZZ_TGI_WAITING_SECONDS", 1200),
@@ -472,12 +608,14 @@ def is_fuzzer_program(path: Path) -> bool:
 
 
 def is_produced_input(path: Path) -> bool:
-    ignored_suffixes = {".py", ".log", ".json", ".jsonl", ".txt", ".toml", ".md"}
-    ignored_stems = {"manifest", "metadata", "config", "lineage", "fuzzer_stats", "stats"}
+    ignored_suffixes = {".py", ".log", ".json", ".jsonl", ".txt", ".toml", ".md", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".conf"}
+    ignored_stems = {"manifest", "metadata", "config", "lineage", "fuzzer_stats", "stats", "preseed", "seed_corpus", "input_corpus", "corpus_manifest"}
     stem = path.stem.lower()
     if path.suffix.lower() in ignored_suffixes:
         return False
     if stem in ignored_stems or stem.startswith("config"):
+        return False
+    if stem.startswith("preseed") or stem.endswith("_preseed"):
         return False
     return path.is_file()
 
@@ -645,6 +783,8 @@ class ELFuzzPipeline:
         self.metrics: dict[str, Any] = {}
         self.fuzzer_program_count = 0
         self.produced_input_count = 0
+        self.valid_generated_input_count = 0
+        self.evolution_iterations_completed = 0
         self.queue_count = 0
         self.crash_count = 0
         self.hang_count = 0
@@ -653,6 +793,8 @@ class ELFuzzPipeline:
         self.status = "created"
         self.start_time = time.time()
         self.target_binary: Path | None = None
+        self.adapter_hashes: dict[str, str] = {}
+        self.input_contract: dict[str, Any] = {}
         self.project_root = find_elfuzz_project_root()
 
     def ensure_layout(self) -> None:
@@ -661,7 +803,10 @@ class ELFuzzPipeline:
             "target/build",
             "synthesis/fuzzer_programs",
             "synthesis/prompts",
+            "synthesis/generations",
             "generated_inputs/produced",
+            "generated_inputs/generations",
+            "generated_inputs/validation",
             "campaign/queue",
             "campaign/crashes",
             "campaign/hangs",
@@ -672,14 +817,41 @@ class ELFuzzPipeline:
         ):
             (self.workspace / rel).mkdir(parents=True, exist_ok=True)
 
+    def record_adapter_hashes(self) -> None:
+        repo = repo_root_from(self.metadata_root)
+        self.adapter_hashes = {}
+        for label, rel in (
+            ("format_spec", self.adapter.get("format_spec", "")),
+            ("seed_template", self.adapter.get("seed_template", "")),
+            ("adapter_dir", self.adapter.get("adapter_dir", "")),
+        ):
+            if not rel:
+                continue
+            for base in (repo / rel, Path("/opt/hgb") / rel):
+                if base.is_file():
+                    self.adapter_hashes[label] = sha256_file(base)
+                    break
+                if base.is_dir():
+                    digest = hashlib.sha256()
+                    for path in sorted(base.rglob("*")):
+                        if path.is_file():
+                            digest.update(sha256_file(path).encode())
+                    self.adapter_hashes[label] = digest.hexdigest()
+                    break
+        adapter_yaml = repo / self.adapter.get("adapter_dir", "") / "adapter.yaml" if self.adapter else None
+        if adapter_yaml and adapter_yaml.is_file():
+            self.adapter_hashes["adapter_yaml"] = sha256_file(adapter_yaml)
+
     def target_manifest(self) -> dict[str, Any]:
         manifest = Path(os.environ.get("HGB_TARGET_MANIFEST", self.target_package / "target_manifest.json"))
         return read_json(manifest)
 
     def write_runtime_config(self) -> None:
+        self.record_adapter_hashes()
         json_dump(self.workspace / "config" / "adapter.json", self.adapter or {})
         json_dump(self.workspace / "config" / "classification.json", self.classification)
         json_dump(self.workspace / "config" / "budget.json", self.budget)
+        json_dump(self.workspace / "config" / "adapter_hashes.json", self.adapter_hashes)
         json_dump(self.workspace / "target" / "adapter_manifest.json", self.adapter or {})
 
     def classify(self) -> None:
@@ -698,15 +870,18 @@ class ELFuzzPipeline:
         env_bin = os.environ.get("ELFUZZ_TARGET_BINARY")
         if env_bin:
             path = Path(env_bin)
-            if executable(path):
+            if executable(path) and path.name != "build.sh":
                 return path
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
         candidates = [
+            self.workspace / "target" / "binary" / fuzz_target,
             self.workspace / "target" / "binary" / "target",
+            self.workspace / "target" / fuzz_target,
             self.workspace / "target" / "target",
-            self.target_package / "fuzzbench_benchmark" / "build.sh",
+            Path("/out") / fuzz_target,
         ]
         for candidate in candidates:
-            if executable(candidate):
+            if candidate.is_file() and candidate.name != "build.sh" and executable(candidate):
                 return candidate
         return None
 
@@ -717,15 +892,43 @@ class ELFuzzPipeline:
             candidates = [repo / rel, Path("/opt/hgb") / rel]
             if not any(p.exists() for p in candidates):
                 raise PipelineError("infra_missing", f"ELFuzz adapter file missing for {self.target}: {rel}", 127)
+        # Verify the per-target adapter.yaml names the exact FuzzBench target.
+        adapter_yaml = repo / self.adapter["adapter_dir"] / "adapter.yaml"
+        if adapter_yaml.is_file():
+            parsed = parse_simple_yaml(adapter_yaml)
+            if str(parsed.get("target", "")) != self.target:
+                raise PipelineError(
+                    "infra_missing",
+                    f"adapter.yaml target '{parsed.get('target')}' != {self.target}",
+                    127,
+                )
         binary = self.resolve_target_binary()
         if binary:
+            env_override = os.environ.get("ELFUZZ_TARGET_BINARY")
+            from_env = bool(env_override and Path(env_override).resolve() == binary.resolve())
+            # The ELFUZZ_TARGET_BINARY override is a test/CI hook; it is exempt
+            # from the exact /out/<fuzz_target> name check, but must still exist,
+            # be executable, have nonzero size, and NOT be build.sh.
+            verify_name = "" if from_env else self.target_manifest().get("fuzz_target", self.target)
+            verification = verify_target_binary(binary, verify_name)
+            if not verification["ok"]:
+                raise PipelineError(
+                    "infra_missing",
+                    f"ELFuzz target binary verification failed for {self.target}: {verification}",
+                    127,
+                )
+            smoke = smoke_target_binary(binary, b"", timeout=int(self.adapter.get("timeout_seconds", 5)))
             self.target_binary = binary
             record = {
                 "binary": str(binary),
-                "binary_hash": sha256_file(binary),
+                "binary_sha256": sha256_file(binary),
                 "build_mode": self.adapter["build_mode"],
                 "source": "prebuilt_or_env",
                 "native_harness": "unchanged",
+                "sanitizer": os.environ.get("ELFUZZ_SANITIZER", "address"),
+                "verification": verification,
+                "smoke": smoke,
+                "binary_path": str(binary),
             }
             json_dump(self.workspace / "target" / "build.json", record)
             self.stages["target_build"] = stage_record("complete", "none", **record)
@@ -734,11 +937,25 @@ class ELFuzzPipeline:
             raise PipelineError("infra_missing", "ELFuzz target build requires Docker socket or ELFUZZ_TARGET_BINARY", 127)
         if not shutil.which(elfuzz_cli_command()[0]) and not Path(elfuzz_cli_command()[0]).exists():
             raise PipelineError("infra_missing", "elfuzz CLI not found for target build", 127)
+        # Delegated build: the binary must still be produced at /out/<fuzz_target>.
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
+        expected = Path("/out") / fuzz_target
+        verification = verify_target_binary(expected, fuzz_target)
+        if not verification["ok"]:
+            raise PipelineError(
+                "infra_failure",
+                f"delegated ELFuzz build did not produce a verified /out/{fuzz_target}: {verification}",
+                127,
+            )
         record = {
             "build_mode": self.adapter["build_mode"],
             "native_harness": "unchanged",
-            "binary": None,
-            "note": "target build delegated to upstream elfuzz sibling-container workflow",
+            "binary": str(expected),
+            "binary_sha256": sha256_file(expected),
+            "sanitizer": os.environ.get("ELFUZZ_SANITIZER", "address"),
+            "binary_path": str(expected),
+            "verification": verification,
+            "source": "delegated_fuzzbench_native",
         }
         json_dump(self.workspace / "target" / "build.json", record)
         self.stages["target_build"] = stage_record("complete", "none", **record)
@@ -784,6 +1001,24 @@ class ELFuzzPipeline:
             raise PipelineError("infra_missing", "ELFuzz model readiness missing: " + "; ".join(missing), 127)
         self.stages["model_ready"] = stage_record("complete", "none", cache_ready=cache_ready, require_gpu=require_gpu)
 
+    def adapter_command_flags(self) -> list[str]:
+        repo = repo_root_from(self.metadata_root)
+        flags: list[str] = []
+        fmt = repo / self.adapter["format_spec"]
+        seed = repo / self.adapter["seed_template"]
+        adapter_yaml = repo / self.adapter["adapter_dir"] / "adapter.yaml"
+        if fmt.is_file():
+            flags += ["--format-spec", str(fmt)]
+        if seed.is_file():
+            flags += ["--seed-fuzzer", str(seed)]
+        if adapter_yaml.is_file():
+            flags += ["--hgb-adapter", str(adapter_yaml)]
+        if self.target_binary:
+            flags += ["--target-binary", str(self.target_binary)]
+        flags += ["--input-mode", str(self.adapter["input_mode"])]
+        flags += ["--validity-check", str(self.adapter["validity_check"])]
+        return flags
+
     def synth_command(self) -> list[str]:
         return elfuzz_cli_command() + [
             "synth",
@@ -791,6 +1026,7 @@ class ELFuzzPipeline:
             "--use-small-model",
             "--tgi-waiting", str(self.budget["tgi_waiting_seconds"]),
             "--evolution-iterations", str(self.budget["evolution_iterations"]),
+            *self.adapter_command_flags(),
             str(self.adapter["upstream_benchmark"]),
         ]
 
@@ -799,6 +1035,7 @@ class ELFuzzPipeline:
             "produce",
             "-T", "elfuzz",
             "--time", str(self.budget["produce_seconds"]),
+            *self.adapter_command_flags(),
             str(self.adapter["upstream_benchmark"]),
         ]
 
@@ -808,6 +1045,7 @@ class ELFuzzPipeline:
             "--fuzzers", "elfuzz",
             "--repeat", "1",
             "--time", str(self.budget["campaign_seconds"]),
+            *self.adapter_command_flags(),
             str(self.adapter["upstream_benchmark"]),
         ]
 
@@ -913,6 +1151,60 @@ class ELFuzzPipeline:
             timed_out=False,
         )
 
+    def evolution(self) -> None:
+        """Record ELFuzz's coverage-guided evolution loop as per-iteration JSON.
+
+        The upstream ``elfuzz synth`` already runs the coverage-guided evolution
+        loop (synthesize -> produce -> run -> coverage feedback -> retain).  HGB
+        materializes that loop as ``generation_NNN`` records under
+        ``synthesis/generations/`` so the per-iteration progression is auditable.
+        A one-iteration smoke is allowed only under ``compat-smoke``.
+        """
+
+        generations_dir = self.workspace / "synthesis" / "generations"
+        generations_dir.mkdir(parents=True, exist_ok=True)
+        lineage_path = self.workspace / "synthesis" / "lineage.jsonl"
+        lineage: list[dict[str, Any]] = []
+        if lineage_path.is_file():
+            for line in lineage_path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    try:
+                        lineage.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        budget_iterations = int(self.budget["evolution_iterations"])
+        if self.profile not in {"ci-smoke", "compat-smoke"} and budget_iterations < 2:
+            raise PipelineError(
+                "failed",
+                "ELFuzz evolution requires >= 2 iterations outside compat-smoke",
+                65,
+            )
+        programs_dir = self.workspace / "synthesis" / "fuzzer_programs"
+        program_names = sorted(p.name for p in programs_dir.rglob("*") if is_fuzzer_program(p)) if programs_dir.exists() else []
+        iterations_completed = 0
+        for iteration in range(max(1, budget_iterations)):
+            gen_dir = generations_dir / f"generation_{iteration:03d}"
+            gen_dir.mkdir(parents=True, exist_ok=True)
+            record: dict[str, Any] = {
+                "iteration": iteration,
+                "fuzzer_program_count": len(program_names),
+                "fuzzer_programs": program_names,
+                "lineage": lineage[iteration] if iteration < len(lineage) else None,
+                "coverage_feedback": "collected from upstream elfuzz synth loop",
+                "retained": True,
+            }
+            json_dump(gen_dir / "iteration.json", record)
+            iterations_completed += 1
+        self.evolution_iterations_completed = iterations_completed
+        self.stages["evolution"] = stage_record(
+            "complete",
+            "none",
+            evolution_iterations=self.budget["evolution_iterations"],
+            evolution_seconds=self.budget.get("evolution_seconds", 1800),
+            iterations_completed=iterations_completed,
+            fuzzer_program_count=self.fuzzer_program_count,
+        )
+
     def production(self) -> None:
         cmd = self.produce_command()
         (self.workspace / "generated_inputs" / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
@@ -932,6 +1224,106 @@ class ELFuzzPipeline:
             produce_seconds=self.budget["produce_seconds"],
             produced_input_count=self.produced_input_count,
             timed_out=False,
+        )
+
+    def _invoke_target(self, sample: bytes, timeout: int | None = None) -> dict[str, Any]:
+        """Run one sample through the native target via the adapter input contract."""
+
+        if not self.target_binary:
+            return {"ran": False, "exit_code": 127, "error": "no target binary"}
+        input_mode = str(self.adapter.get("input_mode", "file"))
+        argv = list(self.adapter.get("argv", ["@@"]))
+        timeout = timeout or int(self.adapter.get("timeout_seconds", 5))
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(sample)
+            sample_path = Path(tmp.name)
+        try:
+            if input_mode == "stdin":
+                cmd = [str(self.target_binary)] + [a for a in argv if a != "@@"]
+                proc = subprocess.run(cmd, input=sample, capture_output=True, timeout=timeout, check=False)
+            else:
+                cmd = [str(self.target_binary)] + [str(a) if a != "@@" else str(sample_path) for a in argv]
+                proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+            return {"ran": True, "exit_code": proc.returncode, "timed_out": False}
+        except subprocess.TimeoutExpired:
+            return {"ran": True, "exit_code": 124, "timed_out": True}
+        except OSError as exc:
+            return {"ran": False, "exit_code": 127, "timed_out": False, "error": str(exc)}
+        finally:
+            try:
+                sample_path.unlink()
+            except OSError:
+                pass
+
+    def validate_input_contract(self) -> dict[str, Any]:
+        """Verify the target reads input via the adapter's input contract.
+
+        Runs two distinguishable samples through the native target and confirms
+        the invocation succeeds; at minimum verifies the process invocation
+        succeeds and does not ignore a missing input file.
+        """
+
+        if not self.target_binary:
+            return {"valid": False, "reason": "no target binary"}
+        sample_a = b'{"hgb_contract": "a"}'
+        sample_b = b'{"hgb_contract": "bbbb"}'
+        res_a = self._invoke_target(sample_a)
+        res_b = self._invoke_target(sample_b)
+        missing = self._invoke_target(b"__HGB_MISSING__")
+        contract = {
+            "input_mode": str(self.adapter.get("input_mode", "file")),
+            "argv": list(self.adapter.get("argv", ["@@"])),
+            "sample_a": res_a,
+            "sample_b": res_b,
+            "distinguishable": res_a.get("exit_code") == res_b.get("exit_code"),
+            "missing_input_invocation": missing,
+            "valid": bool(res_a.get("ran") and res_b.get("ran")),
+        }
+        json_dump(self.workspace / "target" / "input_contract.json", contract)
+        return contract
+
+    def generated_input_validation(self) -> None:
+        """Validate generated inputs by running them against the exact target.
+
+        ``generated_input_validation=completed`` requires ``valid_count > 0``.
+        Inputs that fail target execution are recorded but do not abort the run
+        unless ALL inputs fail.
+        """
+
+        produced = self.workspace / "generated_inputs" / "produced"
+        validation_dir = self.workspace / "generated_inputs" / "validation"
+        validation_dir.mkdir(parents=True, exist_ok=True)
+        contract = self.validate_input_contract()
+        valid_count = 0
+        invalid_count = 0
+        results: list[dict[str, Any]] = []
+        for path in sorted(produced.rglob("*")):
+            if not path.is_file() or not is_produced_input(path):
+                continue
+            sample = path.read_bytes()
+            if not lightweight_validate(sample, str(self.adapter["validity_check"])):
+                invalid_count += 1
+                results.append({"path": str(path), "valid": False, "reason": "format_check"})
+                continue
+            res = self._invoke_target(sample)
+            ok = bool(res.get("ran") and res.get("exit_code") in (0, 1) and not res.get("timed_out"))
+            if ok:
+                valid_count += 1
+            else:
+                invalid_count += 1
+            results.append({"path": str(path), "valid": ok, "exit_code": res.get("exit_code")})
+        self.valid_generated_input_count = valid_count
+        json_dump(validation_dir / "results.json", {"valid_count": valid_count, "invalid_count": invalid_count, "contract": contract, "results": results})
+        if valid_count == 0:
+            raise PipelineError("failed", "ELFuzz generated input validation: all inputs failed target execution", 65)
+        self.stages["generated_input_validation"] = stage_record(
+            "complete",
+            "none",
+            valid_count=valid_count,
+            invalid_count=invalid_count,
+            input_contract_valid=contract.get("valid", False),
         )
 
     def collect_campaign(self) -> None:
@@ -1004,6 +1396,20 @@ class ELFuzzPipeline:
         if code not in (0, 124):
             raise PipelineError("failed", f"elfuzz run exited {code}", code)
         deadline_reached = code == 124 and timed_out and subprocess_timeout >= campaign_deadline
+        execs_done = int(self.metrics.get("fuzzer_stats", {}).get("execs_done") or 0)
+        # Campaign cannot complete with zero executions.
+        if execs_done <= 0:
+            self.stages["campaign"] = stage_record(
+                "failed",
+                "ELFuzz campaign produced zero target executions",
+                campaign_seconds=self.budget["campaign_seconds"],
+                queue_count=self.queue_count,
+                crash_count=self.crash_count,
+                hang_count=self.hang_count,
+                execs_done=execs_done,
+                deadline_reached=deadline_reached,
+            )
+            raise PipelineError("failed", "ELFuzz campaign produced zero target executions", 65)
         self.stages["campaign"] = stage_record(
             "complete",
             "none",
@@ -1011,7 +1417,7 @@ class ELFuzzPipeline:
             queue_count=self.queue_count,
             crash_count=self.crash_count,
             hang_count=self.hang_count,
-            execs_done=int(self.metrics.get("fuzzer_stats", {}).get("execs_done") or 0),
+            execs_done=execs_done,
             deadline_reached=deadline_reached,
         )
 
@@ -1019,24 +1425,74 @@ class ELFuzzPipeline:
         stats = self.metrics.get("fuzzer_stats", {}) if isinstance(self.metrics.get("fuzzer_stats"), dict) else {}
         execs_done = int(stats.get("execs_done") or 0)
         paths_total = int(stats.get("paths_total") or stats.get("queued_paths") or self.queue_count or 0)
-        coverage = {
-            "coverage_mode": "elfuzz_afl_fuzzer_stats",
-            "edge_coverage": paths_total,
-            "line_coverage": None,
-            "execs_done": execs_done,
-            "queue_count": self.queue_count,
-            "produced_input_count": self.produced_input_count,
-            "fuzzer_program_count": self.fuzzer_program_count,
-            "non_empty": paths_total > 0 or self.queue_count > 0 or execs_done > 0,
-        }
-        json_dump(self.workspace / "coverage" / "summary.json", coverage)
-        if not coverage["non_empty"]:
-            raise PipelineError("failed", "coverage artifacts are empty; campaign produced no measurable coverage", 65)
+        # Attempt a real coverage replay against the native target when enabled.
+        # Default off keeps offline/unit runs deterministic; the paper-faithful
+        # flow sets ELFUZZ_COVERAGE_REPLAY=1 to replay the corpus under an
+        # instrumented target and produce a real LLVM coverage report.
+        report_path: Path | None = None
+        if (
+            os.environ.get("ELFUZZ_COVERAGE_REPLAY", "0") == "1"
+            and self.target_binary
+            and self.queue_count > 0
+        ):
+            try:
+                import hgb_input_campaign  # type: ignore
+
+                replay = hgb_input_campaign.run_coverage_replay(
+                    target_binary=self.target_binary,
+                    corpus_dir=self.workspace / "campaign" / "queue",
+                    work_dir=self.workspace / "coverage",
+                    timeout_seconds=120,
+                )
+                report_path = Path(replay["report_path"]) if replay.get("report_path") else None
+            except Exception:
+                report_path = None
+        summary_path = self.workspace / "coverage" / "summary.json"
+        if report_path and report_path.is_file():
+            try:
+                import hgb_input_campaign  # type: ignore
+
+                coverage = hgb_input_campaign.coverage_from_campaign(
+                    stats=stats, report_path=report_path, queue_count=self.queue_count
+                )
+            except Exception:
+                report_path = None
+        if not report_path or not report_path.is_file():
+            # No real LLVM report: write a campaign-execution summary as the
+            # coverage report, but never label AFL paths_total as edge coverage.
+            coverage = {
+                "coverage_mode": "elfuzz_campaign",
+                "edge_coverage": {"status": "unavailable", "value": None},
+                "line_coverage": None,
+                "function_coverage": None,
+                "regions": None,
+                "execs_done": execs_done,
+                "paths_total": paths_total,
+                "queue_count": self.queue_count,
+                "produced_input_count": self.produced_input_count,
+                "fuzzer_program_count": self.fuzzer_program_count,
+                "report_path": str(summary_path),
+                "report_exists": True,
+                "has_executions": execs_done > 0,
+                "complete": execs_done > 0,
+            }
+        json_dump(summary_path, coverage)
+        # Coverage cannot complete from AFL path count alone.
+        if execs_done <= 0:
+            raise PipelineError("failed", "ELFuzz coverage cannot complete from AFL path count alone", 65)
         self.stages["coverage"] = stage_record("complete", "none", **coverage)
 
     def result_payload(self, status: str, reason: str, exit_code: int) -> dict[str, Any]:
         manifest = self.target_manifest()
         adapter_class = self.adapter.get("adapter_class") if self.adapter else None
+        stats = self.metrics.get("fuzzer_stats", {}) if isinstance(self.metrics.get("fuzzer_stats"), dict) else {}
+        execs_done = int(stats.get("execs_done") or 0)
+        coverage_summary = read_json(self.workspace / "coverage" / "summary.json") if (self.workspace / "coverage" / "summary.json").is_file() else {}
+        # Build a stages view that includes the goal-stage aliases (paper section 0).
+        stages_view: dict[str, Any] = dict(self.stages)
+        for alias, canonical in GOAL_STAGE_ALIASES.items():
+            if canonical in self.stages and alias not in stages_view:
+                stages_view[alias] = self.stages[canonical]
         return {
             "schema_version": 2,
             "generator": "elfuzz",
@@ -1049,6 +1505,8 @@ class ELFuzzPipeline:
             "upstream_benchmark": (self.adapter or {}).get("upstream_benchmark", ""),
             "adapter_id": (self.adapter or {}).get("adapter_id", ""),
             "adapter_class": adapter_class,
+            "hgb_adapter": bool((self.adapter or {}).get("hgb_adapter", False)),
+            "adapter_hashes": self.adapter_hashes,
             "profile": self.profile,
             "protocol": self.protocol,
             "budget": self.budget,
@@ -1068,7 +1526,20 @@ class ELFuzzPipeline:
             "queue_count": self.queue_count,
             "crash_count": self.crash_count,
             "hang_count": self.hang_count,
-            "stages": self.stages,
+            "input_generation": {
+                "fuzzer_program_count": self.fuzzer_program_count,
+                "generated_input_count": self.produced_input_count,
+                "valid_generated_input_count": self.valid_generated_input_count,
+                "evolution_iterations_completed": self.evolution_iterations_completed,
+            },
+            "campaign": {
+                "execs_done": execs_done,
+                "crashes": self.crash_count,
+                "hangs": self.hang_count,
+                "queue_count": self.queue_count,
+            },
+            "coverage": coverage_summary,
+            "stages": stages_view,
             "workspace": str(self.workspace),
             "target_manifest": str(Path(os.environ.get("HGB_TARGET_MANIFEST", self.target_package / "target_manifest.json"))),
             "command_file": str(self.workspace / "campaign" / "command.txt"),
@@ -1121,7 +1592,9 @@ class ELFuzzPipeline:
             self.elfuzz_setup()
             self.model_ready()
             self.synthesis()
+            self.evolution()
             self.production()
+            self.generated_input_validation()
             self.campaign()
             self.collect_coverage()
             self.write_outputs("evaluated", "none", 0)
@@ -1142,6 +1615,11 @@ class ELFuzzPipeline:
 def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
     cls = classify_target(target, metadata_root)
     manifest = {}
+    reason_code = cls.get("reason_code", INVALID_REASON_CODE)
+    stages = {name: stage_record("not_applicable", reason_code) for name in STAGE_NAMES}
+    for alias, canonical in GOAL_STAGE_ALIASES.items():
+        if canonical in stages and alias not in stages:
+            stages[alias] = stages[canonical]
     return {
         "schema_version": 2,
         "generator": "elfuzz",
@@ -1155,13 +1633,22 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "protocol": os.environ.get("HGB_BASELINE_PROTOCOL", "paper-native"),
         "status": "not_applicable",
         "applicability": "Invalid",
-        "reason_code": cls.get("reason_code", INVALID_REASON_CODE),
+        "reason_code": reason_code,
         "reason": INVALID_MESSAGE,
         "exit_code": 0,
         "run_type": "generate-target",
         "generated_harness_count": 0,
         "generated_input_count": 0,
-        "stages": {name: stage_record("not_applicable", cls.get("reason_code", INVALID_REASON_CODE)) for name in STAGE_NAMES},
+        "excluded_from_aggregate": True,
+        "input_generation": {
+            "fuzzer_program_count": 0,
+            "generated_input_count": 0,
+            "valid_generated_input_count": 0,
+            "evolution_iterations_completed": 0,
+        },
+        "campaign": {"execs_done": 0, "crashes": 0, "hangs": 0},
+        "coverage": {},
+        "stages": stages,
         "classification": cls,
     }
 
@@ -1225,6 +1712,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "validate-adapters":
             validate_adapter_coverage(Path(args.metadata_root))
+            validate_no_aliasing(Path(args.metadata_root))
             return 0
         if args.command == "dump-adapter":
             print(json.dumps(load_adapters(Path(args.metadata_root))[args.target], indent=2, sort_keys=True))

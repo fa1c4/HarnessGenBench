@@ -70,8 +70,11 @@ bash scripts/hgb_run_baseline.sh \
 
 `alpha` cannot use the 1-iteration / 60-second smoke defaults; those are
 `compat-smoke` values only. All budgets are CLI/configurable via
-`ELFUZZ_EVOLUTION_ITERATIONS`, `ELFUZZ_PRODUCE_SECONDS`, `ELFUZZ_AFL_SECONDS`,
-and `ELFUZZ_TGI_WAITING_SECONDS`, and are recorded in `result.json` provenance.
+`ELFUZZ_EVOLUTION_ITERATIONS`, `ELFUZZ_EVOLUTION_SECONDS`,
+`ELFUZZ_PRODUCE_SECONDS`, `ELFUZZ_AFL_SECONDS`, and
+`ELFUZZ_TGI_WAITING_SECONDS`, and are recorded in `result.json` provenance.
+`compat-smoke` is **not** a paper reproduction: it sets
+`excluded_from_aggregate=true` and may use 1-iteration smoke values.
 
 ## Workflow and run layout
 
@@ -100,10 +103,61 @@ configs, logs, Python sources, model files, and lineage metadata are not.
 ## Adapters
 
 HGB-owned adapter overlays live under `repro/elfuzz/targets/<target>/`
-(`format.md`, `seed_fuzzer.py`, `adapter.json`, `adapter_manifest.json`).
-Upstream-native adapters (jsoncpp, libxml2, re2, sqlite3) are bound to the
-exact pinned FuzzBench binaries; HGB text extensions cover curl HTTP, libxslt
-XPath/XML, mruby, PHP parser, and systemd `.link` parser.
+(`format.md`, `seed_fuzzer.py`, `adapter.yaml`, `adapter.json`). Each
+`adapter.yaml` names the **exact FuzzBench target** and is the spec passed to
+ELFuzz:
+
+```yaml
+target: curl_curl_fuzzer_http
+adapter_id: curl_http
+adapter_class: extension
+hgb_adapter: true
+build_mode: fuzzbench_native
+input_mode: file
+argv: ["@@"]
+format_spec: format.md
+seed_fuzzer: seed_fuzzer.py
+validity_check: http_response
+upstream_benchmark: curl
+```
+
+Upstream-native adapters (jsoncpp, libxml2, re2, sqlite3) bind to the exact
+pinned FuzzBench binaries. HGB text extensions cover curl HTTP, libxslt
+XPath/XML, mruby, PHP parser, and systemd `.link` parser. **No extension target
+is executed as a `jsoncpp`/`libxml2` alias**: extension targets declare their
+own `upstream_benchmark` and set `hgb_adapter: true`, and the HGB adapter layer
+passes `format.md`, `seed_fuzzer.py`, `adapter.yaml`, and the target command to
+ELFuzz rather than running the aliased benchmark and renaming outputs.
+
+## Synthesis, evolution, and input validation
+
+The pipeline runs the paper-consistent ELFuzz loop, not a one-shot `synth`:
+
+1. **Seed fuzzer synthesis** (`elfuzz synth`): produces initial fuzzer programs
+   under `synthesis/fuzzer_programs/`.
+2. **Coverage-guided evolution**: materializes `elfuzz synth`'s evolution loop
+   as per-iteration JSON under `synthesis/generations/generation_NNN/`. A
+   one-iteration smoke is allowed only under `compat-smoke`; `alpha` and
+   `paper-faithful` require `ELFUZZ_EVOLUTION_ITERATIONS >= 2`.
+3. **Production** (`elfuzz produce`): executes fuzzer programs to produce
+   inputs under `generated_inputs/produced/`.
+4. **Generated-input validation**: runs every produced input through the exact
+   native FuzzBench target via the adapter input contract (`file`/`stdin` +
+   `argv`). `generated_input_validation=completed` requires `valid_count > 0`.
+5. **Final corpus**: merges FuzzBench seeds, valid ELFuzz inputs, and evolved
+   inputs with provenance labels. Format specs, Python sources, logs, configs,
+   and preseed files are never counted as generated inputs.
+
+## Campaign and coverage
+
+- The campaign uses the **native FuzzBench target binary** (not a generated
+  harness) via `elfuzz run rq1.afl`. Campaign completion requires
+  `execs_done > 0`; zero executions is a failure.
+- Coverage replays the final corpus under a coverage-instrumented target when
+  `ELFUZZ_COVERAGE_REPLAY=1` and stores an LLVM source-based report. AFL
+  `paths_total` is **never** labeled as edge coverage; when no edge-level
+  report exists, `edge_coverage.status="unavailable"`. `status=evaluated`
+  requires a coverage report path to exist and nonzero target executions.
 
 ## Compatibility wrappers
 

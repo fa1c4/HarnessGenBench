@@ -1,0 +1,13 @@
+target: libxslt_xpath
+adapter_id: libxslt_xpath
+adapter_class: extension
+hgb_adapter: true
+build_mode: fuzzbench_native
+input_mode: file
+argv: ["@@"]
+format: XPath/XML
+format_spec: format.md
+seed_fuzzer: seed_fuzzer.py
+validity_check: xml
+upstream_benchmark: libxslt
+timeout_seconds: 5

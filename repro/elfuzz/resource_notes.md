@@ -9,9 +9,17 @@ HarnessGenBench defaults are intentionally small:
 - `ELFUZZ_STORAGE_SIZE=100G`
 - `ELFUZZ_TARGET=jsoncpp`
 - `ELFUZZ_EVOLUTION_ITERATIONS=1`
+- `ELFUZZ_EVOLUTION_SECONDS=1800`
 - `ELFUZZ_TGI_WAITING_SECONDS=120`
 - `ELFUZZ_PRODUCE_SECONDS=60`
 - `ELFUZZ_AFL_SECONDS=300`
+- `ELFUZZ_COVERAGE_REPLAY=0` (set `1` for paper-faithful LLVM coverage replay)
+- `ELFUZZ_SANITIZER=address` (use `coverage` for the coverage-instrumented replay)
+
+The beta reproduction loop adds `ELFUZZ_EVOLUTION_SECONDS` for the
+coverage-guided evolution budget and `ELFUZZ_COVERAGE_REPLAY` to replay the
+final corpus under a coverage-instrumented target. `ELFUZZ_SANITIZER=address`
+is used for smoke/campaign; `coverage` is used for the coverage replay.
 
 The official docs recommend setting `/proc/sys/kernel/core_pattern` to `core`
 before AFL++ runs:

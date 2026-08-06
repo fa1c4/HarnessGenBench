@@ -37,7 +37,7 @@ baselines:
     default_profile: alpha
     default_protocol: paper-native
     strict_success_status: evaluated
-    notes: ELFuzz synthesizes and evolves input-producing fuzzer programs against a fixed native FuzzBench target, then runs a final AFL++ campaign. It is an input generator, not a harness generator, and supports only the explicit text-input target set in metadata/elfuzz_target_adapters.yaml. Non-text targets are contractually Invalid (not_applicable) and must not start Docker/model download, TGI, synthesis, or fuzzing.
+    notes: ELFuzz synthesizes and evolves input-producing fuzzer programs against a fixed native FuzzBench target, then runs a final AFL++ campaign. It is an input generator, not a harness generator, and supports only the explicit text-input target set in metadata/elfuzz_target_adapters.yaml. Non-text targets are contractually Invalid (not_applicable) and must not start Docker/model download, TGI, synthesis, or fuzzing. alpha and paper-faithful build and verify the exact /out/<fuzz_target> (rejecting build.sh), load and validate the per-target adapter.yaml (no jsoncpp/libxml2 aliasing for extension targets), run the coverage-guided evolution loop (>= 2 iterations; one-iteration smoke is compat-smoke only), validate generated inputs against the exact target (valid_count > 0), run a campaign with execs_done > 0, and collect real coverage (LLVM report when ELFUZZ_COVERAGE_REPLAY=1; AFL paths_total is never edge coverage). status=evaluated requires a coverage report path, nonzero executions, and all goal stages completed. Invalid rows are excluded from the success/failure denominator and coverage aggregates.
   - name: promefuzz
     task_family: harness_generator
     profiles: [alpha, paper-faithful, compat-smoke]
