@@ -48,18 +48,27 @@ def safe_token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "-", value)
 
 
-def deterministic_image_tag(run_id: str, target: str, candidate_id: str) -> str:
-    """Return ``hgb-ckgfuzzer-<run-id>-<target>-<candidate-id>``.
+def deterministic_image_tag(
+    run_id: str,
+    target: str,
+    candidate_id: str,
+    *,
+    generator: str = "ckgfuzzer",
+) -> str:
+    """Return ``hgb-<generator>-<run-id>-<target>-<candidate-id>``.
 
-    The tag is stable for a given (run, target, candidate) triple so the same
-    image is used for build, smoke, campaign, and coverage.
+    The tag is stable for a given (generator, run, target, candidate) tuple so
+    the same image is used for build, smoke, campaign, and coverage. A
+    consistent tag across all evaluator stages is required by the beta
+    reproduction contract: build/run image tags must never differ.
     """
 
     run = safe_token(run_id or "run")[:32]
     tgt = safe_token(target or "target")[:40]
     cand = safe_token(candidate_id or "cand")[:24]
-    digest = hashlib.sha256(f"{run_id}|{target}|{candidate_id}".encode()).hexdigest()[:8]
-    return f"hgb-ckgfuzzer-{run}-{tgt}-{cand}-{digest}"
+    gen = safe_token(generator or "ckgfuzzer")[:24]
+    digest = hashlib.sha256(f"{generator}|{run_id}|{target}|{candidate_id}".encode()).hexdigest()[:8]
+    return f"hgb-{gen}-{run}-{tgt}-{cand}-{digest}"
 
 
 @dataclass
@@ -452,9 +461,10 @@ def main() -> int:
     parser.add_argument("--run-id", default="")
     parser.add_argument("--target", default="")
     parser.add_argument("--candidate-id", default="")
+    parser.add_argument("--generator", default="ckgfuzzer")
     args = parser.parse_args()
     if args.image_tag:
-        print(deterministic_image_tag(args.run_id, args.target, args.candidate_id))
+        print(deterministic_image_tag(args.run_id, args.target, args.candidate_id, generator=args.generator))
         return 0
     parser.print_help()
     return 64

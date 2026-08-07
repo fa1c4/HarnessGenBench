@@ -57,10 +57,43 @@ workspace/oss-fuzz-gen/<target>/<run-id>/
   benchmark/           # generated.yaml, selection.json
   generation/          # work/, candidates/, repair_iterations/
   generated_harnesses/ # final.c|final.cc
-  evaluation/          # build/, smoke/, campaign/, coverage/
+  evaluation/          # build/, smoke/, campaign/, coverage/, candidates/
   result.json          # schema v2 with stages + provenance
   HGB_SUMMARY.md
 ```
+
+## Independent evaluator and coverage diff
+
+The entrypoint delegates to the shared `hgb_harness_evaluator.py`
+(`--generator oss-fuzz-gen`). For each candidate it:
+
+1. overlays the candidate at the exact native FuzzBench harness path
+   (evaluator-only metadata);
+2. builds the sealed target image with **one deterministic image tag** reused
+   for build, smoke, campaign, and coverage;
+3. runs sanitizer smoke on empty input and seeds;
+4. confirms intended project API reachability (from the benchmark
+   YAML/Introspector, never the reference harness);
+5. runs a fixed-budget libFuzzer campaign requiring `execs_done > 0`;
+6. measures real LLVM source-based coverage from a report file (never a
+   process exit code);
+7. builds a native/reference coverage control and computes the **runtime line
+   coverage diff** (`coverage_diff`): `candidate_lines_covered`,
+   `native_lines_covered`, `new_lines_vs_native`,
+   `line_coverage_diff_percent`, `runtime_coverage_valid`. When the native
+   control cannot be computed, candidate coverage is still emitted but
+   `coverage_diff.status="unavailable"`; the row is never labelled
+   paper-equivalent.
+
+Evaluator CLI failure is never swallowed: a nonzero exit propagates to
+`infra_failure/failed_stage=evaluator`.
+
+## Budgets
+
+`alpha` defaults to `OFG_NUM_SAMPLES=3`, `OFG_NUM_EVALUATIONS=3`,
+`OFG_GENERATION_TIMEOUT_SECONDS=7200`, `OFG_MAX_ROUND=5`. `paper-faithful`
+defaults to `OFG_NUM_SAMPLES=10`. `compat-smoke` uses 1/1/1 budgets. All
+budgets are recorded in `result.json` provenance.
 
 ## Reproduction (legacy smoke)
 

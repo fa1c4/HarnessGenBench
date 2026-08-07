@@ -444,9 +444,27 @@ def test_evaluator_reaches_verified_for_fixture(tmp_path: Path) -> None:
 
     calls: list[list[str]] = []
 
+    llvm_cov = json.dumps({
+        "data": [{"totals": {"lines": {"count": 40, "covered": 12},
+                              "functions": {"count": 5, "covered": 2},
+                              "regions": {"count": 20, "covered": 6}}}],
+        "type": "llvm.coverage.json.export", "version": "2.0.1",
+    })
+
     def runner(command, timeout):
         calls.append(list(command))
-        return ofg_evaluator.CommandResult(list(command), 0, "ok", "")
+        cmd = list(command)
+        joined = " ".join(cmd)
+        if "docker build" in joined:
+            return ofg_evaluator.CommandResult(cmd, 0, "build ok", "")
+        if "-runs=1" in cmd:
+            return ofg_evaluator.CommandResult(cmd, 0, "", "")
+        if "-max_total_time=" in joined:
+            out = "#500 INITED\n#500 DONE\nstat::number_of_executed_units: 500\n"
+            return ofg_evaluator.CommandResult(cmd, 0, out, "")
+        if "llvm-cov export" in joined:
+            return ofg_evaluator.CommandResult(cmd, 0, llvm_cov, "")
+        return ofg_evaluator.CommandResult(cmd, 0, "ok", "")
 
     result = ofg_evaluator.evaluate_candidates(
         target_root=target_root,
@@ -459,6 +477,16 @@ def test_evaluator_reaches_verified_for_fixture(tmp_path: Path) -> None:
     assert result["verification_ran"] is True
     assert str(candidate) in result["verified_candidates"]
     assert (eval_dir / "results.json").is_file()
+    rec = result["records"][0]
+    # The corrected evaluator must overlay at the native path, use a consistent
+    # image tag, require nonzero execs, and read coverage from a report file.
+    assert rec["overlay"]["performed"] is True
+    assert int(rec["campaign"]["execs_done"]) > 0
+    assert rec["coverage"]["line_coverage"]["covered"] == 12
+    build_tags = [c for c in calls if c[:2] == ["docker", "build"]]
+    assert build_tags, "expected a docker build"
+    tag = build_tags[0][build_tags[0].index("-t") + 1]
+    assert all(tag in c for c in calls if "docker run" in " ".join(c))
 
 
 # ---------------------------------------------------------------------------

@@ -86,8 +86,70 @@ class CandidateRecord:
     api_reachability: dict[str, Any] = field(default_factory=dict)
     campaign: dict[str, Any] = field(default_factory=dict)
     coverage: dict[str, Any] = field(default_factory=dict)
+    coverage_diff: dict[str, Any] = field(default_factory=dict)
+    native_coverage: dict[str, Any] = field(default_factory=dict)
     build: dict[str, Any] = field(default_factory=dict)
     error: str = ""
+
+
+def compute_coverage_diff(
+    candidate_summary: dict[str, Any] | None,
+    native_summary: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Compute the runtime line coverage diff vs the native/reference control.
+
+    Per beta plan section 8.6, emits ``candidate_lines_covered``,
+    ``native_lines_covered``, ``new_lines_vs_native``,
+    ``line_coverage_diff_percent`` and ``runtime_coverage_valid``. When the
+    native/reference coverage cannot be computed, the candidate coverage is
+    still emitted but ``status`` is ``unavailable`` so the row is never
+    falsely labelled paper-equivalent.
+    """
+    cand_lines = _covered_lines(candidate_summary)
+    native_lines = _covered_lines(native_summary)
+    if candidate_summary is None or cand_lines is None:
+        return {
+            "candidate_lines_covered": cand_lines,
+            "native_lines_covered": native_lines,
+            "new_lines_vs_native": None,
+            "line_coverage_diff_percent": None,
+            "runtime_coverage_valid": False,
+            "status": "unavailable",
+        }
+    if native_summary is None or native_lines is None:
+        return {
+            "candidate_lines_covered": cand_lines,
+            "native_lines_covered": None,
+            "new_lines_vs_native": None,
+            "line_coverage_diff_percent": None,
+            "runtime_coverage_valid": True,
+            "status": "unavailable",
+        }
+    new_lines = max(0, cand_lines - native_lines)
+    if native_lines:
+        diff_percent = round(100.0 * (cand_lines - native_lines) / native_lines, 1)
+    else:
+        diff_percent = 100.0 if cand_lines else 0.0
+    return {
+        "candidate_lines_covered": cand_lines,
+        "native_lines_covered": native_lines,
+        "new_lines_vs_native": new_lines,
+        "line_coverage_diff_percent": diff_percent,
+        "runtime_coverage_valid": True,
+        "status": "available",
+    }
+
+
+def _covered_lines(summary: dict[str, Any] | None) -> int | None:
+    if not isinstance(summary, dict):
+        return None
+    line_cov = summary.get("line_coverage")
+    if not isinstance(line_cov, dict):
+        return None
+    covered = line_cov.get("covered")
+    if covered is None:
+        return None
+    return int(covered)
 
 
 def _candidate_files(candidates_dir: Path) -> list[Path]:
@@ -179,6 +241,8 @@ def evaluate_candidate(
     seeds: list[Path],
     coverage_parser: Callable[[Path], dict[str, Any]] | None = None,
     strict: bool = True,
+    run_native_control: bool = False,
+    native_image_tag: str = "",
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
 
@@ -313,7 +377,118 @@ def evaluate_candidate(
         return rec
     rec.coverage = cov_summary
     hgb_result.mark_stage(rec.stages, "coverage", "completed")
+
+    # 6.7 Native/reference coverage control + line coverage diff (beta 8.6).
+    # The native control replays the native (reference) harness under the same
+    # coverage instrumentation so candidate coverage can be compared against a
+    # real control rather than an exit code. When the native control cannot be
+    # computed, candidate coverage is still emitted but coverage_diff.status
+    # is "unavailable" so the row is never labelled paper-equivalent.
+    native_summary: dict[str, Any] | None = None
+    if run_native_control:
+        try:
+            native_summary = _run_native_coverage_control(
+                target_root=target_root,
+                evaluator_root=evaluator_root,
+                sealed_context=sealed_context,
+                native_harness=native_harness,
+                fuzz_target=fuzz_target,
+                image_tag=native_image_tag or (image_tag + "-native"),
+                corpus_dir=corpus_dir,
+                work_dir=candidate_work,
+                runner=runner,
+                coverage_parser=coverage_parser,
+            )
+        except Exception as exc:  # noqa: BLE001 - native control is best-effort
+            rec.native_coverage = {"status": "unavailable", "error": str(exc)}
+    rec.native_coverage = rec.native_coverage or (native_summary or {})
+    rec.coverage_diff = compute_coverage_diff(cov_summary, native_summary)
     return rec
+
+
+def _run_native_coverage_control(
+    *,
+    target_root: Path,
+    evaluator_root: Path,
+    sealed_context: dict[str, Any],
+    native_harness: dict[str, Any],
+    fuzz_target: str,
+    image_tag: str,
+    corpus_dir: Path,
+    work_dir: Path,
+    runner: Callable[..., Any],
+    coverage_parser: Callable[[Path], dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    """Build the native (reference) image and replay coverage as a control.
+
+    Restores the original native harness into a copy of the sealed context so
+    the FuzzBench build compiles the reference (not the candidate), then runs
+    a coverage replay. Returns the parsed coverage summary or None.
+    """
+    import shutil
+
+    context_dir = Path(sealed_context["context_dir"])
+    dockerfile = Path(sealed_context["dockerfile"])
+    native_dest = native_harness.get("container_destination", "")
+    if not native_dest:
+        return None
+    native_rel = native_dest
+    for prefix in ("/src/", "src/"):
+        if native_rel.startswith(prefix):
+            native_rel = native_rel[len(prefix):]
+            break
+    overlay_path = context_dir / "source_input" / native_rel
+    # Locate the original native harness from the evaluator-only half.
+    native_src = evaluator_root / "selected_reference_harnesses"
+    native_file = Path(native_harness.get("selected_reference", ""))
+    original = None
+    if native_file.is_absolute():
+        candidate_path = native_file
+    else:
+        candidate_path = evaluator_root / native_file
+    if candidate_path.is_file():
+        original = candidate_path
+    if original is None and native_src.is_dir():
+        for p in sorted(native_src.rglob("*")):
+            if p.is_file() and p.name == Path(native_dest).name:
+                original = p
+                break
+    if original is None:
+        return None
+    # The candidate was overlaid at overlay_path; restore the native harness.
+    native_work = work_dir / "native_control"
+    native_work.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(original, overlay_path)
+    native_build = hgb_fuzzbench_builder.build_candidate_image(
+        context_dir=context_dir,
+        dockerfile=dockerfile,
+        image_tag=image_tag,
+        fuzz_target=fuzz_target,
+        staged_candidate_host=original,
+        native_destination=native_dest,
+        work_dir=native_work / "build",
+        runner=runner,
+    )
+    if native_build.build_exit_code != 0:
+        return None
+    native_cov = hgb_fuzzbench_builder.run_coverage(
+        image_tag=image_tag,
+        binary_path=native_build.binary_path,
+        corpus_dir=corpus_dir,
+        work_dir=native_work,
+        runner=runner,
+    )
+    raw_text = native_cov.get("raw_text", "")
+    if not raw_text.strip():
+        return None
+    try:
+        cov_path = native_work / "coverage" / "coverage.json"
+        cov_path.parent.mkdir(parents=True, exist_ok=True)
+        cov_path.write_text(raw_text, encoding="utf-8")
+        parser = coverage_parser or hgb_coverage.summarize_coverage_report
+        return parser(cov_path)
+    except hgb_coverage.CoverageError:
+        return None
 
 
 def evaluate(
@@ -335,6 +510,7 @@ def evaluate(
     intended_apis: list[str] | None = None,
     seeds: list[Path] | None = None,
     run_id: str = "",
+    run_native_control: bool = False,
 ) -> dict[str, Any]:
     """Evaluate all candidates and return the run-level result dict."""
 
@@ -416,7 +592,12 @@ def evaluate(
     run_id = run_id or os.environ.get("HGB_RUN_ID", "run")
     for index, candidate in enumerate(candidates, start=1):
         candidate_id = f"cand_{index:03d}"
-        image_tag = hgb_fuzzbench_builder.deterministic_image_tag(run_id, fuzz_target, candidate_id)
+        image_tag = hgb_fuzzbench_builder.deterministic_image_tag(
+            run_id, fuzz_target, candidate_id, generator=generator,
+        )
+        native_image_tag = hgb_fuzzbench_builder.deterministic_image_tag(
+            run_id, fuzz_target, candidate_id + "-native", generator=generator,
+        )
         rec = evaluate_candidate(
             candidate=candidate,
             candidate_id=candidate_id,
@@ -434,6 +615,8 @@ def evaluate(
             seeds=seeds,
             coverage_parser=coverage_parser,
             strict=strict,
+            run_native_control=run_native_control,
+            native_image_tag=native_image_tag,
         )
         records.append(rec)
         cand_dict = {
@@ -447,6 +630,8 @@ def evaluate(
             "api_reachability": rec.api_reachability,
             "campaign": rec.campaign,
             "coverage": rec.coverage,
+            "coverage_diff": rec.coverage_diff,
+            "native_coverage": rec.native_coverage,
             "build": rec.build,
             "error": rec.error,
             "image_tag": image_tag,
@@ -507,6 +692,8 @@ def evaluate(
         metrics = {
             "coverage": selected.get("coverage", {}),
             "campaign": selected.get("campaign", {}),
+            "coverage_diff": selected.get("coverage_diff", {}),
+            "native_coverage": selected.get("native_coverage", {}),
         }
     result = hgb_result.build_result(
         generator=generator,
@@ -546,6 +733,8 @@ def main() -> int:
     parser.add_argument("--campaign-seconds", type=int, default=300)
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--intended-apis", default="", help="comma-separated intended APIs")
+    parser.add_argument("--run-native-control", action="store_true",
+                        help="build native/reference coverage control and compute line coverage diff")
     args = parser.parse_args()
 
     intended = [a.strip() for a in args.intended_apis.split(",") if a.strip()] if args.intended_apis else None
@@ -561,6 +750,7 @@ def main() -> int:
         campaign_seconds=args.campaign_seconds,
         strict=args.strict,
         intended_apis=intended,
+        run_native_control=args.run_native_control,
     )
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["status"] == hgb_result.STATUS_INFRA_FAILURE:

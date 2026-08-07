@@ -54,8 +54,10 @@ apply_profile_defaults() {
       export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-3}"
       export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
       export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
       export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
       export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -64,11 +66,13 @@ apply_profile_defaults() {
     paper-faithful)
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-remote}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
-      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-3}"
+      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
       export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
       export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
       export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
       export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -80,8 +84,10 @@ apply_profile_defaults() {
       export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-1}"
       export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
       export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-1}"
       export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
       export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-300}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-600}"
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-1}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-1}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -426,16 +432,46 @@ EOF
     printf 'ofg_introspector_build_failed: no infra/helper.py in %s\n' "$oss_fuzz_dir" >>"$introspector_log"
     return 1
   fi
-  # Locate and copy real report files into introspector_dir.
+  # Locate the target-scoped Introspector report (beta plan section 5): match
+  # by project and fuzz target, NOT the first matching `inspector` directory.
   local report_root
-  report_root="$(find "$oss_fuzz_dir/build/out" -type d -name 'inspector' 2>/dev/null | head -n1 || true)"
+  report_root="$("$python" - "$oss_fuzz_dir/build/out" "$project" "$fuzz_target" <<'PY_OFG_REPORT_SELECT'
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+try:
+    from ofg_introspector_adapter import select_inspector_report, parse_report_manifest, parse_all_functions, parse_calltree
+except Exception:
+    print("", end="")
+    sys.exit(0)
+root, project, fuzz_target = sys.argv[1:4]
+selected = select_inspector_report(root, project, fuzz_target)
+if selected is not None:
+    print(str(selected), end="")
+PY_OFG_REPORT_SELECT
+  )"
   if [[ -z "$report_root" || ! -d "$report_root" ]]; then
-    printf 'ofg_introspector_build_failed: no inspector output directory found\n' >>"$introspector_log"
+    printf 'ofg_introspector_build_failed: no target-scoped inspector report for project=%s fuzz_target=%s\n' "$project" "$fuzz_target" >>"$introspector_log"
     return 1
   fi
   for f in all_functions.json calltree.json type_info.json report_manifest.json; do
     [[ -f "$report_root/$f" ]] && cp "$report_root/$f" "$introspector_dir/$f"
   done
+  # Generate function_source_map.json if upstream did not emit it directly.
+  if [[ ! -f "$report_root/function_source_map.json" ]]; then
+    "$python" - "$report_root" "$introspector_dir/function_source_map.json" "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" <<'PY_OFG_FSM'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+from ofg_introspector_adapter import generate_function_source_map
+report_dir, out_path, source_root = sys.argv[1:4]
+mapping = generate_function_source_map(report_dir, source_root)
+Path(out_path).write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_OFG_FSM
+  else
+    cp "$report_root/function_source_map.json" "$introspector_dir/function_source_map.json"
+  fi
   return 0
 }
 
@@ -466,7 +502,34 @@ run_evaluator() {
   mkdir -p "$eval_dir"
   local selected_functions
   selected_functions="$(json_file_value "$workspace/benchmark/selection.json" selected)"
-  selected_functions="$(printf '%s' "$selected_functions" | "$python" -c 'import json,sys; d=json.load(sys.stdin); print(" ".join(r.get("name","") for r in d))' 2>/dev/null || true)"
+  selected_functions="$(printf '%s' "$selected_functions" | "$python" -c 'import json,sys; d=json.load(sys.stdin); print(",".join(r.get("name","") for r in d))' 2>/dev/null || true)"
+  local evaluator_root="${HGB_EVALUATOR_ROOT:-}"
+  [[ -z "$evaluator_root" && -d "/evaluator" ]] && evaluator_root="/evaluator"
+  [[ -z "$evaluator_root" && -d "${HGB_TARGET_PACKAGE:-/target}/evaluator_only" ]] && evaluator_root="${HGB_TARGET_PACKAGE:-/target}/evaluator_only"
+  # Beta plan section 8/9: delegate to the shared harness evaluator. It
+  # overlays the candidate at the exact native path, uses one deterministic
+  # image tag for build/smoke/campaign/coverage, requires nonzero executions,
+  # reads coverage from a real report, and computes the line coverage diff.
+  # Evaluator CLI failure must propagate (no `|| true`): section 9 forbids
+  # swallowing evaluator failure.
+  if [[ -n "$evaluator_root" ]]; then
+    "$python" /opt/hgb/bin/hgb_harness_evaluator.py \
+      --generator oss-fuzz-gen \
+      --target-root "${HGB_TARGET_PACKAGE:-/target}" \
+      --evaluator-root "$evaluator_root" \
+      --candidates "$workspace/generated_harnesses" \
+      --work-dir "$eval_dir" \
+      --project "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}" \
+      --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
+      --profile "$hgb_profile" \
+      --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}" \
+      --intended-apis "$selected_functions" \
+      --strict \
+      --run-native-control \
+      >"$workspace/logs/evaluator.log" 2>&1
+    return $?
+  fi
+  # Monolithic layout fallback (legacy/compat): ofg_evaluator without the split.
   "$python" /opt/hgb/bin/ofg_evaluator.py \
     --target-root "${HGB_TARGET_PACKAGE:-/target}" \
     --candidates-dir "$workspace/generated_harnesses" \
@@ -475,7 +538,9 @@ run_evaluator() {
     --selected-functions $selected_functions \
     --build-timeout "${OFG_EVAL_BUILD_TIMEOUT:-1800}" \
     --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}" \
-    >"$workspace/logs/evaluator.log" 2>&1 || true
+    --strict \
+    >"$workspace/logs/evaluator.log" 2>&1
+  return $?
 }
 
 write_final_result() {
@@ -497,14 +562,16 @@ write_final_result() {
     "$(hgb_target_manifest_value fuzzbench_commit)" "$OFG_INTROSPECTOR_MODE" \
     "${OFG_NUM_SAMPLES:-3}" "${OFG_MAX_ROUND:-5}" "${OFG_RUN_TIMEOUT:-900}" \
     "$method_variant" "$excluded" "$leakage_audit" "$hgb_profile" "$hgb_protocol" \
-    "${HGB_TARGET:-$(hgb_target_manifest_value target)}" <<'PY_HGB_RESULT'
+    "${HGB_TARGET:-$(hgb_target_manifest_value target)}" \
+    "${HGB_DOCKER_IMAGE_DIGEST:-}" "${OFG_NUM_EVALUATIONS:-3}" \
+    "${OFG_GENERATION_TIMEOUT_SECONDS:-7200}" <<'PY_HGB_RESULT'
 import json
 import os
 import sys
 from pathlib import Path
 (out, status, reason, exit_code, ofg_commit, oss_commit, fb_commit, intro_mode,
  num_samples, max_round, run_timeout, method_variant, excluded, leakage_path,
- profile, protocol, target) = sys.argv[1:]
+ profile, protocol, target, image_digest, num_evals, gen_timeout) = sys.argv[1:]
 try:
     stages = json.loads(Path(os.environ.get("workspace", "/workspace") + "/stages.json").read_text(encoding="utf-8"))
 except Exception:
@@ -514,6 +581,14 @@ try:
     leakage = json.loads(Path(leakage_path).read_text(encoding="utf-8"))
 except Exception:
     leakage = {}
+# Fold the evaluator's per-candidate metrics into the run result when present
+# so the run-level result.json carries real coverage/campaign/diff evidence.
+metrics = {}
+try:
+    ev = json.loads(Path(os.environ.get("workspace", "/workspace") + "/evaluation/result.json").read_text(encoding="utf-8"))
+    metrics = ev.get("metrics") or {}
+except Exception:
+    metrics = {}
 result = {
     "schema_version": 2,
     "generator": "oss-fuzz-gen",
@@ -526,15 +601,18 @@ result = {
     "reason": reason,
     "stages": stages,
     "artifacts": {},
-    "metrics": {},
+    "metrics": metrics,
     "provenance": {
         "oss_fuzz_gen_commit": ofg_commit,
         "oss_fuzz_commit": oss_commit,
         "fuzzbench_commit": fb_commit,
+        "docker_image_digest": image_digest,
         "introspector_mode": intro_mode,
         "ofg_num_samples": int(num_samples),
+        "ofg_num_evaluations": int(num_evals),
         "ofg_max_round": int(max_round),
         "ofg_run_timeout": int(run_timeout),
+        "ofg_generation_timeout_seconds": int(gen_timeout),
     },
     "reference_leakage_audit": leakage,
     "method_variant": method_variant,
@@ -661,6 +739,8 @@ if [[ "$mode" == "generate-target" ]]; then
   hgb_ofg_set_stage benchmark_synthesized completed
 
   # --- Generation + automatic build repair via upstream wrapper ---
+  # Beta plan section 7: allow multiple samples/trials using configurable
+  # defaults (OFG_NUM_SAMPLES, OFG_NUM_EVALUATIONS, OFG_GENERATION_TIMEOUT_SECONDS).
   export HGB_GENERATION_WORK_DIR="$workspace/generation/work"
   mkdir -p "$HGB_GENERATION_WORK_DIR"
   cmd=("$python" /opt/hgb/bin/ofg_run_wrapper.py --artifact "$artifact" -- \
@@ -670,7 +750,7 @@ if [[ "$mode" == "generate-target" ]]; then
   printf '%q ' "${cmd[@]}" >"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
   code=0
   (cd "$artifact" && PIP_CACHE_DIR="$workspace/generation/pip-cache" \
-      timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
+      timeout "${OFG_GENERATION_TIMEOUT_SECONDS:-${HGB_GENERATION_TIMEOUT_SECONDS:-10800}}" "${cmd[@]}") >"$workspace/logs/run.log" 2>&1 || code=$?
   redact_log_file "$workspace/logs/run.log"
 
   # --- Preserve compiling candidates ---
@@ -725,15 +805,57 @@ PY_OFG_LOG_HARNESS
   hgb_ofg_set_stage candidate_build completed
 
   # --- Independent evaluator: build, smoke, reachability, campaign, coverage ---
-  run_evaluator
+  # Beta plan section 9: evaluator CLI failure must propagate to infra_failure.
+  # No `|| true` around run_evaluator: a nonzero exit is a real failure.
+  eval_code=0
+  run_evaluator || eval_code=$?
+  eval_result_json="$workspace/evaluation/result.json"
   eval_results="$workspace/evaluation/results.json"
-  eval_verified="$(json_file_value "$eval_results" verification_ran 2>/dev/null || printf false)"
-  if [[ "$eval_verified" != "true" ]]; then
-    reason="ofg_evaluation_failed: independent evaluator did not reach evaluated (see evaluation/results.json)"
+  eval_status=""
+  if [[ -f "$eval_result_json" ]]; then
+    eval_status="$(json_file_value "$eval_result_json" status 2>/dev/null || printf '')"
+  fi
+  # If the evaluator crashed (nonzero exit, no result.json), it is infra.
+  if [[ "$eval_code" -ne 0 && -z "$eval_status" ]]; then
+    reason="infra_failure/failed_stage=evaluator: independent evaluator exited $eval_code (see logs/evaluator.log)"
+    hgb_ofg_set_stage candidate_build failed
     for s in sanitizer_smoke api_reachability campaign coverage; do hgb_ofg_set_stage "$s" failed; done
     write_final_result failed "$reason" 65
     hgb_write_common_metadata failed "$reason" 65 harness_generator
     hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
+  # Propagate the evaluator's per-stage states and metrics into the run result.
+  if [[ -f "$eval_result_json" ]]; then
+    "$python" - "$eval_result_json" "$workspace/stages.json" <<'PY_OFG_PROPAGATE'
+import json
+import sys
+from pathlib import Path
+result = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+stages_path = Path(sys.argv[2])
+stages = json.loads(stages_path.read_text(encoding="utf-8")) if stages_path.is_file() else {}
+ev_stages = result.get("stages") or {}
+for stage in ("candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"):
+    if ev_stages.get(stage):
+        stages[stage] = ev_stages[stage]
+stages_path.write_text(json.dumps(stages, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_OFG_PROPAGATE
+  fi
+  if [[ "$eval_status" != "evaluated" ]]; then
+    if [[ "$eval_status" == "infra_failure" ]]; then
+      reason="infra_failure: independent evaluator reported infrastructure failure (see evaluation/result.json)"
+    else
+      reason="quality_failure: independent evaluator did not reach evaluated (see evaluation/result.json)"
+    fi
+    for s in sanitizer_smoke api_reachability campaign coverage; do
+      [[ "$(json_file_value "$workspace/stages.json" "$s" 2>/dev/null)" == "completed" ]] || hgb_ofg_set_stage "$s" failed
+    done
+    final_status="$(hgb_ofg_result_status)"
+    [[ "$eval_status" == "infra_failure" ]] && final_status="infra_failure"
+    [[ "$final_status" == "failed" && "$eval_status" == "quality_failure" ]] && final_status="quality_failure"
+    write_final_result "$final_status" "$reason" 65
+    hgb_write_common_metadata "$final_status" "$reason" 65 harness_generator
+    hgb_write_common_summary "$final_status" "$reason" harness_generator
     exit 65
   fi
   for s in sanitizer_smoke api_reachability campaign coverage; do hgb_ofg_set_stage "$s" completed; done

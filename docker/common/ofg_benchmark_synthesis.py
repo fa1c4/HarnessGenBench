@@ -38,6 +38,56 @@ def detect_language(source_dir: str | Path) -> str:
     return "c++" if cpp_count >= c_count else "c"
 
 
+def benchmark_leak_audit(
+    benchmark: dict[str, Any],
+    *,
+    reference_text: str = "",
+    reference_paths: list[str] | None = None,
+) -> dict[str, Any]:
+    """Audit a synthesized benchmark YAML for reference-harness leakage.
+
+    Per beta plan section 6, the benchmark must not include the exact
+    ``LLVMFuzzerTestOneInput`` body, the reference harness path, APIs/calls
+    extracted from the exact reference harness, or a target-specific call
+    sequence from the selected harness. Returns a dict with ``leaked`` (bool),
+    ``hits`` (list), and ``benchmark_source``.
+    """
+    hits: list[str] = []
+    serialized = json.dumps(benchmark, sort_keys=True, default=str)
+    # The exact fuzz entrypoint body must never be embedded in the benchmark.
+    if "LLVMFuzzerTestOneInput" in serialized:
+        # A bare function name reference is allowed (e.g. in a reject list),
+        # but a body block (braces + statements) is leakage.
+        for function in benchmark.get("functions") or []:
+            if not isinstance(function, dict):
+                continue
+            for field in ("body", "source", "implementation", "example", "snippet"):
+                value = str(function.get(field) or "")
+                if "LLVMFuzzerTestOneInput" in value and "{" in value:
+                    hits.append(f"function {function.get('name')!r} embeds the entrypoint body in {field}")
+    # Reference harness paths must never appear in the benchmark.
+    for ref_path in reference_paths or []:
+        if ref_path and ref_path in serialized:
+            hits.append(f"benchmark references the exact harness path {ref_path!r}")
+    # APIs extracted from the reference harness text: if a benchmark function
+    # name appears in the reference text AND the benchmark carries a call
+    # sequence/order field derived from it, flag it.
+    if reference_text:
+        ref_l = reference_text.lower()
+        for function in benchmark.get("functions") or []:
+            if not isinstance(function, dict):
+                continue
+            name = str(function.get("name") or "")
+            call_sequence = function.get("call_sequence") or function.get("calls") or []
+            if name and name.lower() in ref_l and call_sequence:
+                hits.append(f"function {name!r} carries a reference-derived call_sequence")
+    return {
+        "leaked": bool(hits),
+        "hits": hits,
+        "leak_audit": "failed" if hits else "passed",
+    }
+
+
 def synthesize_benchmark(
     *,
     records: list[dict[str, Any]],
@@ -78,8 +128,14 @@ def synthesize_benchmark(
         "target_path": target_path,
         "use_project_examples": False,
     }
+    leak = benchmark_leak_audit(benchmark)
     return {
         "benchmark": benchmark,
+        "benchmark_source": "synthesized_from_introspector",
+        "leak_audit": leak["leak_audit"],
+        "leak_audit_detail": leak,
+        "function_under_test": functions[0]["name"] if functions else "",
+        "project": project,
         "selection": {
             "selection_source": "introspector",
             "selected": selected,

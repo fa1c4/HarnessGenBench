@@ -597,8 +597,13 @@ run_hgb_target_container() {
     # pipeline relative to /opt/hgb (the metadata mount parent).
     extra_docker_args+=(-v "$root/repro:/opt/hgb/repro:ro")
   fi
+  # Record the generator image digest (beta plan section 4) so each result
+  # carries reproducible docker image provenance.
+  local hgb_docker_image_digest=""
+  hgb_docker_image_digest="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
   docker run --rm --init \
     --entrypoint /opt/hgb/entrypoint.sh \
+    -e HGB_DOCKER_IMAGE_DIGEST="$hgb_docker_image_digest" \
     -e API_KEY \
     -e BASE_URL \
     -e MODEL \

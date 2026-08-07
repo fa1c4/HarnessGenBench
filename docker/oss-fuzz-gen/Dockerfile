@@ -46,8 +46,8 @@ COPY artifacts/oss-fuzz-gen /opt/hgb/artifacts/oss-fuzz-gen
 ENV OFG_OSS_FUZZ_DIR=/opt/hgb/oss-fuzz
 ENV OFG_OSS_FUZZ_VENV=/opt/hgb/oss-fuzz-venv
 RUN mkdir -p /opt/hgb/bin
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/ofg_select_benchmark.py docker/common/ofg_run_wrapper.py docker/common/ofg_trim_benchmark.py docker/common/ofg_profile.py docker/common/ofg_introspector_adapter.py docker/common/ofg_benchmark_synthesis.py docker/common/ofg_evaluator.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh /opt/hgb/bin/
-RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/ofg_select_benchmark.py /opt/hgb/bin/ofg_run_wrapper.py /opt/hgb/bin/ofg_trim_benchmark.py /opt/hgb/bin/ofg_profile.py /opt/hgb/bin/ofg_introspector_adapter.py /opt/hgb/bin/ofg_benchmark_synthesis.py /opt/hgb/bin/ofg_evaluator.py
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_api_report.py docker/common/ofg_select_benchmark.py docker/common/ofg_run_wrapper.py docker/common/ofg_trim_benchmark.py docker/common/ofg_profile.py docker/common/ofg_introspector_adapter.py docker/common/ofg_benchmark_synthesis.py docker/common/ofg_evaluator.py docker/common/hgb_harness_evaluator.py docker/common/hgb_result.py docker/common/hgb_coverage.py docker/common/hgb_reachability.py docker/common/hgb_fuzzbench_builder.py docker/common/hgb_target_package.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh /opt/hgb/bin/
+RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/ofg_select_benchmark.py /opt/hgb/bin/ofg_run_wrapper.py /opt/hgb/bin/ofg_trim_benchmark.py /opt/hgb/bin/ofg_profile.py /opt/hgb/bin/ofg_introspector_adapter.py /opt/hgb/bin/ofg_benchmark_synthesis.py /opt/hgb/bin/ofg_evaluator.py /opt/hgb/bin/hgb_harness_evaluator.py
 COPY docker/oss-fuzz-gen/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh
 WORKDIR /opt/hgb/artifacts/oss-fuzz-gen

@@ -16,7 +16,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 # Function-name patterns that are runtime/compiler helpers, trivial accessors,
@@ -371,6 +371,220 @@ def select_functions(
         "all_scored": selected,
         "selection_source": "introspector",
     }
+
+
+def select_inspector_report(
+    report_root: str | Path,
+    project: str,
+    fuzz_target: str,
+) -> Path | None:
+    """Locate the Introspector report by project and fuzz target.
+
+    Per beta plan section 5, reports are located by project and fuzz target,
+    NOT by the first matching ``inspector`` directory under ``build/out``.
+    Each candidate ``inspector`` directory is inspected: its
+    ``report_manifest.json`` project must match the requested project, and the
+    fuzz target must be referenced in the calltree or all_functions. Returns
+    the matching directory or None.
+    """
+    root = Path(report_root)
+    if not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    for path in root.rglob("inspector"):
+        if path.is_dir():
+            candidates.append(path)
+    if not candidates:
+        return None
+    target_l = (fuzz_target or "").lower().replace("-", "_")
+    project_l = (project or "").lower()
+    scored: list[tuple[int, Path]] = []
+    for cand in sorted(candidates):
+        manifest = parse_report_manifest(cand)
+        manifest_project = str(manifest.get("project") or manifest.get("project_name") or "").lower()
+        if project_l and manifest_project and manifest_project != project_l:
+            continue
+        score = 1
+        # Prefer directories whose calltree/all_functions reference the fuzz target.
+        calltree = parse_calltree(cand)
+        functions = parse_all_functions(cand)
+        names = {r.get("name", "").lower() for r in functions}
+        reachable = {n.lower() for n in calltree.get("reachable", set())}
+        if target_l and any(target_l in n for n in names):
+            score += 10
+        if target_l and any(target_l in n for n in reachable):
+            score += 5
+        # A directory with project-sourced functions ranks above a stub-only one.
+        project_sourced = [r for r in functions if r.get("path") and "hgb_introspector_stub" not in r["path"]]
+        if project_sourced:
+            score += 3
+        scored.append((score, cand))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: (-item[0], str(item[1])))
+    return scored[0][1]
+
+
+def generate_function_source_map(
+    report_dir: str | Path,
+    source_root: str = "",
+) -> dict[str, Any]:
+    """Generate ``function_source_map.json`` if upstream does not emit it.
+
+    Maps each function name to its normalized source path and signature so the
+    benchmark synthesis can resolve function source files within project
+    source. This is a derived artifact, never the source of truth.
+    """
+    report_dir = Path(report_dir)
+    records = parse_all_functions(report_dir, source_root)
+    mapping: dict[str, Any] = {}
+    for record in records:
+        name = record.get("name") or ""
+        if not name:
+            continue
+        mapping[name] = {
+            "source_file": record.get("path", ""),
+            "signature": record.get("signature", ""),
+            "return_type": record.get("return_type", ""),
+        }
+    return {"functions": mapping, "source_root": source_root}
+
+
+REQUIRED_REPORT_FILES = (
+    "all_functions.json",
+    "calltree.json",
+    "type_info.json",
+    "report_manifest.json",
+    "function_source_map.json",
+)
+
+
+class IntrospectorReport:
+    """Result of a real Fuzz Introspector build for a single target."""
+
+    def __init__(
+        self,
+        *,
+        report_dir: Path,
+        project: str,
+        fuzz_target: str,
+        valid: bool,
+        message: str,
+        files: dict[str, bool] | None = None,
+    ) -> None:
+        self.report_dir = Path(report_dir)
+        self.project = project
+        self.fuzz_target = fuzz_target
+        self.valid = valid
+        self.message = message
+        self.files = files or {}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "report_dir": str(self.report_dir),
+            "project": self.project,
+            "fuzz_target": self.fuzz_target,
+            "valid": self.valid,
+            "message": self.message,
+            "files": dict(self.files),
+        }
+
+
+def build_introspector_report(
+    target_root: Path,
+    work_dir: Path,
+    project: str,
+    fuzz_target: str,
+    *,
+    oss_fuzz_dir: Path | None = None,
+    source_dir: Path | None = None,
+    runner: Callable[..., Any] | None = None,
+    compat_shim: bool = False,
+) -> IntrospectorReport:
+    """Run the pinned Introspector build and return a validated report.
+
+    Per beta plan section 5, this runs the pinned OSS-Fuzz/FuzzBench build with
+    Introspector enabled for the exact project and fuzz target, locates the
+    report by project and fuzz target (not the first ``inspector`` directory),
+    ensures all required files exist (generating ``function_source_map.json``
+    if upstream does not emit it), and validates nonzero functions whose source
+    files are within project source. A failure in alpha/paper is a real
+    ``infra_failure/failed_stage=introspector`` — never a soft skip.
+    """
+    work_dir = Path(work_dir)
+    introspector_dir = work_dir / "introspector"
+    introspector_dir.mkdir(parents=True, exist_ok=True)
+    if compat_shim:
+        return IntrospectorReport(
+            report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+            valid=True, message="compat-smoke shim", files={},
+        )
+    if oss_fuzz_dir is None or not (Path(oss_fuzz_dir) / "infra" / "helper.py").is_file():
+        return IntrospectorReport(
+            report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+            valid=False, message="infra_failure/failed_stage=introspector: missing infra/helper.py",
+        )
+    oss_fuzz_dir = Path(oss_fuzz_dir)
+    source_dir = Path(source_dir) if source_dir else Path(target_root) / "source_input"
+    overlay_dir = work_dir / "introspector_overlay"
+    if overlay_dir.exists():
+        import shutil as _sh
+        _sh.rmtree(overlay_dir)
+    overlay_dir.mkdir(parents=True, exist_ok=True)
+    if source_dir.is_dir():
+        import shutil as _sh
+        _sh.copytree(source_dir, overlay_dir / "src", dirs_exist_ok=True)
+    (overlay_dir / "hgb_introspector_stub.c").write_text(
+        "int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) { return 0; }\n",
+        encoding="utf-8",
+    )
+    if runner is None:
+        return IntrospectorReport(
+            report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+            valid=False, message="infra_failure/failed_stage=introspector: no runner available",
+        )
+    build_cmd = [
+        "python3", str(oss_fuzz_dir / "infra" / "helper.py"), "build_fuzzers",
+        "--sanitizer", "address", "--engine", "introspector", "--architecture", "x86_64",
+        project, str(overlay_dir),
+    ]
+    result = runner(build_cmd, 3600)
+    if result.returncode != 0:
+        return IntrospectorReport(
+            report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+            valid=False, message=f"infra_failure/failed_stage=introspector: build exited {result.returncode}",
+        )
+    report_root = oss_fuzz_dir / "build" / "out"
+    selected = select_inspector_report(report_root, project, fuzz_target)
+    if selected is None:
+        return IntrospectorReport(
+            report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+            valid=False, message="infra_failure/failed_stage=introspector: no target-scoped inspector report",
+        )
+    files: dict[str, bool] = {}
+    for name in REQUIRED_REPORT_FILES:
+        src = selected / name
+        dst = introspector_dir / name
+        if src.is_file():
+            import shutil as _sh
+            _sh.copy2(src, dst)
+            files[name] = True
+        elif name == "function_source_map.json":
+            mapping = generate_function_source_map(selected, str(source_dir))
+            dst.write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            files[name] = True
+        else:
+            files[name] = False
+    ok, message = validate_reports(introspector_dir)
+    if not ok:
+        return IntrospectorReport(
+            report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+            valid=False, message=f"infra_failure/failed_stage=introspector: {message}", files=files,
+        )
+    return IntrospectorReport(
+        report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
+        valid=True, message=message, files=files,
+    )
 
 
 def main() -> int:
