@@ -583,7 +583,7 @@ run_hgb_target_container() {
   if hgb_generator_is_blind "$generator" && [[ -d "$target_package/generator_input" ]]; then
     target_mount_src="$target_package/generator_input"
     if [[ -d "$target_package/evaluator_only" ]]; then
-      evaluator_mount_args+=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator)
+      evaluator_mount_args+=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
     fi
   fi
   if [[ "$generator" == "elfuzz" ]]; then
@@ -767,6 +767,8 @@ run_hgb_target_container() {
     -e HGB_GENERATOR_COMMIT="$generator_commit" \
     -e HGB_TARGET="$target" \
     -e HGB_TARGET_PACKAGE=/target \
+    -e HGB_TARGET_ROOT=/target \
+    -e HGB_GENERATOR_TARGET_ROOT=/target \
     -e HGB_TARGET_PACKAGE_HOST="$target_package" \
     -e HGB_TARGET_MANIFEST=/target/target_manifest.json \
     -e HGB_TARGET_GENERATOR_MANIFEST=/target/target_manifest.generator.json \

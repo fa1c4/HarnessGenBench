@@ -24,7 +24,10 @@ def parse_llvm_coverage_json(text: str) -> dict[str, Any]:
 
     Returns a normalized dict with ``line_coverage``, ``function_coverage``,
     ``region_coverage`` and ``edge_coverage`` (null for LLVM source-based
-    reports, which do not report edges).
+    reports, which do not report edges).  When the export is not
+    ``-summary-only`` the covered function names are collected under
+    ``covered_functions`` so the evaluator can match intended API symbols to
+    real runtime evidence (plan section 8).
     """
 
     try:
@@ -34,6 +37,7 @@ def parse_llvm_coverage_json(text: str) -> dict[str, Any]:
     if not isinstance(data, dict) or "data" not in data:
         raise CoverageError("llvm coverage JSON has no 'data' key")
     totals = {"lines": {"count": 0, "covered": 0}, "functions": {"count": 0, "covered": 0}, "regions": {"count": 0, "covered": 0}}
+    covered_functions: list[str] = []
     for entry in data.get("data", []):
         entry_totals = entry.get("totals", {}) if isinstance(entry, dict) else {}
         for key in totals:
@@ -42,17 +46,29 @@ def parse_llvm_coverage_json(text: str) -> dict[str, Any]:
                 continue
             totals[key]["count"] += int(sect.get("count", 0) or 0)
             totals[key]["covered"] += int(sect.get("covered", 0) or 0)
+        # Collect covered function names from the per-function array (present
+        # when llvm-cov export is run without -summary-only).
+        functions = entry.get("functions", []) if isinstance(entry, dict) else []
+        if isinstance(functions, list):
+            for func in functions:
+                if not isinstance(func, dict):
+                    continue
+                if int(func.get("count", 0) or 0) > 0 and func.get("name"):
+                    covered_functions.append(str(func["name"]))
     lines = totals["lines"]
     funcs = totals["functions"]
     regions = totals["regions"]
     line_percent = round(100.0 * lines["covered"] / lines["count"], 2) if lines["count"] else 0.0
     func_percent = round(100.0 * funcs["covered"] / funcs["count"], 2) if funcs["count"] else 0.0
     region_percent = round(100.0 * regions["covered"] / regions["count"], 2) if regions["count"] else 0.0
+    # Rename "regions" to "region_coverage" for consistency with the plan.
     return {
         "line_coverage": {"covered": lines["covered"], "total": lines["count"], "percent": line_percent},
         "function_coverage": {"covered": funcs["covered"], "total": funcs["count"], "percent": func_percent},
+        "region_coverage": {"covered": regions["covered"], "total": regions["count"], "percent": region_percent},
         "regions": {"covered": regions["covered"], "total": regions["count"], "percent": region_percent},
         "edge_coverage": None,
+        "covered_functions": sorted(set(covered_functions)),
         "source": "llvm_source_based",
     }
 

@@ -145,7 +145,7 @@ if [[ "$mode" == "generate-target" ]]; then
   ckg_profile="$HGB_PROFILE"
   ckg_protocol="$HGB_PROTOCOL"
   case "$ckg_profile" in
-    alpha|paper-faithful|compat-smoke) ;;
+    alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
     *) hgb_write_common_metadata failed "invalid CKGFuzzer profile: $ckg_profile" 64 harness_generator; exit 64 ;;
   esac
   case "$ckg_protocol" in
@@ -153,7 +153,7 @@ if [[ "$mode" == "generate-target" ]]; then
     *) hgb_write_common_metadata failed "invalid CKGFuzzer protocol: $ckg_protocol" 64 harness_generator; exit 64 ;;
   esac
   # Method-faithful profiles forbid compat fallbacks even if legacy env is set.
-  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" ]]; then
+  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" ]]; then
     if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
       hgb_write_common_metadata failed "CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden in $ckg_profile" 64 harness_generator; exit 64
     fi
@@ -485,7 +485,28 @@ EOF_CKG_USAGE
   export CKGFUZZER_SELECTED_API_LIST="$ckg_db/api_list.json"
   if ! ckg_program_language="$(python3 /opt/hgb/bin/ckgfuzzer_target_harness.py \
     --target-root /target --fuzz-target "$fuzz_target" --field language 2>"$workspace/logs/native_harness.log")"; then
-    hgb_soft_skip ckg_native_harness_unresolved 'target package does not identify one native C/C++ harness path for candidate verification' harness_generator
+    # In blind-project split mode the sanitized generator manifest does not
+    # carry selected_reference_harness_files, so the native-harness resolver
+    # cannot determine the language.  Infer it from the source_input files
+    # instead of soft-skipping: the generator needs the language tag for its
+    # config but must not read evaluator-only reference harness metadata.
+    ckg_lang_script="$workspace/logs/ckg_infer_language.py"
+    mkdir -p "$(dirname "$ckg_lang_script")"
+    cat >"$ckg_lang_script" <<'PY_CKG_LANG_INFER'
+import sys
+from pathlib import Path
+root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("/target/source_input")
+if not root.is_dir():
+    print("c")
+    sys.exit(0)
+cpp = any(p.suffix.lower() in {".cc", ".cpp", ".cxx", ".c++", ".hh", ".hpp"} for p in root.rglob("*") if p.is_file())
+print("c++" if cpp else "c")
+PY_CKG_LANG_INFER
+    ckg_program_language="$(python3 "$ckg_lang_script" /target/source_input 2>/dev/null || printf 'c')"
+    if [[ -z "$ckg_program_language" ]]; then
+      ckg_program_language="c"
+    fi
+    printf 'Inferred CKGFuzzer program_language=%s from source_input (native harness resolver unavailable in blind mode)\n' "$ckg_program_language" >>"$workspace/logs/native_harness.log"
   fi
   case "$ckg_program_language" in
     c|c++) ;;
@@ -1623,6 +1644,51 @@ PY_CKG_CACHE_WRITE_METADATA
         else
           hgb_result_set_stage "$workspace/stages.json" knowledge_graph completed
         fi
+        # Count CodeQL graph nodes (unique functions) and edges (call rows)
+        # for the result schema (plan section 5/6).
+        ckg_codeql_graph_nodes=0
+        ckg_codeql_graph_edges=0
+        ckg_graph_csv="$(find "$ckg_db/codebase/call_graph" -maxdepth 1 -type f -name '*.csv' -print -quit 2>/dev/null || true)"
+        if [[ -s "$ckg_graph_csv" ]]; then
+          ckg_codeql_graph_edges="$(python3 - "$ckg_graph_csv" <<'PY_CKG_GRAPH_COUNT' 2>/dev/null || printf '0'
+import csv
+import sys
+edges = 0
+nodes = set()
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    reader = csv.reader(f)
+    for row in reader:
+        if not row:
+            continue
+        if row[0] in ("caller", ""):
+            continue
+        edges += 1
+        if len(row) > 1 and row[1]:
+            nodes.add(row[1])
+        if row[0]:
+            nodes.add(row[0])
+print(edges)
+PY_CKG_GRAPH_COUNT
+)"
+          ckg_codeql_graph_nodes="$(python3 - "$ckg_graph_csv" <<'PY_CKG_GRAPH_NODES' 2>/dev/null || printf '0'
+import csv
+import sys
+nodes = set()
+with open(sys.argv[1], encoding="utf-8", errors="replace") as f:
+    reader = csv.reader(f)
+    for row in reader:
+        if not row:
+            continue
+        if row[0] in ("caller", ""):
+            continue
+        if len(row) > 1 and row[1]:
+            nodes.add(row[1])
+        if row[0]:
+            nodes.add(row[0])
+print(len(nodes))
+PY_CKG_GRAPH_NODES
+)"
+        fi
       fi
     fi
     if [[ "$code" == "0" ]]; then
@@ -1713,37 +1779,42 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   verification_ran=false
   verified_harness_count=0
   verification_context_mode=''
+  evaluator_status=''
+  evaluator_execs_done=0
+  evaluator_cov_lines=''
   if [[ "${generated_harness_count:-0}" -gt 0 ]]; then
-    verification_code=0
-    timeout "${CKGFUZZER_CANDIDATE_VERIFY_TIMEOUT_SECONDS:-7200}" \
-      python3 /opt/hgb/bin/ckgfuzzer_candidate_verifier.py \
-        --target-root /target \
-        --candidates "$workspace/generated_harnesses" \
-        --work-dir "$candidate_verification_dir" \
-        --fuzz-target "$fuzz_target" \
-        --timeout-seconds "${CKGFUZZER_CANDIDATE_BUILD_TIMEOUT_SECONDS:-1800}" \
-        >"$workspace/logs/candidate_verification.log" 2>&1 || verification_code=$?
-    if [[ -f "$candidate_verification_file" ]]; then
-      verification_ran="$(jq -r '.verification_ran // false' "$candidate_verification_file" 2>/dev/null || printf false)"
-      verification_context_mode="$(jq -r '.verification_context.mode // ""' "$candidate_verification_file" 2>/dev/null || printf '')"
-      jq '.verified_candidates // []' "$candidate_verification_file" >"$workspace/verified_harnesses.json" 2>/dev/null || printf '[]\n' >"$workspace/verified_harnesses.json"
-      verified_harness_count="$(jq '(.verified_candidates // []) | length' "$candidate_verification_file" 2>/dev/null || printf '0')"
-    else
-      printf '[]\n' >"$workspace/verified_harnesses.json"
-    fi
-    if [[ "$verification_code" != "0" || "$verification_ran" != "true" ]]; then
-      code=6
-      if [[ "$verification_context_mode" == "verification_context_unreproducible" ]]; then
-        failed_stage=verification_context
-      else
-        failed_stage=verification
+    # Reject candidates with no LLVMFuzzerTestOneInput (or no fuzz-driver
+    # equivalent accepted by FuzzBench).  Only candidates that define a
+    # libFuzzer entry point are forwarded to the evaluator.
+    hgb_filtered_dir="$workspace/generated_harnesses_filtered"
+    rm -rf "$hgb_filtered_dir"
+    mkdir -p "$hgb_filtered_dir"
+    filtered_count=0
+    while IFS= read -r -d '' cand; do
+      if grep -qE 'LLVMFuzzerTestOneInput' "$cand" 2>/dev/null; then
+        filtered_count=$((filtered_count + 1))
+        cp "$cand" "$hgb_filtered_dir/${filtered_count}_$(basename "$cand")" 2>/dev/null || true
       fi
-      hgb_result_set_stage "$workspace/stages.json" candidate_build failed
+    done < <(find "$workspace/generated_harnesses" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) -print0 2>/dev/null)
+    if [[ "$filtered_count" -gt 0 ]]; then
+      rm -rf "$workspace/generated_harnesses"
+      mv "$hgb_filtered_dir" "$workspace/generated_harnesses"
+      generated_harness_count="$filtered_count"
     else
-      hgb_result_set_stage "$workspace/stages.json" candidate_build completed
-      # Beta plan §6: sanitizer_smoke, api_reachability, campaign, and coverage
-      # are set ONLY from the full harness evaluator output. A candidate that
-      # merely compiled must never mark these stages completed.
+      generated_harness_count=0
+    fi
+  fi
+  if [[ "${generated_harness_count:-0}" -gt 0 ]]; then
+    if [[ "$ckg_method_faithful" == "1" ]]; then
+      # reproduction-gamma / paper-faithful / alpha: route candidates directly
+      # into the split-aware shared evaluator.  The old build-only verifier is
+      # NOT invoked before evaluation; in blind mode /target is generator_input
+      # only and the old verifier cannot find fuzzbench_benchmark, which would
+      # block the split-package reproduction loop.
+      verification_ran=true
+      verification_code=0
+      verified_harness_count="$generated_harness_count"
+      hgb_result_set_stage "$workspace/stages.json" candidate_build pending
       evaluator_root="${HGB_EVALUATOR_ROOT:-/target}"
       evaluator_dir="$workspace/evaluation"
       evaluator_code=0
@@ -1762,20 +1833,100 @@ PY_CKG_SOURCE_FALLBACK_BODIES
           >"$workspace/logs/harness_evaluator.log" 2>&1 || evaluator_code=$?
       evaluator_result="$evaluator_dir/result.json"
       if [[ -f "$evaluator_result" ]]; then
-        for stage in sanitizer_smoke api_reachability campaign coverage; do
+        # The evaluator drives candidate_build through coverage; mirror all
+        # evaluation stages from the evaluator result so a build-only success
+        # never marks campaign/coverage completed.
+        for stage in candidate_build sanitizer_smoke api_reachability campaign coverage; do
           stage_state="$(jq -r --arg s "$stage" '.stages[$s] // "pending"' "$evaluator_result" 2>/dev/null || printf pending)"
           hgb_result_set_stage "$workspace/stages.json" "$stage" "$stage_state"
         done
         evaluator_status="$(jq -r '.status // ""' "$evaluator_result" 2>/dev/null || printf '')"
         evaluator_execs_done="$(jq -r '.metrics.campaign.execs_done // 0' "$evaluator_result" 2>/dev/null || printf 0)"
         evaluator_cov_lines="$(jq -r '.metrics.coverage.line_coverage.covered // empty' "$evaluator_result" 2>/dev/null || true)"
+        # Record the selected candidate as the verified harness list so the
+        # status derivation below does not treat a successful evaluation as
+        # "no verified harness".
+        jq '[.selected_candidate // empty] | map(select(. != null and . != {}))' "$evaluator_result" >"$workspace/verified_harnesses.json" 2>/dev/null || printf '[]\n' >"$workspace/verified_harnesses.json"
+        verified_harness_count="$(jq 'length' "$workspace/verified_harnesses.json" 2>/dev/null || printf '0')"
       else
-        for stage in sanitizer_smoke api_reachability campaign coverage; do
+        for stage in candidate_build sanitizer_smoke api_reachability campaign coverage; do
           hgb_result_set_stage "$workspace/stages.json" "$stage" failed
         done
         evaluator_status=''
         evaluator_execs_done=0
         evaluator_cov_lines=''
+        printf '[]\n' >"$workspace/verified_harnesses.json"
+        if [[ "$code" -eq 0 ]]; then
+          code=6
+          failed_stage=evaluator
+        fi
+      fi
+    else
+      # compat-smoke: optional legacy build-only verifier path, excluded from
+      # the scientific aggregate (method_variant=compat_smoke).
+      verification_code=0
+      timeout "${CKGFUZZER_CANDIDATE_VERIFY_TIMEOUT_SECONDS:-7200}" \
+        python3 /opt/hgb/bin/ckgfuzzer_candidate_verifier.py \
+          --target-root /target \
+          --candidates "$workspace/generated_harnesses" \
+          --work-dir "$candidate_verification_dir" \
+          --fuzz-target "$fuzz_target" \
+          --timeout-seconds "${CKGFUZZER_CANDIDATE_BUILD_TIMEOUT_SECONDS:-1800}" \
+          >"$workspace/logs/candidate_verification.log" 2>&1 || verification_code=$?
+      if [[ -f "$candidate_verification_file" ]]; then
+        verification_ran="$(jq -r '.verification_ran // false' "$candidate_verification_file" 2>/dev/null || printf false)"
+        verification_context_mode="$(jq -r '.verification_context.mode // ""' "$candidate_verification_file" 2>/dev/null || printf '')"
+        jq '.verified_candidates // []' "$candidate_verification_file" >"$workspace/verified_harnesses.json" 2>/dev/null || printf '[]\n' >"$workspace/verified_harnesses.json"
+        verified_harness_count="$(jq '(.verified_candidates // []) | length' "$candidate_verification_file" 2>/dev/null || printf '0')"
+      else
+        printf '[]\n' >"$workspace/verified_harnesses.json"
+      fi
+      if [[ "$verification_code" != "0" || "$verification_ran" != "true" ]]; then
+        code=6
+        if [[ "$verification_context_mode" == "verification_context_unreproducible" ]]; then
+          failed_stage=verification_context
+        else
+          failed_stage=verification
+        fi
+        hgb_result_set_stage "$workspace/stages.json" candidate_build failed
+      else
+        hgb_result_set_stage "$workspace/stages.json" candidate_build completed
+        # Beta plan §6: sanitizer_smoke, api_reachability, campaign, and coverage
+        # are set ONLY from the full harness evaluator output. A candidate that
+        # merely compiled must never mark these stages completed.
+        evaluator_root="${HGB_EVALUATOR_ROOT:-/target}"
+        evaluator_dir="$workspace/evaluation"
+        evaluator_code=0
+        timeout "${HGB_CKG_EVALUATOR_TIMEOUT_SECONDS:-14400}" \
+          python3 /opt/hgb/bin/hgb_harness_evaluator.py \
+            --generator ckgfuzzer \
+            --target-root /target \
+            --evaluator-root "$evaluator_root" \
+            --candidates "$workspace/generated_harnesses" \
+            --work-dir "$evaluator_dir" \
+            --project "$ckg_project" \
+            --fuzz-target "$fuzz_target" \
+            --profile "$ckg_profile" \
+            --campaign-seconds "${HGB_CAMPAIGN_SECONDS:-300}" \
+            --strict \
+            >"$workspace/logs/harness_evaluator.log" 2>&1 || evaluator_code=$?
+        evaluator_result="$evaluator_dir/result.json"
+        if [[ -f "$evaluator_result" ]]; then
+          for stage in sanitizer_smoke api_reachability campaign coverage; do
+            stage_state="$(jq -r --arg s "$stage" '.stages[$s] // "pending"' "$evaluator_result" 2>/dev/null || printf pending)"
+            hgb_result_set_stage "$workspace/stages.json" "$stage" "$stage_state"
+          done
+          evaluator_status="$(jq -r '.status // ""' "$evaluator_result" 2>/dev/null || printf '')"
+          evaluator_execs_done="$(jq -r '.metrics.campaign.execs_done // 0' "$evaluator_result" 2>/dev/null || printf 0)"
+          evaluator_cov_lines="$(jq -r '.metrics.coverage.line_coverage.covered // empty' "$evaluator_result" 2>/dev/null || true)"
+        else
+          for stage in sanitizer_smoke api_reachability campaign coverage; do
+            hgb_result_set_stage "$workspace/stages.json" "$stage" failed
+          done
+          evaluator_status=''
+          evaluator_execs_done=0
+          evaluator_cov_lines=''
+        fi
       fi
     fi
   else
@@ -1894,6 +2045,65 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       printf 'Reference leakage audit passed: no canary leakage detected\n' >"$workspace/logs/leakage_audit.log"
     fi
   fi
+  # --- Candidate reference-copy audit (plan section 4.4 / 5) ---
+  # Compare the selected candidate to evaluator-only reference harnesses
+  # *after* generation.  This never runs before generation and never writes
+  # reference contents into generator-visible directories.
+  ckg_candidate_audit='{"contains_reference_canary":false,"near_duplicate_reference":false,"exact_copy":false}'
+  ckg_candidate_path=''
+  ckg_candidate_sha256=''
+  ckg_selected_candidate_json='{}'
+  if [[ -f "$workspace/evaluation/result.json" ]]; then
+    ckg_selected_candidate_json="$(jq '.selected_candidate // {}' "$workspace/evaluation/result.json" 2>/dev/null || printf '{}')"
+    ckg_candidate_path="$(printf '%s' "$ckg_selected_candidate_json" | jq -r '.candidate_path // ""' 2>/dev/null || true)"
+  fi
+  if [[ -z "$ckg_candidate_path" && "${generated_harness_count:-0}" -gt 0 ]]; then
+    ckg_candidate_path="$(find "$workspace/generated_harnesses" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) -print -quit 2>/dev/null || true)"
+  fi
+  if [[ -n "$ckg_candidate_path" && -f "$ckg_candidate_path" ]]; then
+    ckg_candidate_sha256="$(sha256sum "$ckg_candidate_path" | awk '{print $1}' 2>/dev/null || true)"
+    ckg_eval_ref_dir="${HGB_EVALUATOR_ROOT:-/evaluator}/reference_harnesses"
+    if [[ -d "$ckg_eval_ref_dir" ]]; then
+      ckg_audit_script="$workspace/logs/ckg_candidate_audit.py"
+      mkdir -p "$(dirname "$ckg_audit_script")"
+      cat >"$ckg_audit_script" <<'PY_CKG_CAND_AUDIT'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+try:
+    from hgb_split_context import audit_candidate_reference_copy
+except Exception:
+    print(json.dumps({"contains_reference_canary": False, "near_duplicate_reference": False, "exact_copy": False}))
+    sys.exit(0)
+candidate = Path(sys.argv[1])
+ref_dir = Path(sys.argv[2])
+canary = sys.argv[3] if len(sys.argv) > 3 else ""
+result = audit_candidate_reference_copy(candidate, ref_dir, canary=canary)
+print(json.dumps(result, sort_keys=True))
+PY_CKG_CAND_AUDIT
+      ckg_candidate_audit="$(PYTHONPATH="/opt/hgb/bin${PYTHONPATH:+:$PYTHONPATH}" python3 "$ckg_audit_script" "$ckg_candidate_path" "$ckg_eval_ref_dir" "${HGB_REF_CANARY:-}" 2>/dev/null || printf '%s' "$ckg_candidate_audit")"
+    fi
+  fi
+  # Report API summary/combination mode and compilation repair attempts.
+  if [[ "$ckg_method_faithful" == "1" ]]; then
+    ckg_api_summary_mode='llm'
+    ckg_api_combination_mode='llm'
+  else
+    ckg_api_summary_mode='local'
+    ckg_api_combination_mode='local'
+  fi
+  ckg_repair_attempts="$(grep -cE 'check_compilation|compilation_fix|repair' "$workspace/logs/fuzzing.log" 2>/dev/null || printf '0')"
+  ckg_repair_attempts="${ckg_repair_attempts:-0}"
+  ckg_codeql_graph_nodes_final="${ckg_codeql_graph_nodes:-0}"
+  ckg_codeql_graph_edges_final="${ckg_codeql_graph_edges:-0}"
+  ckg_candidate_block="$(printf '{"path":"%s","sha256":"%s","contains_reference_canary":%s,"near_duplicate_reference":%s}' \
+    "$(hgb_json_escape "$ckg_candidate_path")" "$(hgb_json_escape "$ckg_candidate_sha256")" \
+    "$(printf '%s' "$ckg_candidate_audit" | jq -r '.contains_reference_canary // false' 2>/dev/null || printf false)" \
+    "$(printf '%s' "$ckg_candidate_audit" | jq -r '.near_duplicate_reference // false' 2>/dev/null || printf false)")"
+  ckg_block="$(printf '{"codeql_database":"%s","codeql_graph_nodes":%s,"codeql_graph_edges":%s,"api_summary_mode":"%s","api_combination_mode":"%s","compilation_repair_attempts":%s}' \
+    "$(hgb_json_escape "$ckg_db")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" \
+    "$ckg_api_summary_mode" "$ckg_api_combination_mode" "$ckg_repair_attempts")"
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "ckgfuzzer_project": "%s",
   "ckgfuzzer_shared_dir": "%s",
@@ -1918,11 +2128,15 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   "analysis_fallback_reason": "%s",
   "source_fallback_recovered_body_count": %s,
   "codeql_version": "%s",
+  "codeql_graph_nodes": %s,
+  "codeql_graph_edges": %s,
   "ckgfuzzer_codeql_cache_status": "%s",
   "ckgfuzzer_codeql_cache_key": "%s",
   "ckgfuzzer_codeql_cache_path": "%s",
   "ckgfuzzer_codeql_cache_reason": "%s",
-  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_leakage_audit")
+  "candidate": %s,
+  "ckgfuzzer": %s,
+  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_candidate_block" "$ckg_block" "$ckg_leakage_audit")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

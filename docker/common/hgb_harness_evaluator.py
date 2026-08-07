@@ -70,6 +70,11 @@ except Exception:  # pragma: no cover - only in stripped-down test environments
     ckgfuzzer_verifier_context = None
     ckgfuzzer_target_harness = None
 
+try:
+    hgb_split_context = _load("hgb_split_context", _HERE / "hgb_split_context.py")
+except Exception:  # pragma: no cover - only in stripped-down test environments
+    hgb_split_context = None
+
 
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx"}
 
@@ -212,9 +217,30 @@ def _prepare_sealed_context(
     work_dir: Path,
     context_provider: Callable[..., Any] | None,
 ) -> dict[str, Any]:
-    """Build the sealed Docker context for the evaluator."""
+    """Build the sealed Docker context for the evaluator.
+
+    In blind-project split mode the evaluator must combine ``source_input``
+    and ``source_repos.json`` from the generator half (``/target``) with
+    ``benchmark_copy`` and ``native_harness_path.json`` from the evaluator
+    half (``/evaluator``).  Passing either half alone into the monolithic
+    ``prepare_verification_context`` fails because each half is missing files
+    the other provides.
+    """
+
     if context_provider is not None:
         return context_provider(target_root, work_dir)
+    # Split-aware path: generator half has source_input, evaluator half has
+    # benchmark_copy.  Use the split context loader to combine them.
+    if hgb_split_context is not None:
+        has_gen_source = (target_root / "source_input").is_dir()
+        has_eval_benchmark = (evaluator_root / "benchmark_copy").is_dir()
+        if has_gen_source and has_eval_benchmark and target_root != evaluator_root:
+            try:
+                ctx = hgb_split_context.SplitTargetContext.load(target_root, evaluator_root)
+                return hgb_split_context.create_sealed_build_context(ctx, work_dir)
+            except hgb_split_context.VerificationContextError:
+                pass  # fall through to monolithic path
+    # Monolithic fallback (non-split packages).
     if ckgfuzzer_verifier_context is None:
         raise RuntimeError("sealed context provider unavailable")
     benchmark_copy = evaluator_root / "benchmark_copy"
@@ -317,19 +343,13 @@ def evaluate_candidate(
         hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "failed")
         rec.error = "sanitizer misuse crash on smoke samples"
         return rec
+    if not smoke.get("any_executed"):
+        hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "failed")
+        rec.error = "no smoke sample executed the target"
+        return rec
     hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "completed")
 
-    # 6.4 API reachability.
-    reach_trace = {"executed_functions": intended_apis} if intended_apis else {}
-    reach = hgb_reachability.check_reachability(intended_apis, reach_trace)
-    rec.api_reachability = reach
-    if not reach["reached"]:
-        hgb_result.mark_stage(rec.stages, "api_reachability", "failed")
-        rec.error = "no intended project API executed dynamically"
-        return rec
-    hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
-
-    # 6.5 Fuzzing campaign (fixed-budget libFuzzer).
+    # 6.4 Fuzzing campaign (fixed-budget libFuzzer).
     corpus_dir = candidate_work / "corpus"
     corpus_dir.mkdir(parents=True, exist_ok=True)
     for seed in seeds:
@@ -350,7 +370,7 @@ def evaluate_candidate(
         return rec
     hgb_result.mark_stage(rec.stages, "campaign", "completed")
 
-    # 6.6 Coverage (real LLVM source-based coverage).
+    # 6.5 Coverage (real LLVM source-based coverage with function detail).
     cov = hgb_fuzzbench_builder.run_coverage(
         image_tag=image_tag,
         binary_path=build.binary_path,
@@ -377,6 +397,30 @@ def evaluate_candidate(
         return rec
     rec.coverage = cov_summary
     hgb_result.mark_stage(rec.stages, "coverage", "completed")
+
+    # 6.6 API reachability (real runtime evidence, never fabricated).
+    # Replace the old fake reachability that passed intended_apis as
+    # executed_functions.  Use the coverage report's covered function names
+    # (from llvm-cov export without -summary-only) to match intended API
+    # symbols.  If no intended API list exists, mark not_requested.
+    if not intended_apis:
+        rec.api_reachability = {
+            "status": "not_requested",
+            "reason": "no_intended_api_list",
+            "intended_apis": [],
+            "reached_apis": [],
+            "reached": True,
+        }
+        hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
+    else:
+        covered_functions = cov_summary.get("covered_functions", []) if cov_summary else []
+        reach = hgb_reachability.check_reachability(intended_apis, {"executed_functions": covered_functions})
+        rec.api_reachability = reach
+        if not reach["reached"]:
+            hgb_result.mark_stage(rec.stages, "api_reachability", "failed")
+            rec.error = "no intended project API executed dynamically (no coverage evidence)"
+            return rec
+        hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
 
     # 6.7 Native/reference coverage control + line coverage diff (beta 8.6).
     # The native control replays the native (reference) harness under the same

@@ -81,8 +81,6 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
     benchmark = target_root / "fuzzbench_benchmark"
     if not source_input.is_dir():
         raise SystemExit(f"missing source_input: {source_input}")
-    if not benchmark.is_dir():
-        raise SystemExit(f"missing fuzzbench_benchmark: {benchmark}")
 
     if project_dir.exists():
         shutil.rmtree(project_dir)
@@ -97,32 +95,37 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
     # Reproduce Dockerfile COPY build.sh/*.dict/fuzzer sources to $SRC.  These
     # files are needed for build replay, but intentionally not copied to the
     # distinct synthetic CKG project Docker context so generators do not see
-    # the benchmark answer.
-    for child in benchmark.iterdir():
-        # A package-only .dockerignore can intentionally hide a synthetic
-        # top-level build.sh from native replay. It must not leak into the
-        # distinct synthetic CKG project Docker context.
-        if child.name in {"Dockerfile", "benchmark.yaml", ".dockerignore"}:
-            continue
-        target = project_dir / child.name
-        if child.is_dir() and not child.is_symlink():
-            shutil.copytree(child, target, symlinks=True, dirs_exist_ok=True)
-        else:
-            if target.exists() or target.is_symlink():
-                target.unlink()
-            shutil.copy2(child, target, follow_symlinks=False)
+    # the benchmark answer.  In blind-project split mode the benchmark lives
+    # under the evaluator-only half and is intentionally NOT visible to the
+    # generator; the CodeQL wrapper then falls back to compiling individual
+    # source_input translation units.
+    has_benchmark = benchmark.is_dir()
+    if has_benchmark:
+        for child in benchmark.iterdir():
+            # A package-only .dockerignore can intentionally hide a synthetic
+            # top-level build.sh from native replay. It must not leak into the
+            # distinct synthetic CKG project Docker context.
+            if child.name in {"Dockerfile", "benchmark.yaml", ".dockerignore"}:
+                continue
+            target = project_dir / child.name
+            if child.is_dir() and not child.is_symlink():
+                shutil.copytree(child, target, symlinks=True, dirs_exist_ok=True)
+            else:
+                if target.exists() or target.is_symlink():
+                    target.unlink()
+                shutil.copy2(child, target, follow_symlinks=False)
 
-    workdir = _last_workdir(benchmark / "Dockerfile")
+    workdir = _last_workdir(benchmark / "Dockerfile") if has_benchmark else ""
     build_dir = map_workdir(workdir, project_name)
     metadata = {
         "analysis_dir": str(analysis_dir),
-        "benchmark_dir": str(benchmark),
+        "benchmark_dir": str(benchmark) if has_benchmark else "",
         "build_dir": build_dir,
         "project_dir": str(project_dir),
         "project_name": project_name,
         "source_input_dir": str(source_input),
         "workdir": workdir,
-        "build_context": "fuzzbench_replay",
+        "build_context": "fuzzbench_replay" if has_benchmark else "source_input_only",
     }
     return metadata
 

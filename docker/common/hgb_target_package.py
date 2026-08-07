@@ -10,10 +10,13 @@ Layout produced by :func:`split_package`::
 
     <package>/generator_input/
         source_input/   docs/   seeds/   dictionary/   build_metadata/
+        source_repos.json
+        target_manifest.json                # sanitized, generator-safe copy
         target_manifest.generator.json
     <package>/evaluator_only/
         reference_harnesses/   selected_reference_harnesses/
         benchmark_copy/   native_harness_path.json
+        evaluator_manifest.json
         target_manifest.evaluator.json
 
 This module is imported by ``scripts/hgb_targets.py`` (host) and by the
@@ -121,6 +124,25 @@ def _write_native_harness_path(evaluator_only: Path, native_harness: dict[str, A
     )
 
 
+def _write_evaluator_manifest(evaluator_only: Path) -> None:
+    """Write evaluator_manifest.json naming the evaluator-only inputs.
+
+    The split-aware sealed evaluator context validates that these files exist
+    under /evaluator before combining them with /target/source_input.
+    """
+    payload = {
+        "benchmark_copy_dir": "benchmark_copy",
+        "native_harness_path_file": "native_harness_path.json",
+        "reference_harnesses_dir": "reference_harnesses",
+        "selected_reference_harnesses_dir": "selected_reference_harnesses",
+        "target_manifest_file": "target_manifest.evaluator.json",
+        "protocol_visibility": "evaluator_only",
+    }
+    (evaluator_only / "evaluator_manifest.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
 def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | None = None) -> dict[str, str]:
     """Split a monolithic target package into generator_input/evaluator_only.
 
@@ -155,9 +177,19 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
     # build_metadata holds the source provenance needed by the generator.
     if (package / "source_repos.json").is_file():
         shutil.copy2(package / "source_repos.json", generator_input / "build_metadata" / "source_repos.json")
+        # Also expose source_repos.json at the generator_input top level so
+        # consumers that read /target/source_repos.json (e.g. the split-aware
+        # sealed evaluator context) find it under the blind generator mount.
+        shutil.copy2(package / "source_repos.json", generator_input / "source_repos.json")
 
     generator_manifest = _build_generator_manifest(full_manifest)
     (generator_input / "target_manifest.generator.json").write_text(
+        json.dumps(generator_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    # Sanitized generator-safe manifest at the canonical path so consumers that
+    # read /target/target_manifest.json never see reference-harness fields and
+    # never read the wrong (evaluator-only) manifest in blind mode.
+    (generator_input / "target_manifest.json").write_text(
         json.dumps(generator_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
@@ -185,6 +217,11 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
     (evaluator_only / "target_manifest.evaluator.json").write_text(
         json.dumps(evaluator_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    # Concise evaluator manifest naming the evaluator-only files the sealed
+    # context must combine (benchmark_copy, native_harness_path, reference
+    # harnesses). This is distinct from the full target_manifest.evaluator.json
+    # so the split-aware evaluator can validate its inputs by name.
+    _write_evaluator_manifest(evaluator_only)
 
     return {
         "generator_input": str(generator_input),

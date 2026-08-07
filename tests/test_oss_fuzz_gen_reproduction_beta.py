@@ -44,14 +44,18 @@ matrix_collector = _load_module("hgb_collect_matrix", "scripts/hgb_collect_matri
 LLVM_COVERAGE_JSON = json.dumps({
     "data": [{"totals": {"lines": {"count": 100, "covered": 31},
                           "functions": {"count": 10, "covered": 6},
-                          "regions": {"count": 50, "covered": 14}}}],
+                          "regions": {"count": 50, "covered": 14}},
+              "functions": [{"name": "jsoncpp_parse", "count": 5},
+                            {"name": "LLVMFuzzerTestOneInput", "count": 12}]}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",
 })
 
 LLVM_COVERAGE_NATIVE = json.dumps({
     "data": [{"totals": {"lines": {"count": 100, "covered": 45},
                           "functions": {"count": 10, "covered": 7},
-                          "regions": {"count": 50, "covered": 18}}}],
+                          "regions": {"count": 50, "covered": 18}},
+              "functions": [{"name": "jsoncpp_parse", "count": 8},
+                            {"name": "LLVMFuzzerTestOneInput", "count": 15}]}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",
 })
 

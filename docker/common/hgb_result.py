@@ -150,6 +150,8 @@ def build_result(
             method_variant = "compat-smoke"
         if status == STATUS_EVALUATED:
             status = STATUS_COMPAT_SMOKE_COMPLETED
+    if profile == "reproduction-gamma" and not method_variant:
+        method_variant = "paper-faithful"
     if status not in ALLOWED_STATUSES and status not in {"failed", "partial_completed", "missing_api_key"}:
         # Normalize legacy statuses into the beta contract.  A bare "failed"
         # from the legacy entrypoint is preserved for backwards compatibility
@@ -201,7 +203,9 @@ def select_best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | 
         if smoke.get("misuse_crash"):
             return False
         reach = c.get("api_reachability", {})
-        if not reach.get("reached_apis"):
+        # not_requested reachability (no intended API list) is acceptable;
+        # otherwise require at least one reached API with real evidence.
+        if reach.get("status") != "not_requested" and not reach.get("reached_apis"):
             return False
         cov = c.get("coverage", {})
         if cov.get("line_coverage", {}).get("covered") in (None, 0):

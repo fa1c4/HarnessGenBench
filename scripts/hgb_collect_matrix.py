@@ -182,6 +182,59 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
     return violations
 
 
+def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
+    """Extract the plan-section-9 CKGFuzzer row fields from metadata.
+
+    Returns a dict with the canonical CKGFuzzer matrix columns so the
+    collector can emit a per-target breakdown with real runtime evidence,
+    coverage, graph stats, and reference-leak/copy audit flags.
+    """
+    stages = meta.get("stages") or {}
+    if not isinstance(stages, dict):
+        stages = {}
+    cov = meta.get("metrics", {}).get("coverage") or meta.get("coverage") or {}
+    if not isinstance(cov, dict):
+        cov = {}
+    campaign = meta.get("metrics", {}).get("campaign") or meta.get("campaign") or {}
+    if not isinstance(campaign, dict):
+        campaign = {}
+    line_cov = cov.get("line_coverage") or {}
+    region_cov = cov.get("region_coverage") or cov.get("regions") or {}
+    func_cov = cov.get("function_coverage") or {}
+    candidate = meta.get("candidate") or {}
+    if not isinstance(candidate, dict):
+        candidate = {}
+    ckg = meta.get("ckgfuzzer") or {}
+    if not isinstance(ckg, dict):
+        ckg = {}
+    leak_audit = meta.get("reference_leakage_audit") or {}
+    if not isinstance(leak_audit, dict):
+        leak_audit = {}
+    return {
+        "target": meta.get("target", ""),
+        "status": str(meta.get("status", "")),
+        "applicability": str(meta.get("applicability", "")),
+        "candidate_build": str(stages.get("candidate_build", "")),
+        "sanitizer_smoke": str(stages.get("sanitizer_smoke", "")),
+        "api_reachability": str(stages.get("api_reachability", "")),
+        "campaign": str(stages.get("campaign", "")),
+        "coverage": str(stages.get("coverage", "")),
+        "line_coverage": line_cov.get("covered") if isinstance(line_cov, dict) else None,
+        "region_coverage": region_cov.get("covered") if isinstance(region_cov, dict) else None,
+        "function_coverage": func_cov.get("covered") if isinstance(func_cov, dict) else None,
+        "execs_done": int(campaign.get("execs_done", 0) or 0),
+        "crashes": int(campaign.get("crashes", 0) or 0),
+        "hangs": int(campaign.get("timeouts", 0) or 0),
+        "llm_calls": int(meta.get("api_trace_total_count", 0) or 0),
+        "embedding_calls": int(meta.get("embedding_calls", 0) or meta.get("api_trace_total_count", 0) or 0),
+        "codeql_graph_nodes": int(ckg.get("codeql_graph_nodes", meta.get("codeql_graph_nodes", 0) or 0) or 0),
+        "codeql_graph_edges": int(ckg.get("codeql_graph_edges", meta.get("codeql_graph_edges", 0) or 0) or 0),
+        "reference_canary_leak": bool(candidate.get("contains_reference_canary") or leak_audit.get("leaked")),
+        "near_duplicate_reference": bool(candidate.get("near_duplicate_reference")),
+        "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
+    }
+
+
 def read_rows(matrix_dir: Path) -> list[dict[str, str]]:
     matrix_file = matrix_dir / "matrix.tsv"
     if not matrix_file.exists():
@@ -379,6 +432,7 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "") -> di
     applicable_quality_failure = 0
     applicable_infra_failure = 0
     coverage_by_applicable_evaluated: list[dict[str, Any]] = []
+    ckgfuzzer_target_rows: list[dict[str, Any]] = []
     for record in records:
         meta = record["metadata"]
         gen = meta.get("generator") or meta.get("fuzzer") or record["row"].get("generator") or "unknown"
@@ -386,6 +440,9 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "") -> di
         family = str(meta.get("task_family") or meta.get("capability") or ("input_generator" if gen in {"g2fuzz", "elfuzz"} else "harness_generator"))
         task_family_counts[family] += 1
         status_counts_by_task_family[family][status_s] += 1
+        # Collect per-target CKGFuzzer matrix rows (plan section 9).
+        if gen == "ckgfuzzer":
+            ckgfuzzer_target_rows.append(extract_ckgfuzzer_row(meta))
         # Aggregate artifact counts by task family so harness and input
         # generators never share a single counter.
         harness_counts[gen] += int(meta.get("generated_harness_count") or meta.get("generated_driver_count") or 0)
@@ -467,6 +524,7 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "") -> di
         "top_remediations": remediation_counts.most_common(10),
         "storage": storage_report(matrix_dir, records),
         "evaluated_row_violations": evaluated_violations,
+        "ckgfuzzer_target_rows": ckgfuzzer_target_rows,
     }
 
 

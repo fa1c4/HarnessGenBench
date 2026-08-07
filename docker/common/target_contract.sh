@@ -233,17 +233,38 @@ hgb_write_common_summary() {
 hgb_require_target_package() {
   local workspace="${workspace:-/workspace}"
   local target_root="${HGB_TARGET_PACKAGE:-/target}"
+  local evaluator_root="${HGB_EVALUATOR_ROOT:-}"
   local missing=0
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/generated_inputs"
-  for path in \
-    "$target_root/target_manifest.json" \
-    "$target_root/fuzzbench_benchmark/benchmark.yaml" \
-    "$target_root/fuzzbench_benchmark/build.sh"; do
-    if [[ ! -e "$path" ]]; then
-      printf 'missing required target package path: %s\n' "$path" >>"$workspace/logs/target_contract.log"
+  # In blind-project split mode, /target is generator_input only. The
+  # benchmark.yaml/build.sh live under /evaluator/benchmark_copy, so they must
+  # not be required from the generator-visible half. Only require the manifest
+  # and source_input from /target; the evaluator validates its own half.
+  if [[ -n "$evaluator_root" && -d "$target_root/source_input" ]]; then
+    for path in \
+      "$target_root/target_manifest.json" \
+      "$target_root/source_input"; do
+      if [[ ! -e "$path" ]]; then
+        printf 'missing required generator-visible target path: %s\n' "$path" >>"$workspace/logs/target_contract.log"
+        missing=1
+      fi
+    done
+    # The evaluator half must provide the benchmark copy.
+    if [[ ! -d "$evaluator_root/benchmark_copy" ]]; then
+      printf 'missing evaluator-only benchmark_copy: %s/benchmark_copy\n' "$evaluator_root" >>"$workspace/logs/target_contract.log"
       missing=1
     fi
-  done
+  else
+    for path in \
+      "$target_root/target_manifest.json" \
+      "$target_root/fuzzbench_benchmark/benchmark.yaml" \
+      "$target_root/fuzzbench_benchmark/build.sh"; do
+      if [[ ! -e "$path" ]]; then
+        printf 'missing required target package path: %s\n' "$path" >>"$workspace/logs/target_contract.log"
+        missing=1
+      fi
+    done
+  fi
   if [[ "$missing" == "1" ]]; then
     hgb_write_common_metadata target_package_missing 'target package is missing required files' 66 "${HGB_CAPABILITY:-harness_generator}"
     hgb_write_common_summary target_package_missing 'target package is missing required files' "${HGB_CAPABILITY:-harness_generator}"
@@ -382,6 +403,7 @@ hgb_write_result_json() {
   local method_variant="$profile"
   case "$profile" in
     compat-smoke) excluded=true; method_variant="compat-smoke" ;;
+    reproduction-gamma) method_variant="paper-faithful" ;;
   esac
   local stages_json
   stages_json="$(hgb_result_read_stages "$stage_file")"

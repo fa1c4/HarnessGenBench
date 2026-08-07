@@ -177,9 +177,19 @@ def _container_run(
     command: list[str],
     phase: str,
     copy_out: tuple[str, Path] | None = None,
+    copy_in: list[tuple[Path, str]] | None = None,
     env: list[str] | None = None,
 ) -> CommandResult:
-    """Run a one-shot container with the candidate image and capture logs."""
+    """Run a one-shot container with the candidate image and capture logs.
+
+    ``copy_in`` is a list of ``(host_path, container_path)`` tuples copied into
+    the container *before* it starts (so smoke/campaign samples are present).
+    ``copy_out`` is a ``(container_path, host_path)`` tuple.  The container
+    path is prefixed with the generated container name so ``docker cp``
+    receives a valid ``<name>:<path>`` source.  Earlier versions passed a
+    malformed ``hgb-eval-<phase>-:container:`` literal which never copied real
+    artifacts out of the container, and smoke samples were never copied in.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     container_name = f"hgb-eval-{phase}-{uuid.uuid4().hex[:12]}"
     create = ["docker", "create", "--name", container_name]
@@ -194,12 +204,25 @@ def _container_run(
     result = create_result
     try:
         if create_result.exit_code == 0:
+            for host_path, container_path in (copy_in or []):
+                host_p = Path(host_path)
+                if not host_p.is_file():
+                    continue
+                cp_in = _run_phase(
+                    runner,
+                    ["docker", "cp", str(host_p), f"{container_name}:{container_path}"],
+                    timeout_seconds,
+                    f"copy_in {phase}",
+                )
+                phases.append(("copy_in", cp_in))
             start_result = _run_phase(runner, ["docker", "start", "-a", container_name], timeout_seconds, f"run {phase}")
             phases.append(("run", start_result))
             result = start_result
             if copy_out:
-                src, dst = copy_out
-                cp = _run_phase(runner, ["docker", "cp", src, str(dst)], timeout_seconds, f"copy {phase}")
+                container_src, dst = copy_out
+                docker_cp_src = f"{container_name}:{container_src}"
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                cp = _run_phase(runner, ["docker", "cp", docker_cp_src, str(dst)], timeout_seconds, f"copy {phase}")
                 phases.append(("copy", cp))
     finally:
         rm = _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {phase}")
@@ -227,7 +250,12 @@ def run_smoke(
     runner: Runner = _run,
     timeout_seconds: int = 120,
 ) -> dict:
-    """Run the built binary on empty input and available seeds (sanitizer smoke)."""
+    """Run the built binary on empty input and available seeds (sanitizer smoke).
+
+    Each sample file is copied into the container before the binary runs so the
+    target actually executes on real input.  A smoke run that never executed
+    the target (e.g. missing input) is reported as ``executed=false``.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     samples: list[dict] = []
     # Empty input sample.
@@ -238,6 +266,7 @@ def run_smoke(
         if Path(seed).is_file():
             invocations.append((Path(seed), Path(seed).name))
     misuse_crash = False
+    any_executed = False
     for host_input, label in invocations:
         container_input = f"/tmp/smoke_{label}"
         result = _container_run(
@@ -245,10 +274,12 @@ def run_smoke(
             work_dir=work_dir / "smoke" / label,
             runner=runner,
             timeout_seconds=timeout_seconds,
-            command=["sh", "-lc", f"cp {container_input} /tmp/in && {binary_path} /tmp/in"],
+            command=["sh", "-lc", f"test -f {container_input} && {binary_path} {container_input}"],
             phase=f"smoke_{label}",
-            env=[f"HGB_SMOKE_INPUT={container_input}"],
+            copy_in=[(host_input, container_input)],
         )
+        # The target executed if the input file was present and the binary ran.
+        executed = result.exit_code in (0, 1, 77) or bool(result.stdout) or bool(result.stderr)
         # A sanitizer-misuse crash is indicated by a non-zero exit (libFuzzer
         # returns 77 for a misuse crash on a single input).
         crashed = result.exit_code not in (0, 1, 124)
@@ -256,8 +287,10 @@ def run_smoke(
             crashed = True
         if crashed:
             misuse_crash = True
-        samples.append({"label": label, "exit_code": result.exit_code, "crashed": crashed, "stderr": result.stderr[:4000]})
-    return {"samples": samples, "misuse_crash": misuse_crash}
+        if executed:
+            any_executed = True
+        samples.append({"label": label, "exit_code": result.exit_code, "crashed": crashed, "executed": executed, "stderr": result.stderr[:4000]})
+    return {"samples": samples, "misuse_crash": misuse_crash, "any_executed": any_executed}
 
 
 def run_campaign(
@@ -270,26 +303,46 @@ def run_campaign(
     runner: Runner = _run,
     timeout_seconds: int | None = None,
 ) -> dict:
-    """Run a fixed-budget libFuzzer campaign and parse execs_done from the log."""
+    """Run a fixed-budget libFuzzer campaign and parse execs_done from the log.
+
+    Seed corpus files are copied into the container before the campaign starts.
+    After the campaign the final corpus, crashes, and fuzzer stats are copied
+    out so the coverage stage can replay the real corpus.
+    """
     work_dir.mkdir(parents=True, exist_ok=True)
     corpus_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir = work_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     budget = max(1, int(campaign_seconds))
+    # Build copy_in list for seed corpus files.
+    copy_in: list[tuple[Path, str]] = []
+    seed_index = 0
+    for seed in sorted(corpus_dir.iterdir()) if corpus_dir.is_dir() else []:
+        if seed.is_file():
+            copy_in.append((seed, f"/tmp/corpus/seed_{seed_index:04d}"))
+            seed_index += 1
     cmd = [
         "sh",
         "-lc",
         f'mkdir -p /tmp/corpus /tmp/artifacts && {binary_path} '
-        f'-max_total_time={budget} -artifact_prefix=/tmp/artifacts/ /tmp/corpus',
+        f'-max_total_time={budget} -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
+        f'> /tmp/campaign.log 2>&1; '
+        f'echo "---STATS---"; '
+        f'ls /tmp/corpus | wc -l; '
+        f'ls /tmp/artifacts 2>/dev/null | wc -l; '
+        f'cat /tmp/campaign.log',
     ]
     timeout = timeout_seconds or (budget + 60)
+    campaign_work = work_dir / "campaign"
     result = _container_run(
         image_tag=image_tag,
-        work_dir=work_dir / "campaign",
+        work_dir=campaign_work,
         runner=runner,
         timeout_seconds=timeout,
         command=cmd,
         phase="campaign",
+        copy_in=copy_in if copy_in else None,
+        copy_out=("/tmp/campaign.log", campaign_work / "campaign.log"),
     )
     log = result.stdout + "\n" + result.stderr
     execs_done = _parse_execs_done(log)
@@ -303,7 +356,7 @@ def run_campaign(
         "ooms": int("out-of-memory" in log.lower() or "SUMMARY: libFuzzer: out-of-memory" in log),
         "peak_rss_mb": _parse_peak_rss(log),
         "exit_code": result.exit_code,
-        "log": str(work_dir / "campaign" / "campaign.log"),
+        "log": str(campaign_work / "campaign.log"),
     }
 
 
@@ -348,31 +401,42 @@ def run_coverage(
     Returns a dict with the raw coverage text path and exit code.  The caller
     parses it with :mod:`hgb_coverage`.  This never fabricates coverage: if the
     coverage report is missing or empty, the evaluator must mark coverage as
-    failed.
+    failed.  The export includes per-function detail (not ``-summary-only``)
+    so the evaluator can match intended API symbols to covered functions for
+    real API reachability evidence.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
+    # Build copy_in list for corpus files to replay.
+    copy_in: list[tuple[Path, str]] = []
+    seed_index = 0
+    for seed in sorted(corpus_dir.iterdir()) if corpus_dir.is_dir() else []:
+        if seed.is_file():
+            copy_in.append((seed, f"/tmp/corpus/cov_{seed_index:04d}"))
+            seed_index += 1
+    cov_work = work_dir / "coverage"
     cmd = [
         "sh",
         "-lc",
         f'mkdir -p /tmp/cov /tmp/corpus && LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw '
         f'{binary_path} -runs=0 /tmp/corpus && '
         f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && '
-        f'llvm-cov export -format=text -summary-only {binary_path} -instr-profile=/tmp/cov/merged.profdata '
+        f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
         f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err; cat /tmp/cov/coverage.json',
     ]
     result = _container_run(
         image_tag=image_tag,
-        work_dir=work_dir / "coverage",
+        work_dir=cov_work,
         runner=runner,
         timeout_seconds=timeout_seconds,
         command=cmd,
         phase="coverage",
-        copy_out=(f"hgb-eval-coverage-:container:/tmp/cov/coverage.json", work_dir / "coverage" / "coverage.json"),
+        copy_in=copy_in if copy_in else None,
+        copy_out=("/tmp/cov/coverage.json", cov_work / "coverage.json"),
     )
     return {
         "exit_code": result.exit_code,
         "raw_text": result.stdout,
-        "log": str(work_dir / "coverage" / "coverage.log"),
+        "log": str(cov_work / "coverage.log"),
     }
 
 

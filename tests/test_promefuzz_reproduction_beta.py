@@ -455,7 +455,9 @@ def test_entrypoint_cannot_mark_campaign_coverage_complete_without_evaluator_out
 LLVM_COVERAGE_JSON = json.dumps({
     "data": [{"totals": {"lines": {"count": 100, "covered": 27},
                           "functions": {"count": 10, "covered": 5},
-                          "regions": {"count": 50, "covered": 12}}}],
+                          "regions": {"count": 50, "covered": 12}},
+              "functions": [{"name": "hgb_sample_api", "count": 5},
+                            {"name": "LLVMFuzzerTestOneInput", "count": 12}]}],
     "type": "llvm.coverage.json.export",
     "version": "2.0.1",
 })
