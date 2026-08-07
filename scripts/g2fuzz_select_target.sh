@@ -49,11 +49,16 @@ Path(sys.argv[2]).write_text(f"""# G2FUZZ Target Selection
 - Selected program: `{program}`
 - Formats: `{', '.join(sel['formats'])}`
 - Reason: {sel['reason']}
-- AFL binary: `not found`
-- CMPLOG binary: `not found`
+- AFL binary: `auto-built from pinned FuzzBench target`
+- CMPLOG binary: `auto-built from pinned FuzzBench target (AFL_LLVM_CMPLOG=1)`
 - Reference data path: `{sel['data_repo_comparison_path']}`
 
-G2FUZZ AFL target binaries are not bundled in the pinned artifact checkout. Docker smoke runs search `$G2FUZZ_TARGET_DIR`, `/workspace/targets/{program}/`, and `/opt/hgb/artifacts/g2fuzz/`. Missing binaries soft-skip by default and write `TARGET_BUILD_MISSING.md`.
+G2Fuzz auto-builds the `.afl`/`.cmp` target pair from the pinned FuzzBench
+benchmark source inside the G2Fuzz image (CC/CXX = modified afl-clang-fast,
+FUZZING_ENGINE=afl, SANITIZER=address; CmpLog for `.cmp`). A host-provided pair
+may still be supplied via `G2FUZZ_TARGET_DIR` as an optional override. Missing
+toolchain or a failed build is `infra_missing`/`infra_failure`, never a soft
+skip.
 """)
 PYNOTE
   log "G2FUZZ target selection written to $selected_json"

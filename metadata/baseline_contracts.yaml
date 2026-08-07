@@ -30,7 +30,28 @@ baselines:
     default_profile: alpha
     default_protocol: paper-native
     strict_success_status: evaluated
-    notes: G2Fuzz generates input generators and seeds for a fixed native target pair; it is not a harness generator.
+    notes: >
+      G2Fuzz generates input generators and seeds for a fixed native target pair
+      and is not a harness generator. alpha and paper-faithful auto-build the
+      .afl (default AFL++ instrumentation) and .cmp (CmpLog) binaries from the
+      pinned FuzzBench target with the modified afl-clang-fast; no externally
+      prebuilt pair is required (G2FUZZ_TARGET_DIR is an optional override
+      only). The native FuzzBench harness is kept unchanged. The pipeline
+      validates the per-target input contract (file/stdin/argv from the adapter
+      manifest, never a global @@ assumption), runs program_gen.py with an
+      adapter-derived program_to_format mapping, counts only real
+      generator-produced inputs (excluding .py/.json/logs/preseed/common
+      corpus), requires at least one valid G2-generated input, runs the
+      modified AFL++ campaign with -c target.cmp -k <G2FUZZ> requiring
+      execs_done>0 and a nonempty queue, and collects real LLVM/lcov coverage
+      (AFL paths_total is never edge coverage; edge_coverage is unavailable
+      when no edge report exists). status=evaluated requires
+      target_pair_build.status==completed, valid_g2_generated_count>0,
+      campaign.execs_done>0, campaign.queue_count>0, and a real coverage report
+      with non-null covered lines. A failed/missing pair build is
+      infra_failure/infra_missing, never a soft skip; all generated inputs
+      failing validation is quality_failure. paper-faithful and extension
+      method_profile groups are reported separately by the matrix collector.
   - name: elfuzz
     task_family: input_generator
     profiles: [alpha, paper-faithful, compat-smoke]

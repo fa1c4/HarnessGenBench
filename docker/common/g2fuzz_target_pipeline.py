@@ -2,10 +2,21 @@
 """Target-aware G2Fuzz input-generation pipeline for HarnessGenBench.
 
 The real G2Fuzz artifact creates input generators and seeds, then drives its
-modified AFL++ against an existing native target.  This helper owns the HGB
-contract around that workflow: adapter validation, target-pair discovery,
-invocation rendering, provenance accounting, campaign execution, and normalized
-result metadata.
+modified AFL++ against a native target pair built as ``.afl`` (default AFL++
+instrumentation) and ``.cmp`` (CmpLog instrumentation) binaries.  G2Fuzz is an
+``input_generator``; it never generates ``LLVMFuzzerTestOneInput`` and is never
+ranked with harness generators.
+
+This helper owns the HGB contract around that workflow: adapter validation,
+automatic target-pair building from the pinned FuzzBench target, input-contract
+validation, ``program_gen.py`` orchestration, generated-input validation,
+seed-provenance accounting, modified AFL++ campaign execution, real coverage
+collection, and normalized schema-version-2 results.
+
+A successful row is ``evaluated`` only when the target pair was built, at least
+one G2-generated input validated against the target, the campaign recorded
+``execs_done > 0`` and a nonempty queue, and a real coverage report measured a
+non-null covered-line count.  AFL ``paths_total`` is never treated as coverage.
 """
 
 from __future__ import annotations
@@ -32,6 +43,16 @@ STAGE_NAMES = (
     "campaign",
     "coverage",
 )
+# Goal-stage aliases (beta plan section 0) mapped onto the canonical internal
+# stage names so the result payload carries both the internal ordering and the
+# contract names.
+GOAL_STAGE_ALIASES = {
+    "target_pair_build": "target_pair_built",
+    "program_generation": "input_generators_created",
+    "generated_input_validation": "generated_inputs_validated",
+    "campaign": "campaign",
+    "coverage": "coverage",
+}
 REQUIRED_ADAPTER_KEYS = {
     "target",
     "applicability",
@@ -46,6 +67,25 @@ REQUIRED_ADAPTER_KEYS = {
 PAPER_METHOD_PROFILE = "paper-faithful"
 EXTENSION_METHOD_PROFILE = "extension"
 TASK_FAMILY = "input_generator"
+BUILD_MODE = "fuzzbench_native_afl_cmps"
+
+
+# Coverage helpers are optional at import time; the offline pytest suite does
+# not require LLVM tooling.  They are resolved from the same directory as this
+# module when available.
+try:  # pragma: no cover - import shim
+    import hgb_coverage  # type: ignore
+    from hgb_coverage import CoverageError, summarize_coverage_report, write_coverage_outputs
+except ImportError:  # pragma: no cover
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        import hgb_coverage  # type: ignore
+        from hgb_coverage import CoverageError, summarize_coverage_report, write_coverage_outputs
+    except ImportError:
+        CoverageError = RuntimeError  # type: ignore[misc,assignment]
+        summarize_coverage_report = None  # type: ignore[assignment]
+        write_coverage_outputs = None  # type: ignore[assignment]
 
 
 class PipelineError(RuntimeError):
@@ -70,7 +110,7 @@ def append_jsonl(path: Path, data: dict[str, Any]) -> None:
 def read_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+    except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
@@ -253,6 +293,7 @@ def load_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]
         raise PipelineError("adapter_manifest_missing", f"missing G2Fuzz adapter manifest: {path}", 66)
     raw = parse_simple_yaml(path)
     adapters: dict[str, dict[str, Any]] = {}
+    seen: set[str] = set()
     for entry in raw.get("targets", []):
         if not isinstance(entry, dict):
             raise PipelineError("adapter_parse_failed", f"adapter entry is not a mapping: {entry}", 64)
@@ -264,6 +305,9 @@ def load_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]
                 64,
             )
         target = str(entry["target"])
+        if target in seen:
+            raise PipelineError("adapter_parse_failed", f"duplicate adapter entry for target: {target}", 64)
+        seen.add(target)
         formats = entry.get("formats")
         argv = entry.get("argv")
         if not isinstance(formats, list) or not formats:
@@ -301,6 +345,16 @@ def validate_adapter_coverage(metadata_root: Path | None = None) -> list[str]:
     return valuable
 
 
+def adapter_profile_counts(metadata_root: Path | None = None) -> dict[str, int]:
+    adapters = load_adapters(metadata_root)
+    counts = {PAPER_METHOD_PROFILE: 0, EXTENSION_METHOD_PROFILE: 0}
+    for entry in adapters.values():
+        profile = str(entry.get("method_profile", ""))
+        if profile in counts:
+            counts[profile] += 1
+    return counts
+
+
 def formats_for_profile(adapter: dict[str, Any], profile: str, env: dict[str, str] | None = None) -> list[str]:
     formats = [str(item) for item in adapter.get("formats", [])]
     env = env or os.environ
@@ -320,32 +374,57 @@ def try_num_for_profile(profile: str, env: dict[str, str] | None = None) -> str:
     return env.get("G2FUZZ_TRY_NUM", "3") or "3"
 
 
-def build_command_pair(adapter: dict[str, Any]) -> dict[str, Any]:
-    common = [
-        "bash",
-        "/target/fuzzbench_benchmark/build.sh",
-    ]
-    afl_env = {
+def build_command_pair(
+    adapter: dict[str, Any],
+    artifact_dir: str | Path | None = None,
+    target_package: str | Path | None = None,
+    workspace: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return the two (afl/cmp) FuzzBench build commands for the target pair.
+
+    Both variants share the same ``argv`` (the native FuzzBench ``build.sh``)
+    and the same compiler/toolchain env; they differ ONLY in
+    ``AFL_LLVM_CMPLOG`` (0 for the default-instrumented ``.afl`` binary, 1 for
+    the CmpLog ``.cmp`` binary) and the ``HGB_G2FUZZ_OUTPUT`` path.  CmpLog is
+    used exclusively for the ``.cmp`` build.
+    """
+
+    artifact = Path(artifact_dir) if artifact_dir else Path("/opt/hgb/artifacts/g2fuzz")
+    bench_root = Path(target_package) if target_package else Path("/target")
+    out_root = Path(workspace) if workspace else Path("/workspace")
+    build_sh = bench_root / "fuzzbench_benchmark" / "build.sh"
+    cc = artifact / "afl-clang-fast"
+    cxx = artifact / "afl-clang-fast++"
+    src = bench_root / "source_input"
+    common_env = {
+        "CC": str(cc),
+        "CXX": str(cxx),
         "FUZZING_ENGINE": "afl",
-        "AFL_LLVM_CMPLOG": "0",
-        "HGB_G2FUZZ_OUTPUT": "/workspace/target/target.afl",
+        "SANITIZER": "address",
+        "ARCHITECTURE": "x86_64",
+        "SRC": str(src),
+        "WORK": str(out_root / "target" / "build_work"),
+        "LIB_FUZZING_ENGINE": "",
     }
-    cmp_env = {
-        "FUZZING_ENGINE": "afl",
-        "AFL_LLVM_CMPLOG": "1",
-        "HGB_G2FUZZ_OUTPUT": "/workspace/target/target.cmp",
-    }
+    afl_env = dict(common_env)
+    afl_env["AFL_LLVM_CMPLOG"] = "0"
+    afl_env["HGB_G2FUZZ_OUTPUT"] = str(out_root / "target" / "target.afl")
+    cmp_env = dict(common_env)
+    cmp_env["AFL_LLVM_CMPLOG"] = "1"
+    cmp_env["HGB_G2FUZZ_OUTPUT"] = str(out_root / "target" / "target.cmp")
+    argv = ["bash", str(build_sh)]
     return {
         "program_id": adapter["program_id"],
-        "afl": {"env": afl_env, "argv": common},
-        "cmp": {"env": cmp_env, "argv": common},
+        "build_mode": BUILD_MODE,
+        "afl": {"env": afl_env, "argv": argv},
+        "cmp": {"env": cmp_env, "argv": argv},
         "expected_difference": "AFL_LLVM_CMPLOG and output path only",
     }
 
 
 def resolved_invocation(
     adapter: dict[str, Any],
-    executable: str | Path,
+    executable_path: str | Path,
     input_token: str = "@@",
 ) -> dict[str, Any]:
     input_mode = str(adapter.get("input_mode", "file"))
@@ -357,7 +436,7 @@ def resolved_invocation(
         raise PipelineError("bad_target_invocation", f"{adapter['target']}: stdin mode must not contain @@", 64)
     if input_mode == "argv" and token_count > 1:
         raise PipelineError("bad_target_invocation", f"{adapter['target']}: argv mode accepts at most one @@", 64)
-    argv = [str(executable), *adapter_argv]
+    argv = [str(executable_path), *adapter_argv]
     return {
         "target": adapter["target"],
         "program_id": adapter["program_id"],
@@ -381,6 +460,139 @@ def stage_record(status: str, reason: str = "none", **extra: Any) -> dict[str, A
     record = {"status": status, "reason": reason}
     record.update(extra)
     return record
+
+
+def is_generated_input_candidate(path: Path) -> bool:
+    """Return True only for real generator-produced input files.
+
+    Excludes Python generator source, JSON/model configs, logs, model files,
+    common/bootstrap corpus, and preseed files.  Only data files produced by
+    generator execution (e.g. under ``gen_seeds``) are admitted.
+    """
+
+    ignored_suffixes = {".py", ".log", ".json", ".jsonl", ".txt", ".toml", ".md", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".conf"}
+    ignored_stems = {
+        "manifest",
+        "metadata",
+        "config",
+        "model_setting",
+        "program_to_format",
+        "openai_key",
+        "lineage",
+        "fuzzer_stats",
+        "stats",
+        "preseed",
+        "seed_corpus",
+        "input_corpus",
+        "corpus_manifest",
+        "readme",
+    }
+    stem = path.stem.lower()
+    if path.suffix.lower() in ignored_suffixes:
+        return False
+    if stem in ignored_stems or stem.startswith("config"):
+        return False
+    if stem.startswith("preseed") or stem.endswith("_preseed"):
+        return False
+    if stem.startswith("hgb_corpus") or stem.startswith("common_"):
+        return False
+    return path.is_file()
+
+
+def parse_fuzzer_stats(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    data: dict[str, Any] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if ":" not in line:
+            continue
+        key, value = [part.strip() for part in line.split(":", 1)]
+        try:
+            data[key] = int(value)
+        except ValueError:
+            data[key] = value
+    return data
+
+
+def bootstrap_bytes(fmt: str) -> bytes:
+    normalized = fmt.lower()
+    if "png" in normalized:
+        return bytes.fromhex("89504e470d0a1a0a0000000d49484452") + b"\x00" * 16
+    if "jpeg" in normalized or "jpg" in normalized:
+        return b"\xff\xd8\xff\xd9"
+    if "zlib" in normalized:
+        return b"\x78\x9c\x03\x00\x00\x00\x00\x01"
+    if "json" in normalized:
+        return b"{}\n"
+    if "xml" in normalized or "xpath" in normalized:
+        return b"<root/>\n"
+    if "sql" in normalized:
+        return b"select 1;\n"
+    if "http" in normalized:
+        return b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    if "ttf" in normalized:
+        return bytes.fromhex("000100000000000000000000")
+    if "otf" in normalized:
+        return b"OTTO" + b"\x00" * 8
+    if "ttc" in normalized:
+        return b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00"
+    if "pcap" in normalized:
+        return bytes.fromhex("d4c3b2a1020004000000000000000000ffff000001000000")
+    if "icc" in normalized:
+        return b"\x00\x00\x00\x80" + b"\x00" * 124
+    return (fmt + "\n").encode("utf-8", "replace")
+
+
+def count_files(path: Path, exclude_readme: bool = False) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        if not item.is_file():
+            continue
+        if exclude_readme and item.name == "README.txt":
+            continue
+        total += 1
+    return total
+
+
+def dir_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    total = 0
+    for item in path.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def unique_dest(directory: Path, name: str) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    safe = name or "seed"
+    candidate = directory / safe
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    index = 1
+    while True:
+        alt = directory / f"{stem}_{index}{suffix}"
+        if not alt.exists():
+            return alt
+        index += 1
+
+
+def _is_crash_exit(exit_code: int | None, stderr: str = "") -> bool:
+    if exit_code is None:
+        return True
+    if isinstance(exit_code, int) and exit_code >= 128:
+        return True
+    if "AddressSanitizer" in stderr or "UndefinedBehaviorSanitizer" in stderr:
+        return True
+    return False
 
 
 class G2FuzzPipeline:
@@ -416,26 +628,42 @@ class G2FuzzPipeline:
             "common_initial": 0,
             "bootstrap": 0,
             "g2_generated": 0,
+            "afl_initial": 0,
+            "afl_queue": 0,
+        }
+        self.seed_bytes: dict[str, int] = {
+            "common_initial": 0,
+            "bootstrap": 0,
+            "g2_generated": 0,
+            "afl_initial": 0,
             "afl_queue": 0,
         }
         self.metrics: dict[str, Any] = {}
         self.generated_generator_count = 0
         self.generated_input_count = 0
+        self.valid_generated_input_count = 0
         self.exit_code = 0
         self.reason = "none"
         self.status = "created"
         self.start_time = time.time()
         self.target_afl = self.workspace / "target" / "target.afl"
         self.target_cmp = self.workspace / "target" / "target.cmp"
+        self.target_cov = self.workspace / "target" / "target.cov"
         self.invocation: dict[str, Any] | None = None
+        self.input_contract: dict[str, Any] = {}
+        self.build_source = "none"
+        self.coverage_summary: dict[str, Any] = {}
 
     def ensure_layout(self) -> None:
         for rel in (
             "target",
+            "target/build_afl",
+            "target/build_cmp",
             "generators/source",
             "seeds/common_initial",
             "seeds/bootstrap",
             "seeds/g2_generated",
+            "seeds/afl_initial",
             "seeds/afl_queue",
             "campaign/output",
             "campaign/stats",
@@ -446,6 +674,8 @@ class G2FuzzPipeline:
             (self.workspace / rel).mkdir(parents=True, exist_ok=True)
 
     def write_runtime_mapping(self) -> None:
+        # program_to_format.json is generated from the adapter manifest so the
+        # G2Fuzz program maps to this target's formats/spec; no stale default.
         mapping = {self.program_id: self.formats}
         json_dump(self.workspace / "config" / "program_to_format.json", mapping)
         json_dump(
@@ -453,7 +683,7 @@ class G2FuzzPipeline:
             {"model": [os.environ.get("G2FUZZ_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("MODEL") or "gpt-4o-mini"]},
         )
         json_dump(self.workspace / "config" / "adapter.json", self.adapter)
-        json_dump(self.workspace / "config" / "build_commands.json", build_command_pair(self.adapter))
+        json_dump(self.workspace / "config" / "build_commands.json", build_command_pair(self.adapter, self.artifact_dir, self.target_package, self.workspace))
 
     def target_manifest(self) -> dict[str, Any]:
         manifest = Path(os.environ.get("HGB_TARGET_MANIFEST", self.target_package / "target_manifest.json"))
@@ -474,12 +704,13 @@ class G2FuzzPipeline:
         required = (
             self.target_package / "target_manifest.json",
             self.target_package / "fuzzbench_benchmark" / "benchmark.yaml",
-            self.target_package / "fuzzbench_benchmark" / "build.sh",
         )
         missing = [str(path) for path in required if not path.exists()]
         if missing:
             raise PipelineError("target_package_missing", f"target package is missing required files: {', '.join(missing)}", 66)
         self.stages["target_prepared"] = stage_record("complete", formats=self.formats, method_profile=self.adapter["method_profile"])
+
+    # -- target pair discovery / build -------------------------------------
 
     def candidate_pair_dirs(self) -> list[Path]:
         raw = [
@@ -512,6 +743,12 @@ class G2FuzzPipeline:
                 afl = directory / afl_name
                 cmp = directory / cmp_name
                 if afl.exists() or cmp.exists():
+                    if not (afl.exists() and cmp.exists()):
+                        raise PipelineError(
+                            "infra_missing",
+                            f"G2Fuzz target pair is incomplete: missing {'target.cmp' if afl.exists() else 'target.afl'} in {directory}",
+                            127,
+                        )
                     if executable(afl) and executable(cmp):
                         return directory, afl, cmp
                     raise PipelineError("infra_missing", f"G2Fuzz target pair exists but is not executable: {afl}, {cmp}", 127)
@@ -526,69 +763,276 @@ class G2FuzzPipeline:
         if not executable(self.target_afl) or not executable(self.target_cmp):
             raise PipelineError("infra_missing", "copied G2Fuzz target pair is not executable", 127)
 
+    def resolve_toolchain(self) -> tuple[Path, Path]:
+        cc = self.artifact_dir / "afl-clang-fast"
+        cxx = self.artifact_dir / "afl-clang-fast++"
+        if not (executable(cc) and executable(cxx)):
+            raise PipelineError(
+                "infra_missing",
+                "G2Fuzz AFL++ toolchain (afl-clang-fast/afl-clang-fast++) not found at "
+                f"{self.artifact_dir}; cannot auto-build the .afl/.cmp target pair",
+                127,
+            )
+        return cc, cxx
+
+    def resolve_build_sh(self) -> Path:
+        bench_dir_env = os.environ.get("HGB_FUZZBENCH_BENCHMARK_DIR")
+        if bench_dir_env:
+            candidate = Path(bench_dir_env) / "build.sh"
+            if candidate.is_file():
+                return candidate
+        manifest = self.target_manifest()
+        bench_dir = manifest.get("benchmark_dir", "")
+        if bench_dir:
+            candidate = Path(bench_dir) / "build.sh"
+            if candidate.is_file():
+                return candidate
+        pkg_build = self.target_package / "fuzzbench_benchmark" / "build.sh"
+        if pkg_build.is_file():
+            return pkg_build
+        raise PipelineError("infra_missing", "G2Fuzz target build.sh not found for auto-build", 127)
+
+    def resolve_source_dir(self) -> Path:
+        for candidate in (
+            self.target_package / "source_input",
+            self.target_package / "fuzzbench_benchmark" / "source_input",
+            self.target_package / "fuzzbench_benchmark",
+        ):
+            if candidate.is_dir():
+                return candidate
+        return self.target_package / "source_input"
+
+    def auto_build_pair(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        cc, cxx = self.resolve_toolchain()
+        build_sh = self.resolve_build_sh()
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
+        src = self.resolve_source_dir()
+        commands = build_command_pair(self.adapter, self.artifact_dir, self.target_package, self.workspace)
+        results: dict[str, Any] = {}
+        for label, variant in (("afl", commands["afl"]), ("cmp", commands["cmp"])):
+            out_dir = self.workspace / "target" / f"build_{label}"
+            work_dir = self.workspace / "target" / f"work_{label}"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            work_dir.mkdir(parents=True, exist_ok=True)
+            env = os.environ.copy()
+            env.update(variant["env"])
+            env["OUT"] = str(out_dir)
+            env["SRC"] = str(src)
+            env["WORK"] = str(work_dir)
+            log_path = self.workspace / "logs" / f"build_{label}.log"
+            cmd = ["bash", str(build_sh)]
+            try:
+                with log_path.open("wb") as log:
+                    proc = subprocess.run(
+                        cmd,
+                        env=env,
+                        cwd=str(src) if src.is_dir() else None,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        timeout=int(os.environ.get("G2FUZZ_BUILD_TIMEOUT_SECONDS", "3600") or "3600"),
+                        check=False,
+                    )
+                code = proc.returncode
+            except subprocess.TimeoutExpired:
+                code = 124
+            except OSError as exc:
+                raise PipelineError("infra_failure", f"G2Fuzz {label} build invocation failed: {exc}", 127)
+            produced = out_dir / fuzz_target
+            results[label] = {
+                "command": cmd,
+                "env": {k: variant["env"][k] for k in ("AFL_LLVM_CMPLOG", "HGB_G2FUZZ_OUTPUT")},
+                "exit_code": code,
+                "out_dir": str(out_dir),
+                "produced": str(produced),
+                "produced_exists": produced.is_file(),
+                "log": str(log_path),
+            }
+            if code != 0 or not produced.is_file():
+                raise PipelineError(
+                    "infra_failure",
+                    f"G2Fuzz {label} target build failed (exit {code}); no {fuzz_target} produced at {produced}",
+                    127,
+                )
+            dest = self.target_afl if label == "afl" else self.target_cmp
+            shutil.copy2(produced, dest)
+            if not executable(dest):
+                raise PipelineError("infra_failure", f"G2Fuzz {label} built binary is not executable: {dest}", 127)
+        return results, commands
+
     def write_invocation(self) -> None:
         self.invocation = resolved_invocation(self.adapter, self.target_afl)
         json_dump(self.workspace / "target" / "invocation.json", self.invocation)
         command = " ".join(self.invocation["argv"])
         (self.workspace / "target" / "command.txt").write_text(command + "\n", encoding="utf-8")
 
-    def smoke_pair(self) -> dict[str, Any]:
+    def _invoke(self, binary: Path, sample: bytes, timeout: int | None = None) -> dict[str, Any]:
         assert self.invocation is not None
+        input_mode = self.invocation["input_mode"]
+        adapter_argv = list(self.invocation["adapter_argv"])
+        timeout = timeout or int(self.invocation.get("timeout_seconds", 5))
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(sample)
+            sample_path = Path(tmp.name)
+        try:
+            if input_mode == "stdin":
+                cmd = [str(binary)] + [a for a in adapter_argv if a != "@@"]
+                proc = subprocess.run(cmd, input=sample, capture_output=True, timeout=timeout, check=False)
+            else:
+                cmd = [str(binary)] + [str(a) if a != "@@" else str(sample_path) for a in adapter_argv]
+                proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+            return {
+                "ran": True,
+                "exit_code": proc.returncode,
+                "timed_out": False,
+                "stderr": (proc.stderr or b"").decode("utf-8", "replace")[-1000:],
+            }
+        except subprocess.TimeoutExpired:
+            return {"ran": True, "exit_code": 124, "timed_out": True, "stderr": ""}
+        except OSError as exc:
+            return {"ran": False, "exit_code": None, "timed_out": False, "error": str(exc)}
+        finally:
+            try:
+                sample_path.unlink()
+            except OSError:
+                pass
+
+    def validate_input_contract(self) -> dict[str, Any]:
+        """Validate the adapter input contract against both pair binaries.
+
+        Ensures a provided sample runs, a missing sample is not silently
+        ignored for file mode, and both binaries behave consistently.  This is
+        per-target: ``@@`` is never assumed globally.
+        """
+
+        if not self.invocation:
+            return {"valid": False, "reason": "no invocation"}
+        sample_a = bootstrap_bytes(self.formats[0] if self.formats else "custom")
+        sample_b = sample_a + b"\x00HGB_DISTINGUISHABLE"
+        per_binary: dict[str, Any] = {}
+        for label, binary in (("afl", self.target_afl), ("cmp", self.target_cmp)):
+            res_a = self._invoke(binary, sample_a)
+            res_b = self._invoke(binary, sample_b)
+            per_binary[label] = {"sample_a": res_a, "sample_b": res_b}
+        # Missing-input check for file mode: invoking with a nonexistent path
+        # must not be silently ignored (the target should error or no-op, but
+        # the invocation itself must reach the target).
+        missing_ok = True
+        if self.invocation["input_mode"] == "file":
+            missing_path = self.workspace / "seeds" / "__HGB_MISSING_CONTRACT__"
+            missing_path.parent.mkdir(parents=True, exist_ok=True)
+            if missing_path.exists():
+                missing_path.unlink()
+            cmd = [str(self.target_afl)] + [str(a) if a != "@@" else str(missing_path) for a in self.invocation["adapter_argv"]]
+            try:
+                proc = subprocess.run(cmd, capture_output=True, timeout=int(self.invocation.get("timeout_seconds", 5)), check=False)
+                missing_ok = proc.returncode is not None
+            except Exception:
+                missing_ok = False
+        contract = {
+            "input_mode": self.invocation["input_mode"],
+            "argv": list(self.invocation["argv"]),
+            "uses_at_at": self.invocation["uses_at_at"],
+            "per_binary": per_binary,
+            "missing_input_handled": missing_ok,
+            "consistent": per_binary["afl"]["sample_a"].get("exit_code") == per_binary["cmp"]["sample_a"].get("exit_code"),
+            "valid": bool(
+                per_binary["afl"]["sample_a"].get("ran")
+                and per_binary["cmp"]["sample_a"].get("ran")
+                and missing_ok
+            ),
+        }
+        json_dump(self.workspace / "target" / "input_contract.json", contract)
+        self.input_contract = contract
+        return contract
+
+    def smoke_pair(self) -> dict[str, Any]:
         smoke_dir = self.workspace / "seeds" / "bootstrap"
         smoke_dir.mkdir(parents=True, exist_ok=True)
         smoke_input = smoke_dir / f"{self.program_id}_bootstrap_seed"
         if not smoke_input.exists():
             smoke_input.write_bytes(bootstrap_bytes(self.formats[0] if self.formats else "custom"))
+        empty_input = smoke_dir / f"{self.program_id}_empty_seed"
+        if not empty_input.exists():
+            empty_input.write_bytes(b"")
         results: dict[str, Any] = {}
         for label, binary in (("afl", self.target_afl), ("cmp", self.target_cmp)):
-            inv = dict(self.invocation)
-            inv["argv"] = [str(binary), *self.invocation["adapter_argv"]]
-            cmd = argv_for_input(inv, smoke_input)
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    input=smoke_input.read_bytes() if inv["input_mode"] == "stdin" else None,
-                    text=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    timeout=int(inv.get("timeout_seconds", 5)),
-                    check=False,
-                )
-                results[label] = {"exit_code": proc.returncode, "stderr_tail": proc.stderr.decode("utf-8", "replace")[-500:]}
-            except Exception as exc:  # noqa: BLE001 - smoke failures are recorded, not fatal.
-                results[label] = {"exit_code": None, "error": str(exc)}
+            inv = dict(self.invocation) if self.invocation else {}
+            inv["argv"] = [str(binary), *(self.invocation or {}).get("adapter_argv", [])]
+            per: dict[str, Any] = {}
+            for name, sample in (("empty", empty_input), ("seed", smoke_input)):
+                cmd = argv_for_input(inv, sample)
+                try:
+                    proc = subprocess.run(
+                        cmd,
+                        input=sample.read_bytes() if inv.get("input_mode") == "stdin" else None,
+                        text=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=int(inv.get("timeout_seconds", 5)),
+                        check=False,
+                    )
+                    per[name] = {
+                        "exit_code": proc.returncode,
+                        "stderr_tail": (proc.stderr or b"").decode("utf-8", "replace")[-500:],
+                    }
+                except Exception as exc:  # noqa: BLE001
+                    per[name] = {"exit_code": None, "error": str(exc)}
+            results[label] = per
         return results
 
     def build_target_pair(self) -> None:
         located = self.locate_pair()
-        if not located:
-            searched = [str(path) for path in self.candidate_pair_dirs()]
-            (self.workspace / "target" / "TARGET_BUILD_MISSING.md").write_text(
-                "# G2Fuzz Target Pair Missing\n\n"
-                "G2Fuzz requires a native target pair built for its modified AFL++.\n\n"
-                f"- Program: `{self.program_id}`\n"
-                f"- Required binaries: `{self.program_id}.afl` and `{self.program_id}.cmp` or `target.afl` and `target.cmp`\n"
-                f"- Searched: `{', '.join(searched)}`\n",
-                encoding="utf-8",
-            )
-            raise PipelineError("infra_missing", "G2Fuzz target .afl/.cmp pair is missing", 127)
-        source_dir, src_afl, src_cmp = located
-        self.copy_pair(src_afl, src_cmp)
-        self.write_invocation()
-        smoke = self.smoke_pair()
-        hashes = {"afl": sha256_file(self.target_afl), "cmp": sha256_file(self.target_cmp)}
-        json_dump(
-            self.workspace / "target" / "build.json",
-            {
+        build_results: dict[str, Any]
+        commands = build_command_pair(self.adapter, self.artifact_dir, self.target_package, self.workspace)
+        if located:
+            source_dir, src_afl, src_cmp = located
+            self.copy_pair(src_afl, src_cmp)
+            self.build_source = "prebuilt_override"
+            build_results = {
+                "afl": {"prebuilt": str(src_afl)},
+                "cmp": {"prebuilt": str(src_cmp)},
                 "source_dir": str(source_dir),
-                "source_afl": str(src_afl),
-                "source_cmp": str(src_cmp),
-                "binary_hashes": hashes,
-                "smoke": smoke,
-                "build_commands": build_command_pair(self.adapter),
-            },
-        )
-        self.stages["target_pair_built"] = stage_record("complete", source_dir=str(source_dir), binary_hashes=hashes, smoke=smoke)
+            }
+        else:
+            build_results, commands = self.auto_build_pair()
+            self.build_source = "auto_built"
+            source_dir = self.workspace / "target"
+        self.write_invocation()
+        contract = self.validate_input_contract()
+        smoke = self.smoke_pair()
+        # Smoke failure (process cannot run, or crashes on empty/seed) fails
+        # the stage as infra_failure, never a soft skip.
+        for label in ("afl", "cmp"):
+            for name in ("empty", "seed"):
+                res = smoke.get(label, {}).get(name, {})
+                if not res.get("ran", True) and res.get("error"):
+                    raise PipelineError("infra_failure", f"G2Fuzz pair smoke could not run {label}/{name}: {res.get('error')}", 127)
+                if _is_crash_exit(res.get("exit_code"), res.get("stderr_tail", "")):
+                    raise PipelineError(
+                        "infra_failure",
+                        f"G2Fuzz pair smoke crashed for {label}/{name} (exit {res.get('exit_code')})",
+                        127,
+                    )
+        hashes = {"afl": sha256_file(self.target_afl), "cmp": sha256_file(self.target_cmp)}
+        record = {
+            "afl_binary": str(self.target_afl),
+            "cmp_binary": str(self.target_cmp),
+            "afl_sha256": hashes["afl"],
+            "cmp_sha256": hashes["cmp"],
+            "build_mode": BUILD_MODE,
+            "build_source": self.build_source,
+            "build_commands": commands,
+            "build_results": build_results,
+            "input_contract": contract,
+            "smoke": smoke,
+            "source_dir": str(source_dir),
+            "status": "completed",
+        }
+        json_dump(self.workspace / "target" / "build.json", record)
+        stage_extra = {k: v for k, v in record.items() if k != "status"}
+        self.stages["target_pair_built"] = stage_record("complete", "none", **stage_extra)
+
+    # -- seed corpus / generation ------------------------------------------
 
     def copy_common_corpus(self) -> None:
         if not bool(self.adapter.get("common_corpus")):
@@ -598,6 +1042,7 @@ class G2FuzzPipeline:
             self.target_package / "corpus",
             self.target_package / "seeds",
             self.target_package / "seed_corpus",
+            self.target_package / "fuzzbench_benchmark" / "seeds",
         )
         copied = 0
         limit = int(os.environ.get("G2FUZZ_MAX_PRESEEDED_CORPUS_FILES", "32") or "32")
@@ -663,15 +1108,16 @@ class G2FuzzPipeline:
                 pass
         if code == 124:
             self.collect_program_gen_outputs(output_dir)
-            raise PipelineError("generation_timeout", "program_gen timed out; partial inputs are not evaluated", 124)
+            raise PipelineError("failed", "program_gen timed out; partial inputs are not evaluated", 124)
         if code != 0:
             self.collect_program_gen_outputs(output_dir)
             raise PipelineError("failed", f"program_gen exited {code}", code)
         self.collect_program_gen_outputs(output_dir)
         if self.generated_input_count <= 0:
-            raise PipelineError("validation_failed", "G2Fuzz program_gen completed without generated input files", 65)
+            raise PipelineError("failed", "G2Fuzz program_gen completed without generated input files", 65)
         self.stages["input_generators_created"] = stage_record(
             "complete",
+            "none",
             program_gen=str(program_gen),
             generator_count=self.generated_generator_count,
             generated_input_count=self.generated_input_count,
@@ -710,44 +1156,41 @@ class G2FuzzPipeline:
                 "generator_count": copied_generators,
                 "generated_input_count": copied_seeds,
                 "upstream_output_dir": str(output_dir),
+                "generator_sha256": [sha256_file(p) for p in sorted(source_dir.glob("*.py"))] if source_dir.exists() else [],
             },
         )
 
     def validate_generated_inputs(self) -> None:
         generated = sorted((self.workspace / "seeds" / "g2_generated").rglob("*"))
-        files = [path for path in generated if path.is_file()]
+        files = [path for path in generated if path.is_file() and is_generated_input_candidate(path)]
         non_empty = [path for path in files if path.stat().st_size > 0]
-        unique_hashes = {sha256_file(path) for path in non_empty}
+        max_inputs = int(os.environ.get("G2FUZZ_VALIDATE_MAX_INPUTS", "32") or "32")
+        results: list[dict[str, Any]] = []
+        valid_count = 0
+        invalid_count = 0
+        for path in non_empty[: max(1, max_inputs)]:
+            assert self.invocation is not None
+            res = self._invoke(self.target_afl, path.read_bytes())
+            crash = _is_crash_exit(res.get("exit_code"), res.get("stderr", ""))
+            ok = bool(res.get("ran") and res.get("exit_code") in (0, 1) and not res.get("timed_out") and not crash)
+            if ok:
+                valid_count += 1
+            else:
+                invalid_count += 1
+            results.append({"path": str(path), "exit_code": res.get("exit_code"), "timeout": bool(res.get("timed_out")), "crash": crash, "valid": ok})
         validation = {
             "file_count": len(files),
             "non_empty_count": len(non_empty),
-            "unique_count": len(unique_hashes),
-            "size_distribution": sorted(path.stat().st_size for path in non_empty),
+            "validated_count": len(results),
+            "valid_count": valid_count,
+            "invalid_count": invalid_count,
+            "per_input": results,
         }
-        if len(non_empty) == 0 or len(unique_hashes) == 0:
-            json_dump(self.workspace / "seeds" / "validation.json", validation)
-            raise PipelineError("validation_failed", "G2Fuzz generated inputs are empty or duplicate-only", 65)
-        assert self.invocation is not None
-        sample_results = []
-        for path in non_empty[: min(8, len(non_empty))]:
-            inv = dict(self.invocation)
-            cmd = argv_for_input(inv, path)
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    input=path.read_bytes() if inv["input_mode"] == "stdin" else None,
-                    text=False,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                    timeout=int(inv.get("timeout_seconds", 5)),
-                    check=False,
-                )
-                sample_results.append({"path": str(path), "exit_code": proc.returncode})
-            except Exception as exc:  # noqa: BLE001
-                sample_results.append({"path": str(path), "error": str(exc)})
-        validation["target_sample_results"] = sample_results
         json_dump(self.workspace / "seeds" / "validation.json", validation)
-        self.stages["generated_inputs_validated"] = stage_record("complete", **validation)
+        self.valid_generated_input_count = valid_count
+        if valid_count == 0:
+            raise PipelineError("quality_failure", "G2Fuzz generated input validation: all generated inputs failed target execution", 65)
+        self.stages["generated_inputs_validated"] = stage_record("complete", "none", **validation)
 
     def write_seed_provenance(self) -> None:
         provenance = self.workspace / "seeds" / "provenance.jsonl"
@@ -776,9 +1219,10 @@ class G2FuzzPipeline:
                     append_jsonl(provenance, record)
                     count += 1
             self.seed_counts[source_class] = count
+            self.seed_bytes[source_class] = dir_bytes(base)
 
     def assemble_initial_corpus(self) -> Path:
-        initial = self.workspace / "campaign" / "initial_corpus"
+        initial = self.workspace / "seeds" / "afl_initial"
         if initial.exists():
             shutil.rmtree(initial)
         initial.mkdir(parents=True)
@@ -789,6 +1233,8 @@ class G2FuzzPipeline:
             if not base.exists():
                 continue
             for path in sorted(p for p in base.rglob("*") if p.is_file()):
+                if source_class == "g2_generated" and not is_generated_input_candidate(path):
+                    continue
                 digest = sha256_file(path)
                 if digest in seen:
                     continue
@@ -798,7 +1244,11 @@ class G2FuzzPipeline:
         if index == 0:
             fallback = initial / "empty"
             fallback.write_bytes(b"\n")
+        self.seed_counts["afl_initial"] = count_files(initial)
+        self.seed_bytes["afl_initial"] = dir_bytes(initial)
         return initial
+
+    # -- campaign ----------------------------------------------------------
 
     def afl_fuzz_path(self) -> Path:
         path = Path(os.environ.get("G2FUZZ_AFL_FUZZ", "")) if os.environ.get("G2FUZZ_AFL_FUZZ") else self.artifact_dir / "afl-fuzz"
@@ -852,41 +1302,227 @@ class G2FuzzPipeline:
         if queue_dir.exists():
             for path in sorted(p for p in queue_dir.rglob("*") if p.is_file()):
                 shutil.copy2(path, unique_dest(afl_queue, path.name))
+        stats = parse_fuzzer_stats(out / "default" / "fuzzer_stats")
+        queue_count = count_files(queue_dir, exclude_readme=False)
+        crash_count = count_files(crashes_dir, exclude_readme=True)
+        hang_count = count_files(hangs_dir, exclude_readme=True)
+        execs_done = int(stats.get("execs_done") or 0)
         metrics = {
             "afl_exit_code": code,
             "campaign_timeout_configured": timed_out or code == 124,
-            "queue_count": count_files(queue_dir, exclude_readme=False),
-            "crash_count": count_files(crashes_dir, exclude_readme=True),
-            "hang_count": count_files(hangs_dir, exclude_readme=True),
-            "fuzzer_stats": parse_fuzzer_stats(out / "default" / "fuzzer_stats"),
+            "deadline_reached": timed_out and code == 124,
+            "queue_count": queue_count,
+            "crash_count": crash_count,
+            "hang_count": hang_count,
+            "execs_done": execs_done,
+            "fuzzer_stats": stats,
+            "fuzzer_stats_exists": (out / "default" / "fuzzer_stats").is_file(),
+            "instrumentation_handshake_failure": "no instrumentation" in (self.workspace / "logs" / "afl.log").read_text(encoding="utf-8", errors="replace").lower() if (self.workspace / "logs" / "afl.log").exists() else False,
         }
         self.metrics.update(metrics)
-        if code not in {0, 124}:
-            json_dump(self.workspace / "campaign" / "metrics.json", metrics)
-            raise PipelineError("failed", f"afl-fuzz exited {code}", code)
+        self.seed_counts["afl_queue"] = count_files(afl_queue)
+        self.seed_bytes["afl_queue"] = dir_bytes(afl_queue)
         json_dump(self.workspace / "campaign" / "metrics.json", metrics)
-        self.stages["campaign"] = stage_record("complete", **metrics)
+        if code not in {0, 124}:
+            raise PipelineError("failed", f"afl-fuzz exited {code}", code)
+        # Campaign success requires real progress: fuzzer_stats, execs_done>0,
+        # a nonempty queue, and no instrumentation handshake failure.
+        if not metrics["fuzzer_stats_exists"]:
+            self.stages["campaign"] = stage_record("failed", "G2Fuzz campaign produced no fuzzer_stats", **metrics)
+            raise PipelineError("failed", "G2Fuzz campaign produced no fuzzer_stats", 65)
+        if metrics["instrumentation_handshake_failure"]:
+            self.stages["campaign"] = stage_record("failed", "G2Fuzz AFL++ instrumentation handshake failure", **metrics)
+            raise PipelineError("failed", "G2Fuzz AFL++ instrumentation handshake failure", 65)
+        if execs_done <= 0:
+            self.stages["campaign"] = stage_record("failed", "G2Fuzz campaign produced zero target executions", **metrics)
+            raise PipelineError("failed", "G2Fuzz campaign produced zero target executions", 65)
+        if queue_count <= 0:
+            self.stages["campaign"] = stage_record("failed", "G2Fuzz campaign produced an empty queue", **metrics)
+            raise PipelineError("failed", "G2Fuzz campaign produced an empty queue", 65)
+        self.stages["campaign"] = stage_record("complete", "none", **metrics)
+
+    # -- coverage ----------------------------------------------------------
+
+    def build_coverage_target(self) -> Path | None:
+        """Best-effort build of a coverage-instrumented native target.
+
+        Uses the same FuzzBench build.sh with ``clang``/``clang++`` and
+        ``-fprofile-instr-generate -fcoverage-mapping``.  Returns the binary
+        path on success, ``None`` when the build environment is unavailable.
+        """
+
+        clang = shutil.which("clang") or shutil.which("clang-18") or shutil.which("clang-17")
+        clangxx = shutil.which("clang++") or shutil.which("clang++-18") or shutil.which("clang++-17")
+        if not clang or not clangxx:
+            return None
+        try:
+            build_sh = self.resolve_build_sh()
+        except PipelineError:
+            return None
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
+        src = self.resolve_source_dir()
+        out_dir = self.workspace / "target" / "build_cov"
+        work_dir = self.workspace / "target" / "work_cov"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        cov_flags = "-fprofile-instr-generate -fcoverage-mapping"
+        env = os.environ.copy()
+        env.update(
+            {
+                "CC": clang,
+                "CXX": clangxx,
+                "FUZZING_ENGINE": "coverage",
+                "SANITIZER": "address",
+                "ARCHITECTURE": "x86_64",
+                "SRC": str(src),
+                "OUT": str(out_dir),
+                "WORK": str(work_dir),
+                "CFLAGS": cov_flags,
+                "CXXFLAGS": cov_flags,
+                "LIB_FUZZING_ENGINE": "",
+            }
+        )
+        log_path = self.workspace / "logs" / "build_cov.log"
+        try:
+            with log_path.open("wb") as log:
+                proc = subprocess.run(["bash", str(build_sh)], env=env, stdout=log, stderr=subprocess.STDOUT, timeout=int(os.environ.get("G2FUZZ_BUILD_TIMEOUT_SECONDS", "3600") or "3600"), check=False)
+            if proc.returncode != 0:
+                return None
+        except Exception:
+            return None
+        produced = out_dir / fuzz_target
+        if not produced.is_file() or not executable(produced):
+            return None
+        shutil.copy2(produced, self.target_cov)
+        return self.target_cov
 
     def collect_coverage(self) -> None:
         stats = self.metrics.get("fuzzer_stats", {}) if isinstance(self.metrics.get("fuzzer_stats"), dict) else {}
+        execs_done = int(stats.get("execs_done") or self.metrics.get("execs_done") or 0)
         queue_count = int(self.metrics.get("queue_count") or 0)
-        paths_total = int(stats.get("paths_total") or stats.get("queued_paths") or queue_count or 0)
-        execs_done = int(stats.get("execs_done") or 0)
-        coverage = {
-            "coverage_mode": "afl_fuzzer_stats",
-            "edge_coverage": paths_total,
+        report_path: Path | None = None
+        raw_text = ""
+        # 1. Explicit coverage report hook (test/CI or precomputed report).
+        env_report = os.environ.get("G2FUZZ_COVERAGE_REPORT")
+        if env_report and Path(env_report).is_file():
+            report_path = Path(env_report)
+        # 2. Build a coverage-instrumented target and replay the corpus.
+        if report_path is None and summarize_coverage_report is not None:
+            cov_target = self.target_cov if self.target_cov.exists() else self.build_coverage_target()
+            if cov_target and queue_count > 0:
+                # Replay the AFL queue plus the G2-generated corpus (plan 10.2).
+                corpus = self.workspace / "coverage" / "corpus"
+                if corpus.exists():
+                    shutil.rmtree(corpus)
+                corpus.mkdir(parents=True, exist_ok=True)
+                seen: set[str] = set()
+                for source_class in ("afl_queue", "g2_generated"):
+                    base = self.workspace / "seeds" / source_class
+                    if not base.exists():
+                        continue
+                    for path in sorted(p for p in base.rglob("*") if p.is_file()):
+                        digest = sha256_file(path)
+                        if digest in seen:
+                            continue
+                        seen.add(digest)
+                        shutil.copy2(path, unique_dest(corpus, path.name))
+                try:
+                    import hgb_input_campaign  # type: ignore
+
+                    replay = hgb_input_campaign.run_coverage_replay(
+                        target_binary=cov_target,
+                        corpus_dir=corpus,
+                        work_dir=self.workspace / "coverage",
+                        timeout_seconds=int(os.environ.get("G2FUZZ_COVERAGE_TIMEOUT_SECONDS", "600") or "600"),
+                    )
+                    if replay.get("report_path") and Path(replay["report_path"]).is_file():
+                        report_path = Path(replay["report_path"])
+                        raw_text = replay.get("raw_text", "")
+                except Exception:
+                    report_path = None
+        coverage: dict[str, Any] = {
+            "coverage_mode": "g2fuzz_campaign",
+            "edge_coverage": {"status": "unavailable", "reason": "not_collected"},
             "line_coverage": None,
+            "function_coverage": None,
+            "regions": None,
             "execs_done": execs_done,
             "queue_count": queue_count,
-            "common_initial_count": self.seed_counts.get("common_initial", 0),
-            "bootstrap_count": self.seed_counts.get("bootstrap", 0),
-            "g2_generated_count": self.seed_counts.get("g2_generated", 0),
+            "report_path": str(report_path) if report_path else None,
+            "report_exists": bool(report_path and report_path.is_file()),
+            "has_executions": execs_done > 0,
         }
+        if report_path and report_path.is_file() and summarize_coverage_report is not None:
+            try:
+                parsed = summarize_coverage_report(report_path)
+                coverage["line_coverage"] = parsed.get("line_coverage")
+                coverage["function_coverage"] = parsed.get("function_coverage")
+                coverage["regions"] = parsed.get("regions")
+                coverage["coverage_mode"] = parsed.get("source", "g2fuzz_campaign")
+            except CoverageError:
+                coverage["report_parse_error"] = True
+        if write_coverage_outputs is not None and coverage.get("line_coverage") is not None:
+            try:
+                write_coverage_outputs(self.workspace / "coverage", coverage, raw_text)
+            except Exception:
+                pass
         json_dump(self.workspace / "coverage" / "summary.json", coverage)
-        self.stages["coverage"] = stage_record("complete", **coverage)
+        self.coverage_summary = coverage
+        # Coverage cannot complete from AFL path count alone: a real report
+        # with a non-null covered-line count is required.
+        if coverage.get("line_coverage") is None or coverage["line_coverage"].get("covered") is None:
+            self.stages["coverage"] = stage_record("failed", "G2Fuzz coverage requires a real coverage report; AFL path count is not coverage", **coverage)
+            raise PipelineError("failed", "G2Fuzz coverage requires a real coverage report; AFL path count is not coverage", 65)
+        self.stages["coverage"] = stage_record("complete", "none", **coverage)
+
+    # -- result ------------------------------------------------------------
+
+    def _evaluated_ok(self) -> bool:
+        if self.stages["target_pair_built"].get("status") != "complete":
+            return False
+        if self.valid_generated_input_count <= 0:
+            return False
+        if int(self.metrics.get("execs_done") or 0) <= 0:
+            return False
+        if int(self.metrics.get("queue_count") or 0) <= 0:
+            return False
+        line_cov = self.coverage_summary.get("line_coverage")
+        if not isinstance(line_cov, dict) or line_cov.get("covered") is None:
+            return False
+        return True
 
     def result_payload(self, status: str, reason: str, exit_code: int) -> dict[str, Any]:
         manifest = self.target_manifest()
+        stats = self.metrics.get("fuzzer_stats", {}) if isinstance(self.metrics.get("fuzzer_stats"), dict) else {}
+        execs_done = int(stats.get("execs_done") or self.metrics.get("execs_done") or 0)
+        # Build a stages view that includes the goal-stage aliases.
+        stages_view: dict[str, Any] = dict(self.stages)
+        for alias, canonical in GOAL_STAGE_ALIASES.items():
+            if canonical in self.stages and alias not in stages_view:
+                stages_view[alias] = self.stages[canonical]
+        seed_provenance = {
+            "common_initial": self.seed_counts.get("common_initial", 0),
+            "bootstrap": self.seed_counts.get("bootstrap", 0),
+            "g2_generated": self.seed_counts.get("g2_generated", 0),
+            "afl_initial": self.seed_counts.get("afl_initial", 0),
+            "afl_queue": self.seed_counts.get("afl_queue", 0),
+        }
+        seed_provenance_bytes = {
+            "common_initial": self.seed_bytes.get("common_initial", 0),
+            "bootstrap": self.seed_bytes.get("bootstrap", 0),
+            "g2_generated": self.seed_bytes.get("g2_generated", 0),
+            "afl_initial": self.seed_bytes.get("afl_initial", 0),
+            "afl_queue": self.seed_bytes.get("afl_queue", 0),
+        }
+        target_pair_build = {
+            "status": "completed" if self.stages.get("target_pair_built", {}).get("status") == "complete" else self.stages.get("target_pair_built", {}).get("status", "pending"),
+            "afl_binary": str(self.target_afl) if self.target_afl.exists() else "",
+            "cmp_binary": str(self.target_cmp) if self.target_cmp.exists() else "",
+            "afl_sha256": sha256_file(self.target_afl) if self.target_afl.exists() else "",
+            "cmp_sha256": sha256_file(self.target_cmp) if self.target_cmp.exists() else "",
+            "build_mode": BUILD_MODE,
+            "build_source": self.build_source,
+        }
         return {
             "schema_version": 2,
             "generator": "g2fuzz",
@@ -917,7 +1553,23 @@ class G2FuzzPipeline:
             "queue_count": int(self.metrics.get("queue_count") or 0),
             "crash_count": int(self.metrics.get("crash_count") or 0),
             "hang_count": int(self.metrics.get("hang_count") or 0),
-            "stages": self.stages,
+            # Nested beta schema (plan section 11).
+            "target_pair_build": target_pair_build,
+            "input_generation": {
+                "program_count": self.generated_generator_count,
+                "g2_generated_count": self.generated_input_count,
+                "valid_g2_generated_count": self.valid_generated_input_count,
+            },
+            "seed_provenance": seed_provenance,
+            "seed_provenance_bytes": seed_provenance_bytes,
+            "campaign": {
+                "execs_done": execs_done,
+                "queue_count": int(self.metrics.get("queue_count") or 0),
+                "crashes": int(self.metrics.get("crash_count") or 0),
+                "hangs": int(self.metrics.get("hang_count") or 0),
+            },
+            "coverage": self.coverage_summary,
+            "stages": stages_view,
             "workspace": str(self.workspace),
             "target_manifest": str(Path(os.environ.get("HGB_TARGET_MANIFEST", self.target_package / "target_manifest.json"))),
             "command_file": str(self.workspace / "campaign" / "command.txt"),
@@ -944,8 +1596,10 @@ class G2FuzzPipeline:
             f"- Method profile: `{self.adapter['method_profile']}`",
             f"- Status: `{payload['status']}`",
             f"- Generated inputs: `{payload['generated_input_count']}`",
+            f"- Valid generated inputs: `{self.valid_generated_input_count}`",
             f"- Generators: `{payload['generator_count']}`",
             f"- Queue/crash/hang counts: queue={payload['queue_count']}, crashes={payload['crash_count']}, hangs={payload['hang_count']}",
+            f"- Target pair build: `{payload['target_pair_build']['status']}` (source: `{self.build_source}`)",
             f"- Top failure reason: {payload['reason']}",
             "",
             "## Stages",
@@ -973,7 +1627,10 @@ class G2FuzzPipeline:
             self.run_campaign()
             self.write_seed_provenance()
             self.collect_coverage()
-            self.write_outputs("evaluated", "none", 0)
+            if self._evaluated_ok():
+                self.write_outputs("evaluated", "none", 0)
+            else:
+                self.write_outputs("quality_failure", "G2Fuzz completed stages but evaluated invariants were not met", 65)
             return 0
         except PipelineError as exc:
             self.reason = exc.reason
@@ -983,90 +1640,6 @@ class G2FuzzPipeline:
                 self.stages[failed_stage] = stage_record(exc.status, exc.reason)
             self.write_outputs(exc.status, exc.reason, exc.code)
             return exc.code
-
-
-def count_files(path: Path, exclude_readme: bool = False) -> int:
-    if not path.exists():
-        return 0
-    total = 0
-    for item in path.rglob("*"):
-        if not item.is_file():
-            continue
-        if exclude_readme and item.name == "README.txt":
-            continue
-        total += 1
-    return total
-
-
-def unique_dest(directory: Path, name: str) -> Path:
-    directory.mkdir(parents=True, exist_ok=True)
-    safe = name or "seed"
-    candidate = directory / safe
-    if not candidate.exists():
-        return candidate
-    stem = candidate.stem
-    suffix = candidate.suffix
-    index = 1
-    while True:
-        alt = directory / f"{stem}_{index}{suffix}"
-        if not alt.exists():
-            return alt
-        index += 1
-
-
-
-def is_generated_input_candidate(path: Path) -> bool:
-    ignored_suffixes = {".py", ".log"}
-    ignored_names = {"manifest", "metadata", "config", "model_setting", "program_to_format"}
-    stem = path.stem.lower()
-    if path.suffix.lower() in ignored_suffixes:
-        return False
-    if stem in ignored_names or stem.startswith("config"):
-        return False
-    return True
-
-def parse_fuzzer_stats(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    data: dict[str, Any] = {}
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if ":" not in line:
-            continue
-        key, value = [part.strip() for part in line.split(":", 1)]
-        try:
-            data[key] = int(value)
-        except ValueError:
-            data[key] = value
-    return data
-
-
-def bootstrap_bytes(fmt: str) -> bytes:
-    normalized = fmt.lower()
-    if "png" in normalized:
-        return bytes.fromhex("89504e470d0a1a0a0000000d49484452") + b"\x00" * 16
-    if "jpeg" in normalized or "jpg" in normalized:
-        return b"\xff\xd8\xff\xd9"
-    if "zlib" in normalized:
-        return b"\x78\x9c\x03\x00\x00\x00\x00\x01"
-    if "json" in normalized:
-        return b"{}\n"
-    if "xml" in normalized or "xpath" in normalized:
-        return b"<root/>\n"
-    if "sql" in normalized:
-        return b"select 1;\n"
-    if "http" in normalized:
-        return b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
-    if "ttf" in normalized:
-        return bytes.fromhex("000100000000000000000000")
-    if "otf" in normalized:
-        return b"OTTO" + b"\x00" * 8
-    if "ttc" in normalized:
-        return b"ttcf\x00\x01\x00\x00\x00\x00\x00\x00"
-    if "pcap" in normalized:
-        return bytes.fromhex("d4c3b2a1020004000000000000000000ffff000001000000")
-    if "icc" in normalized:
-        return b"\x00\x00\x00\x80" + b"\x00" * 124
-    return (fmt + "\n").encode("utf-8", "replace")
 
 
 def add_common_args(parser: argparse.ArgumentParser) -> None:

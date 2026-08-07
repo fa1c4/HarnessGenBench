@@ -493,6 +493,11 @@ run_hgb_container() {
     -e G2FUZZ_AFL_FUZZ \
     -e G2FUZZ_PROGRAM_GEN \
     -e G2FUZZ_USE_DATA \
+    -e G2FUZZ_COVERAGE_REPORT \
+    -e G2FUZZ_BUILD_TIMEOUT_SECONDS \
+    -e G2FUZZ_VALIDATE_MAX_INPUTS \
+    -e G2FUZZ_COVERAGE_TIMEOUT_SECONDS \
+    -e HGB_FUZZBENCH_BENCHMARK_DIR \
     -e HGB_BASELINE_PROFILE \
     -e HGB_BASELINE_PROTOCOL \
     -e PROME_FUZZ_SKIP_BAD_DOCS \
@@ -528,6 +533,12 @@ run_hgb_target_container() {
   elif [[ "$generator" == "g2fuzz" ]]; then
     extra_docker_args+=(-v "$root/artifacts/g2fuzz:/opt/hgb/artifacts/g2fuzz:ro")
     extra_docker_args+=(-v "$root/repro:/opt/hgb/repro:ro")
+    # G2Fuzz is a paper-native input_generator (not blind-project): it builds
+    # the native FuzzBench target pair (.afl/.cmp) unchanged from the pinned
+    # benchmark source, so the FuzzBench benchmark dir is mounted read-only.
+    if [[ -d "$root/artifacts/fuzzbench" ]]; then
+      extra_docker_args+=(-v "$root/artifacts/fuzzbench:/opt/hgb/fuzzbench:ro" -e HGB_FUZZBENCH_BENCHMARK_DIR="/opt/hgb/fuzzbench/benchmarks/$target")
+    fi
     if [[ -n "${G2FUZZ_TARGET_DIR:-}" ]]; then
       extra_docker_args+=(-v "${G2FUZZ_TARGET_DIR}:/g2fuzz-target-pair:ro" -e G2FUZZ_TARGET_DIR=/g2fuzz-target-pair)
     fi
@@ -734,6 +745,11 @@ run_hgb_target_container() {
     -e G2FUZZ_AFL_FUZZ \
     -e G2FUZZ_PROGRAM_GEN \
     -e G2FUZZ_USE_DATA \
+    -e G2FUZZ_COVERAGE_REPORT \
+    -e G2FUZZ_BUILD_TIMEOUT_SECONDS \
+    -e G2FUZZ_VALIDATE_MAX_INPUTS \
+    -e G2FUZZ_COVERAGE_TIMEOUT_SECONDS \
+    -e HGB_FUZZBENCH_BENCHMARK_DIR \
     -e HGB_BASELINE_PROFILE \
     -e HGB_BASELINE_PROTOCOL \
     -e HGB_STRICT \

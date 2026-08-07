@@ -45,6 +45,42 @@ PY
   queue_count="$(extract_json_number queue_count "$metadata")"; [[ -n "$queue_count" ]] || queue_count="$(count_files "$run_dir/seeds/afl_queue" -type f)"
   crash_count="$(extract_json_number crash_count "$metadata")"; [[ -n "$crash_count" ]] || crash_count="$(count_files "$run_dir/campaign/output" -type f -path "*/crashes/*" ! -name README.txt)"
   hang_count="$(extract_json_number hang_count "$metadata")"; [[ -n "$hang_count" ]] || hang_count="$(count_files "$run_dir/campaign/output" -type f -path "*/hangs/*" ! -name README.txt)"
+  valid_g2="$(python3 - "$metadata" <<"PY"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(int(d.get("input_generation", {}).get("valid_g2_generated_count", d.get("valid_generated_input_count", 0)) or 0))
+except Exception:
+    print(0)
+PY
+)"
+  execs_done="$(python3 - "$metadata" <<"PY"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(int(d.get("campaign", {}).get("execs_done", 0) or 0))
+except Exception:
+    print(0)
+PY
+)"
+  pair_status="$(python3 - "$metadata" <<"PY"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(str(d.get("target_pair_build", {}).get("status", "pending")))
+except Exception:
+    print("pending")
+PY
+)"
+  build_source="$(python3 - "$metadata" <<"PY"
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+    print(str(d.get("target_pair_build", {}).get("build_source", "none")))
+except Exception:
+    print("none")
+PY
+)"
 
   {
     printf "# HarnessGenBench G2Fuzz Summary\n\n"
@@ -54,12 +90,13 @@ PY
     printf -- "- Target/program: `%s`\n" "$target"
     printf -- "- Task family: `%s`\n" "$task_family"
     printf -- "- Method profile: `%s`\n" "$method_profile"
+    printf -- "- Target pair build: `%s` (source: `%s`)\n" "$pair_status" "$build_source"
     printf -- "- Model: `%s`\n" "$model"
     printf -- "- API key present: `%s`\n" "$api_key_present"
     printf -- "- Log files: %s\n" "$log_count"
-    printf -- "- Generated input count: %s\n" "$generated_input_count"
+    printf -- "- Generated input count: %s (valid: %s)\n" "$generated_input_count" "$valid_g2"
     printf -- "- Generator source count: %s\n" "$generator_count"
-    printf -- "- Queue/crash/hang counts: queue=%s, crashes=%s, hangs=%s\n" "$queue_count" "$crash_count" "$hang_count"
+    printf -- "- Campaign: execs_done=%s, queue=%s, crashes=%s, hangs=%s\n" "$execs_done" "$queue_count" "$crash_count" "$hang_count"
     printf -- "- Top failure reason: %s\n" "$reason"
     printf "\n## Logs\n\n"
     list_files "$run_dir/logs" -type f | sort | sed "s#^$run_dir/##" | sed "s/^/- /"

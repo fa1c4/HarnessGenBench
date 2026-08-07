@@ -256,6 +256,11 @@ if [[ "$mode" == "generate-target" ]]; then
   hgb_require_target_package
   patch_g2fuzz_program_gen
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  # FuzzBench benchmark dir for auto-building the .afl/.cmp pair. Commonly set
+  # by the host mount; fall back to the pinned checkout mounted at /opt/hgb/fuzzbench.
+  if [[ -z "${HGB_FUZZBENCH_BENCHMARK_DIR:-}" && -d "/opt/hgb/fuzzbench/benchmarks/$target_name" ]]; then
+    export HGB_FUZZBENCH_BENCHMARK_DIR="/opt/hgb/fuzzbench/benchmarks/$target_name"
+  fi
   dry_run_arg=()
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     dry_run_arg=(--dry-run)

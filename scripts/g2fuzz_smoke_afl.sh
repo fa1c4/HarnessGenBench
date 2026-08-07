@@ -9,10 +9,10 @@ usage() {
 Usage:
   bash scripts/g2fuzz_smoke_afl.sh [TARGET]
 
-Compatibility wrapper around the staged G2Fuzz baseline pipeline. If
-G2FUZZ_TARGET_DIR points at host-built .afl/.cmp binaries, hgb_run_baseline.sh
-mounts that directory at /g2fuzz-target-pair and sets the container-visible
-G2FUZZ_TARGET_DIR to that path.
+Compatibility wrapper around the staged G2Fuzz baseline pipeline. The .afl/.cmp
+target pair is auto-built from the pinned FuzzBench target inside the G2Fuzz
+image; a host-provided pair may still be supplied via G2FUZZ_TARGET_DIR as an
+optional override.
 EOF
 }
 

@@ -367,6 +367,83 @@ def run_coverage(
     }
 
 
+# -- G2Fuzz native target-pair builder ------------------------------------
+
+G2FUZZ_BUILD_MODE = "fuzzbench_native_afl_cmps"
+
+
+def g2fuzz_target_pair_build_commands(
+    *,
+    artifact_dir: Path,
+    target_package: Path,
+    workspace: Path,
+    program_id: str,
+) -> dict:
+    """Return the two (afl/cmp) FuzzBench build commands for a G2Fuzz pair.
+
+    Both variants share the same ``argv`` (the native FuzzBench ``build.sh``)
+    and the same AFL++ compiler/toolchain env.  They differ ONLY in
+    ``AFL_LLVM_CMPLOG`` (0 for ``.afl``, 1 for CmpLog ``.cmp``) and the
+    ``HGB_G2FUZZ_OUTPUT`` path.  CmpLog is used exclusively for the ``.cmp``
+    build; the ``.afl`` build never sets ``AFL_LLVM_CMPLOG=1``.
+    """
+
+    artifact = Path(artifact_dir)
+    bench_root = Path(target_package)
+    out_root = Path(workspace)
+    build_sh = bench_root / "fuzzbench_benchmark" / "build.sh"
+    cc = artifact / "afl-clang-fast"
+    cxx = artifact / "afl-clang-fast++"
+    src = bench_root / "source_input"
+    common_env = {
+        "CC": str(cc),
+        "CXX": str(cxx),
+        "FUZZING_ENGINE": "afl",
+        "SANITIZER": "address",
+        "ARCHITECTURE": "x86_64",
+        "SRC": str(src),
+        "WORK": str(out_root / "target" / "build_work"),
+        "LIB_FUZZING_ENGINE": "",
+    }
+    afl_env = dict(common_env)
+    afl_env["AFL_LLVM_CMPLOG"] = "0"
+    afl_env["HGB_G2FUZZ_OUTPUT"] = str(out_root / "target" / "target.afl")
+    cmp_env = dict(common_env)
+    cmp_env["AFL_LLVM_CMPLOG"] = "1"
+    cmp_env["HGB_G2FUZZ_OUTPUT"] = str(out_root / "target" / "target.cmp")
+    argv = ["bash", str(build_sh)]
+    return {
+        "program_id": program_id,
+        "build_mode": G2FUZZ_BUILD_MODE,
+        "afl": {"env": afl_env, "argv": argv},
+        "cmp": {"env": cmp_env, "argv": argv},
+        "expected_difference": "AFL_LLVM_CMPLOG and output path only",
+    }
+
+
+def verify_g2fuzz_target_pair(afl_binary: Path, cmp_binary: Path) -> dict:
+    """Verify a built G2Fuzz target pair: both binaries exist and are executable.
+
+    A missing ``.cmp`` binary fails verification.  This is used by the pipeline
+    and the offline tests; it never soft-skips a missing pair.
+    """
+
+    import os as _os
+
+    def _stat(p: Path) -> dict:
+        return {
+            "path": str(p),
+            "exists": p.is_file(),
+            "executable": _os.access(p, _os.X_OK) if p.exists() else False,
+            "size": p.stat().st_size if p.exists() else 0,
+        }
+
+    afl = _stat(Path(afl_binary))
+    cmp = _stat(Path(cmp_binary))
+    ok = bool(afl["exists"] and afl["executable"] and afl["size"] > 0 and cmp["exists"] and cmp["executable"] and cmp["size"] > 0)
+    return {"afl": afl, "cmp": cmp, "ok": ok, "build_mode": G2FUZZ_BUILD_MODE}
+
+
 def main() -> int:
     import argparse
 

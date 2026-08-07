@@ -127,27 +127,54 @@ def remediation_for(status: str, reason: str) -> str:
 
 
 def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
-    """Return invariant violations for an ``evaluated`` harness-generator row.
+    """Return invariant violations for an ``evaluated`` row.
 
-    Per the beta reproduction contract, an ``evaluated`` row must have a real
-    coverage report (non-null covered lines) and a campaign with
-    ``execs_done > 0``, plus a per-candidate evaluator JSON (selected_candidate).
+    Harness-generator rows (per the beta reproduction contract) must have a
+    real coverage report (non-null covered lines), a campaign with
+    ``execs_done > 0``, and a per-candidate evaluator JSON (selected_candidate).
+
+    Input-generator rows (G2Fuzz) must additionally have a completed
+    ``target_pair_build`` (auto-built ``.afl``/``.cmp`` evidence), at least one
+    valid G2-generated input, ``execs_done > 0``, a nonempty queue, and a real
+    coverage report.  AFL ``paths_total`` is never accepted as coverage.
     """
     if str(meta.get("status")) != "evaluated":
         return []
     violations: list[str] = []
     family = str(meta.get("task_family") or meta.get("capability") or "")
-    if family and family != "harness_generator":
-        return []
     cov = meta.get("metrics", {}).get("coverage") or meta.get("coverage") or {}
     if not isinstance(cov, dict):
         cov = {}
-    line_cov = cov.get("line_coverage", {}) if isinstance(cov, dict) else {}
-    if line_cov.get("covered") is None:
-        violations.append("evaluated row has coverage.line_coverage.covered == null")
+    line_cov = cov.get("line_coverage")
+    if not isinstance(line_cov, dict):
+        line_cov = {}
     campaign = meta.get("metrics", {}).get("campaign") or meta.get("campaign") or {}
     if not isinstance(campaign, dict):
         campaign = {}
+    if family == "input_generator":
+        # G2Fuzz beta contract (plan section 11).
+        target_pair = meta.get("target_pair_build", {})
+        if isinstance(target_pair, dict) and target_pair.get("status") != "completed":
+            violations.append("evaluated input-generator row has no completed target_pair_build")
+        if not (target_pair.get("afl_binary") and target_pair.get("cmp_binary")):
+            violations.append("evaluated input-generator row lacks .afl/.cmp build evidence")
+        input_gen = meta.get("input_generation", {})
+        if not isinstance(input_gen, dict) or int(input_gen.get("valid_g2_generated_count", 0) or 0) <= 0:
+            violations.append("evaluated input-generator row has no valid G2-generated input")
+        if int(campaign.get("execs_done", 0) or 0) <= 0:
+            violations.append("evaluated row has campaign.execs_done <= 0")
+        if int(campaign.get("queue_count", 0) or 0) <= 0:
+            violations.append("evaluated input-generator row has campaign.queue_count <= 0")
+        if line_cov.get("covered") is None:
+            violations.append("evaluated row has coverage.line_coverage.covered == null")
+        edge = cov.get("edge_coverage")
+        if isinstance(edge, dict) and edge.get("status") != "unavailable":
+            violations.append("evaluated input-generator row must not report AFL paths as edge coverage")
+        return violations
+    if family and family != "harness_generator":
+        return []
+    if line_cov.get("covered") is None:
+        violations.append("evaluated row has coverage.line_coverage.covered == null")
     if int(campaign.get("execs_done", 0) or 0) <= 0:
         violations.append("evaluated row has campaign.execs_done <= 0")
     if not meta.get("selected_candidate"):
@@ -277,7 +304,7 @@ def storage_report(matrix_dir: Path, records: list[dict[str, Any]]) -> dict[str,
     }
 
 
-def collect(matrix_dir: Path, *, strict: bool = False) -> dict[str, Any]:
+def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "") -> dict[str, Any]:
     rows = read_rows(matrix_dir)
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -388,8 +415,30 @@ def collect(matrix_dir: Path, *, strict: bool = False) -> dict[str, Any]:
             elif status_s == "infra_failure":
                 applicable_infra_failure += 1
     applicable_pairs = len(aggregate_records) - not_applicable
+    # method_profile split (G2Fuzz beta plan section 3): paper-faithful and
+    # extension aggregates are reported separately when --split-by method_profile.
+    method_profile_groups: dict[str, dict[str, Any]] = {}
+    if split_by == "method_profile":
+        for record in records:
+            meta = record["metadata"]
+            profile = str(meta.get("method_profile") or "")
+            if not profile:
+                continue
+            group = method_profile_groups.setdefault(profile, {"total": 0, "evaluated": 0, "quality_failure": 0, "infra_failure": 0, "other": 0})
+            group["total"] += 1
+            status_s = str(meta.get("status") or record["row"].get("status") or "missing_metadata")
+            if status_s == "evaluated":
+                group["evaluated"] += 1
+            elif status_s == "quality_failure":
+                group["quality_failure"] += 1
+            elif status_s == "infra_failure":
+                group["infra_failure"] += 1
+            else:
+                group["other"] += 1
     return {
         "matrix_dir": str(matrix_dir),
+        "split_by": split_by,
+        "method_profile_groups": method_profile_groups,
         "total_pairs": total,
         "aggregate_pairs": len(aggregate_records),
         "excluded_pairs": excluded_count,
@@ -484,6 +533,17 @@ def write_outputs(matrix_dir: Path, summary: dict[str, Any]) -> None:
             else:
                 completed_family = sum(statuses.get(status, 0) for status in COMPLETED_STATUSES)
             lines.append(f"- `{family}`: {count} pairs, {completed_family} completed/evaluated, {evaluated} evaluated")
+    groups = summary.get("method_profile_groups", {})
+    if groups:
+        lines.extend(["", "## Method Profile Groups", ""])
+        for profile, group in sorted(groups.items()):
+            lines.append(
+                f"- `{profile}`: {group.get('total', 0)} pairs, "
+                f"{group.get('evaluated', 0)} evaluated, "
+                f"{group.get('quality_failure', 0)} quality_failure, "
+                f"{group.get('infra_failure', 0)} infra_failure, "
+                f"{group.get('other', 0)} other"
+            )
     storage = summary.get("storage", {})
     if storage:
         lines.extend(["", "## Storage", ""])
@@ -526,10 +586,12 @@ def main() -> int:
                         help="validate evaluated rows have coverage and execs_done>0")
     parser.add_argument("--generators", default="")
     parser.add_argument("--targets", default="")
+    parser.add_argument("--split-by", dest="split_by", default="",
+                        help="split aggregates by a metadata field (e.g. method_profile)")
     args = parser.parse_args()
     matrix_dir = Path(args.matrix_dir).resolve()
     matrix_dir.mkdir(parents=True, exist_ok=True)
-    summary = collect(matrix_dir, strict=args.strict)
+    summary = collect(matrix_dir, strict=args.strict, split_by=args.split_by)
     write_outputs(matrix_dir, summary)
     if args.strict and summary.get("evaluated_row_violations"):
         print(f"ERROR: {len(summary['evaluated_row_violations'])} evaluated row(s) lack coverage/execs:", file=sys.stderr)

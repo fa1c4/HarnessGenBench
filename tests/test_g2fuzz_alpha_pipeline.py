@@ -108,6 +108,26 @@ raise SystemExit(0)
     )
 
 
+def fake_coverage_report(path: Path) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "data": [
+                    {
+                        "totals": {
+                            "lines": {"count": 12, "covered": 9},
+                            "functions": {"count": 5, "covered": 4},
+                            "regions": {"count": 10, "covered": 7},
+                        }
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def run_helper(tmp_path: Path, env: dict[str, str], target: str = "libpng_libpng_read_fuzzer") -> subprocess.CompletedProcess[str]:
     workspace = tmp_path / "workspace"
     package = make_target_package(tmp_path, target)
@@ -221,6 +241,7 @@ def test_fake_modified_afl_fixture_reaches_evaluated_with_separate_seed_counts(t
     fake_pair(pair)
     program_gen = fake_program_gen(tmp_path / "program_gen.py")
     afl = fake_afl_fuzz(tmp_path / "afl-fuzz")
+    coverage = fake_coverage_report(tmp_path / "coverage.json")
 
     result = run_helper(
         tmp_path,
@@ -229,6 +250,7 @@ def test_fake_modified_afl_fixture_reaches_evaluated_with_separate_seed_counts(t
             "G2FUZZ_PROGRAM_GEN": str(program_gen),
             "G2FUZZ_AFL_FUZZ": str(afl),
             "G2FUZZ_AFL_TIMEOUT_SECONDS": "5",
+            "G2FUZZ_COVERAGE_REPORT": str(coverage),
         },
     )
 

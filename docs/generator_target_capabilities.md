@@ -6,7 +6,7 @@
 | CKGFuzzer | harness generator | run | Needs API candidates, runtime config, and a real CodeQL/code knowledge graph. `alpha`/`paper-faithful` require a real embedding service, upstream LLM API summaries, the upstream API-combination planner, and the upstream compilation-check/repair loop. The beta harness evaluator overlays each candidate, runs sanitizer smoke, API reachability, a fixed-budget campaign, and real LLVM coverage. |
 | PromeFuzz | harness generator | run if compile DB exists, otherwise soft-skip | Needs headers and `compile_commands.json`. |
 | ELFuzz | input generator | run via manifest applicability gate | Synthesizes/evolves input-producing fuzzer programs against a fixed native FuzzBench target, then runs a final campaign. Applicability is decided from `metadata/elfuzz_target_adapters.yaml`; non-text targets return `Invalid`/`not_applicable` before Docker, TGI, or model work. `--allow-input-generator` is a deprecated no-op. |
-| G2Fuzz | input generator | run target-aware staged pipeline | Requires a native `.afl`/`.cmp` pair and reports `evaluated` only after generation, campaign, and coverage/queue metric collection. |
+| G2Fuzz | input generator | run target-aware staged pipeline | Auto-builds the native `.afl`/`.cmp` pair from the pinned FuzzBench target with the modified afl-clang-fast (CmpLog for `.cmp`); no externally prebuilt pair is required. Reports `evaluated` only after a completed pair build, at least one valid G2-generated input, a modified AFL++ campaign with `execs_done>0` and a nonempty queue, and a real coverage report. AFL `paths_total` is never coverage. |
 
 All target-aware runs execute inside Docker. Host-side outputs stay under
 `workspace/`, and upstream artifacts or target source checkouts stay under
@@ -45,3 +45,19 @@ Each applicable target ships a per-target adapter at
 (no `jsoncpp`/`libxml2` aliasing for extension targets). The collector excludes
 Invalid rows from the success/failure denominator and reports coverage only for
 applicable evaluated rows.
+
+## G2Fuzz method profiles
+
+G2Fuzz is an `input_generator`, not a harness generator. Every valuable target
+has an adapter in `metadata/g2fuzz_target_adapters.yaml` with a `method_profile`:
+
+- **paper-faithful (9):** targets whose format/program family is directly
+  aligned with the G2Fuzz paper experiments or official artifact support.
+- **extension (11):** text/custom targets or formats not directly in the
+  paper's core set.
+
+Both profiles may run, but matrix summaries separate the aggregates
+(`--split-by method_profile`). Extension rows are excluded from paper-only
+aggregates. The `.afl`/`.cmp` pair is auto-built from the pinned FuzzBench
+target; `G2FUZZ_TARGET_DIR` is an optional override only, never required in
+alpha or paper-faithful.
