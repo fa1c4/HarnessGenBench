@@ -28,6 +28,28 @@ VALID_PROFILES = {"alpha", "paper-faithful", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
 METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful"}
 
+# Beta plan section 10: allowed run-level statuses for a PromeFuzz
+# harness_generator row. ``evaluated`` requires a verified candidate, real
+# coverage, nonzero campaign executions, and dynamic API reachability.
+STATUS_EVALUATED = "evaluated"
+STATUS_QUALITY_FAILURE = "quality_failure"
+STATUS_INFRA_FAILURE = "infra_failure"
+STATUS_COMPAT_SMOKE_COMPLETED = "compat_smoke_completed"
+ALLOWED_BETA_STATUSES = {
+    STATUS_EVALUATED,
+    STATUS_QUALITY_FAILURE,
+    STATUS_INFRA_FAILURE,
+    STATUS_COMPAT_SMOKE_COMPLETED,
+}
+# Evaluator stages that must actually run before a row may be ``evaluated``.
+EVALUATION_STAGES = (
+    "candidate_build",
+    "sanitizer_smoke",
+    "api_reachability",
+    "campaign",
+    "coverage",
+)
+
 # Flags that are forbidden in method-faithful profiles because they collapse
 # PromeFuzz into a compat-smoke no-op: a synthetic compile database, a
 # mock/hash embedding provider, and the selected-reference-harness API report.
@@ -188,6 +210,8 @@ def build_result(
     reason: str = "",
     method_variant: str = "",
     excluded_from_aggregate: bool = False,
+    selected_candidate: dict[str, Any] | None = None,
+    candidate_count: int = 0,
 ) -> dict[str, Any]:
     stages = stages if stages is not None else default_stages()
     if status is None:
@@ -196,8 +220,11 @@ def build_result(
         excluded_from_aggregate = True
         if not method_variant:
             method_variant = "compat-smoke"
+        # compat-smoke never reaches the scientific ``evaluated`` status.
+        if status == STATUS_EVALUATED:
+            status = STATUS_COMPAT_SMOKE_COMPLETED
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generator": generator,
         "task_family": task_family,
         "profile": profile,
@@ -213,7 +240,51 @@ def build_result(
         "reference_leakage_audit": reference_leakage_audit or {},
         "method_variant": method_variant or profile,
         "excluded_from_aggregate": excluded_from_aggregate,
+        "selected_candidate": selected_candidate or {},
+        "candidate_count": candidate_count,
     }
+
+
+def finalize_status_from_evaluator(
+    evaluator_status: str,
+    *,
+    stages: dict[str, str],
+    profile: str,
+    coverage_covered_lines: int | None = None,
+    campaign_execs_done: int = 0,
+    reached_count: int = 0,
+    candidate_count: int = 0,
+) -> str:
+    """Map the shared evaluator status to a PromeFuzz run-level status.
+
+    Per beta plan section 10, ``evaluated`` is only allowed when the evaluator
+    produced a verified candidate, real coverage (non-null covered lines),
+    ``execs_done > 0``, and ``api_reachability.reached_count > 0``. A
+    compile-only candidate can never be ``evaluated``.
+    """
+
+    if is_compat_smoke(profile):
+        if evaluator_status == STATUS_EVALUATED:
+            return STATUS_COMPAT_SMOKE_COMPLETED
+        return evaluator_status
+    if evaluator_status == STATUS_EVALUATED:
+        if candidate_count <= 0:
+            return STATUS_QUALITY_FAILURE
+        if coverage_covered_lines is None:
+            return STATUS_QUALITY_FAILURE
+        if int(campaign_execs_done or 0) <= 0:
+            return STATUS_QUALITY_FAILURE
+        if int(reached_count or 0) <= 0:
+            return STATUS_QUALITY_FAILURE
+        # Every evaluation stage must be completed.
+        if any(stages.get(stage) != "completed" for stage in EVALUATION_STAGES):
+            return STATUS_QUALITY_FAILURE
+        return STATUS_EVALUATED
+    if evaluator_status == STATUS_INFRA_FAILURE:
+        return STATUS_INFRA_FAILURE
+    # quality_failure, compat_smoke_completed, or any other evaluator state is
+    # a quality failure for a method-faithful profile.
+    return STATUS_QUALITY_FAILURE
 
 
 def write_result(result: dict[str, Any], path: str | Path) -> None:

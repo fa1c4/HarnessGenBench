@@ -346,6 +346,9 @@ promefuzz_write_final_result() {
   PROME_FUZZ_STATUS="$status" PROME_FUZZ_REASON="$reason" PROME_FUZZ_CODE="$exit_code" \
   PROME_FUZZ_METHOD="$method_variant" PROME_FUZZ_EXCLUDED="$excluded" \
   PROME_FUZZ_LEAKAGE="$leakage_json" \
+  PROME_FUZZ_METRICS="${PROME_FUZZ_EVALUATOR_METRICS:-}" \
+  PROME_FUZZ_SELECTED="${PROME_FUZZ_EVALUATOR_SELECTED:-}" \
+  PROME_FUZZ_CANDIDATE_COUNT="${PROME_FUZZ_CANDIDATE_COUNT:-0}" \
     "$python" - "$workspace/result.json" "$(promefuzz_stages_file)" "$(commit)" <<'PY_PROMEFUZZ_WRITE_FINAL'
 import json
 import os
@@ -364,6 +367,18 @@ try:
     leakage = json.loads(os.environ.get("PROME_FUZZ_LEAKAGE", "{}") or "{}")
 except Exception:
     leakage = {}
+try:
+    metrics = json.loads(os.environ.get("PROME_FUZZ_METRICS", "") or "{}")
+except Exception:
+    metrics = {}
+try:
+    selected = json.loads(os.environ.get("PROME_FUZZ_SELECTED", "") or "{}")
+except Exception:
+    selected = {}
+try:
+    candidate_count = int(os.environ.get("PROME_FUZZ_CANDIDATE_COUNT", "0") or "0")
+except ValueError:
+    candidate_count = 0
 result = promefuzz_profile.build_result(
     profile=os.environ["PROME_FUZZ_PROFILE"],
     protocol=os.environ["PROME_FUZZ_PROTOCOL"],
@@ -374,6 +389,9 @@ result = promefuzz_profile.build_result(
     method_variant=os.environ["PROME_FUZZ_METHOD"],
     excluded_from_aggregate=os.environ["PROME_FUZZ_EXCLUDED"] == "true",
     reference_leakage_audit=leakage,
+    metrics=metrics,
+    selected_candidate=selected,
+    candidate_count=candidate_count,
     provenance={
         "promefuzz_commit": ofg_commit,
         "fuzzbench_commit": os.environ.get("HGB_FUZZBENCH_COMMIT", ""),
@@ -382,6 +400,10 @@ result = promefuzz_profile.build_result(
         "build_context_method": os.environ.get("PROME_FUZZ_BUILD_CONTEXT_METHOD", "auto"),
         "all_cover_candidates": os.environ.get("PROME_FUZZ_ALL_COVER_CANDIDATES", ""),
         "all_cover_max_wall_seconds": os.environ.get("PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS", ""),
+        "generation_budget_seconds": os.environ.get("PROME_GENERATION_BUDGET_SECONDS", ""),
+        "max_candidates": os.environ.get("PROME_MAX_CANDIDATES", ""),
+        "campaign_seconds": os.environ.get("HGB_CAMPAIGN_SECONDS", ""),
+        "consumer_cases_status": os.environ.get("PROME_FUZZ_CONSUMER_CASES_STATUS", ""),
     },
 )
 out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -453,9 +475,9 @@ if [[ "$mode" == "generate-target" ]]; then
   if ! "$python" /opt/hgb/bin/promefuzz_profile.py validate --profile "$promefuzz_profile" --protocol "$promefuzz_protocol" >/dev/null 2>"$workspace/logs/profile_validation.log"; then
     violations="$(cat "$workspace/logs/profile_validation.log" 2>/dev/null || printf 'unknown')"
     reason="promefuzz_profile_violation: $violations"
-    hgb_write_common_metadata failed "$reason" 65 harness_generator
+    hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
     promefuzz_set_stage target_prepared failed
-    promefuzz_write_final_result failed "$reason" 65
+    promefuzz_write_final_result infra_failure "$reason" 65
     hgb_write_common_summary failed "$reason" harness_generator
     exit 65
   fi
@@ -483,6 +505,13 @@ if [[ "$mode" == "generate-target" ]]; then
   export PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS="${PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS:-5400}"
   export PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS="${PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS:-64}"
   export PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS="${PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS:-3}"
+  # Beta plan section 8: define ALL-COVER/generation/campaign budgets in one
+  # place. A smaller user-supplied budget is recorded but is not a paper
+  # reproduction unless the paper budget matches.
+  export PROME_GENERATION_BUDGET_SECONDS="${PROME_GENERATION_BUDGET_SECONDS:-3600}"
+  export PROME_MAX_CANDIDATES="${PROME_MAX_CANDIDATES:-10}"
+  export HGB_CAMPAIGN_SECONDS="${HGB_CAMPAIGN_SECONDS:-300}"
+  export PROME_FUZZ_CAMPAIGN_SECONDS="${PROME_FUZZ_CAMPAIGN_SECONDS:-$HGB_CAMPAIGN_SECONDS}"
   promefuzz_set_stage target_prepared completed
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
@@ -507,8 +536,8 @@ if [[ "$mode" == "generate-target" ]]; then
   if ! native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination 2>"$workspace/logs/native_harness.log")"; then
     promefuzz_set_stage target_prepared failed
     reason="promefuzz_native_harness_unresolved: target package does not identify a native C/C++ harness path"
-    hgb_write_common_metadata failed "$reason" 65 harness_generator
-    promefuzz_write_final_result failed "$reason" 65
+    hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+    promefuzz_write_final_result infra_failure "$reason" 65
     hgb_write_common_summary failed "$reason" harness_generator
     exit 65
   fi
@@ -517,8 +546,8 @@ if [[ "$mode" == "generate-target" ]]; then
   promefuzz_pool_size="${PROME_FUZZ_POOL_SIZE:-1}"
   if ! is_positive_integer "$promefuzz_pool_size"; then
     reason="invalid PROME_FUZZ_POOL_SIZE: $promefuzz_pool_size"
-    hgb_write_common_metadata failed "$reason" 64 harness_generator
-    promefuzz_write_final_result failed "$reason" 64
+    hgb_write_common_metadata infra_failure "$reason" 64 harness_generator
+    promefuzz_write_final_result infra_failure "$reason" 64
     hgb_write_common_summary failed "$reason" harness_generator
     exit 64
   fi
@@ -562,8 +591,8 @@ PY_PROMEFUZZ_NEUTRAL_STUB
       if ! bash /opt/hgb/bin/promefuzz_target_build.sh "$baseline_source" "$baseline_binary" >"$workspace/logs/baseline-build.log" 2>&1; then
         promefuzz_set_stage build_context failed
         reason="promefuzz_baseline_build_failed: native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget"
-        hgb_write_common_metadata failed "$reason" 65 harness_generator
-        promefuzz_write_final_result failed "$reason" 65
+        hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+        promefuzz_write_final_result infra_failure "$reason" 65
         hgb_write_common_summary failed "$reason" harness_generator
         exit 65
       fi
@@ -584,9 +613,9 @@ PY_PROMEFUZZ_NEUTRAL_STUB
     promefuzz_set_stage build_context failed
     if [[ "$promefuzz_method_faithful" == "1" ]]; then
       reason="promefuzz_build_context_failed: real compile database could not be captured from the pinned FuzzBench build; inspect build_context.log"
-      hgb_write_common_metadata failed "$reason" 65 harness_generator
-      promefuzz_write_final_result failed "$reason" 65
-      hgb_write_common_summary failed "$reason" harness_generator
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
       exit 65
     else
       hgb_soft_skip needs_compile_commands 'PromeFuzz could not capture a compile_commands.json; inspect build_context.log' harness_generator
@@ -599,9 +628,9 @@ PY_PROMEFUZZ_NEUTRAL_STUB
     promefuzz_set_stage build_context failed
     if [[ "$promefuzz_method_faithful" == "1" ]]; then
       reason="promefuzz_build_context_empty: real compile database is empty after filtering; inspect build_context.log"
-      hgb_write_common_metadata failed "$reason" 65 harness_generator
-      promefuzz_write_final_result failed "$reason" 65
-      hgb_write_common_summary failed "$reason" harness_generator
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
       exit 65
     else
       hgb_soft_skip needs_compile_commands 'PromeFuzz requires a non-empty compile_commands.json' harness_generator
@@ -613,6 +642,7 @@ PY_PROMEFUZZ_NEUTRAL_STUB
   compile_db_for_metadata="$preserved_compile_db"
   # Recovered libraries and link arguments from the real build.
   libraries_json="$workspace/build_context/libraries.json"
+  link_context_json="$workspace/build_context/link_context.json"
   driver_build_args_json="[]"
   if [[ -f "$libraries_json" ]]; then
     driver_build_args_json="$("$python" - "$libraries_json" <<'PY_PROMEFUZZ_DRIVER_ARGS'
@@ -627,14 +657,80 @@ except Exception:
 PY_PROMEFUZZ_DRIVER_ARGS
 )"
   fi
+  # Beta plan section 5: enforce nonempty, verified link/build context. In
+  # alpha/paper-faithful empty driver_build_args is an infra_failure with
+  # failed_stage=link_context, never a soft skip.
+  driver_build_args_count="$(printf '%s' "$driver_build_args_json" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || printf '0')"
+  link_verified=false
+  if [[ "$driver_build_args_count" -gt 0 ]]; then
+    link_verified=true
+    "$python" - "$link_context_json" "$libraries_json" "$workspace/link_probe" "$language" "$workspace/build_context/src" >"$workspace/logs/verify_link_set.log" 2>&1 <<'PY_PROMEFUZZ_VERIFY_LINK' || link_verified=false
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_build_context as pbc
+link_context_path = Path(sys.argv[1])
+libraries_path = Path(sys.argv[2])
+work_dir = Path(sys.argv[3])
+language = sys.argv[4]
+source_root = Path(sys.argv[5])
+try:
+    libraries = json.loads(libraries_path.read_text(encoding="utf-8"))
+except Exception:
+    libraries = {}
+driver_build_args = libraries.get("driver_build_args", [])
+ok, msg = pbc.verify_and_record_link_set(
+    link_context_path=link_context_path,
+    driver_build_args=driver_build_args,
+    work_dir=work_dir,
+    language=language,
+    source_root=source_root,
+)
+print(msg)
+sys.exit(0 if ok else 1)
+PY_PROMEFUZZ_VERIFY_LINK
+  else
+    printf 'driver_build_args is empty; link context not verified\n' >"$workspace/logs/verify_link_set.log"
+    [[ -f "$link_context_json" ]] && python3 - "$link_context_json" <<'PY_PROMEFUZZ_LINK_EMPTY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+try:
+    data = json.loads(p.read_text(encoding="utf-8"))
+except Exception:
+    data = {}
+data["verified"] = False
+data["verify_message"] = "driver_build_args is empty"
+p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_PROMEFUZZ_LINK_EMPTY
+  fi
+  if [[ "$promefuzz_method_faithful" == "1" ]]; then
+    if [[ "$driver_build_args_count" -le 0 ]]; then
+      promefuzz_set_stage build_context failed
+      reason="promefuzz_link_context_empty: driver_build_args is empty; alpha/paper-faithful require verified nonempty link/build arguments (failed_stage=link_context)"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+    if [[ "$link_verified" != "true" ]]; then
+      promefuzz_set_stage build_context failed
+      reason="promefuzz_link_context_unverified: verify_link_set failed to build a minimal consumer with the recovered driver_build_args (failed_stage=link_context)"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+  fi
   # --- Embedding preflight (real provider required in alpha/paper-faithful) ---
   if [[ "$promefuzz_method_faithful" == "1" ]] && [[ "${PROME_FUZZ_EMBEDDING_PREFLIGHT:-1}" == "1" ]]; then
     if ! promefuzz_embedding_preflight "$workspace/logs/embedding_preflight.log"; then
       promefuzz_set_stage knowledge failed
       reason="promefuzz_embedding_unavailable: real embedding service is unavailable; configure PROME_FUZZ_EMBEDDING_LLM_TYPE/MODEL/BASE_URL/API_KEY"
-      hgb_write_common_metadata failed "$reason" 2 harness_generator
-      promefuzz_write_final_result failed "$reason" 2
-      hgb_write_common_summary failed "$reason" harness_generator
+      hgb_write_common_metadata infra_failure "$reason" 2 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 2
+      hgb_write_common_summary infra_failure "$reason" harness_generator
       exit 2
     fi
   fi
@@ -643,6 +739,19 @@ PY_PROMEFUZZ_DRIVER_ARGS
   libraries=/run/hgb/promefuzz/libraries.toml
   promefuzz_write_config "$config"
   driver_build_args_toml="$driver_build_args_json"
+  # Beta plan section 6: wire consumer knowledge into the upstream PromeFuzz
+  # config. consumer_cases.json was produced by build_context capture from
+  # legitimate examples/tests/docs only (never the reference harness).
+  consumer_cases_json="$workspace/knowledge/consumer_cases.json"
+  consumer_cases_status="unavailable"
+  consumer_case_paths_toml="[]"
+  if [[ -f "$consumer_cases_json" ]]; then
+    consumer_cases_count="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("consumer_count",0))' "$consumer_cases_json" 2>/dev/null || printf '0')"
+    if [[ "${consumer_cases_count:-0}" -gt 0 ]]; then
+      consumer_cases_status="available"
+      consumer_case_paths_toml='["/workspace/knowledge/consumer_cases"]'
+    fi
+  fi
   cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
 [$safe_target]
 language = "$language"
@@ -656,6 +765,7 @@ exclude_paths = ["/target/source_input/test", "/target/source_input/tests", "/ta
 driver_headers = []
 driver_build_args = $driver_build_args_toml
 consumer_build_args = $driver_build_args_toml
+consumer_case_paths = $consumer_case_paths_toml
 EOF_PROMEFUZZ_LIBS
   printf 'PromeFuzz config: %s\nPromeFuzz libraries: %s\n' "$config" "$libraries" >"$workspace/command.txt"
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
@@ -906,10 +1016,10 @@ PY_PROMEFUZZ_LLM_TRACE_PATCH
     printf 'PromeFuzz processor binaries are missing under %s/build/bin. Rebuild the image so docker/promefuzz/Dockerfile runs setup.sh.\n' "$runtime_artifact" >"$workspace/logs/processor.log"
     if [[ "$promefuzz_method_faithful" == "1" ]]; then
       reason="missing_processor_binaries: PromeFuzz processor binaries are missing; rebuild the PromeFuzz image so setup.sh runs during docker build"
-      hgb_write_common_metadata failed "$reason" 65 harness_generator
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
       promefuzz_set_stage api_preprocess failed
-      promefuzz_write_final_result failed "$reason" 65
-      hgb_write_common_summary failed "$reason" harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
       exit 65
     else
       hgb_soft_skip missing_processor_binaries 'PromeFuzz processor binaries are missing; rebuild the PromeFuzz image so setup.sh runs during docker build' harness_generator
@@ -965,9 +1075,9 @@ PY_PROME_API_COUNT
       if [[ "${api_count_after_preprocess:-0}" == "0" ]]; then
         promefuzz_set_stage api_preprocess failed
         reason="promefuzz_no_api_candidates: PromeFuzz preprocess completed but extracted zero API functions"
-        hgb_write_common_metadata failed "$reason" 1 harness_generator
-        promefuzz_write_final_result failed "$reason" 1
-        hgb_write_common_summary failed "$reason" harness_generator
+        hgb_write_common_metadata quality_failure "$reason" 1 harness_generator
+        promefuzz_write_final_result quality_failure "$reason" 1
+        hgb_write_common_summary quality_failure "$reason" harness_generator
         exit 1
       fi
       promefuzz_set_stage api_preprocess completed
@@ -976,6 +1086,37 @@ PY_PROME_API_COUNT
       # real embeddings must exist where the target API requires structured
       # objects. Consumer call graph/call order are generated when consumer
       # cases exist (recorded by build_context/consumer_cases.json).
+      # Beta plan section 6: assert PromeFuzz produced nonempty
+      # retrieval/correlation knowledge when consumer cases exist.
+      knowledge_dir="$workspace/promefuzz_out/$safe_target"
+      comprehend_ok=1
+      "$python" - "$knowledge_dir" "$consumer_cases_status" >"$workspace/logs/comprehend_knowledge_audit.log" 2>&1 <<'PY_PROMEFUZZ_COMPREHEND_AUDIT' || comprehend_ok=0
+import json
+import sys
+from pathlib import Path
+knowledge_dir = Path(sys.argv[1])
+consumer_status = sys.argv[2]
+# Look for the upstream comprehend/retrieval artifacts. PromeFuzz writes
+# metadata/type/correlation JSON under the output knowledge directory.
+candidate_globs = ("*knowledge*", "*comprehend*", "*correlation*", "*retriev*", "*embed*")
+knowledge_files = []
+if knowledge_dir.is_dir():
+    for path in sorted(knowledge_dir.rglob("*")):
+        if path.is_file() and any(g.replace("*", "") in path.name.lower() for g in candidate_globs):
+            knowledge_files.append(str(path))
+if consumer_status == "available" and not knowledge_files:
+    print("comprehend produced no retrieval/correlation knowledge despite available consumer cases")
+    sys.exit(1)
+print(f"knowledge_artifacts={len(knowledge_files)}")
+PY_PROMEFUZZ_COMPREHEND_AUDIT
+      if [[ "$comprehend_ok" != "1" && "$promefuzz_method_faithful" == "1" ]]; then
+        promefuzz_set_stage knowledge failed
+        reason="promefuzz_comprehend_empty: PromeFuzz comprehend produced no retrieval/correlation knowledge despite available consumer cases"
+        hgb_write_common_metadata quality_failure "$reason" 1 harness_generator
+        promefuzz_write_final_result quality_failure "$reason" 1
+        hgb_write_common_summary quality_failure "$reason" harness_generator
+        exit 1
+      fi
       promefuzz_set_stage knowledge completed
     elif [[ "$stage" == "generate" ]]; then
       promefuzz_set_stage generation completed
@@ -1035,50 +1176,142 @@ PY_PROME_API_COUNT
     reason="PromeFuzz finalized $generated_harness_count sanitized target harnesses but reported $deprecated_api_event_count deprecated API generation events"
   fi
   # --- Independent common harness evaluator (build + smoke + reachability +
-  # campaign + coverage). Only a candidate that passes the exact FuzzBench
-  # build and evaluation reaches `evaluated`. ---
+  # campaign + coverage). Beta plan section 9: PromeFuzz reuses the shared
+  # full evaluator (hgb_harness_evaluator.py) so there is no parallel,
+  # incompatible evaluation abstraction. Only a candidate that passes the
+  # exact FuzzBench build and evaluation reaches `evaluated`; a compile-only
+  # candidate can never mark campaign/coverage completed. ---
   verification_code=not_run
   verified_harness_count=0
+  evaluator_status=""
+  evaluator_execs_done=0
+  evaluator_cov_lines=""
+  evaluator_reached_count=0
+  evaluator_metrics_json="{}"
+  evaluator_selected_json="{}"
   if [[ "${generated_harness_count:-0}" -gt 0 && "$code" -eq 0 ]]; then
     eval_dir="$workspace/evaluation"
     mkdir -p "$eval_dir"
+    evaluator_root="${HGB_EVALUATOR_ROOT:-/target}"
     verification_code=0
-    "$python" /opt/hgb/bin/promefuzz_evaluator.py \
-      --target-root /target --candidates-dir "$workspace/generated_harnesses" \
-      --work-dir "$eval_dir" --fuzz-target "$fuzz_target" \
-      --build-timeout "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-1800}" \
-      --campaign-seconds "${PROME_FUZZ_CAMPAIGN_SECONDS:-60}" \
-      >"$workspace/logs/evaluator.log" 2>&1 || verification_code=$?
-    eval_result="$eval_dir/results.json"
-    if [[ -f "$eval_result" ]]; then
-      verified_harness_count="$(python3 -c 'import json; d=json.load(open("'"$eval_result"'")); print(len(d.get("verified_candidates", [])))' 2>/dev/null || printf '0')"
+    intended_apis_arg=""
+    if [[ -f "$selected_api_names_file" ]]; then
+      python3 - "$selected_api_names_file" >"$workspace/promefuzz_intended_apis.txt" 2>/dev/null <<'PY_PROMEFUZZ_INTENDED_APIS' || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    data = []
+names = []
+for item in data if isinstance(data, list) else []:
+    if isinstance(item, str):
+        names.append(item.split('::')[-1])
+    elif isinstance(item, dict) and item.get('name'):
+        names.append(str(item.get('name')).split('::')[-1])
+print(','.join(names))
+PY_PROMEFUZZ_INTENDED_APIS
+      intended_apis_arg="$(tr -d '\n' <"$workspace/promefuzz_intended_apis.txt" 2>/dev/null || true)"
     fi
-    if [[ "$verification_code" -eq 0 && "${verified_harness_count:-0}" -gt 0 ]]; then
-      promefuzz_set_stage candidate_build completed
-      promefuzz_set_stage sanitizer_smoke completed
-      promefuzz_set_stage api_reachability completed
-      promefuzz_set_stage campaign completed
-      promefuzz_set_stage coverage completed
+    evaluator_args=(
+      /opt/hgb/bin/hgb_harness_evaluator.py
+      --generator promefuzz
+      --target-root /target
+      --evaluator-root "$evaluator_root"
+      --candidates "$workspace/generated_harnesses"
+      --work-dir "$eval_dir"
+      --project "$project"
+      --fuzz-target "$fuzz_target"
+      --profile "$promefuzz_profile"
+      --campaign-seconds "${PROME_FUZZ_CAMPAIGN_SECONDS:-$HGB_CAMPAIGN_SECONDS}"
+      --build-timeout "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-1800}"
+      --strict
+    )
+    [[ -n "$intended_apis_arg" ]] && evaluator_args+=(--intended-apis "$intended_apis_arg")
+    "$python" "${evaluator_args[@]}" >"$workspace/logs/evaluator.log" 2>&1 || verification_code=$?
+    eval_result="$eval_dir/result.json"
+    if [[ -f "$eval_result" ]]; then
+      evaluator_status="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(d.get("status",""))' "$eval_result" 2>/dev/null || printf '')"
+      evaluator_execs_done="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print((d.get("metrics",{}) or {}).get("campaign",{}).get("execs_done",0))' "$eval_result" 2>/dev/null || printf 0)"
+      evaluator_cov_lines="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); v=(d.get("metrics",{}) or {}).get("coverage",{}).get("line_coverage",{}).get("covered"); print("" if v is None else v)' "$eval_result" 2>/dev/null || true)"
+      evaluator_reached_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(len(sel.get("api_reachability",{}).get("reached_apis",[]) or []))' "$eval_result" 2>/dev/null || printf 0)"
+      evaluator_metrics_json="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("metrics",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
+      evaluator_selected_json="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("selected_candidate",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
+      verified_harness_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(1 if sel.get("overlaid") and all((d.get("stages",{}) or {}).get(s)=="completed" for s in ("candidate_build","sanitizer_smoke","api_reachability","campaign","coverage")) else 0)' "$eval_result" 2>/dev/null || printf '0')"
+      # Beta plan section 9: set campaign/coverage/reachability stages ONLY
+      # from the shared evaluator output, never from a build-only success.
+      for stage in candidate_build sanitizer_smoke api_reachability campaign coverage; do
+        stage_state="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d.get("stages",{}) or {}).get(sys.argv[2],"pending"))' "$eval_result" "$stage" 2>/dev/null || printf pending)"
+        promefuzz_set_stage "$stage" "$stage_state"
+      done
+      promefuzz_set_stage generation completed
     else
-      promefuzz_set_stage candidate_build failed
-      if [[ "$status" == "evaluated" ]]; then
-        status=failed
-        reason="promefuzz_no_verified_harness: no generated harness passed the exact FuzzBench build + smoke + reachability + campaign + coverage evaluation"
-        code=5
-      fi
+      for stage in candidate_build sanitizer_smoke api_reachability campaign coverage; do
+        promefuzz_set_stage "$stage" failed
+      done
+      evaluator_status=""
+    fi
+    # Beta plan section 10: derive the canonical status from the evaluator.
+    final_eval_status="$("$python" - "$evaluator_status" "$promefuzz_profile" "$workspace/promefuzz_stages.json" "${verified_harness_count:-0}" "${evaluator_execs_done:-0}" "${evaluator_cov_lines:-}" "${evaluator_reached_count:-0}" <<'PY_PROMEFUZZ_FINAL_STATUS'
+import json
+import os
+import sys
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+evaluator_status = sys.argv[1]
+profile = sys.argv[2]
+try:
+    stages = json.loads(open(sys.argv[3]).read())
+except Exception:
+    stages = promefuzz_profile.default_stages()
+candidate_count = int(sys.argv[4] or 0)
+execs_done = int(sys.argv[5] or 0)
+cov_lines = sys.argv[6]
+try:
+    cov_lines_int = int(cov_lines) if cov_lines not in ("", "None") else None
+except ValueError:
+    cov_lines_int = None
+reached_count = int(sys.argv[7] or 0)
+print(promefuzz_profile.finalize_status_from_evaluator(
+    evaluator_status,
+    stages=stages,
+    profile=profile,
+    coverage_covered_lines=cov_lines_int,
+    campaign_execs_done=execs_done,
+    reached_count=reached_count,
+    candidate_count=candidate_count,
+))
+PY_PROMEFUZZ_FINAL_STATUS
+)"
+    if [[ "$final_eval_status" == "evaluated" ]]; then
+      status=evaluated
+      reason=none
+      code=0
+    elif [[ "$final_eval_status" == "infra_failure" ]]; then
+      status=infra_failure
+      reason="promefuzz_infra_failure: shared harness evaluator tooling failed"
+      [[ "$verification_code" -ne 0 ]] && reason="$reason (exit $verification_code)"
+      code=2
+    elif [[ "$final_eval_status" == "compat_smoke_completed" ]]; then
+      status=compat_smoke_completed
+      reason="compat-smoke completed (excluded from aggregate)"
+      code=0
+    else
+      status=quality_failure
+      reason="promefuzz_no_verified_harness: no generated harness passed the exact FuzzBench build + smoke + reachability + campaign + coverage evaluation"
+      code=5
     fi
   elif [[ "$code" -eq 0 ]]; then
     promefuzz_set_stage candidate_build failed
-    status=failed
+    status=quality_failure
+    reason="promefuzz_no_generated_harness: generation produced no candidate harness to evaluate"
     code=4
   fi
-  # Derive the canonical status from the PromeFuzz stage states.
+  # Derive the canonical status from the PromeFuzz stage states as a backstop.
   stage_status="$(promefuzz_result_status)"
-  if [[ "$code" -eq 0 && "$stage_status" == "evaluated" ]]; then
-    status=evaluated
-    reason=none
-  elif [[ "$stage_status" == "failed" && "$status" == "evaluated" ]]; then
-    status=failed
+  if [[ "$status" == "evaluated" && "$stage_status" != "evaluated" ]]; then
+    status=quality_failure
+    reason="promefuzz_evaluator_incomplete: evaluator stages not all completed"
+    code=5
   fi
   # --- Reference leakage audit ---
   # If the host placed a canary token in the evaluator-only reference source
@@ -1110,6 +1343,10 @@ PY_PROME_API_COUNT
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "native_build_enabled": %s,\n  "native_harness_destination": "%s",\n  "final_harness_count": %s,\n  "temporary_harness_attempt_count": %s,\n  "deprecated_api_event_count": %s,\n  "driver_build_args": %s,\n  "verified_harness_count": %s,\n  "candidate_verification_exit_code": "%s"' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$native_build_json" "$(hgb_json_escape "$native_harness_destination")" "${generated_harness_count:-0}" "${temporary_harness_attempt_count:-0}" "${deprecated_api_event_count:-0}" "$driver_build_args_json" "${verified_harness_count:-0}" "$(hgb_json_escape "$verification_code")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
+  export PROME_FUZZ_EVALUATOR_METRICS="$evaluator_metrics_json"
+  export PROME_FUZZ_EVALUATOR_SELECTED="$evaluator_selected_json"
+  export PROME_FUZZ_CANDIDATE_COUNT="${generated_harness_count:-0}"
+  export PROME_FUZZ_CONSUMER_CASES_STATUS="$consumer_cases_status"
   promefuzz_write_final_result "$status" "$reason" "$code" "$promefuzz_leakage_audit"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

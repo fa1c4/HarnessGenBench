@@ -610,13 +610,63 @@ def capture_build_context(
         _within(Path(entry.get("file", "")).resolve(strict=False), staged_src.resolve(strict=False))
         for entry in filtered
     )
+    # A compile DB "covers the fuzz target" when it includes a translation unit
+    # at (or sibling to) the native harness destination. This is informational;
+    # a generic CMake DB that never builds the project source is already
+    # rejected by the ``covers_project`` check below.
+    native_rel = native_destination
+    for prefix in ("/src/", "src/"):
+        if native_rel.startswith(prefix):
+            native_rel = native_rel[len(prefix):]
+            break
+    covers_fuzz_target = bool(native_rel) and any(
+        native_rel in str(Path(entry.get("file", "")))
+        or Path(entry.get("file", "")).name == Path(native_rel).name
+        for entry in filtered
+    )
     real_capture = bool(filtered) and not synthetic
     method_faithful = profile in {"alpha", "paper-faithful"}
+    # The exact-replay mode is only set when the capture came from the real
+    # FuzzBench build (bear_replay replays build.sh; cmake_export runs the
+    # project's actual CMake build over the staged source). A synthetic DB is
+    # never an exact replay and is unreachable in alpha/paper-faithful.
+    compiler_wrapper = {
+        "bear_replay": "bear",
+        "cmake_export": "cmake",
+    }.get(chosen_method, "")
+    if synthetic:
+        compiler_wrapper = "synthetic"
+    exact_replay = real_capture and chosen_method in {"bear_replay", "cmake_export"}
+    # alpha/paper-faithful reject a generic CMake DB that never builds the
+    # project translation units (covers_project is False); compat-smoke may
+    # accept a synthetic DB when allow_synthetic is set.
     valid = real_capture and covers_project
 
     build_script = target_root / "fuzzbench_benchmark" / "build.sh"
+    full_manifest = json.loads((target_root / "target_manifest.json").read_text(encoding="utf-8")) if (target_root / "target_manifest.json").is_file() else {}
+    link_context = {
+        "mode": "fuzzbench_build_replay" if exact_replay else ("synthetic" if synthetic else "generic_cmake"),
+        "compile_commands_count": len(filtered),
+        "compiler_wrapper": compiler_wrapper,
+        "benchmark_project": str(full_manifest.get("project", "")),
+        "fuzz_target": fuzz_target,
+        "image_digest": os.environ.get("HGB_DOCKER_IMAGE_DIGEST", ""),
+        "driver_build_args": libs["driver_build_args"],
+        "library_paths": libs["library_paths"],
+        "compile_flags": libs["compile_flags"],
+        "link_flags": libs["link_flags"],
+        "link_commands_count": len(libs["link_commands"]),
+        "covers_fuzz_target": covers_fuzz_target,
+        "verified": False,
+    }
+    link_context_path = build_context_dir / "link_context.json"
+    link_context_path.write_text(json.dumps(link_context, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
     manifest = {
         "capture_method": chosen_method if filtered else "",
+        "mode": link_context["mode"],
+        "compiler_wrapper": compiler_wrapper,
+        "exact_replay": exact_replay,
         "synthetic": synthetic,
         "real_capture": real_capture,
         "valid": valid,
@@ -626,11 +676,13 @@ def capture_build_context(
         "build_log_path": str(build_log_path),
         "link_commands_path": str(link_commands_path),
         "libraries_path": str(libraries_path),
+        "link_context_path": str(link_context_path),
         "consumer_cases_path": str(consumer_path),
         "generated_files_dir": str(generated_dir),
         "generated_files": generated_files,
         "entry_count": len(filtered),
         "covers_project_translation_units": covers_project,
+        "covers_fuzz_target": covers_fuzz_target,
         "native_harness_destination": native_destination,
         "language": language,
         "driver_build_args": libs["driver_build_args"],
@@ -703,6 +755,138 @@ def verify_link_set(
     cmd = [compiler, str(consumer), *driver_build_args, "-o", str(work_dir / "hgb_link_probe")]
     result = runner(cmd, timeout)
     return result.returncode == 0, (result.stderr or result.stdout)
+
+
+@dataclass
+class CompileContext:
+    """The exact FuzzBench compile/link context captured for PromeFuzz.
+
+    Per beta plan section 4, this carries the real compile database, the
+    recovered link/build arguments, the capture mode, and the image provenance
+    of the build that produced it. It is the single object PromeFuzz
+    preprocessing and ``libraries.toml`` must consume in alpha/paper-faithful.
+    """
+
+    compile_commands_path: str
+    link_context_path: str
+    libraries_path: str
+    consumer_cases_path: str
+    mode: str
+    compiler_wrapper: str
+    benchmark_project: str
+    fuzz_target: str
+    image_digest: str
+    compile_commands_count: int
+    driver_build_args: list[str]
+    library_paths: list[str]
+    valid: bool
+    exact_replay: bool
+    synthetic: bool
+    manifest: dict[str, Any]
+
+
+def capture_fuzzbench_compile_db(
+    target_root: Path,
+    work_dir: Path,
+    project: str,
+    fuzz_target: str,
+    *,
+    language: str = "",
+    profile: str = "alpha",
+    allow_synthetic: bool = False,
+    capture_method: str = "auto",
+    build_workdir_relative: str = "",
+    runner: Runner = _real_runner,
+    build_timeout: int = 1800,
+    source_root: Path | None = None,
+) -> CompileContext:
+    """Capture the exact compile database from the pinned FuzzBench build.
+
+    This is the paper-faithful entry point required by beta plan section 4.
+    It replays the FuzzBench target build (bear/cmake) and returns a
+    :class:`CompileContext`. In ``alpha``/``paper-faithful`` a synthetic or
+    generic compile database is rejected (``valid=False``); the entrypoint
+    must surface this as ``failed_stage=compile_context``, not a soft skip.
+    """
+
+    manifest = capture_build_context(
+        target_root=target_root,
+        work_dir=work_dir,
+        fuzz_target=fuzz_target,
+        language=language,
+        profile=profile,
+        allow_synthetic=allow_synthetic,
+        capture_method=capture_method,
+        build_workdir_relative=build_workdir_relative,
+        runner=runner,
+        build_timeout=build_timeout,
+        source_root=source_root,
+    )
+    link_ctx_path = Path(manifest.get("link_context_path", work_dir / "build_context" / "link_context.json"))
+    link_ctx: dict[str, Any] = {}
+    if link_ctx_path.is_file():
+        try:
+            link_ctx = json.loads(link_ctx_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            link_ctx = {}
+    return CompileContext(
+        compile_commands_path=manifest["compile_commands_path"],
+        link_context_path=str(link_ctx_path),
+        libraries_path=manifest["libraries_path"],
+        consumer_cases_path=manifest["consumer_cases_path"],
+        mode=manifest.get("mode", ""),
+        compiler_wrapper=manifest.get("compiler_wrapper", ""),
+        benchmark_project=project or link_ctx.get("benchmark_project", ""),
+        fuzz_target=fuzz_target,
+        image_digest=link_ctx.get("image_digest", ""),
+        compile_commands_count=manifest.get("entry_count", 0),
+        driver_build_args=manifest.get("driver_build_args", []),
+        library_paths=manifest.get("library_paths", []),
+        valid=manifest.get("valid", False),
+        exact_replay=manifest.get("exact_replay", False),
+        synthetic=manifest.get("synthetic", False),
+        manifest=manifest,
+    )
+
+
+def verify_and_record_link_set(
+    *,
+    link_context_path: Path,
+    driver_build_args: list[str],
+    work_dir: Path,
+    language: str = "c++",
+    source_root: Path | None = None,
+    runner: Runner = _real_runner,
+    timeout: int = 120,
+) -> tuple[bool, str]:
+    """Verify the recovered link set and record ``verified`` in link_context.json.
+
+    Per beta plan section 5, the production path must call ``verify_link_set``
+    before generating ``libraries.toml``. An empty ``driver_build_args`` is
+    never verified.
+    """
+
+    link_context_path = Path(link_context_path)
+    if not driver_build_args:
+        ok, msg = False, "driver_build_args is empty"
+    else:
+        ok, msg = verify_link_set(
+            source_root=source_root or Path(work_dir),
+            driver_build_args=driver_build_args,
+            work_dir=work_dir,
+            language=language,
+            runner=runner,
+            timeout=timeout,
+        )
+    if link_context_path.is_file():
+        try:
+            data = json.loads(link_context_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        data["verified"] = ok
+        data["verify_message"] = msg
+        link_context_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return ok, msg
 
 
 def main() -> int:

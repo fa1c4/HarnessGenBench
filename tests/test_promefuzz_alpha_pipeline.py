@@ -449,8 +449,12 @@ def test_noop_candidate_fails_reachability() -> None:
 
 def test_entrypoint_runs_common_evaluator_for_reachability() -> None:
     entrypoint = (REPO_ROOT / "docker/promefuzz/entrypoint.sh").read_text(encoding="utf-8")
-    assert "promefuzz_evaluator.py" in entrypoint
-    assert "api_reachability completed" in entrypoint
+    # Beta plan section 9: PromeFuzz reuses the shared full evaluator
+    # (hgb_harness_evaluator.py), not the thin promefuzz_evaluator.py facade.
+    assert "/opt/hgb/bin/hgb_harness_evaluator.py" in entrypoint
+    assert "--generator promefuzz" in entrypoint
+    assert "--evaluator-root" in entrypoint
+    assert "api_reachability" in entrypoint
     assert "promefuzz_no_verified_harness" in entrypoint
 
 
