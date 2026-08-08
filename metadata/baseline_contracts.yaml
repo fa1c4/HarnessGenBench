@@ -2,7 +2,7 @@ schema_version: 1
 baselines:
   - name: oss-fuzz-gen
     task_family: harness_generator
-    profiles: [alpha, paper-faithful, compat-smoke]
+    profiles: [alpha, paper-faithful, reproduction-gamma, compat-smoke]
     default_profile: alpha
     default_protocol: blind-project
     strict_success_status: evaluated
@@ -21,9 +21,13 @@ baselines:
       The OSS-Fuzz checkout is pinned and immutable; cloning floating master is
       forbidden. compat-smoke may use the local shim, 1/1/1 budgets, and
       coverage skip but must set excluded_from_aggregate=true and is never the
-      default. Exact FuzzBench reference harnesses are evaluator-only and must
-      never reach the generator in blind-project. Only status=evaluated counts
-      as a successful alpha matrix row.
+      default. reproduction-gamma is the paper-faithful reproduction profile:
+      it pins OFG_INTROSPECTOR_MODE=real, forbids
+      OFG_ALLOW_PROJECT_YAML_FALLBACK=1 and OFG_SYNTHESIZE_ON_BAD_BENCHMARK=1
+      by default, and maps to method_variant=paper-faithful. Exact FuzzBench
+      reference harnesses are evaluator-only and must never reach the
+      generator in blind-project. Only status=evaluated counts as a
+      successful alpha matrix row.
   - name: g2fuzz
     task_family: input_generator
     profiles: [alpha, paper-faithful, extension, reproduction-gamma, compat-smoke]

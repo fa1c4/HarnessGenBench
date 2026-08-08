@@ -17,9 +17,15 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "target-aware"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma"}
+
+# Introspector modes that satisfy the "real Fuzz Introspector" requirement of
+# method-faithful profiles. ``real`` is the reproduction-gamma default; the
+# upstream ``remote`` mode is the historical alpha/paper default. ``local`` is
+# the compat-smoke shim and is never method-faithful.
+REAL_INTROSPECTOR_MODES = {"real", "remote"}
 
 # Flags that are forbidden in method-faithful profiles because they collapse
 # OSS-Fuzz-Gen into a compat-smoke no-op: local introspector shim, coverage
@@ -27,6 +33,16 @@ METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful"}
 FORBIDDEN_ALPHA_ENV = {
     "OFG_SKIP_COVERAGE_GAINS": "1",
     "OFG_INTROSPECTOR_MODE": "local",
+}
+
+# Flags that are forbidden in reproduction-gamma / paper-faithful because they
+# silently relax the paper-faithful contract: falling back to a project YAML
+# that may leak the reference answer, or synthesizing a benchmark when the
+# real one is bad instead of failing. They may only be enabled with an
+# explicit, separately reported variant (never the default).
+FORBIDDEN_GAMMA_ENV = {
+    "OFG_ALLOW_PROJECT_YAML_FALLBACK": "1",
+    "OFG_SYNTHESIZE_ON_BAD_BENCHMARK": "1",
 }
 FORBIDDEN_ALPHA_BUDGETS = {
     "OFG_NUM_SAMPLES": "1",
@@ -85,6 +101,25 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 violations.append(
                     f"{key}={actual} is forbidden in {profile}; "
                     f"method-faithful profiles require real Introspector and coverage"
+                )
+        # reproduction-gamma / paper-faithful must not silently relax the
+        # paper-faithful contract with project-YAML fallback or bad-benchmark
+        # synthesis. These collapse the reproduction into a softer variant and
+        # are only allowed in an explicitly reported (non-default) run.
+        if profile in {"reproduction-gamma", "paper-faithful"}:
+            for key, bad_value in FORBIDDEN_GAMMA_ENV.items():
+                actual = normalize_env_bool(env.get(key))
+                if actual == bad_value:
+                    violations.append(
+                        f"{key}={actual} is forbidden in {profile}; "
+                        f"it silently relaxes the paper-faithful contract"
+                    )
+            # reproduction-gamma pins the real introspector mode by default.
+            intro_mode = normalize_env_bool(env.get("OFG_INTROSPECTOR_MODE"), "real")
+            if intro_mode not in REAL_INTROSPECTOR_MODES:
+                violations.append(
+                    f"OFG_INTROSPECTOR_MODE={intro_mode} is forbidden in {profile}; "
+                    f"expected one of {sorted(REAL_INTROSPECTOR_MODES)} (real Fuzz Introspector)"
                 )
         # Tiny 1/1/1 budgets are compat-smoke, not alpha.
         for key, bad_value in FORBIDDEN_ALPHA_BUDGETS.items():

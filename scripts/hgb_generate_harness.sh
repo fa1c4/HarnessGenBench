@@ -20,6 +20,8 @@ Options:
       --save-mode compact|debug
                              compact removes duplicate transient outputs; debug preserves them
       --timeout SECONDS      generation timeout passed into the container
+      --profile NAME         baseline profile (e.g. alpha, paper-faithful, reproduction-gamma)
+      --protocol NAME        baseline protocol (e.g. blind-project, target-aware)
       --allow-input-generator
                              legacy compatibility flag for input-generation baselines
 EOF
@@ -36,6 +38,8 @@ target_layout="compact"
 save_mode="compact"
 strict=0
 force=0
+profile=""
+protocol=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -78,6 +82,14 @@ while [[ $# -gt 0 ]]; do
     --force)
       force=1
       shift
+      ;;
+    --profile)
+      profile="${2:-}"
+      shift 2
+      ;;
+    --protocol)
+      protocol="${2:-}"
+      shift 2
       ;;
     --allow-input-generator|--allow-input-generators)
       printf 'WARNING: --allow-input-generator is a deprecated no-op; input-generator baselines run from metadata/baseline_contracts.yaml.\n' >&2
@@ -174,6 +186,8 @@ fi
 
 export HGB_DRY_RUN="$dry_run"
 export HGB_GENERATION_TIMEOUT_SECONDS="$timeout_seconds"
+if [[ -n "$profile" ]]; then export HGB_BASELINE_PROFILE="$profile"; fi
+if [[ -n "$protocol" ]]; then export HGB_BASELINE_PROTOCOL="$protocol"; fi
 export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900}"
 export CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS="${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
 export CKGFUZZER_LLM_MAX_RETRIES="${CKGFUZZER_LLM_MAX_RETRIES:-3}"

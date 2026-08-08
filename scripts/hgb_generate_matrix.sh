@@ -43,11 +43,11 @@ strict=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --generators)
+    --generators|--generator)
       generators="${2:-}"
       shift 2
       ;;
-    --targets)
+    --targets|--target-set)
       targets="${2:-}"
       shift 2
       ;;

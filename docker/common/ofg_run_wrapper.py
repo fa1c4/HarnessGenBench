@@ -37,7 +37,7 @@ def active_protocol() -> str:
 
 
 def is_method_faithful() -> bool:
-    return active_profile() in {"alpha", "paper-faithful"}
+    return active_profile() in {"alpha", "paper-faithful", "reproduction-gamma"}
 
 
 def is_compat_smoke() -> bool:

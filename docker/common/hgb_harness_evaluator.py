@@ -167,6 +167,25 @@ def _candidate_files(candidates_dir: Path) -> list[Path]:
     ]
 
 
+def _resolve_target_metadata(target_root: Path) -> tuple[str, str]:
+    """Read project/fuzz_target from the generator-visible target manifest.
+
+    The plan's stable evaluator CLI (section 4) does not pass ``--fuzz-target``
+    or ``--project``; they are resolved from ``<target_root>/target_manifest.json``
+    so the same CLI works for OSS-Fuzz-Gen, CKGFuzzer, and PromeFuzz. Returns
+    ``(project, fuzz_target)``; both are "" if the manifest is unreadable.
+    """
+    for candidate in (Path(target_root) / "target_manifest.json", Path(target_root) / "target_manifest.generator.json"):
+        if not candidate.is_file():
+            continue
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        return str(data.get("project") or ""), str(data.get("fuzz_target") or "")
+    return "", ""
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -269,6 +288,7 @@ def evaluate_candidate(
     strict: bool = True,
     run_native_control: bool = False,
     native_image_tag: str = "",
+    build_timeout_seconds: int = 1800,
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
 
@@ -313,6 +333,7 @@ def evaluate_candidate(
         native_destination=native_destination,
         work_dir=candidate_work / "build",
         runner=runner,
+        timeout_seconds=build_timeout_seconds,
     )
     rec.build = {
         "image_tag": image_tag,
@@ -555,8 +576,20 @@ def evaluate(
     seeds: list[Path] | None = None,
     run_id: str = "",
     run_native_control: bool = False,
+    protocol: str = "blind-project",
+    build_timeout_seconds: int = 1800,
+    result_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Evaluate all candidates and return the run-level result dict."""
+    """Evaluate all candidates and return the run-level result dict.
+
+    ``protocol`` overrides the historical default (``blind-project``) so the
+    shared evaluator can report ``api-oracle`` / ``target-aware`` variants
+    faithfully.  ``build_timeout_seconds`` is the per-candidate FuzzBench
+    Docker build timeout.  ``result_dir`` writes an additional copy of
+    ``result.json`` (and the per-candidate JSONs) to a caller-chosen
+    directory so OSS-Fuzz-Gen / CKGFuzzer / PromeFuzz entrypoints can collect
+    auditable outputs at a stable path.
+    """
 
     work_dir.mkdir(parents=True, exist_ok=True)
     runner = runner or hgb_fuzzbench_builder._run
@@ -564,21 +597,26 @@ def evaluate(
     candidates_json_dir = work_dir / "candidates"
     candidates_json_dir.mkdir(parents=True, exist_ok=True)
 
+    def _emit(result: dict[str, Any]) -> dict[str, Any]:
+        hgb_result.write_result(result, work_dir / "result.json")
+        if result_dir is not None:
+            hgb_result.write_result(result, Path(result_dir) / "result.json")
+        return result
+
     if not candidates:
         stages = hgb_result.default_stages()
         hgb_result.mark_stage(stages, "generation", "failed")
         result = hgb_result.build_result(
             generator=generator,
             profile=profile,
-            protocol="blind-project",
+            protocol=protocol,
             target=fuzz_target,
             status=hgb_result.STATUS_QUALITY_FAILURE,
             stages=stages,
             reason="no candidate source files were supplied to the evaluator",
             candidate_count=0,
         )
-        hgb_result.write_result(result, work_dir / "result.json")
-        return result
+        return _emit(result)
 
     try:
         native_harness = _resolve_native_harness(
@@ -589,15 +627,14 @@ def evaluate(
         result = hgb_result.build_result(
             generator=generator,
             profile=profile,
-            protocol="blind-project",
+            protocol=protocol,
             target=fuzz_target,
             status=hgb_result.STATUS_INFRA_FAILURE,
             stages=stages,
             reason=f"native_harness_unresolved: {exc}",
             candidate_count=len(candidates),
         )
-        hgb_result.write_result(result, work_dir / "result.json")
-        return result
+        return _emit(result)
 
     try:
         sealed_context = _prepare_sealed_context(target_root, evaluator_root, work_dir / "sealed_context", context_provider)
@@ -606,15 +643,14 @@ def evaluate(
         result = hgb_result.build_result(
             generator=generator,
             profile=profile,
-            protocol="blind-project",
+            protocol=protocol,
             target=fuzz_target,
             status=hgb_result.STATUS_INFRA_FAILURE,
             stages=stages,
             reason=f"sealed_context_failed: {exc}",
             candidate_count=len(candidates),
         )
-        hgb_result.write_result(result, work_dir / "result.json")
-        return result
+        return _emit(result)
 
     plan_apis = intended_apis
     if plan_apis is None:
@@ -661,6 +697,7 @@ def evaluate(
             strict=strict,
             run_native_control=run_native_control,
             native_image_tag=native_image_tag,
+            build_timeout_seconds=build_timeout_seconds,
         )
         records.append(rec)
         cand_dict = {
@@ -742,7 +779,7 @@ def evaluate(
     result = hgb_result.build_result(
         generator=generator,
         profile=profile,
-        protocol="blind-project",
+        protocol=protocol,
         target=fuzz_target,
         status=status,
         stages=run_stages,
@@ -760,42 +797,106 @@ def evaluate(
         if violations and strict:
             result["status"] = hgb_result.STATUS_QUALITY_FAILURE
             result["reason"] = "evaluated invariants violated: " + "; ".join(violations)
-    hgb_result.write_result(result, work_dir / "result.json")
-    return result
+    return _emit(result)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--generator", default="ckgfuzzer")
+    # --baseline is the plan's stable alias for --generator (used by the
+    # shared OSS-Fuzz-Gen / CKGFuzzer / PromeFuzz entrypoint contract).
+    parser.add_argument("--baseline", default="",
+                        help="alias for --generator (overrides --generator when set)")
     parser.add_argument("--target-root", required=True, type=Path)
     parser.add_argument("--evaluator-root", required=True, type=Path)
-    parser.add_argument("--candidates", required=True, type=Path)
-    parser.add_argument("--work-dir", required=True, type=Path)
+    # --candidates is a directory of candidates; --candidate is a single file.
+    # Exactly one of the two must be supplied so the shared CLI works for both
+    # the multi-candidate (OFG) and single-candidate (plan section 4) flows.
+    parser.add_argument("--candidates", default="", type=Path,
+                        help="directory of candidate source files")
+    parser.add_argument("--candidate", default="", type=Path,
+                        help="single candidate source file (staged into a temp candidates dir)")
+    parser.add_argument("--work-dir", default="", type=Path,
+                        help="evaluation work directory (defaults to --result-dir/work)")
+    parser.add_argument("--result-dir", default="", type=Path,
+                        help="directory to write result.json and per-candidate JSONs")
     parser.add_argument("--project", default="")
-    parser.add_argument("--fuzz-target", required=True)
+    parser.add_argument("--fuzz-target", default="",
+                        help="fuzz target name (defaults to target_manifest.json fuzz_target)")
     parser.add_argument("--profile", default="alpha")
+    parser.add_argument("--protocol", default="blind-project",
+                        help="reproduction protocol (blind-project or target-aware)")
     parser.add_argument("--campaign-seconds", type=int, default=300)
+    parser.add_argument("--build-timeout-seconds", type=int, default=1800,
+                        help="per-candidate FuzzBench Docker build timeout")
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--intended-apis", default="", help="comma-separated intended APIs")
     parser.add_argument("--run-native-control", action="store_true",
                         help="build native/reference coverage control and compute line coverage diff")
     args = parser.parse_args()
 
+    generator = args.baseline or args.generator
+    if not args.candidates and not args.candidate:
+        parser.error("one of --candidates or --candidate is required")
+    import tempfile
+
+    staged_candidates_dir: Path
+    cleanup_dir: Path | None = None
+    if args.candidate:
+        # Stage the single candidate into a temp directory so the evaluator's
+        # multi-candidate loop processes exactly one candidate.
+        single = Path(args.candidate)
+        if not single.is_file():
+            parser.error(f"--candidate file not found: {single}")
+        staged = Path(tempfile.mkdtemp(prefix="hgb-eval-cand-"))
+        cleanup_dir = staged
+        dest = staged / single.name
+        shutil.copy2(single, dest)
+        staged_candidates_dir = staged
+    else:
+        staged_candidates_dir = Path(args.candidates)
+        if not staged_candidates_dir.is_dir():
+            parser.error(f"--candidates directory not found: {staged_candidates_dir}")
+
+    result_dir = Path(args.result_dir) if args.result_dir else None
+    if result_dir:
+        result_dir.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(args.work_dir) if args.work_dir else (result_dir / "work" if result_dir else Path("/workspace/evaluation"))
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    project = args.project
+    fuzz_target = args.fuzz_target
+    if not fuzz_target or not project:
+        m_project, m_fuzz_target = _resolve_target_metadata(args.target_root)
+        if not project:
+            project = m_project
+        if not fuzz_target:
+            fuzz_target = m_fuzz_target
+    if not fuzz_target:
+        parser.error("--fuzz-target is required and could not be resolved from the target manifest")
+
     intended = [a.strip() for a in args.intended_apis.split(",") if a.strip()] if args.intended_apis else None
-    result = evaluate(
-        generator=args.generator,
-        target_root=args.target_root,
-        evaluator_root=args.evaluator_root,
-        candidates_dir=args.candidates,
-        work_dir=args.work_dir,
-        project=args.project,
-        fuzz_target=args.fuzz_target,
-        profile=args.profile,
-        campaign_seconds=args.campaign_seconds,
-        strict=args.strict,
-        intended_apis=intended,
-        run_native_control=args.run_native_control,
-    )
+    try:
+        result = evaluate(
+            generator=generator,
+            target_root=args.target_root,
+            evaluator_root=args.evaluator_root,
+            candidates_dir=staged_candidates_dir,
+            work_dir=work_dir,
+            project=project,
+            fuzz_target=fuzz_target,
+            profile=args.profile,
+            protocol=args.protocol,
+            campaign_seconds=args.campaign_seconds,
+            build_timeout_seconds=args.build_timeout_seconds,
+            strict=args.strict,
+            intended_apis=intended,
+            run_native_control=args.run_native_control,
+            result_dir=result_dir,
+        )
+    finally:
+        if cleanup_dir is not None:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
     print(json.dumps(result, indent=2, sort_keys=True))
     if result["status"] == hgb_result.STATUS_INFRA_FAILURE:
         return 2

@@ -78,6 +78,27 @@ apply_profile_defaults() {
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
       export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
       ;;
+    reproduction-gamma)
+      # reproduction-gamma is the paper-faithful default for this plan. It
+      # pins the real Fuzz Introspector mode, forbids project-YAML fallback and
+      # bad-benchmark synthesis by default, and uses a meaningful generation
+      # budget (never 1/1/1). See plan sections 2.3 and 7.
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
+      export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
+      export OFG_ALLOW_PROJECT_YAML_FALLBACK="${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}"
+      export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}"
+      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
+      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
+      export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+      export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+      export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
+      export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
+      export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+      export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+      ;;
     compat-smoke)
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
@@ -522,7 +543,9 @@ run_evaluator() {
       --project "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}" \
       --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
       --profile "$hgb_profile" \
+      --protocol "$hgb_protocol" \
       --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}" \
+      --build-timeout-seconds "${OFG_EVAL_BUILD_TIMEOUT:-1800}" \
       --intended-apis "$selected_functions" \
       --strict \
       --run-native-control \

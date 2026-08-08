@@ -208,15 +208,16 @@ case "$generator" in
     ;;
   oss-fuzz-gen)
     case "$profile" in
-      alpha|paper-faithful|compat-smoke) ;;
-      *) die "oss-fuzz-gen: invalid profile: $profile (expected alpha, paper-faithful, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
+      *) die "oss-fuzz-gen: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|target-aware) ;;
       *) die "oss-fuzz-gen: invalid protocol: $protocol (expected blind-project or target-aware)" ;;
     esac
-    # In alpha/paper-faithful, refuse legacy compat env before an LLM call.
-    if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" ]]; then
+    # In alpha/paper-faithful/reproduction-gamma, refuse legacy compat env
+    # before an LLM call so the profile cannot be silently downgraded.
+    if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" ]]; then
       if [[ "${OFG_SKIP_COVERAGE_GAINS:-0}" == "1" ]]; then
         die "oss-fuzz-gen/$profile: OFG_SKIP_COVERAGE_GAINS=1 is forbidden; use compat-smoke to skip coverage"
       fi
@@ -226,6 +227,17 @@ case "$generator" in
       if [[ "${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}" == "1" ]]; then
         die "oss-fuzz-gen/$profile: OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden in blind-project; the target answer must not be downloaded"
       fi
+    fi
+    # reproduction-gamma pins the paper-faithful contract: no project-YAML
+    # fallback and no bad-benchmark synthesis by default (plan section 2.3).
+    if [[ "$profile" == "reproduction-gamma" ]]; then
+      if [[ "${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}" == "1" ]]; then
+        die "oss-fuzz-gen/reproduction-gamma: OFG_ALLOW_PROJECT_YAML_FALLBACK=1 is forbidden by default; record an explicit variant if a fallback is reported"
+      fi
+      if [[ "${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}" == "1" ]]; then
+        die "oss-fuzz-gen/reproduction-gamma: OFG_SYNTHESIZE_ON_BAD_BENCHMARK=1 is forbidden by default; record an explicit variant if synthesis is reported"
+      fi
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
     fi
     export HGB_EXCLUDE_FROM_AGGREGATE=0
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1

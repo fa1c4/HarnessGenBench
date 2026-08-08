@@ -405,7 +405,7 @@ def _apply_filters(records: list[dict[str, Any]], *, generator: str = "", target
     return filtered
 
 
-def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", generator: str = "", target_set: str = "", task_family: str = "", profile: str = "", method_profile: str = "") -> dict[str, Any]:
+def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", generator: str = "", target_set: str = "", task_family: str = "", profile: str = "", method_profile: str = "", require_evaluated: bool = False) -> dict[str, Any]:
     rows = read_rows(matrix_dir)
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -414,6 +414,28 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
     # Apply filters before computing the summary.
     records = _apply_filters(records, generator=generator, target_set=target_set, task_family=task_family, profile=profile, method_profile=method_profile)
     total = len(records)
+    # --require-evaluated: every applicable (non-excluded, non-not-applicable)
+    # harness-generator row in the filtered set must be ``evaluated``.  This is
+    # the gamma acceptance gate: a build-only or failed row fails the matrix
+    # loudly instead of being silently counted.
+    require_evaluated_violations: list[dict[str, Any]] = []
+    if require_evaluated:
+        for record in records:
+            meta = record["metadata"]
+            if bool(meta.get("excluded_from_aggregate")):
+                continue
+            status_s = str(meta.get("status") or record["row"].get("status") or "missing_metadata")
+            if status_s in NOT_APPLICABLE_STATUSES:
+                continue
+            family = str(meta.get("task_family") or meta.get("capability") or "harness_generator")
+            if family != "harness_generator":
+                continue
+            if status_s not in HARNESS_GENERATOR_STRICT_COMPLETED:
+                require_evaluated_violations.append({
+                    "generator": record["row"].get("generator", ""),
+                    "target": record["row"].get("target", ""),
+                    "status": status_s,
+                })
     # Strict-mode validation: an evaluated harness-generator row must have a
     # real coverage report and nonzero campaign execs.  Violations are reported
     # and, in strict mode, the row is downgraded for counting so the aggregate
@@ -560,6 +582,7 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         "applicable_infra_failure_pairs": applicable_infra_failure,
         "coverage_by_applicable_evaluated": coverage_by_applicable_evaluated,
         "missing_api_key_count": missing_api_key,
+        "require_evaluated_violations": require_evaluated_violations,
         "statuses": dict(statuses),
         "aggregate_statuses": dict(agg_statuses),
         "generated_harness_counts_by_generator": dict(harness_counts),
@@ -706,6 +729,8 @@ def main() -> int:
                         help="filter rows by profile (e.g. reproduction-gamma)")
     parser.add_argument("--method-profile", dest="method_profile", default="",
                         help="filter rows by method profile (e.g. paper-faithful or extension)")
+    parser.add_argument("--require-evaluated", action="store_true",
+                        help="require every applicable harness-generator row to be evaluated; exit nonzero otherwise")
     args = parser.parse_args()
     matrix_dir = Path(args.matrix_dir).resolve()
     matrix_dir.mkdir(parents=True, exist_ok=True)
@@ -718,12 +743,18 @@ def main() -> int:
         task_family=args.task_family,
         profile=args.profile,
         method_profile=args.method_profile,
+        require_evaluated=args.require_evaluated,
     )
     write_outputs(matrix_dir, summary)
     if args.strict and summary.get("evaluated_row_violations"):
         print(f"ERROR: {len(summary['evaluated_row_violations'])} evaluated row(s) lack coverage/execs:", file=sys.stderr)
         for v in summary["evaluated_row_violations"]:
             print(f"  {v['generator']}/{v['target']}: {'; '.join(v['violations'])}", file=sys.stderr)
+        return 2
+    if args.require_evaluated and summary.get("require_evaluated_violations"):
+        print(f"ERROR: {len(summary['require_evaluated_violations'])} applicable harness-generator row(s) are not evaluated:", file=sys.stderr)
+        for v in summary["require_evaluated_violations"]:
+            print(f"  {v['generator']}/{v['target']}: status={v['status']}", file=sys.stderr)
         return 2
     return 0
 
