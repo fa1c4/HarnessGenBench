@@ -517,6 +517,114 @@ def verify_g2fuzz_target_pair(afl_binary: Path, cmp_binary: Path) -> dict:
     return {"afl": afl, "cmp": cmp, "ok": ok, "build_mode": G2FUZZ_BUILD_MODE}
 
 
+# -- ELFuzz native+coverage SUT builder ------------------------------------
+
+ELFUZZ_NATIVE_ENGINE = "libfuzzer"
+ELFUZZ_COVERAGE_ENGINE = "coverage"
+
+
+def _elfuzz_build_args(*, engine: str, sanitizer: str) -> list[str]:
+    """Return the FuzzBench ``docker build`` arg list for an ELFuzz SUT variant.
+
+    The FuzzBench base-builder ``compile`` script reads ``FUZZING_ENGINE`` and
+    ``SANITIZER`` build args and invokes the benchmark ``build.sh`` with the
+    matching ``CC``/``CXX``/``FUZZER_LIB``/``SRC``/``WORK``/``OUT`` environment,
+    producing ``/out/<fuzz_target>``.  The native variant uses the libFuzzer
+    engine (one-input execution via ``@@``); the coverage variant uses the
+    FuzzBench coverage engine, which instruments with
+    ``-fprofile-instr-generate -fcoverage-mapping`` and a replay main.
+    """
+
+    return [
+        "--build-arg", f"FUZZING_ENGINE={engine}",
+        "--build-arg", f"SANITIZER={sanitizer}",
+        "--build-arg", "ARCHITECTURE=x86_64",
+    ]
+
+
+def build_elfuzz_sut(
+    *,
+    benchmark_dir: Path,
+    image_tag: str,
+    fuzz_target: str,
+    work_dir: Path,
+    runner: Runner = _run,
+    timeout_seconds: int = 3600,
+    engine: str = ELFUZZ_NATIVE_ENGINE,
+    sanitizer: str = "address",
+) -> dict:
+    """Build one ELFuzz SUT variant (native or coverage) from the FuzzBench benchmark.
+
+    Runs ``docker build`` on the exact FuzzBench benchmark Dockerfile with the
+    engine/sanitizer build args, then extracts ``/out/<fuzz_target>`` from the
+    built image into ``work_dir/out/<fuzz_target>``.  Returns a record with the
+    image tag/digest, binary path, and build exit code.  This never accepts a
+    prebuilt binary: the SUT is always built from the benchmark Dockerfile so
+    the reproduction is traceable to the exact FuzzBench environment.
+    """
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "out").mkdir(parents=True, exist_ok=True)
+    dockerfile = Path(benchmark_dir) / "Dockerfile"
+    build_command = [
+        "docker", "build",
+        *_elfuzz_build_args(engine=engine, sanitizer=sanitizer),
+        "--file", str(dockerfile),
+        "--tag", image_tag,
+        str(benchmark_dir),
+    ]
+    build_result = _run_phase(runner, build_command, timeout_seconds, f"build elfuzz {engine} sut")
+    _write_log(work_dir / "build.log", build_result)
+    image_digest = ""
+    binary_path = ""
+    binary_sha256 = ""
+    extracted = False
+    if build_result.exit_code == 0:
+        inspect = _run_phase(runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60, f"inspect {engine} image")
+        image_digest = inspect.stdout.strip()
+        # Extract /out/<fuzz_target> from the image via a throwaway container.
+        container_name = f"hgb-elfuzz-{engine}-{uuid.uuid4().hex[:12]}"
+        create = _run_phase(runner, ["docker", "create", "--name", container_name, image_tag, "true"], 60, f"create {engine}")
+        copy_out = CommandResult(list(create.command), create.exit_code, create.stdout, create.stderr)
+        if create.exit_code == 0:
+            host_binary = work_dir / "out" / Path(fuzz_target).name
+            cp = _run_phase(
+                runner,
+                ["docker", "cp", f"{container_name}:/out/{fuzz_target}", str(host_binary)],
+                120,
+                f"copy {engine} binary",
+            )
+            copy_out = cp
+            if cp.exit_code == 0 and host_binary.is_file():
+                extracted = True
+                binary_path = str(host_binary)
+                binary_sha256 = _sha256_file(host_binary)
+            _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {engine}")
+        else:
+            _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {engine}")
+    return {
+        "engine": engine,
+        "sanitizer": sanitizer,
+        "image_tag": image_tag,
+        "image_digest": image_digest,
+        "build_exit_code": build_result.exit_code,
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "binary_extracted": extracted,
+        "log": str(work_dir / "build.log"),
+        "build_command": build_result.command,
+    }
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def main() -> int:
     import argparse
 

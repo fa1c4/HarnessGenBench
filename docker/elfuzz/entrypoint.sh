@@ -120,6 +120,16 @@ if [[ "$mode" == "generate-target" ]]; then
   export ELFUZZ_EVOLUTION_SECONDS="${ELFUZZ_EVOLUTION_SECONDS:-1800}"
   export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-0}"
   export ELFUZZ_SANITIZER="${ELFUZZ_SANITIZER:-address}"
+  # reproduction-gamma (plan elfuzz_reproduction_gamma.md): build exact
+  # FuzzBench native+coverage SUTs, replay generated/campaign inputs on the
+  # coverage SUT, and require a real LLVM coverage report. The SUT build needs
+  # the Docker socket (base-builder environment) and is never satisfied by a
+  # prebuilt ELFUZZ_TARGET_BINARY.
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" ]]; then
+    export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-1}"
+    export ELFUZZ_REQUIRE_GPU="${ELFUZZ_REQUIRE_GPU:-1}"
+    export ELFUZZ_ALLOW_SUT_BUILD="${ELFUZZ_ALLOW_SUT_BUILD:-1}"
+  fi
   mkdir -p "$workspace/logs"
   hgb_require_target_package
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"

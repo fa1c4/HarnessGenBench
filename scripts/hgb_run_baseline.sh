@@ -123,6 +123,28 @@ export HGB_BASELINE_PROTOCOL="$protocol"
 
 # Validate profile/protocol combinations before any expensive work.
 case "$generator" in
+  elfuzz)
+    case "$profile" in
+      alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
+      *) die "elfuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, or compat-smoke)" ;;
+    esac
+    case "$protocol" in
+      paper-native|extension) ;;
+      *) die "elfuzz: invalid protocol: $protocol (expected paper-native or extension)" ;;
+    esac
+    # reproduction-gamma invariants: refuse a prebuilt ELFUZZ_TARGET_BINARY so
+    # the SUT is always built from the exact FuzzBench Dockerfile, and require
+    # a real coverage replay (never AFL path counters).
+    if [[ "$profile" == "reproduction-gamma" ]]; then
+      if [[ -n "${ELFUZZ_TARGET_BINARY:-}" ]]; then
+        die "elfuzz/reproduction-gamma: ELFUZZ_TARGET_BINARY is forbidden; the SUT must be built from the FuzzBench Dockerfile"
+      fi
+      export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-1}"
+      export ELFUZZ_REQUIRE_GPU="${ELFUZZ_REQUIRE_GPU:-1}"
+    fi
+    export HGB_EXCLUDE_FROM_AGGREGATE=0
+    [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1
+    ;;
   ckgfuzzer)
     case "$profile" in
       alpha|paper-faithful|compat-smoke) ;;
