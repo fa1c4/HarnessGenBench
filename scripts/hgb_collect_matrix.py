@@ -186,6 +186,23 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
         violations.append("evaluated row has campaign.execs_done <= 0")
     if not meta.get("selected_candidate"):
         violations.append("evaluated row has no per-candidate evaluator JSON")
+    # reproduction-delta paper-equivalent invariants (plan section 7).
+    if str(meta.get("profile", "")) == "reproduction-delta":
+        if str(meta.get("method_variant", "")) != "paper-faithful":
+            violations.append("evaluated reproduction-delta row has method_variant != paper-faithful")
+        if bool(meta.get("excluded_from_aggregate")):
+            violations.append("evaluated reproduction-delta row is excluded_from_aggregate")
+        if line_cov.get("covered") is not None and int(line_cov.get("covered", 0) or 0) <= 0:
+            violations.append("evaluated reproduction-delta row has coverage.line_coverage.covered <= 0")
+        sel = meta.get("selected_candidate") or {}
+        if isinstance(sel, dict):
+            copy_audit = sel.get("copy_audit") or {}
+            if copy_audit.get("exact_copy"):
+                violations.append("evaluated reproduction-delta row has copy_audit.exact_copy == true")
+            build = sel.get("build") or {}
+            overlay_audit = build.get("overlay_audit") or {}
+            if overlay_audit and overlay_audit.get("matches_candidate") is not True:
+                violations.append("evaluated reproduction-delta row has build.overlay_audit.matches_candidate != true")
     return violations
 
 
@@ -217,19 +234,51 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     leak_audit = meta.get("reference_leakage_audit") or {}
     if not isinstance(leak_audit, dict):
         leak_audit = {}
+    build = meta.get("build") or {}
+    if not isinstance(build, dict):
+        build = {}
+    selected = meta.get("selected_candidate") or {}
+    if not isinstance(selected, dict):
+        selected = {}
+    sel_build = selected.get("build") or build or {}
+    overlay_audit = sel_build.get("overlay_audit") or meta.get("overlay_audit") or {}
+    if not isinstance(overlay_audit, dict):
+        overlay_audit = {}
+    copy_audit = meta.get("copy_audit") or candidate.get("copy_audit") or selected.get("copy_audit") or {}
+    if not isinstance(copy_audit, dict):
+        copy_audit = {}
+    exact_copy = bool(copy_audit.get("exact_copy", candidate.get("exact_copy", False)))
+    matches_candidate = overlay_audit.get("matches_candidate")
+    profile = str(meta.get("profile", ""))
+    method_variant = str(meta.get("method_variant", ""))
+    line_covered = line_cov.get("covered") if isinstance(line_cov, dict) else None
+    execs_done = int(campaign.get("execs_done", 0) or 0)
+    # reproduction-delta paper-equivalent gate (plan section 7).
+    paper_equivalent_delta = bool(
+        profile == "reproduction-delta"
+        and method_variant == "paper-faithful"
+        and str(meta.get("status", "")) == "evaluated"
+        and not bool(meta.get("excluded_from_aggregate"))
+        and isinstance(line_covered, int) and line_covered > 0
+        and execs_done > 0
+        and not exact_copy
+        and matches_candidate is True
+    )
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
         "applicability": str(meta.get("applicability", "")),
+        "profile": profile,
+        "method_variant": method_variant,
         "candidate_build": str(stages.get("candidate_build", "")),
         "sanitizer_smoke": str(stages.get("sanitizer_smoke", "")),
         "api_reachability": str(stages.get("api_reachability", "")),
         "campaign": str(stages.get("campaign", "")),
         "coverage": str(stages.get("coverage", "")),
-        "line_coverage": line_cov.get("covered") if isinstance(line_cov, dict) else None,
+        "line_coverage": line_covered,
         "region_coverage": region_cov.get("covered") if isinstance(region_cov, dict) else None,
         "function_coverage": func_cov.get("covered") if isinstance(func_cov, dict) else None,
-        "execs_done": int(campaign.get("execs_done", 0) or 0),
+        "execs_done": execs_done,
         "crashes": int(campaign.get("crashes", 0) or 0),
         "hangs": int(campaign.get("timeouts", 0) or 0),
         "llm_calls": int(meta.get("api_trace_total_count", 0) or 0),
@@ -238,6 +287,9 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         "codeql_graph_edges": int(ckg.get("codeql_graph_edges", meta.get("codeql_graph_edges", 0) or 0) or 0),
         "reference_canary_leak": bool(candidate.get("contains_reference_canary") or leak_audit.get("leaked")),
         "near_duplicate_reference": bool(candidate.get("near_duplicate_reference")),
+        "exact_copy": exact_copy,
+        "matches_candidate": matches_candidate,
+        "paper_equivalent_delta": paper_equivalent_delta,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
 

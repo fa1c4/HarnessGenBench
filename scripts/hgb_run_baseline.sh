@@ -147,30 +147,53 @@ case "$generator" in
     ;;
   ckgfuzzer)
     case "$profile" in
-      alpha|paper-faithful|compat-smoke) ;;
-      *) die "ckgfuzzer: invalid profile: $profile (expected alpha, paper-faithful, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke) ;;
+      *) die "ckgfuzzer: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|api-oracle) ;;
       *) die "ckgfuzzer: invalid protocol: $protocol (expected blind-project or api-oracle)" ;;
     esac
-    # In alpha/paper-faithful, refuse legacy compat env before an LLM call.
-    if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" ]]; then
-      if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
-        die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden; use compat-smoke for local summaries"
+    # reproduction-delta is the strictest profile. It inherits the alpha/
+    # paper-faithful forbiddens and additionally refuses selected-harness API
+    # mode and compatibility query rewrite unless the patch is pinned. The
+    # env-content guards are "before an LLM call" guards, so a dry run (which
+    # makes no LLM/embedding calls) only validates that the profile/protocol
+    # combination is accepted.
+    if [[ "$dry_run" != "1" ]]; then
+      if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" ]]; then
+        if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
+          die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden; use compat-smoke for local summaries"
+        fi
+        if [[ "${CKGFUZZER_LOCAL_API_COMBINATION:-0}" == "1" ]]; then
+          die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_COMBINATION=1 is forbidden; use compat-smoke for local combinations"
+        fi
+        if [[ "${CKGFUZZER_SKIP_CHECK_COMPILATION:-0}" == "1" ]]; then
+          die "ckgfuzzer/$profile: --skip_check_compilation is forbidden; use compat-smoke to skip compilation checking"
+        fi
+        emb="${CKGFUZZER_EMBEDDING_MODEL:-}"
+        if [[ -z "$emb" || "$emb" == "mock" || "$emb" == "local" ]]; then
+          die "ckgfuzzer/$profile: CKGFUZZER_EMBEDDING_MODEL must be a real embedding service (e.g. openai-text-embedding-3-small), not mock/local/empty"
+        fi
+        case "${HGB_API_SELECTION_MODE:-}" in
+          selected_harness|selected_harness_fallback) die "ckgfuzzer/$profile: HGB_API_SELECTION_MODE=$HGB_API_SELECTION_MODE is forbidden; reference-harness API filtering is evaluator-only" ;;
+        esac
       fi
-      if [[ "${CKGFUZZER_LOCAL_API_COMBINATION:-0}" == "1" ]]; then
-        die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_COMBINATION=1 is forbidden; use compat-smoke for local combinations"
-      fi
-      if [[ "${CKGFUZZER_SKIP_CHECK_COMPILATION:-0}" == "1" ]]; then
-        die "ckgfuzzer/$profile: --skip_check_compilation is forbidden; use compat-smoke to skip compilation checking"
-      fi
-      emb="${CKGFUZZER_EMBEDDING_MODEL:-}"
-      if [[ -z "$emb" || "$emb" == "mock" || "$emb" == "local" ]]; then
-        die "ckgfuzzer/$profile: CKGFUZZER_EMBEDDING_MODEL must be a real embedding service (e.g. openai-text-embedding-3-small), not mock/local/empty"
+      # reproduction-delta forbids the source-only CodeQL graph fallback and
+      # unrecorded compatibility query rewrites.
+      if [[ "$profile" == "reproduction-delta" ]]; then
+        if [[ "${CKGFUZZER_ALLOW_SOURCE_FALLBACK:-0}" == "1" ]]; then
+          die "ckgfuzzer/reproduction-delta: CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden; source-only CodeQL graph fallback is not allowed"
+        fi
+        if [[ -n "${CKGFUZZER_COMPAT_QUERY_PATCH:-}" && -z "${CKGFUZZER_COMPAT_QUERY_PATCH_PINNED:-}" ]]; then
+          die "ckgfuzzer/reproduction-delta: a compatibility query rewrite (CKGFUZZER_COMPAT_QUERY_PATCH) is set but not pinned; record method_variant=compatibility_patch and set CKGFUZZER_COMPAT_QUERY_PATCH_PINNED to the pinned file"
+        fi
+        if [[ -n "${CKGFUZZER_COMPAT_QUERY_PATCH_PINNED:-}" ]]; then
+          export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-1}"
+        fi
       fi
     fi
-    export HGB_EXCLUDE_FROM_AGGREGATE=0
+    export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1
     ;;
   promefuzz)
@@ -263,6 +286,53 @@ case "$generator" in
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1
     ;;
 esac
+
+# Dry-run fast path: validate the profile/protocol combination and write a
+# dry_run_ok result without starting Docker or making any LLM/embedding calls.
+# The plan (reproduction-delta section 1) requires a dry run to pass profile
+# validation and never start Docker.
+if [[ "$dry_run" == "1" ]]; then
+  _dry_run_id="${run_id:-$(make_timestamp)}"
+  workspace="$(workspace_generator_target_run_dir "$generator" "$target" "$_dry_run_id" "$(repo_root)")"
+  ensure_dir "$workspace/logs"
+  python3 - "$workspace" "$generator" "$target" "$profile" "$protocol" <<'PY_HGB_DRY_RUN'
+import json
+import sys
+from pathlib import Path
+workspace, generator, target, profile, protocol = sys.argv[1:6]
+meta = {
+    "schema_version": 1,
+    "generator": generator,
+    "target": target,
+    "run_type": "generate-target",
+    "capability": "harness_generator",
+    "task_family": "harness_generator",
+    "profile": profile,
+    "protocol": protocol,
+    "applicability": "applicable",
+    "status": "dry_run_ok",
+    "reason": "dry run validated profile/protocol without Docker or LLM calls",
+    "exit_code": 0,
+}
+result = {
+    "schema_version": 2,
+    "generator": generator,
+    "task_family": "harness_generator",
+    "profile": profile,
+    "protocol": protocol,
+    "target": target,
+    "applicability": "applicable",
+    "status": "dry_run_ok",
+    "reason": "dry run validated profile/protocol without Docker or LLM calls",
+    "method_variant": "paper-faithful" if profile in ("reproduction-gamma", "reproduction-delta") else profile,
+    "excluded_from_aggregate": True,
+}
+Path(workspace, "metadata.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+Path(workspace, "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_HGB_DRY_RUN
+  printf '%s\n' "$workspace"
+  exit 0
+fi
 
 args=(--generator "$generator" --target "$target" --layout "$target_layout" --save-mode "$save_mode" --timeout "$timeout_seconds")
 if [[ -n "$run_id" ]]; then args+=(--run-id "$run_id"); fi

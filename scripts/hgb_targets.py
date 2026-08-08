@@ -81,6 +81,10 @@ PROJECT_REPO_ALIASES = {
 }
 
 
+class PackageSplitError(RuntimeError):
+    """The target package cannot be split into generator/evaluator halves."""
+
+
 def now_iso() -> str:
     return _dt.datetime.now(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -1447,7 +1451,7 @@ def write_summary(output: Path, manifest: dict[str, Any]) -> None:
     (output / "HGB_TARGET_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def package_target(root: Path, target: str, output: Path, layout: str = "compact") -> Path:
+def package_target(root: Path, target: str, output: Path, layout: str = "compact", require_split: bool = False) -> Path:
     if layout not in {"compact", "full"}:
         raise SystemExit(f"unknown target package layout: {layout}")
     resolved = resolve_target(root, target)
@@ -1575,22 +1579,42 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     }
     (output / "target_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     write_summary(output, manifest)
-    _apply_package_split(output, manifest, target, resolved.get("fuzz_target", ""))
+    _apply_package_split(output, manifest, target, resolved.get("fuzz_target", ""), require_split=require_split)
     return output
 
 
-def _apply_package_split(output: Path, manifest: dict[str, Any], target: str, fuzz_target: str) -> None:
+def _apply_package_split(
+    output: Path,
+    manifest: dict[str, Any],
+    target: str,
+    fuzz_target: str,
+    *,
+    require_split: bool = False,
+) -> None:
     """Create the generator_input/evaluator_only physical split (beta plan §3).
 
     The monolithic layout is preserved for backwards compatibility; the split
     is what blind-project generators mount.  ``target_manifest.generator.json``
     omits every reference-harness field so a blind generator cannot read the
     exact target harness answer.
+
+    When ``require_split`` is true (reproduction-delta / blind harness
+    generators), a split failure is fail-closed: the exception is re-raised so
+    the caller writes an ``infra_failure`` result instead of leaving a
+    monolithic package that would leak reference harnesses to the generator.
+    A reference canary is embedded in the evaluator-only half and asserted to
+    be absent from ``generator_input/``.
     """
     if os.environ.get("HGB_TARGET_DISABLE_SPLIT", "0") == "1":
+        if require_split:
+            raise PackageSplitError(
+                "target package split is required (reproduction-delta/blind) but HGB_TARGET_DISABLE_SPLIT=1 is set"
+            )
         return
     hgb_target_package = _load_docker_common_module("hgb_target_package")
     if hgb_target_package is None:
+        if require_split:
+            raise PackageSplitError("hgb_target_package module unavailable; cannot create required split")
         return
     native_harness: dict[str, Any] | None = None
     target_harness_mod = _load_docker_common_module("ckgfuzzer_target_harness")
@@ -1607,11 +1631,28 @@ def _apply_package_split(output: Path, manifest: dict[str, Any], target: str, fu
         except Exception:
             native_harness = None
     try:
-        hgb_target_package.split_package(output, native_harness=native_harness)
-    except Exception as exc:  # pragma: no cover - split is best-effort at package time
+        hgb_target_package.split_package(
+            output,
+            native_harness=native_harness,
+            require_split=require_split,
+        )
+    except Exception as exc:
+        if require_split:
+            raise
         (output / "logs" / "split_error.log").write_text(
             f"target package split failed: {exc}\n", encoding="utf-8"
         )
+        return
+    # Fail-closed canary audit: the evaluator-only reference harnesses carry a
+    # canary token that must never appear under generator_input/.
+    generator_input = output / "generator_input"
+    canary = os.environ.get("HGB_REF_CANARY", "")
+    if canary and generator_input.is_dir():
+        audit = hgb_target_package.audit_generator_input(generator_input)
+        if not audit["clean"]:
+            raise PackageSplitError(
+                f"generator_input leaked reference-harness tokens after split: {audit['hits']}"
+            )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1630,6 +1671,8 @@ def main(argv: list[str] | None = None) -> int:
     package_parser.add_argument("target")
     package_parser.add_argument("--output", required=True)
     package_parser.add_argument("--layout", choices=("compact", "full"), default=os.environ.get("HGB_TARGET_PACKAGE_LAYOUT", "compact"))
+    package_parser.add_argument("--require-split", action="store_true",
+                                help="fail closed if the generator_input/evaluator_only split cannot be created")
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -1652,7 +1695,44 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"{key}: {resolved.get(key, '')}")
         return 0
     if args.command == "package":
-        output = package_target(root, args.target, Path(args.output), layout=args.layout)
+        require_split = args.require_split
+        # Infer require_split for blind-project harness generators when not
+        # explicitly set (reproduction-delta fail-closed contract).
+        if not require_split:
+            baseline_profile = os.environ.get("HGB_BASELINE_PROFILE", "")
+            baseline_protocol = os.environ.get("HGB_BASELINE_PROTOCOL", "")
+            if baseline_protocol == "blind-project" and (
+                os.environ.get("HGB_TARGET_REQUIRE_SPLIT", "0") == "1"
+                or baseline_profile == "reproduction-delta"
+            ):
+                require_split = True
+        try:
+            output = package_target(root, args.target, Path(args.output), layout=args.layout, require_split=require_split)
+        except PackageSplitError as exc:
+            # Write an infra_failure result.json so the host runner can surface
+            # the fail-closed split failure instead of mounting a monolithic
+            # package that would leak reference harnesses to the generator.
+            out_dir = Path(args.output).resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+            result = {
+                "schema_version": 2,
+                "generator": os.environ.get("HGB_GENERATOR", ""),
+                "task_family": "harness_generator",
+                "profile": os.environ.get("HGB_BASELINE_PROFILE", ""),
+                "protocol": os.environ.get("HGB_BASELINE_PROTOCOL", ""),
+                "target": args.target,
+                "applicability": "applicable",
+                "status": "infra_failure",
+                "reason": f"target_split_failed: {exc}",
+                "error": {"reason_code": "target_split_failed", "detail": str(exc)},
+                "stages": {},
+                "method_variant": os.environ.get("HGB_BASELINE_PROFILE", ""),
+                "excluded_from_aggregate": True,
+            }
+            (out_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            print(f"infra_failure: target_split_failed: {exc}", file=sys.stderr)
+            return 3
         print(output)
         return 0
     raise SystemExit(f"unknown command: {args.command}")

@@ -289,6 +289,8 @@ def evaluate_candidate(
     strict: bool = True,
     run_native_control: bool = False,
     native_image_tag: str = "",
+    coverage_image_tag: str = "",
+    build_coverage_image: bool = False,
     build_timeout_seconds: int = 1800,
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
@@ -360,17 +362,32 @@ def evaluate_candidate(
         "image_tag": image_tag,
         "image_digest": build.image_digest,
         "binary_path": build.binary_path,
+        "binary_sha256": build.binary_sha256,
+        "binary_verified": build.binary_verified,
         "build_exit_code": build.build_exit_code,
         "compiler": build.compiler,
         "sanitizer": build.sanitizer,
         "engine": build.engine,
         "log": build.log,
+        "overlay_audit": build.overlay_audit or {},
     }
     if build.build_exit_code != 0:
         hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
         rec.error = f"FuzzBench build exited {build.build_exit_code}"
         return rec
+    # Section 5.1: the built image must contain an executable /out/<fuzz_target>.
+    if not build.binary_verified:
+        hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
+        rec.error = "candidate_build: /out/<fuzz_target> is missing or not executable in the built image"
+        return rec
     hgb_result.mark_stage(rec.stages, "candidate_build", "completed")
+    # Section 3.5: if the source compiled at the native path does not match the
+    # candidate, the reference harness overwrote the candidate. Do not proceed.
+    overlay_audit = build.overlay_audit or {}
+    if overlay_audit.get("container_native_sha256") and not overlay_audit.get("matches_candidate"):
+        hgb_result.mark_stage(rec.stages, "candidate_overlay", "failed")
+        rec.error = "candidate_overlay=failed: source at native path does not match the candidate (reference overwrote candidate)"
+        return rec
 
     # 6.3 Sanitizer smoke.
     smoke = hgb_fuzzbench_builder.run_smoke(
@@ -413,10 +430,30 @@ def evaluate_candidate(
     hgb_result.mark_stage(rec.stages, "campaign", "completed")
 
     # 6.5 Coverage (real LLVM source-based coverage with function detail).
+    # Replay the final campaign corpus (not only the seed corpus) so coverage
+    # reflects the inputs the fuzzer actually executed. Build a separate
+    # coverage-instrumented image so an address/libFuzzer image is never reused
+    # for source-based coverage unless explicitly built with coverage flags.
+    coverage_corpus_dir = Path(campaign.get("corpus_dir", "")) if campaign.get("corpus_dir") else corpus_dir
+    if not coverage_corpus_dir.is_dir() or not any(coverage_corpus_dir.iterdir()):
+        coverage_corpus_dir = corpus_dir
+    cov_image = image_tag
+    if build_coverage_image and coverage_image_tag:
+        cov_build = hgb_fuzzbench_builder.build_coverage_image(
+            context_dir=context_dir,
+            dockerfile=dockerfile,
+            image_tag=coverage_image_tag,
+            fuzz_target=fuzz_target,
+            work_dir=candidate_work / "coverage_build",
+            runner=runner,
+            timeout_seconds=build_timeout_seconds,
+        )
+        if cov_build.build_exit_code == 0 and cov_build.binary_verified:
+            cov_image = coverage_image_tag
     cov = hgb_fuzzbench_builder.run_coverage(
-        image_tag=image_tag,
+        image_tag=cov_image,
         binary_path=build.binary_path,
-        corpus_dir=corpus_dir,
+        corpus_dir=coverage_corpus_dir,
         work_dir=candidate_work,
         runner=runner,
     )
@@ -599,6 +636,7 @@ def evaluate(
     run_native_control: bool = False,
     protocol: str = "blind-project",
     build_timeout_seconds: int = 1800,
+    build_coverage_image: bool = False,
     result_dir: str | Path | None = None,
 ) -> dict[str, Any]:
     """Evaluate all candidates and return the run-level result dict.
@@ -699,6 +737,9 @@ def evaluate(
         native_image_tag = hgb_fuzzbench_builder.deterministic_image_tag(
             run_id, fuzz_target, candidate_id + "-native", generator=generator,
         )
+        coverage_image_tag = hgb_fuzzbench_builder.deterministic_image_tag(
+            run_id, fuzz_target, candidate_id + "-cov", generator=generator,
+        )
         rec = evaluate_candidate(
             candidate=candidate,
             candidate_id=candidate_id,
@@ -718,6 +759,8 @@ def evaluate(
             strict=strict,
             run_native_control=run_native_control,
             native_image_tag=native_image_tag,
+            coverage_image_tag=coverage_image_tag,
+            build_coverage_image=build_coverage_image,
             build_timeout_seconds=build_timeout_seconds,
         )
         records.append(rec)
@@ -855,6 +898,8 @@ def main() -> int:
     parser.add_argument("--intended-apis", default="", help="comma-separated intended APIs")
     parser.add_argument("--run-native-control", action="store_true",
                         help="build native/reference coverage control and compute line coverage diff")
+    parser.add_argument("--build-coverage-image", action="store_true",
+                        help="build a separate coverage-instrumented image for source-based coverage")
     args = parser.parse_args()
 
     generator = args.baseline or args.generator
@@ -914,6 +959,7 @@ def main() -> int:
             strict=args.strict,
             intended_apis=intended,
             run_native_control=args.run_native_control,
+            build_coverage_image=args.build_coverage_image,
             result_dir=result_dir,
         )
     finally:

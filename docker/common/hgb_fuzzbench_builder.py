@@ -82,6 +82,8 @@ class BuildResult:
     compiler: str
     sanitizer: str
     engine: str
+    binary_verified: bool = False
+    overlay_audit: dict = None
 
 
 def _run_phase(runner: Runner, command: Sequence[str], timeout_seconds: int, phase: str) -> CommandResult:
@@ -126,34 +128,83 @@ def build_candidate_image(
     """
 
     work_dir.mkdir(parents=True, exist_ok=True)
-    # Overlay the candidate into the context at the native destination.
-    dest_in_context = context_dir / native_destination.lstrip("/")
-    if dest_in_context.parent != context_dir and not native_destination.startswith("source_input/"):
-        # The native destination is under /src/<repo>/...; mirror it inside the
-        # context's source_input tree so COPY source_input/ /src/ restores it.
-        rel = native_destination
-        for prefix in ("/src/", "src/"):
-            if rel.startswith(prefix):
-                rel = rel[len(prefix):]
-                break
-        dest_in_context = context_dir / "source_input" / rel
+    # Resolve the relative native path inside the source_input tree.
+    rel = native_destination
+    for prefix in ("/src/", "src/"):
+        if rel.startswith(prefix):
+            rel = rel[len(prefix):]
+            break
+    rel = rel.lstrip("/")
+    # Overlay the candidate into the context at the native destination so
+    # COPY source_input/ /src/ restores it.
+    dest_in_context = context_dir / "source_input" / rel
     dest_in_context.parent.mkdir(parents=True, exist_ok=True)
     staged_candidate_host = Path(staged_candidate_host)
+    candidate_sha256 = ""
     if staged_candidate_host.is_file():
         import shutil
 
         shutil.copy2(staged_candidate_host, dest_in_context)
+        candidate_sha256 = _sha256_file(staged_candidate_host)
+        # Also stage the candidate into hgb_candidate_overlay so the rewritten
+        # Dockerfile can COPY it as the final write at the native path, after
+        # any non-target sibling harness restore (reproduction-delta section 3).
+        overlay_dir = context_dir / "hgb_candidate_overlay" / rel
+        overlay_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(staged_candidate_host, overlay_dir)
+        # Append the final candidate-overlay COPY to the Dockerfile so the
+        # candidate is the last write at the native harness path.
+        df = Path(dockerfile)
+        if df.is_file():
+            text = df.read_text(encoding="utf-8", errors="replace")
+            overlay_copy = f"COPY hgb_candidate_overlay/{rel} /src/{rel}"
+            if overlay_copy not in text:
+                text = text.rstrip() + "\n" + overlay_copy + "\n"
+                df.write_text(text, encoding="utf-8")
 
     build_command = ["docker", "build", "--file", str(dockerfile), "--tag", image_tag, str(context_dir)]
     build_result = _run_phase(runner, build_command, timeout_seconds, "build candidate image")
     _write_log(work_dir / "image_build.log", build_result)
 
     image_digest = ""
+    binary_sha256 = ""
+    binary_verified = False
+    overlay_audit: dict = {
+        "candidate_sha256": candidate_sha256,
+        "container_native_sha256": "",
+        "matches_candidate": False,
+        "matches_reference": False,
+    }
     if build_result.exit_code == 0:
         inspect = _run_phase(runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60, "inspect image")
         image_digest = inspect.stdout.strip()
+        # Section 5.1: verify /out/<fuzz_target> exists and is executable.
+        binary_path = f"/out/{Path(fuzz_target).stem}"
+        verify_cmd = [
+            "docker", "run", "--rm", image_tag,
+            "sh", "-lc", f"test -x {binary_path} && sha256sum {binary_path}",
+        ]
+        verify = _run_phase(runner, verify_cmd, 120, "verify candidate binary")
+        _write_log(work_dir / "binary_verify.log", verify)
+        if verify.exit_code == 0:
+            binary_verified = True
+            line = (verify.stdout or "").strip().splitlines()
+            if line:
+                binary_sha256 = line[0].split()[0]
+        # Section 3.4: overlay audit. Compare the source file compiled at the
+        # native path with the candidate SHA256 to prove the candidate (not the
+        # reference) was the final write at the native harness path.
+        if rel and candidate_sha256:
+            audit_cmd = [
+                "docker", "run", "--rm", image_tag,
+                "sh", "-lc", f"sha256sum /src/{rel} 2>/dev/null || true",
+            ]
+            audit = _run_phase(runner, audit_cmd, 120, "overlay audit")
+            audit_line = (audit.stdout or "").strip().splitlines()
+            container_sha = audit_line[0].split()[0] if audit_line and audit_line[0].split() else ""
+            overlay_audit["container_native_sha256"] = container_sha
+            overlay_audit["matches_candidate"] = bool(container_sha) and container_sha == candidate_sha256
 
-    binary_sha256 = ""
     binary_path = f"/out/{Path(fuzz_target).stem}"
     return BuildResult(
         image_tag=image_tag,
@@ -165,6 +216,73 @@ def build_candidate_image(
         compiler="clang/clang++",
         sanitizer=sanitizer,
         engine=engine,
+        binary_verified=binary_verified,
+        overlay_audit=overlay_audit,
+    )
+
+
+def build_coverage_image(
+    *,
+    context_dir: Path,
+    dockerfile: Path,
+    image_tag: str,
+    fuzz_target: str,
+    work_dir: Path,
+    runner: Runner = _run,
+    timeout_seconds: int = 1800,
+    sanitizer: str = "none",
+) -> BuildResult:
+    """Build a separate coverage-instrumented image for source-based coverage.
+
+    The coverage image reuses the same sealed candidate overlay context but is
+    built with ``FUZZING_ENGINE=coverage`` so the FuzzBench compile script
+    instruments with ``-fprofile-instr-generate -fcoverage-mapping``. An
+    address/libFuzzer image must NOT be reused for coverage unless it was
+    explicitly built with source-based coverage instrumentation.
+    """
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    build_command = [
+        "docker", "build",
+        "--build-arg", "FUZZING_ENGINE=coverage",
+        "--build-arg", f"SANITIZER={sanitizer}",
+        "--build-arg", "ARCHITECTURE=x86_64",
+        "--file", str(dockerfile),
+        "--tag", image_tag,
+        str(context_dir),
+    ]
+    build_result = _run_phase(runner, build_command, timeout_seconds, "build coverage image")
+    _write_log(work_dir / "image_build.log", build_result)
+    image_digest = ""
+    binary_verified = False
+    binary_sha256 = ""
+    if build_result.exit_code == 0:
+        inspect = _run_phase(runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60, "inspect coverage image")
+        image_digest = inspect.stdout.strip()
+        binary_path = f"/out/{Path(fuzz_target).stem}"
+        verify_cmd = [
+            "docker", "run", "--rm", image_tag,
+            "sh", "-lc", f"test -x {binary_path} && sha256sum {binary_path}",
+        ]
+        verify = _run_phase(runner, verify_cmd, 120, "verify coverage binary")
+        _write_log(work_dir / "binary_verify.log", verify)
+        if verify.exit_code == 0:
+            binary_verified = True
+            line = (verify.stdout or "").strip().splitlines()
+            if line:
+                binary_sha256 = line[0].split()[0]
+    return BuildResult(
+        image_tag=image_tag,
+        image_digest=image_digest,
+        binary_path=f"/out/{Path(fuzz_target).stem}",
+        binary_sha256=binary_sha256,
+        build_exit_code=build_result.exit_code,
+        log=str(work_dir / "image_build.log"),
+        compiler="clang/clang++",
+        sanitizer=sanitizer,
+        engine="coverage",
+        binary_verified=binary_verified,
+        overlay_audit=None,
     )
 
 
@@ -330,10 +448,13 @@ def run_campaign(
         f'echo "---STATS---"; '
         f'ls /tmp/corpus | wc -l; '
         f'ls /tmp/artifacts 2>/dev/null | wc -l; '
-        f'cat /tmp/campaign.log',
+        f'cat /tmp/campaign.log; '
+        f'cd /tmp && tar -cf /tmp/corpus.tar corpus 2>/dev/null || true',
     ]
     timeout = timeout_seconds or (budget + 60)
     campaign_work = work_dir / "campaign"
+    final_corpus_dir = work_dir / "corpus"
+    final_corpus_dir.mkdir(parents=True, exist_ok=True)
     result = _container_run(
         image_tag=image_tag,
         work_dir=campaign_work,
@@ -342,12 +463,25 @@ def run_campaign(
         command=cmd,
         phase="campaign",
         copy_in=copy_in if copy_in else None,
-        copy_out=("/tmp/campaign.log", campaign_work / "campaign.log"),
+        copy_out=("/tmp/corpus.tar", campaign_work / "corpus.tar"),
     )
+    # Extract the final campaign corpus so the coverage stage can replay it.
+    import tarfile
+    corpus_tar = campaign_work / "corpus.tar"
+    if corpus_tar.is_file():
+        try:
+            with tarfile.open(corpus_tar) as tf:
+                tf.extractall(final_corpus_dir)
+        except (OSError, tarfile.TarError):
+            pass
+    (campaign_work / "campaign.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
     log = result.stdout + "\n" + result.stderr
     execs_done = _parse_execs_done(log)
     new_units = _parse_new_units(log)
     crashes = int("SUMMARY: AddressSanitizer" in log or "SUMMARY: UndefinedBehaviorSanitizer" in log)
+    queue_count = 0
+    if final_corpus_dir.is_dir():
+        queue_count = sum(1 for p in final_corpus_dir.iterdir() if p.is_file())
     return {
         "execs_done": execs_done,
         "new_units": new_units,
@@ -357,6 +491,8 @@ def run_campaign(
         "peak_rss_mb": _parse_peak_rss(log),
         "exit_code": result.exit_code,
         "log": str(campaign_work / "campaign.log"),
+        "corpus_dir": str(final_corpus_dir),
+        "queue_count": queue_count,
     }
 
 

@@ -133,6 +133,7 @@ def build_result(
     protocol: str,
     target: str,
     status: str | None = None,
+    applicability: str = "applicable",
     stages: dict[str, str] | None = None,
     reason: str = "",
     method_variant: str = "",
@@ -142,6 +143,8 @@ def build_result(
     provenance: dict[str, Any] | None = None,
     selected_candidate: dict[str, Any] | None = None,
     candidate_count: int = 0,
+    error: dict[str, Any] | None = None,
+    reproducibility: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stages = stages if stages is not None else default_stages()
     if status is None:
@@ -154,12 +157,15 @@ def build_result(
             status = STATUS_COMPAT_SMOKE_COMPLETED
     if profile == "reproduction-gamma" and not method_variant:
         method_variant = "paper-faithful"
+    if profile == "reproduction-delta" and not method_variant:
+        method_variant = "paper-faithful"
     if status not in ALLOWED_STATUSES and status not in {"failed", "partial_completed", "missing_api_key"}:
         # Normalize legacy statuses into the beta contract.  A bare "failed"
         # from the legacy entrypoint is preserved for backwards compatibility
         # with existing collectors; the beta evaluator always emits one of the
         # allowed statuses above.
         pass
+    metrics = metrics or {}
     return {
         "schema_version": 3,
         "generator": generator,
@@ -168,13 +174,19 @@ def build_result(
         "protocol": protocol,
         "target": target,
         "status": status,
+        "applicability": applicability,
         "reason": reason,
+        "error": error or {},
         "stages": stages,
         "method_variant": method_variant or profile,
         "excluded_from_aggregate": excluded_from_aggregate,
         "candidate_count": candidate_count,
         "artifacts": artifacts or {},
-        "metrics": metrics or {},
+        "metrics": metrics,
+        "build": metrics.get("build", {}),
+        "campaign": metrics.get("campaign", {}),
+        "coverage": metrics.get("coverage", {}),
+        "reproducibility": reproducibility or {},
         "provenance": provenance or {},
         "selected_candidate": selected_candidate or {},
     }

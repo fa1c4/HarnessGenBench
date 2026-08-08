@@ -17,9 +17,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
+# Strict reproduction profile introduced by the reproduction-delta plan. It is
+# paper-faithful but rejects every local/deterministic fallback the earlier
+# alpha/beta/gamma scaffolding allowed. reproduction-gamma remains accepted as
+# a backward-compatible alias of reproduction-delta.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta"}
 
 # Flags that are forbidden in method-faithful profiles.
 FORBIDDEN_ALPHA_ENV = {
@@ -80,6 +85,11 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                     f"{key}={actual} is forbidden in {profile}; "
                     f"method-faithful profiles require the upstream LLM path"
                 )
+        if normalize_env_bool(env.get("CKGFUZZER_SKIP_CHECK_COMPILATION")) == "1":
+            violations.append(
+                f"CKGFUZZER_SKIP_CHECK_COMPILATION=1 is forbidden in {profile}; "
+                f"the compile-check/repair loop must run"
+            )
         # A mock/local embedding model is forbidden in alpha/paper.
         embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip().lower()
         if embedding_model in {"mock", "local", ""}:
@@ -90,8 +100,42 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
         # source_fallback_only must not be permitted in alpha.
         if normalize_env_bool(env.get("CKGFUZZER_ALLOW_SOURCE_FALLBACK")) == "1":
             violations.append(
-                "CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in {profile}; "
+                f"CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in {profile}; "
                 "source-only graph fallback is only allowed in compat-smoke"
+            )
+        # selected-harness API mode is evaluator-only; a blind generator must
+        # never read the reference-derived API list.
+        api_mode = (env.get("HGB_API_SELECTION_MODE") or "").strip()
+        if api_mode in {"selected_harness", "selected_harness_fallback"}:
+            violations.append(
+                f"HGB_API_SELECTION_MODE={api_mode} is forbidden in {profile}; "
+                "the selected-harness API list is evaluator-only"
+            )
+
+    # reproduction-delta is the strictest profile: forbid every local fallback
+    # the earlier scaffolding allowed, even when an alias env var is set.
+    if profile in STRICT_REPRODUCTION_PROFILES:
+        for key, bad_value in FORBIDDEN_ALPHA_ENV.items():
+            if normalize_env_bool(env.get(key)) == bad_value:
+                violations.append(
+                    f"{key}={bad_value} is forbidden in {profile}; "
+                    f"reproduction-delta requires the upstream LLM path"
+                )
+        if normalize_env_bool(env.get("CKGFUZZER_SKIP_CHECK_COMPILATION")) == "1":
+            violations.append(
+                f"CKGFUZZER_SKIP_CHECK_COMPILATION=1 is forbidden in {profile}; "
+                "the compile-check/repair loop must run"
+            )
+        embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip().lower()
+        if embedding_model in {"mock", "local", ""}:
+            violations.append(
+                f"CKGFUZZER_EMBEDDING_MODEL={embedding_model!r} is forbidden in {profile}; "
+                "reproduction-delta requires a real embedding service"
+            )
+        if normalize_env_bool(env.get("CKGFUZZER_ALLOW_SOURCE_FALLBACK")) == "1":
+            violations.append(
+                f"CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in {profile}; "
+                "source-only CodeQL graph fallback is forbidden"
             )
 
     if is_compat_smoke(profile):

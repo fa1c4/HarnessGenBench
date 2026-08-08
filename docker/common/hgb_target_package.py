@@ -27,6 +27,7 @@ on any non-stdlib library.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -143,13 +144,19 @@ def _write_evaluator_manifest(evaluator_only: Path) -> None:
     )
 
 
-def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | None = None) -> dict[str, str]:
+def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | None = None, require_split: bool = False) -> dict[str, str]:
     """Split a monolithic target package into generator_input/evaluator_only.
 
     ``package_dir`` is the existing prepared package (with ``source_input``,
     ``reference_harnesses``, ``fuzzbench_benchmark``, ``target_manifest.json``).
     The function is idempotent: re-running it re-syncs the two halves.
     Returns a dict with the absolute paths of the two halves.
+
+    When ``require_split`` is true the package must contain the files required
+    for a real split (``source_input`` and ``reference_harnesses``); a missing
+    required input raises :class:`PackageSplitError` instead of producing an
+    empty half.  A reference canary is written into the evaluator-only half so
+    a downstream audit can prove the canary never reaches ``generator_input/``.
     """
 
     package = Path(package_dir)
@@ -159,6 +166,14 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
     if not manifest_path.is_file():
         raise PackageSplitError(f"target package missing target_manifest.json: {package}")
     full_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    if require_split:
+        if not (package / "source_input").is_dir() or not any((package / "source_input").iterdir()):
+            raise PackageSplitError("required split cannot proceed: source_input is missing or empty")
+        if not (package / "reference_harnesses").is_dir():
+            raise PackageSplitError("required split cannot proceed: reference_harnesses is missing")
+        if not (package / "fuzzbench_benchmark").is_dir():
+            raise PackageSplitError("required split cannot proceed: fuzzbench_benchmark is missing")
 
     generator_input = package / GENERATOR_INPUT_DIR
     evaluator_only = package / EVALUATOR_ONLY_DIR
@@ -222,6 +237,17 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
     # harnesses). This is distinct from the full target_manifest.evaluator.json
     # so the split-aware evaluator can validate its inputs by name.
     _write_evaluator_manifest(evaluator_only)
+
+    # Embed a reference canary in the evaluator-only half so a downstream audit
+    # can prove the canary never reaches generator_input/. The canary is read
+    # from the environment so the host runner can match it during the leakage
+    # audit. When no canary is supplied a deterministic sentinel is written.
+    canary = os.environ.get("HGB_REF_CANARY", "")
+    if not canary:
+        import hashlib
+        import time
+        canary = "HGB_REF_CANARY_" + hashlib.sha256(str(time.time()).encode()).hexdigest()[:16]
+    (evaluator_only / "reference_canary.txt").write_text(canary + "\n", encoding="utf-8")
 
     return {
         "generator_input": str(generator_input),

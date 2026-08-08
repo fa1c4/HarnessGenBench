@@ -468,6 +468,7 @@ run_hgb_container() {
     -e CKGFUZZER_CODEQL_CACHE \
     -e CKGFUZZER_CODEQL_CACHE_REFRESH \
     -e CKGFUZZER_SKIP_CHECK_COMPILATION \
+    -e CKGFUZZER_ALLOW_SOURCE_FALLBACK \
     -e HGB_REF_CANARY \
     -e HGB_EXCLUDE_FROM_AGGREGATE \
     -e PROME_FUZZ_EMBEDDING_LLM_TYPE \
@@ -577,13 +578,38 @@ run_hgb_target_container() {
   # generator_input at /target so the generator cannot read reference_harnesses,
   # selected_reference, or fuzzbench_selected_harness_apis.json.  The
   # evaluator-only half is mounted at /evaluator for the independent evaluator.
-  # Old monolithic packages (no generator_input/) fall back to the package root.
+  # Old monolithic packages (no generator_input/) fall back to the package root
+  # UNLESS reproduction-delta is in effect, in which case a missing split is
+  # fail-closed: never mount the monolithic target root for a blind harness
+  # generator (it would leak reference_harnesses to the generator).
   local target_mount_src="$target_package"
   local evaluator_mount_args=()
+  local ckg_profile="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-}}"
   if hgb_generator_is_blind "$generator" && [[ -d "$target_package/generator_input" ]]; then
     target_mount_src="$target_package/generator_input"
     if [[ -d "$target_package/evaluator_only" ]]; then
       evaluator_mount_args+=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
+    fi
+  fi
+  # reproduction-delta fail-closed: a blind harness generator must never fall
+  # back to the monolithic package root. Require both halves and their
+  # manifests before container launch.
+  if hgb_generator_is_blind "$generator" && [[ "$ckg_profile" == "reproduction-delta" ]]; then
+    if [[ ! -f "$target_package/generator_input/target_manifest.json" ]]; then
+      die "reproduction-delta: missing $target_package/generator_input/target_manifest.json; target split did not produce the generator half (infra_failure)"
+    fi
+    if [[ ! -f "$target_package/evaluator_only/evaluator_manifest.json" ]]; then
+      die "reproduction-delta: missing $target_package/evaluator_only/evaluator_manifest.json; target split did not produce the evaluator half (infra_failure)"
+    fi
+    target_mount_src="$target_package/generator_input"
+    evaluator_mount_args=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
+    # Reference-harness canary audit: the canary written into evaluator_only
+    # during package creation must never appear under generator_input/.
+    if [[ -f "$target_package/evaluator_only/reference_canary.txt" ]]; then
+      ckg_ref_canary="$(cat "$target_package/evaluator_only/reference_canary.txt" 2>/dev/null | head -n1 || true)"
+      if [[ -n "$ckg_ref_canary" ]] && grep -RqF -- "$ckg_ref_canary" "$target_package/generator_input" 2>/dev/null; then
+        die "reproduction-delta: reference canary leaked into generator_input/; refusing to launch the generator container (infra_failure)"
+      fi
     fi
   fi
   if [[ "$generator" == "elfuzz" ]]; then
@@ -707,6 +733,7 @@ run_hgb_target_container() {
     -e CKGFUZZER_CACHE_MAX_CSV_BYTES \
     -e CKGFUZZER_SOURCE_FALLBACK_MAX_FILES \
     -e CKGFUZZER_SKIP_CHECK_COMPILATION \
+    -e CKGFUZZER_ALLOW_SOURCE_FALLBACK \
     -e HGB_REF_CANARY \
     -e HGB_EXCLUDE_FROM_AGGREGATE \
     -e PROME_FUZZ_EMBEDDING_LLM_TYPE \

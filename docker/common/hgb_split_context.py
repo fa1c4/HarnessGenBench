@@ -209,13 +209,30 @@ def create_sealed_build_context(
     # Rewrite the benchmark Dockerfile to use the sealed source snapshot.
     dockerfile_src = benchmark_dst / "Dockerfile"
     rewritten, removed = _rewrite_dockerfile(dockerfile_src)
+    # Enforce the strict overlay copy order (reproduction-delta section 3):
+    # the non-target sibling harness restore must NOT copy the selected native
+    # harness, and the candidate overlay (already staged into source_input by
+    # build_candidate_image) must be the final write at the native path.
+    rewritten = rewritten.replace(
+        "COPY hgb_reference_harnesses/ /src/",
+        "COPY hgb_non_target_reference_harnesses/ /src/",
+    )
     sealed_dockerfile = sealed / "Dockerfile"
     sealed_dockerfile.write_text(rewritten, encoding="utf-8")
 
-    # Also restore the reference harnesses into the sealed context root so the
-    # FuzzBench build can compile sibling fuzzers (e.g. Mbed TLS, OpenSSL).
-    # These are evaluator-only; they never reach the generator workspace.
-    _copy_reference_harnesses_into(sealed, context.reference_harnesses)
+    # Restore only non-target sibling harnesses into the sealed context so the
+    # FuzzBench build can compile sibling fuzzers (e.g. Mbed TLS, OpenSSL)
+    # WITHOUT overwriting the candidate at the native harness path. These are
+    # evaluator-only; they never reach the generator workspace.
+    native_dest = ""
+    try:
+        native_info = context.read_native_harness()
+        native_dest = str(native_info.get("container_destination", ""))
+    except VerificationContextError:
+        native_dest = ""
+    restore_audit = evaluator_restore_non_target_harnesses(
+        context.reference_harnesses, native_dest, sealed,
+    )
 
     return {
         "context_dir": str(sealed),
@@ -227,6 +244,7 @@ def create_sealed_build_context(
         "build_tool_fallbacks": build_tool_fallbacks,
         "generator_root": str(context.generator_root),
         "evaluator_root": str(context.evaluator_root),
+        "reference_restore_audit": restore_audit,
     }
 
 
@@ -258,6 +276,80 @@ def _copy_reference_harnesses_into(sealed: Path, reference_harnesses: Path) -> N
         for label in selected.iterdir():
             if label.is_dir():
                 shutil.copytree(label, destination, symlinks=True, dirs_exist_ok=True)
+
+
+def evaluator_restore_non_target_harnesses(
+    reference_harnesses: Path,
+    native_destination: str,
+    sealed: Path,
+) -> dict[str, Any]:
+    """Restore only non-target sibling harnesses into the sealed context.
+
+    HGB5 issue: ``_copy_reference_harnesses_into`` merged
+    ``reference_harnesses/selected`` into ``hgb_reference_harnesses``, and the
+    rewritten Dockerfile copied it over ``/src/`` *after* the candidate overlay,
+    replacing the candidate with the reference harness.
+
+    This strict restore copies only sibling harnesses that are NOT the selected
+    native harness path, writes them into ``hgb_non_target_reference_harnesses``,
+    and never copies the exact selected target harness.  Skipped paths are
+    recorded in the returned audit so the evaluator can prove the candidate was
+    the final write at the native path.
+    """
+
+    destination = sealed / "hgb_non_target_reference_harnesses"
+    destination.mkdir(parents=True, exist_ok=True)
+    rel_native = native_destination
+    for prefix in ("/src/", "src/"):
+        if rel_native.startswith(prefix):
+            rel_native = rel_native[len(prefix):]
+            break
+    rel_native = rel_native.lstrip("/")
+    native_name = Path(rel_native).name
+    skipped: list[str] = []
+    restored: list[str] = []
+    if not reference_harnesses.is_dir():
+        return {"restored": [], "skipped": [], "native_destination": native_destination}
+    for child in reference_harnesses.iterdir():
+        if child.name == "selected":
+            continue
+        target = destination / child.name
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, target, symlinks=True, dirs_exist_ok=True)
+            restored.append(child.name)
+        elif child.is_file() or child.is_symlink():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(child, target, follow_symlinks=False)
+            restored.append(child.name)
+    # The selected/ directory holds the exact native harness. Skip the file that
+    # matches the native destination path/name so it can never overwrite the
+    # candidate; restore only the other siblings.
+    selected = reference_harnesses / "selected"
+    if selected.is_dir():
+        for label in selected.iterdir():
+            if not label.is_dir():
+                continue
+            for src in sorted(label.rglob("*")):
+                if not src.is_file():
+                    continue
+                src_rel = src.relative_to(label)
+                if str(src_rel) == rel_native or src.name == native_name:
+                    skipped.append(str(src_rel))
+                    continue
+                dst = destination / src_rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not dst.exists():
+                    shutil.copy2(src, dst, follow_symlinks=False)
+                    restored.append(str(src_rel))
+    audit = {
+        "native_destination": native_destination,
+        "restored": sorted(set(restored)),
+        "skipped": sorted(set(skipped)),
+    }
+    (sealed / "reference_restore_audit.json").write_text(
+        json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return audit
 
 
 def verify_overlay_path(native_destination: str, sealed_context_dir: Path) -> Path:
