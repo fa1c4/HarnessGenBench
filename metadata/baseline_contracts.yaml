@@ -26,7 +26,7 @@ baselines:
       as a successful alpha matrix row.
   - name: g2fuzz
     task_family: input_generator
-    profiles: [alpha, paper-faithful, extension, compat-smoke]
+    profiles: [alpha, paper-faithful, extension, reproduction-gamma, compat-smoke]
     default_profile: alpha
     default_protocol: paper-native
     strict_success_status: evaluated

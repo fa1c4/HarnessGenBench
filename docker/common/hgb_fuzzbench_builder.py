@@ -517,6 +517,247 @@ def verify_g2fuzz_target_pair(afl_binary: Path, cmp_binary: Path) -> dict:
     return {"afl": afl, "cmp": cmp, "ok": ok, "build_mode": G2FUZZ_BUILD_MODE}
 
 
+# -- G2Fuzz triple (.afl/.cmp/.cov) Docker builder -------------------------
+
+G2FUZZ_AFL_ENGINE = "afl"
+G2FUZZ_COVERAGE_ENGINE = "coverage"
+G2FUZZ_COVERAGE_FLAGS = "-fprofile-instr-generate -fcoverage-mapping"
+G2FUZZ_TRIPLE_VARIANTS = ("afl", "cmp", "cov")
+
+
+def _g2fuzz_variant_build_args(*, variant: str, sanitizer: str) -> list[str]:
+    """Return the FuzzBench ``docker build`` arg list for a G2Fuzz variant.
+
+    - ``afl``: AFL++ default instrumentation (``FUZZING_ENGINE=afl``).
+    - ``cmp``: AFL++ CmpLog instrumentation (``FUZZING_ENGINE=afl`` plus
+      ``AFL_LLVM_CMPLOG=1`` so ``afl-clang-fast`` instruments comparison
+      logging).
+    - ``cov``: coverage instrumentation (``FUZZING_ENGINE=coverage`` so the
+      FuzzBench compile script uses clang with
+      ``-fprofile-instr-generate -fcoverage-mapping``).
+    """
+
+    if variant == "cov":
+        return [
+            "--build-arg", f"FUZZING_ENGINE={G2FUZZ_COVERAGE_ENGINE}",
+            "--build-arg", f"SANITIZER={sanitizer}",
+            "--build-arg", "ARCHITECTURE=x86_64",
+        ]
+    # Both afl and cmp use the AFL engine; cmp additionally passes
+    # AFL_LLVM_CMPLOG=1 as a build-arg so it is present in the build env.
+    args = [
+        "--build-arg", f"FUZZING_ENGINE={G2FUZZ_AFL_ENGINE}",
+        "--build-arg", f"SANITIZER={sanitizer}",
+        "--build-arg", "ARCHITECTURE=x86_64",
+    ]
+    if variant == "cmp":
+        args.extend(["--build-arg", "AFL_LLVM_CMPLOG=1"])
+    return args
+
+
+def _g2fuzz_variant_env(variant: str) -> dict[str, str]:
+    """Return the environment variable overrides that distinguish each variant.
+
+    These are recorded in the build commands dict for auditability and used by
+    the pipeline to verify CmpLog and coverage instrumentation are present.
+    """
+
+    if variant == "afl":
+        return {"AFL_LLVM_CMPLOG": "0"}
+    if variant == "cmp":
+        return {"AFL_LLVM_CMPLOG": "1"}
+    if variant == "cov":
+        return {
+            "CC": "clang",
+            "CXX": "clang++",
+            "CFLAGS": G2FUZZ_COVERAGE_FLAGS,
+            "CXXFLAGS": G2FUZZ_COVERAGE_FLAGS,
+        }
+    return {}
+
+
+def g2fuzz_target_triple_build_commands(
+    *,
+    benchmark_dir: Path,
+    image_tag_base: str,
+    fuzz_target: str,
+    program_id: str,
+    sanitizer: str = "address",
+) -> dict:
+    """Return the three (afl/cmp/cov) Docker build commands for a G2Fuzz triple.
+
+    Each variant builds from the exact FuzzBench benchmark Dockerfile (not a
+    direct-host ``build.sh`` invocation).  The three variants differ only in
+    build args and environment: ``.afl`` uses default AFL++ instrumentation,
+    ``.cmp`` adds ``AFL_LLVM_CMPLOG=1``, and ``.cov`` uses the coverage engine
+    with ``-fprofile-instr-generate -fcoverage-mapping``.
+    """
+
+    dockerfile = Path(benchmark_dir) / "Dockerfile"
+    commands: dict[str, Any] = {}
+    for variant in G2FUZZ_TRIPLE_VARIANTS:
+        tag = f"{image_tag_base}-{variant}"
+        build_cmd = [
+            "docker", "build",
+            *_g2fuzz_variant_build_args(variant=variant, sanitizer=sanitizer),
+            "--file", str(dockerfile),
+            "--tag", tag,
+            str(benchmark_dir),
+        ]
+        commands[variant] = {
+            "build_command": build_cmd,
+            "image_tag": tag,
+            "build_args": _g2fuzz_variant_build_args(variant=variant, sanitizer=sanitizer),
+            "env": _g2fuzz_variant_env(variant),
+            "fuzz_target": fuzz_target,
+            "variant": variant,
+            "dockerfile": str(dockerfile),
+        }
+    return {
+        "program_id": program_id,
+        "build_mode": "fuzzbench_docker_triple",
+        "sanitizer": sanitizer,
+        **commands,
+    }
+
+
+def build_g2fuzz_target_variant(
+    *,
+    benchmark_dir: Path,
+    image_tag: str,
+    fuzz_target: str,
+    variant: str,
+    work_dir: Path,
+    runner: Runner = _run,
+    timeout_seconds: int = 3600,
+    sanitizer: str = "address",
+) -> dict:
+    """Build one G2Fuzz target variant from the FuzzBench benchmark Dockerfile.
+
+    Runs ``docker build`` on the exact benchmark Dockerfile with the variant's
+    build args, then extracts ``/out/<fuzz_target>`` from the built image via a
+    throwaway container.  Returns a record with the image tag/digest, binary
+    path, sha256, and build exit code.  This never accepts a prebuilt binary:
+    the variant is always built from the benchmark Dockerfile so the
+    reproduction is traceable to the exact FuzzBench environment.
+    """
+
+    work_dir = Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / "out").mkdir(parents=True, exist_ok=True)
+    dockerfile = Path(benchmark_dir) / "Dockerfile"
+    build_command = [
+        "docker", "build",
+        *_g2fuzz_variant_build_args(variant=variant, sanitizer=sanitizer),
+        "--file", str(dockerfile),
+        "--tag", image_tag,
+        str(benchmark_dir),
+    ]
+    build_result = _run_phase(runner, build_command, timeout_seconds, f"build g2fuzz {variant} target")
+    _write_log(work_dir / f"build.{variant}.log", build_result)
+    image_digest = ""
+    binary_path = ""
+    binary_sha256 = ""
+    extracted = False
+    if build_result.exit_code == 0:
+        inspect = _run_phase(runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60, f"inspect {variant} image")
+        image_digest = inspect.stdout.strip()
+        container_name = f"hgb-g2fuzz-{variant}-{uuid.uuid4().hex[:12]}"
+        create = _run_phase(runner, ["docker", "create", "--name", container_name, image_tag, "true"], 60, f"create {variant}")
+        if create.exit_code == 0:
+            host_binary = work_dir / "out" / f"target.{variant}"
+            cp = _run_phase(
+                runner,
+                ["docker", "cp", f"{container_name}:/out/{fuzz_target}", str(host_binary)],
+                120,
+                f"copy {variant} binary",
+            )
+            if cp.exit_code == 0 and host_binary.is_file():
+                extracted = True
+                binary_path = str(host_binary)
+                binary_sha256 = _sha256_file(host_binary)
+            _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {variant}")
+        else:
+            _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {variant}")
+    return {
+        "variant": variant,
+        "sanitizer": sanitizer,
+        "image_tag": image_tag,
+        "image_digest": image_digest,
+        "build_exit_code": build_result.exit_code,
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "binary_extracted": extracted,
+        "log": str(work_dir / f"build.{variant}.log"),
+        "build_command": build_result.command,
+        "env": _g2fuzz_variant_env(variant),
+    }
+
+
+def build_g2fuzz_target_triple(
+    *,
+    benchmark_dir: Path,
+    image_tag_base: str,
+    fuzz_target: str,
+    work_dir: Path,
+    runner: Runner = _run,
+    timeout_seconds: int = 3600,
+    sanitizer: str = "address",
+) -> dict:
+    """Build all three G2Fuzz target variants (.afl, .cmp, .cov) via Docker.
+
+    Returns a dict keyed by variant with build records.  Each variant is built
+    from the exact FuzzBench benchmark Dockerfile with variant-specific build
+    args.  The ``.afl`` variant uses default AFL++ instrumentation, ``.cmp``
+    adds ``AFL_LLVM_CMPLOG=1`` for CmpLog, and ``.cov`` uses the coverage
+    engine with ``-fprofile-instr-generate -fcoverage-mapping``.
+    """
+
+    results: dict[str, Any] = {}
+    for variant in G2FUZZ_TRIPLE_VARIANTS:
+        tag = f"{image_tag_base}-{variant}"
+        results[variant] = build_g2fuzz_target_variant(
+            benchmark_dir=benchmark_dir,
+            image_tag=tag,
+            fuzz_target=fuzz_target,
+            variant=variant,
+            work_dir=work_dir,
+            runner=runner,
+            timeout_seconds=timeout_seconds,
+            sanitizer=sanitizer,
+        )
+    return results
+
+
+def verify_g2fuzz_target_triple(afl_binary: Path, cmp_binary: Path, cov_binary: Path) -> dict:
+    """Verify a built G2Fuzz target triple: all three binaries exist and are executable.
+
+    A missing ``.cov`` or ``.cmp`` binary fails verification.  This is used by
+    the gamma pipeline and the offline tests; it never soft-skips a missing
+    triple member.
+    """
+
+    import os as _os
+
+    def _stat(p: Path) -> dict:
+        return {
+            "path": str(p),
+            "exists": p.is_file(),
+            "executable": _os.access(p, _os.X_OK) if p.exists() else False,
+            "size": p.stat().st_size if p.exists() else 0,
+        }
+
+    afl = _stat(Path(afl_binary))
+    cmp = _stat(Path(cmp_binary))
+    cov = _stat(Path(cov_binary))
+    ok = bool(
+        afl["exists"] and afl["executable"] and afl["size"] > 0
+        and cmp["exists"] and cmp["executable"] and cmp["size"] > 0
+        and cov["exists"] and cov["executable"] and cov["size"] > 0
+    )
+    return {"afl": afl, "cmp": cmp, "cov": cov, "ok": ok, "build_mode": "fuzzbench_docker_triple"}
+
+
 # -- ELFuzz native+coverage SUT builder ------------------------------------
 
 ELFUZZ_NATIVE_ENGINE = "libfuzzer"

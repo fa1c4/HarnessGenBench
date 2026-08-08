@@ -261,6 +261,37 @@ if [[ "$mode" == "generate-target" ]]; then
   if [[ -z "${HGB_FUZZBENCH_BENCHMARK_DIR:-}" && -d "/opt/hgb/fuzzbench/benchmarks/$target_name" ]]; then
     export HGB_FUZZBENCH_BENCHMARK_DIR="/opt/hgb/fuzzbench/benchmarks/$target_name"
   fi
+  # reproduction-gamma preflight: verify G2Fuzz modified AFL++ components.
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" ]]; then
+    missing=()
+    [[ -f "$artifact/program_gen.py" ]] || missing+=("program_gen.py")
+    [[ -x "$artifact/afl-fuzz" ]] || missing+=("afl-fuzz")
+    if [[ -x "$artifact/afl-fuzz" ]]; then
+      "$artifact/afl-fuzz" -h 2>&1 | grep -q -- '-c ' || missing+=("afl-fuzz -c (CmpLog)")
+      "$artifact/afl-fuzz" -h 2>&1 | grep -q -- '-k ' || missing+=("afl-fuzz -k (G2FUZZ)")
+    fi
+    [[ -x "$artifact/afl-clang-fast" ]] || missing+=("afl-clang-fast")
+    [[ -x "$artifact/afl-clang-fast++" ]] || missing+=("afl-clang-fast++")
+    if [[ ${#missing[@]} -gt 0 ]]; then
+      printf 'infra_missing: G2Fuzz reproduction-gamma preflight failed: missing %s\n' "${missing[*]}" >&2
+      mkdir -p "$workspace"
+      "$python" - "$workspace" "${missing[*]}" <<'PY_PREFLIGHT'
+import json, sys
+from pathlib import Path
+ws = Path(sys.argv[1])
+missing = sys.argv[2]
+result = {
+    "schema_version": 2, "baseline": "g2fuzz", "generator": "g2fuzz",
+    "task_family": "input_generator", "status": "infra_missing",
+    "reason": f"G2Fuzz reproduction-gamma preflight failed: missing {missing}",
+    "exit_code": 127, "profile": "reproduction-gamma",
+}
+for name in ("result.json", "metadata.json"):
+    (ws / name).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_PREFLIGHT
+      exit 127
+    fi
+  fi
   dry_run_arg=()
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     dry_run_arg=(--dry-run)

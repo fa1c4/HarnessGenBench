@@ -158,6 +158,13 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
             violations.append("evaluated input-generator row has no completed target_pair_build")
         if not (target_pair.get("afl_binary") and target_pair.get("cmp_binary")):
             violations.append("evaluated input-generator row lacks .afl/.cmp build evidence")
+        # Gamma contract: also require .cov build evidence.
+        if str(meta.get("profile") or "") == "reproduction-gamma":
+            if not target_pair.get("cov_binary"):
+                violations.append("evaluated gamma input-generator row lacks .cov build evidence")
+            cov_gamma = meta.get("coverage_gamma") or {}
+            if isinstance(cov_gamma, dict) and int(cov_gamma.get("inputs_replayed", 0) or 0) <= 0:
+                violations.append("evaluated gamma input-generator row has coverage_gamma.inputs_replayed <= 0")
         input_gen = meta.get("input_generation", {})
         if not isinstance(input_gen, dict) or int(input_gen.get("valid_g2_generated_count", 0) or 0) <= 0:
             violations.append("evaluated input-generator row has no valid G2-generated input")
@@ -357,12 +364,55 @@ def storage_report(matrix_dir: Path, records: list[dict[str, Any]]) -> dict[str,
     }
 
 
-def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "") -> dict[str, Any]:
+def _load_target_set(target_set: str) -> set[str] | None:
+    """Load a named target set from fuzzbench_targets.json. Returns None if not found."""
+    if not target_set:
+        return None
+    for candidate in (Path("metadata/fuzzbench_targets.json"), Path(__file__).resolve().parent.parent / "metadata" / "fuzzbench_targets.json"):
+        if candidate.is_file():
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8"))
+                raw = data.get("target_sets", {}).get(target_set, {})
+                targets = raw.get("targets", raw) if isinstance(raw, dict) else raw
+                return set(str(t) for t in (targets or []))
+            except (json.JSONDecodeError, OSError):
+                continue
+    return None
+
+
+def _apply_filters(records: list[dict[str, Any]], *, generator: str = "", target_set: str = "", task_family: str = "", profile: str = "", method_profile: str = "") -> list[dict[str, Any]]:
+    """Filter records by generator, target-set, task-family, profile, method-profile."""
+    if not any([generator, target_set, task_family, profile, method_profile]):
+        return records
+    target_filter = _load_target_set(target_set)
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        meta = record["metadata"]
+        row = record["row"]
+        gen = meta.get("generator") or meta.get("fuzzer") or row.get("generator") or ""
+        if generator and gen != generator:
+            continue
+        if target_filter and row.get("target", "") not in target_filter:
+            continue
+        fam = str(meta.get("task_family") or meta.get("capability") or "")
+        if task_family and fam != task_family:
+            continue
+        if profile and str(meta.get("profile") or "") != profile:
+            continue
+        if method_profile and str(meta.get("method_profile") or "") != method_profile:
+            continue
+        filtered.append(record)
+    return filtered
+
+
+def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", generator: str = "", target_set: str = "", task_family: str = "", profile: str = "", method_profile: str = "") -> dict[str, Any]:
     rows = read_rows(matrix_dir)
     records: list[dict[str, Any]] = []
     for row in rows:
         metadata = load_metadata(row.get("metadata", ""))
         records.append({"row": row, "metadata": metadata})
+    # Apply filters before computing the summary.
+    records = _apply_filters(records, generator=generator, target_set=target_set, task_family=task_family, profile=profile, method_profile=method_profile)
     total = len(records)
     # Strict-mode validation: an evaluated harness-generator row must have a
     # real coverage report and nonzero campaign execs.  Violations are reported
@@ -646,10 +696,29 @@ def main() -> int:
     parser.add_argument("--targets", default="")
     parser.add_argument("--split-by", dest="split_by", default="",
                         help="split aggregates by a metadata field (e.g. method_profile)")
+    parser.add_argument("--generator", default="",
+                        help="filter rows by generator name (e.g. g2fuzz)")
+    parser.add_argument("--target-set", dest="target_set", default="",
+                        help="filter rows by a named target set from fuzzbench_targets.json (e.g. valuable)")
+    parser.add_argument("--task-family", dest="task_family", default="",
+                        help="filter rows by task family (e.g. input_generator)")
+    parser.add_argument("--profile", default="",
+                        help="filter rows by profile (e.g. reproduction-gamma)")
+    parser.add_argument("--method-profile", dest="method_profile", default="",
+                        help="filter rows by method profile (e.g. paper-faithful or extension)")
     args = parser.parse_args()
     matrix_dir = Path(args.matrix_dir).resolve()
     matrix_dir.mkdir(parents=True, exist_ok=True)
-    summary = collect(matrix_dir, strict=args.strict, split_by=args.split_by)
+    summary = collect(
+        matrix_dir,
+        strict=args.strict,
+        split_by=args.split_by,
+        generator=args.generator,
+        target_set=args.target_set,
+        task_family=args.task_family,
+        profile=args.profile,
+        method_profile=args.method_profile,
+    )
     write_outputs(matrix_dir, summary)
     if args.strict and summary.get("evaluated_row_violations"):
         print(f"ERROR: {len(summary['evaluated_row_violations'])} evaluated row(s) lack coverage/execs:", file=sys.stderr)

@@ -230,6 +230,26 @@ case "$generator" in
     export HGB_EXCLUDE_FROM_AGGREGATE=0
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1
     ;;
+  g2fuzz)
+    case "$profile" in
+      alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
+      *) die "g2fuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, or compat-smoke)" ;;
+    esac
+    case "$protocol" in
+      paper-native|extension) ;;
+      *) die "g2fuzz: invalid protocol: $protocol (expected paper-native or extension)" ;;
+    esac
+    # reproduction-gamma invariants: refuse prebuilt G2FUZZ_TARGET_DIR so the
+    # .afl/.cmp/.cov triple is always built from the FuzzBench Dockerfile, and
+    # do not patch G2FUZZ_TRY_NUM down to 1.
+    if [[ "$profile" == "reproduction-gamma" ]]; then
+      if [[ -n "${G2FUZZ_TARGET_DIR:-}" ]]; then
+        die "g2fuzz/reproduction-gamma: G2FUZZ_TARGET_DIR is forbidden; the .afl/.cmp/.cov triple must be built from the FuzzBench Docker environment"
+      fi
+    fi
+    export HGB_EXCLUDE_FROM_AGGREGATE=0
+    [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1
+    ;;
 esac
 
 args=(--generator "$generator" --target "$target" --layout "$target_layout" --save-mode "$save_mode" --timeout "$timeout_seconds")

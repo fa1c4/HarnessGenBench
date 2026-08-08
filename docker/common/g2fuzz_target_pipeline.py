@@ -63,11 +63,18 @@ REQUIRED_ADAPTER_KEYS = {
     "argv",
     "common_corpus",
     "format_spec",
+    "contract_probe",
 }
 PAPER_METHOD_PROFILE = "paper-faithful"
 EXTENSION_METHOD_PROFILE = "extension"
 TASK_FAMILY = "input_generator"
 BUILD_MODE = "fuzzbench_native_afl_cmps"
+GAMMA_PROFILE = "reproduction-gamma"
+GAMMA_BUILD_MODE = "fuzzbench_docker_triple"
+
+
+def is_gamma_profile(profile: str) -> bool:
+    return profile == GAMMA_PROFILE
 
 
 # Coverage helpers are optional at import time; the offline pytest suite does
@@ -86,6 +93,35 @@ except ImportError:  # pragma: no cover
         CoverageError = RuntimeError  # type: ignore[misc,assignment]
         summarize_coverage_report = None  # type: ignore[assignment]
         write_coverage_outputs = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - import shim
+    import hgb_fuzzbench_builder  # type: ignore
+    from hgb_fuzzbench_builder import build_g2fuzz_target_triple, g2fuzz_target_triple_build_commands, verify_g2fuzz_target_triple
+except ImportError:  # pragma: no cover
+    try:
+        import sys as _sys2
+        _sys2.path.insert(0, str(Path(__file__).resolve().parent))
+        import hgb_fuzzbench_builder  # type: ignore
+        from hgb_fuzzbench_builder import build_g2fuzz_target_triple, g2fuzz_target_triple_build_commands, verify_g2fuzz_target_triple
+    except ImportError:
+        hgb_fuzzbench_builder = None  # type: ignore[assignment]
+        build_g2fuzz_target_triple = None  # type: ignore[assignment]
+        g2fuzz_target_triple_build_commands = None  # type: ignore[assignment]
+        verify_g2fuzz_target_triple = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - import shim
+    import g2fuzz_contract  # type: ignore
+    from g2fuzz_contract import probe_contract as _probe_contract, ContractError as _ContractError
+except ImportError:  # pragma: no cover
+    try:
+        import sys as _sys3
+        _sys3.path.insert(0, str(Path(__file__).resolve().parent))
+        import g2fuzz_contract  # type: ignore
+        from g2fuzz_contract import probe_contract as _probe_contract, ContractError as _ContractError
+    except ImportError:
+        g2fuzz_contract = None  # type: ignore[assignment]
+        _probe_contract = None  # type: ignore[assignment]
+        _ContractError = RuntimeError  # type: ignore[misc,assignment]
 
 
 class PipelineError(RuntimeError):
@@ -371,6 +407,8 @@ def try_num_for_profile(profile: str, env: dict[str, str] | None = None) -> str:
     env = env or os.environ
     if profile == "compat-smoke":
         return env.get("G2FUZZ_TRY_NUM", "1") or "1"
+    if profile == GAMMA_PROFILE:
+        return env.get("G2FUZZ_TRY_NUM", "3") or "3"
     return env.get("G2FUZZ_TRY_NUM", "3") or "3"
 
 
@@ -649,6 +687,10 @@ class G2FuzzPipeline:
         self.target_afl = self.workspace / "target" / "target.afl"
         self.target_cmp = self.workspace / "target" / "target.cmp"
         self.target_cov = self.workspace / "target" / "target.cov"
+        self.target_pair_dir = self.workspace / "target_pair"
+        self.runner = None  # Docker runner; defaults to hgb_fuzzbench_builder._run when needed
+        self.contract_result: dict[str, Any] = {}
+        self.triple_build_results: dict[str, Any] = {}
         self.invocation: dict[str, Any] | None = None
         self.input_contract: dict[str, Any] = {}
         self.build_source = "none"
@@ -659,12 +701,16 @@ class G2FuzzPipeline:
             "target",
             "target/build_afl",
             "target/build_cmp",
+            "target_pair",
+            "program_gen",
             "generators/source",
             "seeds/common_initial",
             "seeds/bootstrap",
             "seeds/g2_generated",
             "seeds/afl_initial",
             "seeds/afl_queue",
+            "seeds/merged_initial",
+            "validation",
             "campaign/output",
             "campaign/stats",
             "coverage",
@@ -981,6 +1027,9 @@ class G2FuzzPipeline:
         return results
 
     def build_target_pair(self) -> None:
+        if is_gamma_profile(self.profile):
+            self.build_target_triple_gamma()
+            return
         located = self.locate_pair()
         build_results: dict[str, Any]
         commands = build_command_pair(self.adapter, self.artifact_dir, self.target_package, self.workspace)
@@ -1031,6 +1080,179 @@ class G2FuzzPipeline:
         json_dump(self.workspace / "target" / "build.json", record)
         stage_extra = {k: v for k, v in record.items() if k != "status"}
         self.stages["target_pair_built"] = stage_record("complete", "none", **stage_extra)
+
+    # -- gamma: exact FuzzBench Docker triple build ------------------------
+
+    def _resolve_runner(self):
+        if self.runner is not None:
+            return self.runner
+        if hgb_fuzzbench_builder is not None:
+            return hgb_fuzzbench_builder._run
+        raise PipelineError("infra_missing", "hgb_fuzzbench_builder is not available for Docker triple build", 127)
+
+    def _resolve_benchmark_dir(self) -> Path:
+        bench_dir_env = os.environ.get("HGB_FUZZBENCH_BENCHMARK_DIR")
+        if bench_dir_env and Path(bench_dir_env).is_dir():
+            return Path(bench_dir_env)
+        manifest = self.target_manifest()
+        bench_dir = manifest.get("benchmark_dir", "")
+        if bench_dir and Path(bench_dir).is_dir():
+            return Path(bench_dir)
+        pkg_bench = self.target_package / "fuzzbench_benchmark"
+        if pkg_bench.is_dir():
+            return pkg_bench
+        raise PipelineError("infra_missing", "G2Fuzz gamma: FuzzBench benchmark directory not found for Docker triple build", 127)
+
+    def build_target_triple_gamma(self) -> None:
+        """Build .afl/.cmp/.cov from the exact FuzzBench Docker environment.
+
+        Refuses prebuilt ``G2FUZZ_TARGET_DIR`` and direct-host ``build.sh`` in
+        reproduction-gamma.  Uses ``docker build`` on the benchmark Dockerfile
+        with variant-specific build args (CmpLog for .cmp, coverage for .cov).
+        Runs the contract probe after the triple is built.
+        """
+
+        # Refuse prebuilt override in gamma.
+        if os.environ.get("G2FUZZ_TARGET_DIR"):
+            raise PipelineError(
+                "infra_missing",
+                "G2Fuzz reproduction-gamma refuses prebuilt G2FUZZ_TARGET_DIR; "
+                "the .afl/.cmp/.cov triple must be built from the FuzzBench Docker environment",
+                127,
+            )
+        if build_g2fuzz_target_triple is None or g2fuzz_target_triple_build_commands is None:
+            raise PipelineError("infra_missing", "G2Fuzz gamma: hgb_fuzzbench_builder triple functions are not available", 127)
+
+        benchmark_dir = self._resolve_benchmark_dir()
+        dockerfile = benchmark_dir / "Dockerfile"
+        if not dockerfile.is_file():
+            raise PipelineError("infra_missing", f"G2Fuzz gamma: benchmark Dockerfile not found: {dockerfile}", 127)
+
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
+        runner = self._resolve_runner()
+        # Deterministic image tag base.
+        import hashlib as _hl
+        tag_digest = _hl.sha256(f"{self.program_id}|{self.target}".encode()).hexdigest()[:8]
+        image_tag_base = f"hgb-g2fuzz-{tag_digest}"
+
+        self.target_pair_dir.mkdir(parents=True, exist_ok=True)
+        triple_work = self.target_pair_dir
+
+        # Record the build commands for auditability.
+        commands = g2fuzz_target_triple_build_commands(
+            benchmark_dir=benchmark_dir,
+            image_tag_base=image_tag_base,
+            fuzz_target=fuzz_target,
+            program_id=self.program_id,
+        )
+        json_dump(triple_work / "build_commands.json", commands)
+
+        # Build all three variants.
+        results = build_g2fuzz_target_triple(
+            benchmark_dir=benchmark_dir,
+            image_tag_base=image_tag_base,
+            fuzz_target=fuzz_target,
+            work_dir=triple_work,
+            runner=runner,
+            timeout_seconds=int(os.environ.get("G2FUZZ_BUILD_TIMEOUT_SECONDS", "3600") or "3600"),
+        )
+        self.triple_build_results = results
+
+        # Verify and copy binaries to canonical paths.
+        for variant, dest_name in (("afl", "target.afl"), ("cmp", "target.cmp"), ("cov", "target.cov")):
+            rec = results.get(variant, {})
+            binary_path = rec.get("binary_path", "")
+            if not binary_path or not Path(binary_path).is_file():
+                raise PipelineError(
+                    "infra_failure",
+                    f"G2Fuzz gamma: {variant} build failed (exit {rec.get('build_exit_code', '?')}); "
+                    f"no {fuzz_target} produced",
+                    127,
+                )
+            dest = self.workspace / "target" / dest_name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(binary_path, dest)
+            if not executable(dest):
+                raise PipelineError("infra_failure", f"G2Fuzz gamma: {variant} built binary is not executable: {dest}", 127)
+            # Also place in target_pair/ directory.
+            pair_dest = self.target_pair_dir / dest_name
+            shutil.copy2(binary_path, pair_dest)
+
+        # Verify all three.
+        verify = verify_g2fuzz_target_triple(self.target_afl, self.target_cmp, self.target_cov)
+        if not verify["ok"]:
+            raise PipelineError("infra_failure", f"G2Fuzz gamma: target triple verification failed: {verify}", 127)
+
+        self.build_source = "fuzzbench_docker_triple"
+        self.write_invocation()
+
+        # Run contract probe (gamma-specific).
+        self.run_contract_probe()
+
+        # Smoke pair on .afl and .cmp.
+        smoke = self.smoke_pair()
+        for label in ("afl", "cmp"):
+            for name in ("empty", "seed"):
+                res = smoke.get(label, {}).get(name, {})
+                if not res.get("ran", True) and res.get("error"):
+                    raise PipelineError("infra_failure", f"G2Fuzz pair smoke could not run {label}/{name}: {res.get('error')}", 127)
+                if _is_crash_exit(res.get("exit_code"), res.get("stderr_tail", "")):
+                    raise PipelineError(
+                        "infra_failure",
+                        f"G2Fuzz pair smoke crashed for {label}/{name} (exit {res.get('exit_code')})",
+                        127,
+                    )
+
+        hashes = {
+            "afl": sha256_file(self.target_afl),
+            "cmp": sha256_file(self.target_cmp),
+            "cov": sha256_file(self.target_cov),
+        }
+        record = {
+            "afl_binary": str(self.target_afl),
+            "cmp_binary": str(self.target_cmp),
+            "cov_binary": str(self.target_cov),
+            "afl_sha256": hashes["afl"],
+            "cmp_sha256": hashes["cmp"],
+            "cov_sha256": hashes["cov"],
+            "build_mode": GAMMA_BUILD_MODE,
+            "build_source": self.build_source,
+            "build_commands": commands,
+            "build_results": results,
+            "input_contract": self.contract_result,
+            "smoke": smoke,
+            "source_dir": str(self.target_pair_dir),
+            "status": "completed",
+        }
+        json_dump(self.workspace / "target" / "build.json", record)
+        json_dump(self.target_pair_dir / "build.json", record)
+        # Build logs are already in target_pair/ (triple_work == target_pair_dir).
+        stage_extra = {k: v for k, v in record.items() if k != "status"}
+        self.stages["target_pair_built"] = stage_record("complete", "none", **stage_extra)
+
+    def run_contract_probe(self) -> dict[str, Any]:
+        """Run the per-target input-contract probe against .afl and .cmp.
+
+        Persists ``contract.json`` in the target_pair directory and fails if the
+        declared adapter contract does not execute the target.
+        """
+
+        if _probe_contract is None:
+            raise PipelineError("infra_missing", "G2Fuzz gamma: g2fuzz_contract module is not available", 127)
+        contract_path = self.target_pair_dir / "contract.json"
+        try:
+            self.contract_result = _probe_contract(
+                self.target_afl,
+                self.adapter,
+                formats=self.formats,
+                output_path=contract_path,
+                timeout=int(os.environ.get("G2FUZZ_CONTRACT_TIMEOUT_SECONDS", "10") or "10"),
+            )
+        except _ContractError as exc:
+            self.contract_result = {"valid": False, "reason": exc.reason}
+            json_dump(contract_path, self.contract_result)
+            raise PipelineError("infra_failure", f"G2Fuzz gamma: contract probe failed: {exc.reason}", 127)
+        return self.contract_result
 
     # -- seed corpus / generation ------------------------------------------
 
@@ -1197,7 +1419,10 @@ class G2FuzzPipeline:
         if provenance.exists():
             provenance.unlink()
         seen: dict[str, str] = {}
-        for source_class in ("common_initial", "bootstrap", "g2_generated", "afl_queue"):
+        source_classes = ("common_initial", "bootstrap", "g2_generated", "afl_queue")
+        if is_gamma_profile(self.profile):
+            source_classes = ("common_initial", "bootstrap", "g2_generated", "merged_initial", "afl_queue")
+        for source_class in source_classes:
             base = self.workspace / "seeds" / source_class
             count = 0
             if base.exists():
@@ -1212,7 +1437,7 @@ class G2FuzzPipeline:
                         "source_class": source_class,
                         "original_path": str(path),
                         "deduplicated": deduplicated,
-                        "admitted_to_initial_afl_input": source_class in {"common_initial", "bootstrap", "g2_generated"} and not deduplicated,
+                        "admitted_to_initial_afl_input": source_class in {"common_initial", "bootstrap", "g2_generated", "merged_initial"} and not deduplicated,
                     }
                     if source_class == "g2_generated":
                         record["generator_manifest"] = str(self.workspace / "generators" / "source" / "manifest.json")
@@ -1222,7 +1447,8 @@ class G2FuzzPipeline:
             self.seed_bytes[source_class] = dir_bytes(base)
 
     def assemble_initial_corpus(self) -> Path:
-        initial = self.workspace / "seeds" / "afl_initial"
+        dir_name = "merged_initial" if is_gamma_profile(self.profile) else "afl_initial"
+        initial = self.workspace / "seeds" / dir_name
         if initial.exists():
             shutil.rmtree(initial)
         initial.mkdir(parents=True)
@@ -1244,8 +1470,12 @@ class G2FuzzPipeline:
         if index == 0:
             fallback = initial / "empty"
             fallback.write_bytes(b"\n")
-        self.seed_counts["afl_initial"] = count_files(initial)
-        self.seed_bytes["afl_initial"] = dir_bytes(initial)
+        self.seed_counts[dir_name] = count_files(initial)
+        self.seed_bytes[dir_name] = dir_bytes(initial)
+        # Also track under afl_initial for backward-compatible provenance keys.
+        if dir_name != "afl_initial":
+            self.seed_counts["afl_initial"] = count_files(initial)
+            self.seed_bytes["afl_initial"] = dir_bytes(initial)
         return initial
 
     # -- campaign ----------------------------------------------------------
@@ -1402,15 +1632,30 @@ class G2FuzzPipeline:
         queue_count = int(self.metrics.get("queue_count") or 0)
         report_path: Path | None = None
         raw_text = ""
+        inputs_replayed = 0
         # 1. Explicit coverage report hook (test/CI or precomputed report).
         env_report = os.environ.get("G2FUZZ_COVERAGE_REPORT")
         if env_report and Path(env_report).is_file():
             report_path = Path(env_report)
+        # Count replayable inputs (from afl_queue and g2_generated) for gamma.
+        if is_gamma_profile(self.profile):
+            for source_class in ("afl_queue", "g2_generated"):
+                base = self.workspace / "seeds" / source_class
+                if base.exists():
+                    seen_replay: set[str] = set()
+                    for path in sorted(p for p in base.rglob("*") if p.is_file()):
+                        digest = sha256_file(path)
+                        if digest not in seen_replay:
+                            seen_replay.add(digest)
+                            inputs_replayed += 1
         # 2. Build a coverage-instrumented target and replay the corpus.
         if report_path is None and summarize_coverage_report is not None:
-            cov_target = self.target_cov if self.target_cov.exists() else self.build_coverage_target()
+            if is_gamma_profile(self.profile):
+                cov_target = self.target_cov if self.target_cov.exists() else None
+            else:
+                cov_target = self.target_cov if self.target_cov.exists() else self.build_coverage_target()
             if cov_target and queue_count > 0:
-                # Replay the AFL queue plus the G2-generated corpus (plan 10.2).
+                # Replay the AFL queue plus the G2-generated corpus (plan 9).
                 corpus = self.workspace / "coverage" / "corpus"
                 if corpus.exists():
                     shutil.rmtree(corpus)
@@ -1426,6 +1671,7 @@ class G2FuzzPipeline:
                             continue
                         seen.add(digest)
                         shutil.copy2(path, unique_dest(corpus, path.name))
+                        inputs_replayed += 1
                 try:
                     import hgb_input_campaign  # type: ignore
 
@@ -1448,6 +1694,7 @@ class G2FuzzPipeline:
             "regions": None,
             "execs_done": execs_done,
             "queue_count": queue_count,
+            "inputs_replayed": inputs_replayed,
             "report_path": str(report_path) if report_path else None,
             "report_exists": bool(report_path and report_path.is_file()),
             "has_executions": execs_done > 0,
@@ -1466,6 +1713,12 @@ class G2FuzzPipeline:
                 write_coverage_outputs(self.workspace / "coverage", coverage, raw_text)
             except Exception:
                 pass
+        # Write gamma coverage outputs.
+        if is_gamma_profile(self.profile):
+            json_dump(self.workspace / "coverage" / "coverage.json", coverage)
+            replay_log = self.workspace / "coverage" / "replay.log"
+            if not replay_log.exists():
+                replay_log.write_text(raw_text or "", encoding="utf-8")
         json_dump(self.workspace / "coverage" / "summary.json", coverage)
         self.coverage_summary = coverage
         # Coverage cannot complete from AFL path count alone: a real report
@@ -1473,6 +1726,9 @@ class G2FuzzPipeline:
         if coverage.get("line_coverage") is None or coverage["line_coverage"].get("covered") is None:
             self.stages["coverage"] = stage_record("failed", "G2Fuzz coverage requires a real coverage report; AFL path count is not coverage", **coverage)
             raise PipelineError("failed", "G2Fuzz coverage requires a real coverage report; AFL path count is not coverage", 65)
+        if is_gamma_profile(self.profile) and inputs_replayed <= 0:
+            self.stages["coverage"] = stage_record("failed", "G2Fuzz gamma coverage requires inputs_replayed > 0", **coverage)
+            raise PipelineError("failed", "G2Fuzz gamma coverage requires inputs_replayed > 0", 65)
         self.stages["coverage"] = stage_record("complete", "none", **coverage)
 
     # -- result ------------------------------------------------------------
@@ -1489,6 +1745,13 @@ class G2FuzzPipeline:
         line_cov = self.coverage_summary.get("line_coverage")
         if not isinstance(line_cov, dict) or line_cov.get("covered") is None:
             return False
+        if is_gamma_profile(self.profile):
+            if not self.target_cov.exists():
+                return False
+            if not self.contract_result.get("valid"):
+                return False
+            if int(self.coverage_summary.get("inputs_replayed") or 0) <= 0:
+                return False
         return True
 
     def result_payload(self, status: str, reason: str, exit_code: int) -> dict[str, Any]:
@@ -1518,24 +1781,68 @@ class G2FuzzPipeline:
             "status": "completed" if self.stages.get("target_pair_built", {}).get("status") == "complete" else self.stages.get("target_pair_built", {}).get("status", "pending"),
             "afl_binary": str(self.target_afl) if self.target_afl.exists() else "",
             "cmp_binary": str(self.target_cmp) if self.target_cmp.exists() else "",
+            "cov_binary": str(self.target_cov) if self.target_cov.exists() else "",
             "afl_sha256": sha256_file(self.target_afl) if self.target_afl.exists() else "",
             "cmp_sha256": sha256_file(self.target_cmp) if self.target_cmp.exists() else "",
-            "build_mode": BUILD_MODE,
+            "cov_sha256": sha256_file(self.target_cov) if self.target_cov.exists() else "",
+            "build_mode": GAMMA_BUILD_MODE if is_gamma_profile(self.profile) else BUILD_MODE,
             "build_source": self.build_source,
         }
+        # Gamma target_pair nested object (plan section 11).
+        target_pair_gamma = {
+            "afl": {"path": str(self.target_afl), "sha256": sha256_file(self.target_afl) if self.target_afl.exists() else ""},
+            "cmp": {"path": str(self.target_cmp), "sha256": sha256_file(self.target_cmp) if self.target_cmp.exists() else ""},
+            "cov": {"path": str(self.target_cov), "sha256": sha256_file(self.target_cov) if self.target_cov.exists() else ""},
+        }
+        # Gamma g2fuzz nested object (plan section 11).
+        line_cov = self.coverage_summary.get("line_coverage") or {}
+        region_cov = self.coverage_summary.get("regions") or {}
+        func_cov = self.coverage_summary.get("function_coverage") or {}
+        line_pct = float(line_cov.get("percent", 0.0)) if isinstance(line_cov, dict) else 0.0
+        region_pct = float(region_cov.get("percent", 0.0)) if isinstance(region_cov, dict) else 0.0
+        func_pct = float(func_cov.get("percent", 0.0)) if isinstance(func_cov, dict) else 0.0
+        g2fuzz_gamma = {
+            "program_id": self.program_id,
+            "formats": self.formats,
+            "afl_binary": str(self.target_afl),
+            "cmplog_enabled": True,
+            "generated_generators": self.generated_generator_count,
+            "g2_generated_seeds": self.generated_input_count,
+            "valid_g2_generated_seeds": self.valid_generated_input_count,
+            "common_initial_seeds": self.seed_counts.get("common_initial", 0),
+            "bootstrap_seeds": self.seed_counts.get("bootstrap", 0),
+        }
+        # Gamma coverage nested object (plan section 11).
+        coverage_gamma = {
+            "line_coverage": line_pct,
+            "region_coverage": region_pct,
+            "function_coverage": func_pct,
+            "inputs_replayed": int(self.coverage_summary.get("inputs_replayed") or 0),
+        }
+        campaign_gamma = {
+            "execs_done": execs_done,
+            "queued_paths": int(self.metrics.get("queue_count") or 0),
+            "crashes": int(self.metrics.get("crash_count") or 0),
+            "hangs": int(self.metrics.get("hang_count") or 0),
+        }
+        protocol = self.protocol
+        if is_gamma_profile(self.profile):
+            protocol = "paper-native" if self.adapter["method_profile"] == PAPER_METHOD_PROFILE else "extension"
         return {
             "schema_version": 2,
+            "baseline": "g2fuzz",
             "generator": "g2fuzz",
             "fuzzer": "g2fuzz",
             "task_family": TASK_FAMILY,
             "capability": TASK_FAMILY,
+            "applicability": "applicable",
             "target": self.target,
             "project": manifest.get("project", os.environ.get("HGB_TARGET_PROJECT", "")),
             "fuzz_target": manifest.get("fuzz_target", os.environ.get("HGB_TARGET_FUZZ_TARGET", "")),
             "program_id": self.program_id,
             "formats": self.formats,
             "profile": self.profile,
-            "protocol": self.protocol,
+            "protocol": protocol,
             "method_profile": self.adapter["method_profile"],
             "model": os.environ.get("G2FUZZ_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("MODEL") or "",
             "api_key_present": bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("API_KEY")),
@@ -1575,6 +1882,11 @@ class G2FuzzPipeline:
             "command_file": str(self.workspace / "campaign" / "command.txt"),
             "log_file": str(self.workspace / "logs" / "program_gen.log"),
             "duration_seconds": round(time.time() - self.start_time, 3),
+            # Gamma nested schema (plan section 11).
+            "g2fuzz": g2fuzz_gamma,
+            "target_pair": target_pair_gamma,
+            "campaign_gamma": campaign_gamma,
+            "coverage_gamma": coverage_gamma,
         }
 
     def write_outputs(self, status: str, reason: str, exit_code: int) -> None:
