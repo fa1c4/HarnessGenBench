@@ -439,7 +439,7 @@ def test_entrypoint_cannot_mark_campaign_coverage_complete_without_evaluator_out
     entrypoint = _entrypoint()
     # campaign/coverage stages are set ONLY from the evaluator result.json,
     # never right after a build-only success.
-    assert 'for stage in candidate_build sanitizer_smoke api_reachability campaign coverage' in entrypoint
+    assert 'for stage in candidate_overlay copy_audit candidate_build sanitizer_smoke api_reachability campaign coverage' in entrypoint
     # The evaluator result is read and stages derived from it.
     assert 'eval_result="$eval_dir/result.json"' in entrypoint
     assert "promefuzz_no_verified_harness" in entrypoint

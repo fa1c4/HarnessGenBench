@@ -94,6 +94,7 @@ class CandidateRecord:
     coverage_diff: dict[str, Any] = field(default_factory=dict)
     native_coverage: dict[str, Any] = field(default_factory=dict)
     build: dict[str, Any] = field(default_factory=dict)
+    copy_audit: dict[str, Any] = field(default_factory=dict)
     error: str = ""
 
 
@@ -319,9 +320,29 @@ def evaluate_candidate(
     if strict and not rec.overlaid:
         rec.error = "candidate overlay did not change the native harness path"
         hgb_result.mark_stage(rec.stages, "generation", "completed")
+        hgb_result.mark_stage(rec.stages, "candidate_overlay", "failed")
         hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
         return rec
     hgb_result.mark_stage(rec.stages, "generation", "completed")
+    hgb_result.mark_stage(rec.stages, "candidate_overlay", "completed")
+
+    # 6.1b Copy audit: compare the candidate to evaluator-only reference
+    # harnesses *after* generation. This never runs before generation and
+    # never writes reference contents into generator-visible directories.
+    ref_dir = evaluator_root / "reference_harnesses"
+    if not ref_dir.is_dir():
+        ref_dir = evaluator_root / "selected_reference_harnesses"
+    canary = os.environ.get("HGB_REF_CANARY", "")
+    if hgb_split_context is not None and ref_dir.is_dir():
+        rec.copy_audit = hgb_split_context.audit_candidate_reference_copy(
+            candidate, ref_dir, canary=canary,
+        )
+        hgb_result.mark_stage(rec.stages, "copy_audit", "completed")
+    elif hgb_split_context is not None:
+        rec.copy_audit = {"status": "not_requested", "reason": "no_reference_harnesses"}
+        hgb_result.mark_stage(rec.stages, "copy_audit", "completed")
+    else:
+        hgb_result.mark_stage(rec.stages, "copy_audit", "completed")
 
     # 6.2 Exact FuzzBench build with the deterministic image tag.
     build = hgb_fuzzbench_builder.build_candidate_image(
@@ -714,6 +735,7 @@ def evaluate(
             "coverage_diff": rec.coverage_diff,
             "native_coverage": rec.native_coverage,
             "build": rec.build,
+            "copy_audit": rec.copy_audit,
             "error": rec.error,
             "image_tag": image_tag,
         }
@@ -745,7 +767,7 @@ def evaluate(
                 continue
             hgb_result.mark_stage(run_stages, stage, selected_stage_states.get(stage, "pending"))
     else:
-        for stage in ("candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"):
+        for stage in ("candidate_overlay", "copy_audit", "candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"):
             if all(rec.stages.get(stage) == "failed" for rec in records):
                 hgb_result.mark_stage(run_stages, stage, "failed")
 

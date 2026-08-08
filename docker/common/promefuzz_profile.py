@@ -5,12 +5,13 @@ This module is imported by both the host-side tests and the container
 entrypoint. It must not depend on any library that is unavailable in the
 PromeFuzz container venv or the host Python 3 used by pytest.
 
-PromeFuzz is a ``harness_generator`` baseline. ``alpha`` and ``paper-faithful``
-require a real compile database captured from the pinned FuzzBench build, real
-link/library context, legitimate consumer knowledge, and a real semantic
-embedding provider. ``compat-smoke`` may retain the synthetic compile database
-and local hash embeddings for offline wiring tests only; it is always excluded
-from the scientific aggregate and is never selected by default.
+PromeFuzz is a ``harness_generator`` baseline. ``alpha``, ``paper-faithful``,
+and ``reproduction-gamma`` require a real compile database captured from the
+pinned FuzzBench build, real link/library context, legitimate consumer
+knowledge, and a real semantic embedding provider. ``compat-smoke`` may retain
+the synthetic compile database and local hash embeddings for offline wiring
+tests only; it is always excluded from the scientific aggregate and is never
+selected by default.
 """
 
 from __future__ import annotations
@@ -24,9 +25,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma"}
 
 # Beta plan section 10: allowed run-level statuses for a PromeFuzz
 # harness_generator row. ``evaluated`` requires a verified candidate, real
@@ -43,6 +44,8 @@ ALLOWED_BETA_STATUSES = {
 }
 # Evaluator stages that must actually run before a row may be ``evaluated``.
 EVALUATION_STAGES = (
+    "candidate_overlay",
+    "copy_audit",
     "candidate_build",
     "sanitizer_smoke",
     "api_reachability",
@@ -70,6 +73,8 @@ STAGE_NAMES = [
     "api_preprocess",
     "knowledge",
     "generation",
+    "candidate_overlay",
+    "copy_audit",
     "candidate_build",
     "sanitizer_smoke",
     "api_reachability",

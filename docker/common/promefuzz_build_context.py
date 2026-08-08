@@ -525,6 +525,11 @@ def capture_build_context(
     methods: list[str]
     if capture_method == "auto":
         methods = ["cmake_export", "bear_replay"]
+    elif capture_method == "exact_fuzzbench":
+        # Gamma plan section 6: prefer the exact FuzzBench build.sh replay
+        # (bear/intercept-build) over a generic CMake export so the compile
+        # database provably originates from the FuzzBench build command.
+        methods = ["bear_replay", "cmake_export"]
     else:
         methods = [capture_method]
 
@@ -897,7 +902,7 @@ def main() -> int:
     parser.add_argument("--language", default="")
     parser.add_argument("--profile", default="alpha")
     parser.add_argument("--allow-synthetic", action="store_true")
-    parser.add_argument("--capture-method", default="auto", choices=("auto", "cmake_export", "bear_replay"))
+    parser.add_argument("--capture-method", default="auto", choices=("auto", "cmake_export", "bear_replay", "exact_fuzzbench"))
     parser.add_argument("--build-workdir-relative", default="")
     parser.add_argument("--build-timeout", type=int, default=1800)
     args = parser.parse_args()

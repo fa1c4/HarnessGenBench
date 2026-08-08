@@ -21,6 +21,8 @@ from typing import Any, Iterable
 # Canonical evaluator stage names, in order.
 STAGE_NAMES = [
     "generation",
+    "candidate_overlay",
+    "copy_audit",
     "candidate_build",
     "sanitizer_smoke",
     "api_reachability",
@@ -45,7 +47,7 @@ ALLOWED_STATUSES = {
 
 # Stages that must actually run (not merely "compiled") before a row may be
 # considered evaluated.
-EVALUATION_STAGES = {"candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"}
+EVALUATION_STAGES = {"candidate_overlay", "copy_audit", "candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"}
 
 
 def default_stages() -> dict[str, str]:
@@ -198,6 +200,11 @@ def select_best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | 
     def eligible(c: dict[str, Any]) -> bool:
         stages = c.get("stages", {})
         if not all(stages.get(s) == "completed" for s in EVALUATION_STAGES):
+            return False
+        # Reject candidates that are exact or near-exact copies of a reference
+        # harness, or that contain the reference canary token (gamma §2.2).
+        audit = c.get("copy_audit", {})
+        if audit.get("exact_copy") or audit.get("contains_reference_canary"):
             return False
         smoke = c.get("sanitizer_smoke", {})
         if smoke.get("misuse_crash"):

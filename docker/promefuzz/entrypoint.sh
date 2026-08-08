@@ -342,6 +342,7 @@ promefuzz_write_final_result() {
   local target="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
   local method_variant="$profile" excluded=false
   [[ "$profile" == "compat-smoke" ]] && { method_variant="compat-smoke"; excluded=true; }
+  [[ "$profile" == "reproduction-gamma" ]] && method_variant="paper-faithful"
   PROME_FUZZ_PROFILE="$profile" PROME_FUZZ_PROTOCOL="$protocol" PROME_FUZZ_TARGET="$target" \
   PROME_FUZZ_STATUS="$status" PROME_FUZZ_REASON="$reason" PROME_FUZZ_CODE="$exit_code" \
   PROME_FUZZ_METHOD="$method_variant" PROME_FUZZ_EXCLUDED="$excluded" \
@@ -482,13 +483,19 @@ if [[ "$mode" == "generate-target" ]]; then
     exit 65
   fi
   case "$promefuzz_profile" in
-    alpha|paper-faithful)
+    alpha|paper-faithful|reproduction-gamma)
       promefuzz_method_faithful=1
       export PROME_FUZZ_EMBEDDING_LLM_TYPE="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-openai}"
       export PROME_FUZZ_EMBEDDING_MODEL="${PROME_FUZZ_EMBEDDING_MODEL:-text-embedding-3-small}"
       export HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=0
       export HGB_EXCLUDE_FROM_AGGREGATE=0
       promefuzz_allow_synthetic=0
+      # Gamma plan section 2.3: reproduction-gamma defaults to the exact
+      # FuzzBench build.sh replay so the compile DB provably originates from
+      # the FuzzBench build command, not a generic top-level CMake export.
+      if [[ "$promefuzz_profile" == "reproduction-gamma" ]]; then
+        export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-exact_fuzzbench}"
+      fi
       ;;
     compat-smoke)
       promefuzz_method_faithful=0
@@ -1223,7 +1230,7 @@ PY_PROMEFUZZ_INTENDED_APIS
       --fuzz-target "$fuzz_target"
       --profile "$promefuzz_profile"
       --campaign-seconds "${PROME_FUZZ_CAMPAIGN_SECONDS:-$HGB_CAMPAIGN_SECONDS}"
-      --build-timeout "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-1800}"
+      --build-timeout-seconds "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-1800}"
       --strict
     )
     [[ -n "$intended_apis_arg" ]] && evaluator_args+=(--intended-apis "$intended_apis_arg")
@@ -1236,16 +1243,16 @@ PY_PROMEFUZZ_INTENDED_APIS
       evaluator_reached_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(len(sel.get("api_reachability",{}).get("reached_apis",[]) or []))' "$eval_result" 2>/dev/null || printf 0)"
       evaluator_metrics_json="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("metrics",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
       evaluator_selected_json="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("selected_candidate",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
-      verified_harness_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(1 if sel.get("overlaid") and all((d.get("stages",{}) or {}).get(s)=="completed" for s in ("candidate_build","sanitizer_smoke","api_reachability","campaign","coverage")) else 0)' "$eval_result" 2>/dev/null || printf '0')"
+      verified_harness_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(1 if sel.get("overlaid") and all((d.get("stages",{}) or {}).get(s)=="completed" for s in ("candidate_overlay","copy_audit","candidate_build","sanitizer_smoke","api_reachability","campaign","coverage")) else 0)' "$eval_result" 2>/dev/null || printf '0')"
       # Beta plan section 9: set campaign/coverage/reachability stages ONLY
       # from the shared evaluator output, never from a build-only success.
-      for stage in candidate_build sanitizer_smoke api_reachability campaign coverage; do
+      for stage in candidate_overlay copy_audit candidate_build sanitizer_smoke api_reachability campaign coverage; do
         stage_state="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d.get("stages",{}) or {}).get(sys.argv[2],"pending"))' "$eval_result" "$stage" 2>/dev/null || printf pending)"
         promefuzz_set_stage "$stage" "$stage_state"
       done
       promefuzz_set_stage generation completed
     else
-      for stage in candidate_build sanitizer_smoke api_reachability campaign coverage; do
+      for stage in candidate_overlay copy_audit candidate_build sanitizer_smoke api_reachability campaign coverage; do
         promefuzz_set_stage "$stage" failed
       done
       evaluator_status=""
