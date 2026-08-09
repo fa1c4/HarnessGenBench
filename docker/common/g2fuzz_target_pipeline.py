@@ -71,6 +71,7 @@ TASK_FAMILY = "input_generator"
 BUILD_MODE = "fuzzbench_native_afl_cmps"
 GAMMA_PROFILE = "reproduction-gamma"
 DELTA_PROFILE = "reproduction-delta"
+EPSILON_PROFILE = "reproduction-epsilon"
 GAMMA_BUILD_MODE = "fuzzbench_docker_triple"
 # method_variant values reported in the delta result schema (plan section 7).
 PAPER_CORE_VARIANT = "paper-core"
@@ -80,17 +81,20 @@ EXTENSION_VARIANT = "extension"
 def is_gamma_profile(profile: str) -> bool:
     """Return True for the strict triple-build profiles.
 
-    ``reproduction-delta`` is the first-class strict profile (plan
-    ``g2fuzz_reproduction_delta.md``); ``reproduction-gamma`` is kept as a
-    backward-compatible alias.  Both share the exact FuzzBench Docker triple
-    build, contract probe, and real coverage replay code path.
+    ``reproduction-epsilon`` is the canonical strict profile (plan
+    ``ckgfuzzer_reproduction_epsilon.md`` shared foundation); ``reproduction-delta``
+    is its backward-compatible alias (plan ``g2fuzz_reproduction_delta.md``);
+    ``reproduction-gamma`` is kept as a backward-compatible alias.  All three
+    share the exact FuzzBench Docker triple build, contract probe, and real
+    coverage replay code path.
     """
 
-    return profile in (GAMMA_PROFILE, DELTA_PROFILE)
+    return profile in (GAMMA_PROFILE, DELTA_PROFILE, EPSILON_PROFILE)
 
 
 def is_delta_profile(profile: str) -> bool:
-    return profile == DELTA_PROFILE
+    """Return True for the strictest triple-build profiles (delta + epsilon)."""
+    return profile in (DELTA_PROFILE, EPSILON_PROFILE)
 
 
 def method_variant_for(adapter: dict[str, Any]) -> str:
@@ -1141,7 +1145,7 @@ class G2FuzzPipeline:
         wrappers, and a consumption smoke (plan sections 2/3).
         """
 
-        label = "reproduction-delta" if is_delta_profile(self.profile) else "reproduction-gamma"
+        label = self.profile if is_delta_profile(self.profile) else "reproduction-gamma"
         # Refuse prebuilt override in the strict triple-build profiles.
         if os.environ.get("G2FUZZ_TARGET_DIR"):
             raise PipelineError(

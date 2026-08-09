@@ -120,15 +120,16 @@ if [[ "$mode" == "generate-target" ]]; then
   export ELFUZZ_EVOLUTION_SECONDS="${ELFUZZ_EVOLUTION_SECONDS:-1800}"
   export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-0}"
   export ELFUZZ_SANITIZER="${ELFUZZ_SANITIZER:-address}"
-  # reproduction-gamma (plan elfuzz_reproduction_gamma.md) and reproduction-delta
-  # (plan elfuzz_reproduction_delta.md): build exact FuzzBench native+coverage
-  # SUTs, replay generated/campaign inputs on the coverage SUT, and require a
-  # real LLVM coverage report. The SUT build needs the Docker socket
-  # (base-builder environment) and is never satisfied by a prebuilt
-  # ELFUZZ_TARGET_BINARY. reproduction-delta is the strict paper-native
-  # input-generator profile; reproduction-gamma remains a backward-compatible
-  # alias.
-  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" ]]; then
+  # reproduction-gamma (plan elfuzz_reproduction_gamma.md), reproduction-delta
+  # (plan elfuzz_reproduction_delta.md), and reproduction-epsilon (epsilon plan
+  # shared foundation): build exact FuzzBench native+coverage SUTs, replay
+  # generated/campaign inputs on the coverage SUT, and require a real LLVM
+  # coverage report. The SUT build needs the Docker socket (base-builder
+  # environment) and is never satisfied by a prebuilt ELFUZZ_TARGET_BINARY.
+  # reproduction-epsilon is the canonical strict paper-native input-generator
+  # profile; reproduction-delta is its backward-compatible alias;
+  # reproduction-gamma remains a backward-compatible alias.
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" ]]; then
     export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-1}"
     export ELFUZZ_REQUIRE_GPU="${ELFUZZ_REQUIRE_GPU:-1}"
     export ELFUZZ_ALLOW_SUT_BUILD="${ELFUZZ_ALLOW_SUT_BUILD:-1}"

@@ -233,8 +233,9 @@ def test_dry_run_passes_profile_validation_without_docker(tmp_path: Path) -> Non
 def test_baseline_sh_accepts_reproduction_delta_for_promefuzz() -> None:
     baseline = _baseline_sh()
     assert "reproduction-delta" in baseline
-    # The promefuzz case must list reproduction-delta as a valid profile.
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke" in baseline
+    # The promefuzz case must list reproduction-delta (and its epsilon alias)
+    # as valid strict profiles.
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke" in baseline
 
 
 def test_baseline_sh_rejects_synthetic_compile_db_for_delta() -> None:

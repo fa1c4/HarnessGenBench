@@ -38,6 +38,11 @@ NOT_APPLICABLE_STATUSES = {"not_applicable", "target_not_supported_by_elfuzz"}
 # only "evaluated" counts as completed. "completed" and "dry_run_ok" are not
 # successful evaluations for harness-generator rows.
 HARNESS_GENERATOR_STRICT_COMPLETED = {"evaluated"}
+
+# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
+# strict profile (epsilon plan); ``reproduction-delta`` is its backward-
+# compatible alias. Both enforce the same paper-equivalent invariants.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
 # For input generators and non-strict harness runs, the broader set applies.
 COMPLETED_STATUSES = {"completed", "dry_run_ok", "evaluated"}
 # Statuses that must never be counted as successful.
@@ -184,14 +189,15 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
             edge = cov.get("edge_coverage")
             if isinstance(edge, dict) and edge.get("status") != "unavailable":
                 violations.append("evaluated elfuzz row must not report AFL paths as edge coverage")
-            if str(meta.get("profile", "")) == "reproduction-delta":
+            elfuzz_profile = str(meta.get("profile", ""))
+            if elfuzz_profile in STRICT_REPRODUCTION_PROFILES:
                 if str(meta.get("method_variant", "")) != "paper-faithful":
-                    violations.append("evaluated reproduction-delta elfuzz row has method_variant != paper-faithful")
+                    violations.append(f"evaluated {elfuzz_profile} elfuzz row has method_variant != paper-faithful")
                 if bool(meta.get("exclude_from_aggregate") or meta.get("excluded_from_aggregate")):
-                    violations.append("evaluated reproduction-delta elfuzz row is excluded_from_aggregate")
+                    violations.append(f"evaluated {elfuzz_profile} elfuzz row is excluded_from_aggregate")
                 build = meta.get("build") or {}
                 if isinstance(build, dict) and not build.get("uses_fuzzbench_docker_environment"):
-                    violations.append("evaluated reproduction-delta elfuzz row did not build from the FuzzBench Docker environment")
+                    violations.append(f"evaluated {elfuzz_profile} elfuzz row did not build from the FuzzBench Docker environment")
             return violations
         # G2Fuzz beta contract (plan section 11).
         target_pair = meta.get("target_pair_build", {})
@@ -200,35 +206,36 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
         if not (target_pair.get("afl_binary") and target_pair.get("cmp_binary")):
             violations.append("evaluated input-generator row lacks .afl/.cmp build evidence")
         profile_s = str(meta.get("profile") or "")
-        # Gamma/delta contract: also require .cov build evidence.
-        if profile_s in ("reproduction-gamma", "reproduction-delta"):
+        # Gamma/delta/epsilon contract: also require .cov build evidence.
+        if profile_s in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon"):
             if not target_pair.get("cov_binary"):
                 violations.append(f"evaluated {profile_s} input-generator row lacks .cov build evidence")
             cov_gamma = meta.get("coverage_gamma") or {}
             if isinstance(cov_gamma, dict) and int(cov_gamma.get("inputs_replayed", 0) or 0) <= 0:
                 violations.append(f"evaluated {profile_s} input-generator row has coverage_gamma.inputs_replayed <= 0")
-        # Delta contract (plan g2fuzz_reproduction_delta.md section 7): the
-        # target triple must be verified, at least one generator and one
-        # G2-generated payload must exist, and covered lines must be > 0.
-        if profile_s == "reproduction-delta":
+        # Strict reproduction contract (plan g2fuzz_reproduction_delta.md
+        # section 7): the target triple must be verified, at least one
+        # generator and one G2-generated payload must exist, and covered lines
+        # must be > 0.
+        if profile_s in STRICT_REPRODUCTION_PROFILES:
             target_triple = meta.get("target_triple") or {}
             if isinstance(target_triple, dict):
                 if not target_triple.get("uses_fuzzbench_docker_environment"):
-                    violations.append("evaluated reproduction-delta g2fuzz row did not build from the FuzzBench Docker environment")
+                    violations.append(f"evaluated {profile_s} g2fuzz row did not build from the FuzzBench Docker environment")
                 variants = target_triple.get("variants") or {}
                 for v in ("afl", "cmp", "cov"):
                     if not (isinstance(variants, dict) and variants.get(v, {}).get("verified")):
-                        violations.append(f"evaluated reproduction-delta g2fuzz row has target_triple.variants.{v}.verified != true")
+                        violations.append(f"evaluated {profile_s} g2fuzz row has target_triple.variants.{v}.verified != true")
             else:
-                violations.append("evaluated reproduction-delta g2fuzz row lacks target_triple")
+                violations.append(f"evaluated {profile_s} g2fuzz row lacks target_triple")
             program_generation = meta.get("program_generation") or {}
             if isinstance(program_generation, dict) and int(program_generation.get("generator_count", 0) or 0) <= 0:
-                violations.append("evaluated reproduction-delta g2fuzz row has program_generation.generator_count <= 0")
+                violations.append(f"evaluated {profile_s} g2fuzz row has program_generation.generator_count <= 0")
             seed_prov = meta.get("seed_provenance_delta") or meta.get("seed_provenance") or {}
             if isinstance(seed_prov, dict) and int(seed_prov.get("g2_generated_count", seed_prov.get("g2_generated", 0)) or 0) <= 0:
-                violations.append("evaluated reproduction-delta g2fuzz row has seed_provenance.g2_generated_count <= 0")
+                violations.append(f"evaluated {profile_s} g2fuzz row has seed_provenance.g2_generated_count <= 0")
             if line_cov.get("covered") is not None and int(line_cov.get("covered", 0) or 0) <= 0:
-                violations.append("evaluated reproduction-delta g2fuzz row has coverage.line_coverage.covered <= 0")
+                violations.append(f"evaluated {profile_s} g2fuzz row has coverage.line_coverage.covered <= 0")
         input_gen = meta.get("input_generation", {})
         if not isinstance(input_gen, dict) or int(input_gen.get("valid_g2_generated_count", 0) or 0) <= 0:
             violations.append("evaluated input-generator row has no valid G2-generated input")
@@ -250,24 +257,26 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
         violations.append("evaluated row has campaign.execs_done <= 0")
     if not meta.get("selected_candidate"):
         violations.append("evaluated row has no per-candidate evaluator JSON")
-    # reproduction-delta paper-equivalent invariants (plan section 7).
-    if str(meta.get("profile", "")) == "reproduction-delta":
+    # Strict reproduction (reproduction-epsilon / reproduction-delta)
+    # paper-equivalent invariants (plan section 7).
+    profile_str = str(meta.get("profile", ""))
+    if profile_str in STRICT_REPRODUCTION_PROFILES:
         if str(meta.get("method_variant", "")) != "paper-faithful":
-            violations.append("evaluated reproduction-delta row has method_variant != paper-faithful")
+            violations.append(f"evaluated {profile_str} row has method_variant != paper-faithful")
         if bool(meta.get("excluded_from_aggregate")):
-            violations.append("evaluated reproduction-delta row is excluded_from_aggregate")
+            violations.append(f"evaluated {profile_str} row is excluded_from_aggregate")
         if line_cov.get("covered") is not None and int(line_cov.get("covered", 0) or 0) <= 0:
-            violations.append("evaluated reproduction-delta row has coverage.line_coverage.covered <= 0")
+            violations.append(f"evaluated {profile_str} row has coverage.line_coverage.covered <= 0")
         sel = meta.get("selected_candidate") or {}
         if isinstance(sel, dict):
             copy_audit = sel.get("copy_audit") or {}
             if copy_audit.get("exact_copy"):
-                violations.append("evaluated reproduction-delta row has copy_audit.exact_copy == true")
+                violations.append(f"evaluated {profile_str} row has copy_audit.exact_copy == true")
             build = sel.get("build") or {}
             overlay_audit = build.get("overlay_audit") or {}
             if overlay_audit and overlay_audit.get("matches_candidate") is not True:
-                violations.append("evaluated reproduction-delta row has build.overlay_audit.matches_candidate != true")
-        # OSS-Fuzz-Gen-specific delta invariants (plan
+                violations.append(f"evaluated {profile_str} row has build.overlay_audit.matches_candidate != true")
+        # OSS-Fuzz-Gen-specific strict invariants (plan
         # oss-fuzz-gen_reproduction_delta.md section 7): a clean prompt audit,
         # a real (non-shim) introspector with nonzero functions, and a valid
         # runtime coverage diff (or an explicitly unavailable native control).
@@ -276,23 +285,23 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
             prompt_audit = meta.get("prompt_audit") or {}
             if isinstance(prompt_audit, dict):
                 if prompt_audit.get("exact_reference_harness_in_prompt"):
-                    violations.append("evaluated reproduction-delta ofg row has prompt_audit.exact_reference_harness_in_prompt == true")
+                    violations.append(f"evaluated {profile_str} ofg row has prompt_audit.exact_reference_harness_in_prompt == true")
                 if prompt_audit.get("selected_harness_api_metadata_used"):
-                    violations.append("evaluated reproduction-delta ofg row has prompt_audit.selected_harness_api_metadata_used == true")
+                    violations.append(f"evaluated {profile_str} ofg row has prompt_audit.selected_harness_api_metadata_used == true")
             else:
-                violations.append("evaluated reproduction-delta ofg row has no prompt_audit")
+                violations.append(f"evaluated {profile_str} ofg row has no prompt_audit")
             introspector = meta.get("introspector") or meta.get("introspector_provenance") or {}
             if isinstance(introspector, dict):
                 if introspector.get("used_local_shim"):
-                    violations.append("evaluated reproduction-delta ofg row has introspector.used_local_shim == true")
+                    violations.append(f"evaluated {profile_str} ofg row has introspector.used_local_shim == true")
                 if int(introspector.get("function_count", 0) or 0) <= 0:
-                    violations.append("evaluated reproduction-delta ofg row has introspector.function_count <= 0")
+                    violations.append(f"evaluated {profile_str} ofg row has introspector.function_count <= 0")
             else:
-                violations.append("evaluated reproduction-delta ofg row has no introspector provenance")
+                violations.append(f"evaluated {profile_str} ofg row has no introspector provenance")
             coverage_diff = meta.get("coverage_diff") or (meta.get("metrics") or {}).get("coverage_diff") or {}
             if isinstance(coverage_diff, dict) and coverage_diff:
                 if coverage_diff.get("runtime_coverage_valid") is False:
-                    violations.append("evaluated reproduction-delta ofg row has coverage_diff.runtime_coverage_valid == false")
+                    violations.append(f"evaluated {profile_str} ofg row has coverage_diff.runtime_coverage_valid == false")
     return violations
 
 
@@ -343,10 +352,14 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     method_variant = str(meta.get("method_variant", ""))
     line_covered = line_cov.get("covered") if isinstance(line_cov, dict) else None
     execs_done = int(campaign.get("execs_done", 0) or 0)
-    # reproduction-delta paper-equivalent gate (plan section 7).
-    paper_equivalent_delta = bool(
-        profile == "reproduction-delta"
-        and method_variant == "paper-faithful"
+    # Strict reproduction paper-equivalent gate (plan section 7 / E7).
+    # reproduction-epsilon is the canonical strict profile; reproduction-delta
+    # is its backward-compatible alias. A row is paper-equivalent only when it
+    # is evaluated, paper-faithful, not excluded, has real coverage (lines > 0),
+    # real campaign executions (> 0), no exact reference copy, and a candidate
+    # overlay that matches the candidate SHA256.
+    _strict_paper_equivalent = (
+        method_variant == "paper-faithful"
         and str(meta.get("status", "")) == "evaluated"
         and not bool(meta.get("excluded_from_aggregate"))
         and isinstance(line_covered, int) and line_covered > 0
@@ -354,6 +367,9 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         and not exact_copy
         and matches_candidate is True
     )
+    paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
+    paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon)
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
@@ -380,6 +396,8 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         "exact_copy": exact_copy,
         "matches_candidate": matches_candidate,
         "paper_equivalent_delta": paper_equivalent_delta,
+        "paper_equivalent_epsilon": paper_equivalent_epsilon,
+        "paper_equivalent_strict": paper_equivalent_strict,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
 
@@ -442,9 +460,8 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         runtime_coverage_valid is True
         or (cov_diff_status == "unavailable" and bool(meta.get("excluded_from_aggregate")))
     )
-    paper_equivalent_delta = bool(
-        profile == "reproduction-delta"
-        and method_variant == "paper-faithful"
+    _strict_paper_equivalent = bool(
+        method_variant == "paper-faithful"
         and str(meta.get("status", "")) == "evaluated"
         and not bool(meta.get("excluded_from_aggregate"))
         and isinstance(line_covered, int) and line_covered > 0
@@ -456,6 +473,9 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         and int(introspector.get("function_count", 0) or 0) > 0
         and cov_diff_ok
     )
+    paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
+    paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon)
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
@@ -477,6 +497,8 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         "runtime_coverage_valid": runtime_coverage_valid,
         "cov_diff_status": cov_diff_status,
         "paper_equivalent_delta": paper_equivalent_delta,
+        "paper_equivalent_epsilon": paper_equivalent_epsilon,
+        "paper_equivalent_strict": paper_equivalent_strict,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
 
@@ -887,15 +909,20 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         "storage": storage_report(matrix_dir, records),
         "evaluated_row_violations": evaluated_violations,
         "ckgfuzzer_target_rows": ckgfuzzer_target_rows,
-        # OSS-Fuzz-Gen reproduction-delta per-target rows and the count of
-        # paper-equivalent rows (plan oss-fuzz-gen_reproduction_delta.md
+        "ckgfuzzer_paper_equivalent_delta": sum(1 for r in ckgfuzzer_target_rows if r.get("paper_equivalent_delta")),
+        "ckgfuzzer_paper_equivalent_epsilon": sum(1 for r in ckgfuzzer_target_rows if r.get("paper_equivalent_epsilon")),
+        "ckgfuzzer_paper_equivalent_strict": sum(1 for r in ckgfuzzer_target_rows if r.get("paper_equivalent_strict")),
+        # OSS-Fuzz-Gen reproduction-delta/epsilon per-target rows and the count
+        # of paper-equivalent rows (plan oss-fuzz-gen_reproduction_delta.md
         # section 7).  Compatibility-fallback rows are reported separately and
         # never counted as paper-equivalent.
         "ofg_target_rows": ofg_target_rows,
         "ofg_paper_equivalent_delta": sum(1 for r in ofg_target_rows if r.get("paper_equivalent_delta")),
+        "ofg_paper_equivalent_epsilon": sum(1 for r in ofg_target_rows if r.get("paper_equivalent_epsilon")),
+        "ofg_paper_equivalent_strict": sum(1 for r in ofg_target_rows if r.get("paper_equivalent_strict")),
         "ofg_compat_fallback_rows": [
             r for r in ofg_target_rows
-            if str(r.get("profile", "")) == "reproduction-delta" and bool(r.get("exclude_from_aggregate"))
+            if str(r.get("profile", "")) in STRICT_REPRODUCTION_PROFILES and bool(r.get("exclude_from_aggregate"))
         ],
     }
 

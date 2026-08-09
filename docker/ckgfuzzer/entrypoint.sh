@@ -145,7 +145,7 @@ if [[ "$mode" == "generate-target" ]]; then
   ckg_profile="$HGB_PROFILE"
   ckg_protocol="$HGB_PROTOCOL"
   case "$ckg_profile" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke) ;;
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke) ;;
     *) hgb_write_common_metadata failed "invalid CKGFuzzer profile: $ckg_profile" 64 harness_generator; exit 64 ;;
   esac
   case "$ckg_protocol" in
@@ -153,7 +153,7 @@ if [[ "$mode" == "generate-target" ]]; then
     *) hgb_write_common_metadata failed "invalid CKGFuzzer protocol: $ckg_protocol" 64 harness_generator; exit 64 ;;
   esac
   # Method-faithful profiles forbid compat fallbacks even if legacy env is set.
-  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "reproduction-delta" ]]; then
+  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]; then
     if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
       hgb_write_common_metadata failed "CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden in $ckg_profile" 64 harness_generator; exit 64
     fi
@@ -164,18 +164,19 @@ if [[ "$mode" == "generate-target" ]]; then
       hgb_write_common_metadata failed "--skip_check_compilation is forbidden in $ckg_profile" 64 harness_generator; exit 64
     fi
     ckg_emb="${CKGFUZZER_EMBEDDING_MODEL:-}"
-    if [[ -z "$ckg_emb" || "$ckg_emb" == "mock" || "$ckg_emb" == "local" ]]; then
-      hgb_write_common_metadata failed "CKGFUZZER_EMBEDDING_MODEL must be a real embedding service in $ckg_profile, not mock/local/empty" 64 harness_generator; exit 64
+    if [[ -z "$ckg_emb" || "$ckg_emb" == "mock" || "$ckg_emb" == "local" || "$ckg_emb" == "hgb-hash-embedding" ]]; then
+      hgb_write_common_metadata failed "CKGFUZZER_EMBEDDING_MODEL must be a real embedding service in $ckg_profile, not mock/local/hgb-hash-embedding/empty" 64 harness_generator; exit 64
     fi
-    # reproduction-delta is the strictest profile: forbid source-only CodeQL
-    # graph fallback and selected-harness API mode.
-    if [[ "$ckg_profile" == "reproduction-delta" ]]; then
+    # Strict reproduction profiles (reproduction-epsilon and its alias
+    # reproduction-delta) forbid source-only CodeQL graph fallback and
+    # selected-harness API mode.
+    if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]; then
       if [[ "${CKGFUZZER_ALLOW_SOURCE_FALLBACK:-0}" == "1" ]]; then
-        hgb_write_common_metadata failed "CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in reproduction-delta; source-only CodeQL graph fallback is not allowed" 64 harness_generator; exit 64
+        hgb_write_common_metadata failed "CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in $ckg_profile; source-only CodeQL graph fallback is not allowed" 64 harness_generator; exit 64
       fi
       case "${HGB_API_SELECTION_MODE:-}" in
         selected_harness|selected_harness_fallback)
-          hgb_write_common_metadata failed "HGB_API_SELECTION_MODE=${HGB_API_SELECTION_MODE} is forbidden in reproduction-delta; reference-harness API filtering is evaluator-only" 64 harness_generator; exit 64 ;;
+          hgb_write_common_metadata failed "HGB_API_SELECTION_MODE=${HGB_API_SELECTION_MODE} is forbidden in $ckg_profile; reference-harness API filtering is evaluator-only" 64 harness_generator; exit 64 ;;
       esac
     fi
     # Force upstream LLM paths in method-faithful profiles.
@@ -1831,12 +1832,13 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       [[ -d "$ckg_db/api_combine" ]] && cat "$ckg_db/api_combine"/*.csv 2>/dev/null >"$ckg_method_dir/api_combinations.jsonl" || true
       [[ -f "$workspace/logs/fuzzing.log" ]] && cp -f "$workspace/logs/fuzzing.log" "$ckg_method_dir/compile_repair_log.jsonl" 2>/dev/null || true
       [[ -d "${HGB_LLM_TRACE_DIR:-$workspace/api_traces}" ]] && cat "${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"/llm_api_samples.jsonl 2>/dev/null >"$ckg_method_dir/llm_trace.jsonl" || true
-      # reproduction-delta: require nonzero method evidence before evaluation.
-      if [[ "$ckg_profile" == "reproduction-delta" ]]; then
+      # Strict reproduction profiles (reproduction-epsilon and its alias
+      # reproduction-delta): require nonzero method evidence before evaluation.
+      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]; then
         ckg_method_missing=0
         for ckg_evidence in codeql_db.json api_list.json api_summaries.jsonl api_combinations.jsonl llm_trace.jsonl; do
           if [[ ! -s "$ckg_method_dir/$ckg_evidence" ]]; then
-            printf 'reproduction-delta: missing method evidence %s\n' "$ckg_evidence" >>"$workspace/logs/method_evidence.log"
+            printf '%s: missing method evidence %s\n' "$ckg_profile" "$ckg_evidence" >>"$workspace/logs/method_evidence.log"
             ckg_method_missing=1
           fi
         done
@@ -1844,7 +1846,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
           code=9
           failed_stage=method_evidence
           status=failed
-          reason='ckg_method_evidence_missing: reproduction-delta requires codeql_db/api_list/api_summaries/api_combinations/llm_trace evidence before evaluation'
+          reason="ckg_method_evidence_missing: $ckg_profile requires codeql_db/api_list/api_summaries/api_combinations/llm_trace evidence before evaluation"
           hgb_result_set_stage "$workspace/stages.json" generation failed
           hgb_write_common_metadata "$status" "$reason" "$code" harness_generator
           hgb_write_common_summary "$status" "$reason" harness_generator
@@ -1855,7 +1857,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
           code=9
           failed_stage=method_evidence
           status=failed
-          reason='ckg_method_evidence_missing: reproduction-delta requires nonzero CodeQL graph query results'
+          reason="ckg_method_evidence_missing: $ckg_profile requires nonzero CodeQL graph query results"
           hgb_result_set_stage "$workspace/stages.json" knowledge_graph failed
           hgb_write_common_metadata "$status" "$reason" "$code" harness_generator
           hgb_write_common_summary "$status" "$reason" harness_generator
@@ -1882,9 +1884,10 @@ PY_CKG_SOURCE_FALLBACK_BODIES
         --campaign-seconds "${HGB_CAMPAIGN_SECONDS:-300}"
         --strict
       )
-      # reproduction-delta builds a separate coverage-instrumented image so an
+      # Strict reproduction profiles (reproduction-epsilon and its alias
+      # reproduction-delta) build a separate coverage-instrumented image so an
       # address/libFuzzer image is never reused for source-based coverage.
-      [[ "$ckg_profile" == "reproduction-delta" ]] && ckg_evaluator_args+=(--build-coverage-image)
+      [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]] && ckg_evaluator_args+=(--build-coverage-image)
       timeout "${HGB_CKG_EVALUATOR_TIMEOUT_SECONDS:-14400}" \
         python3 /opt/hgb/bin/hgb_harness_evaluator.py \
           "${ckg_evaluator_args[@]}" \
@@ -1923,10 +1926,11 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       # compat-smoke: optional legacy build-only verifier path, excluded from
       # the scientific aggregate (method_variant=compat_smoke).
       verification_code=0
-      # reproduction-delta/gamma must never invoke the old build-only verifier
-      # before the shared evaluator. This branch is only reached for
-      # compat-smoke; fail closed if a method-faithful profile reaches here.
-      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" ]]; then
+      # reproduction-delta/gamma/epsilon (and alpha/paper-faithful) must never
+      # invoke the old build-only verifier before the shared evaluator. This
+      # branch is only reached for compat-smoke; fail closed if a method-faithful
+      # profile reaches here.
+      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" ]]; then
         hgb_write_common_metadata failed "ckgfuzzer/$ckg_profile must not invoke the old build-only verifier; the shared evaluator is the only accepted path" 6 harness_generator
         hgb_write_common_summary failed "ckgfuzzer/$ckg_profile must not invoke the old build-only verifier" harness_generator
         exit 6

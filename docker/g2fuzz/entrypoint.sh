@@ -261,11 +261,12 @@ if [[ "$mode" == "generate-target" ]]; then
   if [[ -z "${HGB_FUZZBENCH_BENCHMARK_DIR:-}" && -d "/opt/hgb/fuzzbench/benchmarks/$target_name" ]]; then
     export HGB_FUZZBENCH_BENCHMARK_DIR="/opt/hgb/fuzzbench/benchmarks/$target_name"
   fi
-  # reproduction-gamma/delta preflight: verify G2Fuzz modified AFL++ components.
-  # Delta is the strict paper-native profile; gamma is a backward-compatible
-  # alias. Both require the modified afl-fuzz (with -c CmpLog and -k G2FUZZ),
+  # reproduction-gamma/delta/epsilon preflight: verify G2Fuzz modified AFL++
+  # components. Epsilon is the canonical strict paper-native profile; delta is
+  # its backward-compatible alias; gamma is a backward-compatible alias. All
+  # require the modified afl-fuzz (with -c CmpLog and -k G2FUZZ),
   # afl-clang-fast/afl-clang-fast++, and program_gen.py (plan section 1.2/4.1).
-  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" ]]; then
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" ]]; then
     missing=()
     [[ -f "$artifact/program_gen.py" ]] || missing+=("program_gen.py")
     [[ -x "$artifact/afl-fuzz" ]] || missing+=("afl-fuzz")
@@ -275,9 +276,9 @@ if [[ "$mode" == "generate-target" ]]; then
     fi
     [[ -x "$artifact/afl-clang-fast" ]] || missing+=("afl-clang-fast")
     [[ -x "$artifact/afl-clang-fast++" ]] || missing+=("afl-clang-fast++")
-    # Delta additionally requires program_to_format.json and model_setting.json
-    # (plan section 4.1).
-    if [[ "$HGB_BASELINE_PROFILE" == "reproduction-delta" ]]; then
+    # Delta/epsilon additionally require program_to_format.json and
+    # model_setting.json (plan section 4.1).
+    if [[ "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" ]]; then
       [[ -f "$artifact/program_to_format.json" ]] || missing+=("program_to_format.json")
     fi
     if [[ ${#missing[@]} -gt 0 ]]; then

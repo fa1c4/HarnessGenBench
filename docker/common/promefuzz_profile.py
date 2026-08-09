@@ -25,14 +25,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
-# Strict reproduction profile introduced by the reproduction-delta plan. It is
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
+# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
+# strict profile introduced by the reproduction-epsilon plan. It is
 # paper-faithful but rejects every synthetic/mock/hash fallback the earlier
-# scaffolding allowed. reproduction-gamma remains accepted as a backward-
-# compatible alias of reproduction-delta.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta"}
+# scaffolding allowed. ``reproduction-delta`` remains accepted as a backward-
+# compatible alias. ``reproduction-gamma`` remains a method-faithful but
+# non-strict alias.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
 
 # Beta plan section 10: allowed run-level statuses for a PromeFuzz
 # harness_generator row. ``evaluated`` requires a verified candidate, real
@@ -164,37 +166,38 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                     "the target reference harness body must never feed build-context capture"
                 )
 
-    # reproduction-delta is the strictest profile (plan section 1): forbid every
+    # Strict reproduction profiles (reproduction-epsilon and its alias
+    # reproduction-delta) are the strictest (plan section 1): forbid every
     # synthetic/mock/hash fallback even when an alias env var is set, and reject
     # the selected-harness API modes and report modes.
     if profile in STRICT_REPRODUCTION_PROFILES:
         if normalize_env_bool(env.get("HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB")) == "1":
             violations.append(
-                "HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden in reproduction-delta; "
+                f"HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden in {profile}; "
                 "a real compile database captured from the FuzzBench build is required"
             )
         emb_type = (env.get("PROME_FUZZ_EMBEDDING_LLM_TYPE") or "").strip().lower()
         if emb_type in {"mock", "local", "hash", ""}:
             violations.append(
-                f"PROME_FUZZ_EMBEDDING_LLM_TYPE={emb_type!r} is forbidden in reproduction-delta; "
+                f"PROME_FUZZ_EMBEDDING_LLM_TYPE={emb_type!r} is forbidden in {profile}; "
                 f"a real semantic embedding provider (openai or ollama) is required"
             )
         emb_model = (env.get("PROME_FUZZ_EMBEDDING_MODEL") or "").strip()
         if not emb_model or emb_model == "hgb-hash-embedding":
             violations.append(
-                f"PROME_FUZZ_EMBEDDING_MODEL={emb_model!r} is forbidden in reproduction-delta; "
+                f"PROME_FUZZ_EMBEDDING_MODEL={emb_model!r} is forbidden in {profile}; "
                 f"a real semantic embedding model is required"
             )
         api_mode = (env.get("HGB_API_SELECTION_MODE") or "").strip()
         if api_mode in {"selected_harness", "selected_harness_fallback"}:
             violations.append(
-                f"HGB_API_SELECTION_MODE={api_mode} is forbidden in reproduction-delta; "
+                f"HGB_API_SELECTION_MODE={api_mode} is forbidden in {profile}; "
                 f"reference-harness API filtering is evaluator-only"
             )
         report_mode = (env.get("HGB_API_REPORT_MODE") or "").strip()
         if report_mode in {"report_first", "report_only"}:
             violations.append(
-                f"HGB_API_REPORT_MODE={report_mode} is forbidden in reproduction-delta; "
+                f"HGB_API_REPORT_MODE={report_mode} is forbidden in {profile}; "
                 f"the selected-harness API report is evaluator-only"
             )
 
@@ -274,10 +277,10 @@ def build_result(
         # compat-smoke never reaches the scientific ``evaluated`` status.
         if status == STATUS_EVALUATED:
             status = STATUS_COMPAT_SMOKE_COMPLETED
-    # reproduction-delta/gamma map to the paper-faithful method variant.
-    if profile in {"reproduction-gamma", "reproduction-delta"} and not method_variant:
+    # reproduction-delta/gamma/epsilon map to the paper-faithful method variant.
+    if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} and not method_variant:
         method_variant = "paper-faithful"
-    if profile in {"reproduction-gamma", "reproduction-delta"} and method_variant == profile:
+    if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} and method_variant == profile:
         method_variant = "paper-faithful"
     return {
         "schema_version": 3,

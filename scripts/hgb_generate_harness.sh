@@ -108,6 +108,12 @@ done
 
 [[ -n "$generator" && -n "$target" ]] || { usage; exit 64; }
 valid_hgb_generator "$generator" || die "unknown generator: $generator"
+# Unknown profile is rejected with exit code 2 (epsilon plan E0.4). An empty
+# profile is allowed here; the generator default is applied by the host runner
+# or the container entrypoint.
+if [[ -n "$profile" ]] && ! hgb_known_profile "$profile"; then
+  die_profile "unknown profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, or compat-smoke)"
+fi
 [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
 [[ "$target_layout" == "compact" || "$target_layout" == "full" ]] || die "--layout must be compact or full"
 [[ "$save_mode" == "compact" || "$save_mode" == "debug" ]] || die "--save-mode must be compact or debug"

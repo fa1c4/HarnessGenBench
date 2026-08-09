@@ -340,7 +340,7 @@ def test_prebuilt_target_dir_excluded_from_gamma(tmp_path: Path) -> None:
     assert proc.returncode != 0
     # hgb_run_baseline.sh also refuses G2FUZZ_TARGET_DIR in gamma.
     run_baseline = (ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "g2fuzz/reproduction-gamma: G2FUZZ_TARGET_DIR is forbidden" in run_baseline
+    assert "g2fuzz/$profile: G2FUZZ_TARGET_DIR is forbidden" in run_baseline
 
 
 # 7. Contract probe must pass before campaign

@@ -17,14 +17,16 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
-# Strict reproduction profile introduced by the reproduction-delta plan. It is
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
+# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
+# strict profile introduced by the reproduction-epsilon plan: it is
 # paper-faithful but rejects every local/deterministic fallback the earlier
-# alpha/beta/gamma scaffolding allowed. reproduction-gamma remains accepted as
-# a backward-compatible alias of reproduction-delta.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta"}
+# alpha/beta/gamma scaffolding allowed. ``reproduction-delta`` remains accepted
+# as a backward-compatible alias. ``reproduction-gamma`` is method-faithful but
+# not strict (it does not enforce the epsilon fail-closed invariants).
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
 
 # Flags that are forbidden in method-faithful profiles.
 FORBIDDEN_ALPHA_ENV = {
@@ -92,7 +94,7 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
             )
         # A mock/local embedding model is forbidden in alpha/paper.
         embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip().lower()
-        if embedding_model in {"mock", "local", ""}:
+        if embedding_model in {"mock", "local", "hgb-hash-embedding", ""}:
             violations.append(
                 f"CKGFUZZER_EMBEDDING_MODEL={embedding_model!r} is forbidden in {profile}; "
                 f"a real embedding service is required (openai-* or ollama-* prefix)"
@@ -112,14 +114,15 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 "the selected-harness API list is evaluator-only"
             )
 
-    # reproduction-delta is the strictest profile: forbid every local fallback
-    # the earlier scaffolding allowed, even when an alias env var is set.
+    # Strict reproduction profiles (reproduction-epsilon and its alias
+    # reproduction-delta) are the strictest: forbid every local fallback the
+    # earlier scaffolding allowed, even when an alias env var is set.
     if profile in STRICT_REPRODUCTION_PROFILES:
         for key, bad_value in FORBIDDEN_ALPHA_ENV.items():
             if normalize_env_bool(env.get(key)) == bad_value:
                 violations.append(
                     f"{key}={bad_value} is forbidden in {profile}; "
-                    f"reproduction-delta requires the upstream LLM path"
+                    f"{profile} requires the upstream LLM path"
                 )
         if normalize_env_bool(env.get("CKGFUZZER_SKIP_CHECK_COMPILATION")) == "1":
             violations.append(
@@ -127,10 +130,10 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 "the compile-check/repair loop must run"
             )
         embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip().lower()
-        if embedding_model in {"mock", "local", ""}:
+        if embedding_model in {"mock", "local", "hgb-hash-embedding", ""}:
             violations.append(
                 f"CKGFUZZER_EMBEDDING_MODEL={embedding_model!r} is forbidden in {profile}; "
-                "reproduction-delta requires a real embedding service"
+                f"{profile} requires a real embedding service"
             )
         if normalize_env_bool(env.get("CKGFUZZER_ALLOW_SOURCE_FALLBACK")) == "1":
             violations.append(

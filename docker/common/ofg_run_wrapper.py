@@ -37,11 +37,11 @@ def active_protocol() -> str:
 
 
 def is_method_faithful() -> bool:
-    return active_profile() in {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
+    return active_profile() in {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
 
 
 def is_strict_reproduction() -> bool:
-    return active_profile() == "reproduction-delta"
+    return active_profile() in {"reproduction-delta", "reproduction-epsilon"}
 
 
 def is_compat_smoke() -> bool:

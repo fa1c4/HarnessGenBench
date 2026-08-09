@@ -99,14 +99,16 @@ apply_profile_defaults() {
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
       export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
       ;;
-    reproduction-delta)
-      # reproduction-delta is the strict paper-faithful profile (plan
-      # oss-fuzz-gen_reproduction_delta.md section 1). It is stricter than
-      # reproduction-gamma: OFG_INTROSPECTOR_MODE defaults to real, coverage
-      # gains are never skipped, GCS target download is forbidden, project-YAML
-      # fallback and bad-benchmark synthesis are forbidden unless an explicit
-      # compat variant is recorded and the row is excluded from the aggregate.
-      # No selected-harness API rank/report and no exact reference harness as
+    reproduction-delta|reproduction-epsilon)
+      # Strict reproduction profiles. reproduction-epsilon is the canonical
+      # strict profile (epsilon plan shared foundation); reproduction-delta is
+      # its backward-compatible alias (plan oss-fuzz-gen_reproduction_delta.md
+      # section 1). Both are stricter than reproduction-gamma:
+      # OFG_INTROSPECTOR_MODE defaults to real, coverage gains are never
+      # skipped, GCS target download is forbidden, project-YAML fallback and
+      # bad-benchmark synthesis are forbidden unless an explicit compat variant
+      # is recorded and the row is excluded from the aggregate. No
+      # selected-harness API rank/report and no exact reference harness as
       # example are produced (enforced by ofg_run_wrapper.py / ofg_api_rank.py).
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
@@ -602,7 +604,7 @@ write_final_result() {
   local method_variant excluded
   if [[ "$hgb_profile" == "compat-smoke" ]]; then
     method_variant="compat-smoke"; excluded=true
-  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" ]]; then
+  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" || "$hgb_profile" == "reproduction-epsilon" ]]; then
     method_variant="paper-faithful"; excluded=false
   else
     method_variant="$hgb_profile"; excluded=false

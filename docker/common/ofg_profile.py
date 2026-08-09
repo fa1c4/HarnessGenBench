@@ -17,18 +17,19 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "target-aware"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
 
-# reproduction-delta is the strict reproduction profile introduced by the
-# oss-fuzz-gen_reproduction_delta plan. It is paper-faithful but rejects every
-# local/deterministic fallback the earlier alpha/beta/gamma scaffolding
-# allowed (local introspector shim, coverage skip, GCS target download,
-# project-YAML fallback, bad-benchmark synthesis, selected-harness API
-# ranking, exact reference harness as example). reproduction-gamma remains
-# accepted as a backward-compatible alias.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta"}
+# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
+# strict profile introduced by the reproduction-epsilon plan. It is
+# paper-faithful but rejects every local/deterministic fallback the earlier
+# alpha/beta/gamma scaffolding allowed (local introspector shim, coverage
+# skip, GCS target download, project-YAML fallback, bad-benchmark synthesis,
+# selected-harness API ranking, exact reference harness as example).
+# ``reproduction-delta`` remains accepted as a backward-compatible alias.
+# ``reproduction-gamma`` remains a method-faithful but non-strict alias.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
 
 # Introspector modes that satisfy the "real Fuzz Introspector" requirement of
 # method-faithful profiles. ``real`` is the reproduction-gamma/delta default;
@@ -134,7 +135,7 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
         # paper-faithful contract with project-YAML fallback or bad-benchmark
         # synthesis. These collapse the reproduction into a softer variant and
         # are only allowed in an explicitly reported (non-default) run.
-        if profile in {"reproduction-gamma", "reproduction-delta", "paper-faithful"}:
+        if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "paper-faithful"}:
             for key, bad_value in FORBIDDEN_GAMMA_ENV.items():
                 actual = normalize_env_bool(env.get(key))
                 if actual == bad_value:
@@ -148,9 +149,9 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                         f"{key}={actual} is forbidden in {profile}; "
                         f"it silently relaxes the paper-faithful contract"
                     )
-            # reproduction-gamma/delta pin the real introspector mode by
+            # reproduction-gamma/delta/epsilon pin the real introspector mode by
             # default. paper-faithful/alpha allow the upstream remote mode.
-            if profile in {"reproduction-gamma", "reproduction-delta"}:
+            if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}:
                 intro_mode = normalize_env_bool(env.get("OFG_INTROSPECTOR_MODE"), "real")
                 if intro_mode not in REAL_INTROSPECTOR_MODES:
                     violations.append(

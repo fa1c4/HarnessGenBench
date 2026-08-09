@@ -253,7 +253,8 @@ def run_full(tmp_path, target="libpng_libpng_read_fuzzer", runner=None, *, cover
 def test_reproduction_delta_profile_accepted_by_host_runner():
     run_baseline = (ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
     assert "reproduction-delta" in run_baseline
-    assert "g2fuzz/reproduction-delta: G2FUZZ_TARGET_DIR is forbidden" in run_baseline
+    assert "g2fuzz/$profile: G2FUZZ_TARGET_DIR is forbidden" in run_baseline
+    assert "reproduction-epsilon" in run_baseline
     # A dry run validates the profile/protocol without Docker or LLM calls.
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",

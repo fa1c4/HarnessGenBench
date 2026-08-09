@@ -159,6 +159,8 @@ def build_result(
         method_variant = "paper-faithful"
     if profile == "reproduction-delta" and not method_variant:
         method_variant = "paper-faithful"
+    if profile == "reproduction-epsilon" and not method_variant:
+        method_variant = "paper-faithful"
     if status not in ALLOWED_STATUSES and status not in {"failed", "partial_completed", "missing_api_key"}:
         # Normalize legacy statuses into the beta contract.  A bare "failed"
         # from the legacy entrypoint is preserved for backwards compatibility

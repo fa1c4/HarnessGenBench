@@ -19,6 +19,29 @@ die() {
   exit 1
 }
 
+# Unknown/invalid profile: exit code 2 with a clear message (epsilon plan E0.4).
+die_profile() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+# Return 0 if the given profile is a strict reproduction profile
+# (reproduction-epsilon or its backward-compatible alias reproduction-delta).
+hgb_profile_is_strict_reproduction() {
+  local p="${1:-}"
+  [[ "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" ]]
+}
+
+# Universal set of host-runner profiles accepted across all generators. A
+# profile outside this set is rejected with exit code 2 (epsilon plan E0.4).
+hgb_known_profile() {
+  local p="${1:-}"
+  case "$p" in
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 log() {
   printf '[%s] %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
 }
@@ -591,15 +614,16 @@ run_hgb_target_container() {
       evaluator_mount_args+=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
     fi
   fi
-  # reproduction-delta fail-closed: a blind harness generator must never fall
-  # back to the monolithic package root. Require both halves and their
-  # manifests before container launch.
-  if hgb_generator_is_blind "$generator" && [[ "$ckg_profile" == "reproduction-delta" ]]; then
+  # Strict reproduction (reproduction-epsilon and its alias reproduction-delta)
+  # fail-closed: a blind harness generator must never fall back to the
+  # monolithic package root. Require both halves and their manifests before
+  # container launch.
+  if hgb_generator_is_blind "$generator" && hgb_profile_is_strict_reproduction "$ckg_profile"; then
     if [[ ! -f "$target_package/generator_input/target_manifest.json" ]]; then
-      die "reproduction-delta: missing $target_package/generator_input/target_manifest.json; target split did not produce the generator half (infra_failure)"
+      die "$ckg_profile: missing $target_package/generator_input/target_manifest.json; target split did not produce the generator half (infra_failure)"
     fi
     if [[ ! -f "$target_package/evaluator_only/evaluator_manifest.json" ]]; then
-      die "reproduction-delta: missing $target_package/evaluator_only/evaluator_manifest.json; target split did not produce the evaluator half (infra_failure)"
+      die "$ckg_profile: missing $target_package/evaluator_only/evaluator_manifest.json; target split did not produce the evaluator half (infra_failure)"
     fi
     target_mount_src="$target_package/generator_input"
     evaluator_mount_args=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
@@ -608,7 +632,7 @@ run_hgb_target_container() {
     if [[ -f "$target_package/evaluator_only/reference_canary.txt" ]]; then
       ckg_ref_canary="$(cat "$target_package/evaluator_only/reference_canary.txt" 2>/dev/null | head -n1 || true)"
       if [[ -n "$ckg_ref_canary" ]] && grep -RqF -- "$ckg_ref_canary" "$target_package/generator_input" 2>/dev/null; then
-        die "reproduction-delta: reference canary leaked into generator_input/; refusing to launch the generator container (infra_failure)"
+        die "$ckg_profile: reference canary leaked into generator_input/; refusing to launch the generator container (infra_failure)"
       fi
     fi
   fi

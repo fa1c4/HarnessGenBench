@@ -531,12 +531,14 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
             "method_variant": "compat-smoke",
             "source": "ci-smoke",
         }
-    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta"}:
-        # reproduction-delta is the strict paper-native input-generator profile
-        # (plan elfuzz_reproduction_delta.md). It inherits the paper-faithful
-        # budget and, like reproduction-gamma, rejects a prebuilt
-        # ELFUZZ_TARGET_BINARY and requires a real coverage-instrumented replay.
-        strict = profile in {"reproduction-gamma", "reproduction-delta"}
+    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}:
+        # reproduction-epsilon is the canonical strict paper-native
+        # input-generator profile (plan ckgfuzzer_reproduction_epsilon.md shared
+        # foundation); reproduction-delta is its backward-compatible alias (plan
+        # elfuzz_reproduction_delta.md). It inherits the paper-faithful budget
+        # and, like reproduction-gamma, rejects a prebuilt ELFUZZ_TARGET_BINARY
+        # and requires a real coverage-instrumented replay.
+        strict = profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
         return {
             "profile": profile,
             "evolution_iterations": env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50),
@@ -2198,7 +2200,7 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "fuzz_target": target,
         "profile": profile,
         "protocol": protocol,
-        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta"} else profile,
+        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} else profile,
         "status": "not_applicable",
         "applicability": "Invalid",
         "reason_code": reason_code,
@@ -2245,7 +2247,7 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "reproducibility": {
             "fuzzbench_commit": "",
             "build_uses_fuzzbench_docker_environment": False,
-            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta"} else profile,
+            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} else profile,
         },
         "error": {"reason_code": reason_code, "message": INVALID_MESSAGE},
         "stages": stages,
