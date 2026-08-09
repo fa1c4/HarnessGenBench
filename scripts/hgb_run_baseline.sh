@@ -260,8 +260,8 @@ case "$generator" in
     ;;
   oss-fuzz-gen)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
-      *) die "oss-fuzz-gen: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke) ;;
+      *) die "oss-fuzz-gen: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|target-aware) ;;
@@ -279,6 +279,29 @@ case "$generator" in
       if [[ "${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}" == "1" ]]; then
         die "oss-fuzz-gen/$profile: OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden in blind-project; the target answer must not be downloaded"
       fi
+    fi
+    # reproduction-delta is the strictest profile (plan
+    # oss-fuzz-gen_reproduction_delta.md section 1). It inherits the gamma
+    # forbiddens and additionally refuses coverage skip, GCS target download,
+    # project-YAML fallback, and bad-benchmark synthesis unless an explicit
+    # compat variant is recorded and the row is excluded from the aggregate.
+    if [[ "$profile" == "reproduction-delta" ]]; then
+      if [[ "${OFG_SKIP_COVERAGE_GAINS:-0}" == "1" ]]; then
+        die "oss-fuzz-gen/reproduction-delta: OFG_SKIP_COVERAGE_GAINS=1 is forbidden; the strict profile requires real coverage gains"
+      fi
+      if [[ "${OFG_INTROSPECTOR_MODE:-real}" == "local" ]]; then
+        die "oss-fuzz-gen/reproduction-delta: OFG_INTROSPECTOR_MODE=local is forbidden; the strict profile requires a real Fuzz Introspector report"
+      fi
+      if [[ "${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}" == "1" ]]; then
+        die "oss-fuzz-gen/reproduction-delta: OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden; the current target answer must not be downloaded"
+      fi
+      if [[ "${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}" == "1" && "${HGB_EXCLUDE_FROM_AGGREGATE:-0}" != "1" ]]; then
+        die "oss-fuzz-gen/reproduction-delta: OFG_ALLOW_PROJECT_YAML_FALLBACK=1 is forbidden unless HGB_EXCLUDE_FROM_AGGREGATE=1 and HGB_METHOD_VARIANT=compat_project_yaml_fallback"
+      fi
+      if [[ "${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}" == "1" && "${HGB_EXCLUDE_FROM_AGGREGATE:-0}" != "1" ]]; then
+        die "oss-fuzz-gen/reproduction-delta: OFG_SYNTHESIZE_ON_BAD_BENCHMARK=1 is forbidden unless HGB_EXCLUDE_FROM_AGGREGATE=1 and HGB_METHOD_VARIANT=compat_bad_benchmark_synthesis"
+      fi
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
     fi
     # reproduction-gamma pins the paper-faithful contract: no project-YAML
     # fallback and no bad-benchmark synthesis by default (plan section 2.3).

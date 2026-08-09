@@ -490,6 +490,85 @@ class IntrospectorReport:
         }
 
 
+def _count_source_files(report_dir: str | Path) -> int:
+    """Count distinct project source files referenced by the introspector report."""
+    records = parse_all_functions(report_dir)
+    paths: set[str] = set()
+    for record in records:
+        path = record.get("path") or ""
+        if path and "hgb_introspector_stub" not in path:
+            paths.add(path)
+    return len(paths)
+
+
+def write_introspector_provenance(
+    report_dir: str | Path,
+    *,
+    mode: str,
+    oss_fuzz_commit: str = "",
+    fuzzbench_commit: str = "",
+    project: str = "",
+    target: str = "",
+    used_local_shim: bool = False,
+) -> dict[str, Any]:
+    """Write ``introspector/provenance.json`` (plan section 4).
+
+    Records that the Fuzz Introspector report was real (mode in
+    REAL_INTROSPECTOR_MODES), project/target-scoped, and not a local shim.
+    ``function_count`` and ``source_files_count`` are derived from the report
+    so the matrix gate can prove the report was non-empty.
+    """
+    report_dir = Path(report_dir)
+    function_count = len(parse_all_functions(report_dir))
+    source_files_count = _count_source_files(report_dir)
+    provenance = {
+        "mode": mode,
+        "oss_fuzz_commit": oss_fuzz_commit,
+        "fuzzbench_commit": fuzzbench_commit,
+        "project": project,
+        "target": target,
+        "function_count": int(function_count),
+        "source_files_count": int(source_files_count),
+        "used_local_shim": bool(used_local_shim),
+    }
+    (report_dir / "provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+    )
+    return provenance
+
+
+def load_introspector_provenance(report_dir: str | Path) -> dict[str, Any]:
+    data = load_json(Path(report_dir) / "provenance.json")
+    return data if isinstance(data, dict) else {}
+
+
+def validate_introspector_provenance(
+    provenance: dict[str, Any], *, strict: bool = False,
+) -> tuple[bool, list[str]]:
+    """Validate an introspector provenance record (plan section 4.5).
+
+    Returns ``(ok, violations)``. In strict (reproduction-delta) mode a zero
+    function count or a local shim is a hard failure.
+    """
+    violations: list[str] = []
+    if not isinstance(provenance, dict):
+        return False, ["introspector provenance is not a dict"]
+    mode = str(provenance.get("mode") or "")
+    if mode == "local":
+        violations.append("introspector.mode=local; the local shim is forbidden in method-faithful profiles")
+    if int(provenance.get("function_count", 0) or 0) <= 0:
+        violations.append("introspector.function_count <= 0; the report contains no functions")
+    if provenance.get("used_local_shim"):
+        violations.append("introspector.used_local_shim == true; the local shim is forbidden")
+    ok = not violations
+    if strict:
+        return ok, violations
+    # In non-strict mode, only function_count==0 is fatal; a local shim is
+    # recorded but does not fail validation (compat-smoke may use it).
+    soft_violations = [v for v in violations if "used_local_shim" not in v and "mode=local" not in v]
+    return len(soft_violations) == 0, soft_violations
+
+
 def build_introspector_report(
     target_root: Path,
     work_dir: Path,
@@ -514,7 +593,15 @@ def build_introspector_report(
     work_dir = Path(work_dir)
     introspector_dir = work_dir / "introspector"
     introspector_dir.mkdir(parents=True, exist_ok=True)
-    if compat_shim:
+    intro_mode = os.environ.get("OFG_INTROSPECTOR_MODE", "remote").strip().lower()
+    if compat_shim or intro_mode == "local":
+        provenance = write_introspector_provenance(
+            introspector_dir,
+            mode="local" if (compat_shim or intro_mode == "local") else intro_mode,
+            project=project,
+            target=fuzz_target,
+            used_local_shim=True,
+        )
         return IntrospectorReport(
             report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
             valid=True, message="compat-smoke shim", files={},
@@ -581,6 +668,26 @@ def build_introspector_report(
             report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
             valid=False, message=f"infra_failure/failed_stage=introspector: {message}", files=files,
         )
+    # Write the introspector provenance (plan section 4) proving the report was
+    # real, project/target-scoped, and not a local shim.
+    oss_fuzz_commit = ""
+    try:
+        import subprocess as _sp
+        oss_fuzz_commit = _sp.run(
+            ["git", "-C", str(oss_fuzz_dir), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip() or ""
+    except Exception:  # noqa: BLE001
+        oss_fuzz_commit = ""
+    write_introspector_provenance(
+        introspector_dir,
+        mode=intro_mode if intro_mode in {"real", "remote"} else "real",
+        oss_fuzz_commit=oss_fuzz_commit,
+        fuzzbench_commit=str(os.environ.get("HGB_FUZZBENCH_COMMIT", "")),
+        project=project,
+        target=fuzz_target,
+        used_local_shim=False,
+    )
     return IntrospectorReport(
         report_dir=introspector_dir, project=project, fuzz_target=fuzz_target,
         valid=True, message=message, files=files,

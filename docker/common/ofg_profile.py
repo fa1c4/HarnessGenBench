@@ -17,14 +17,23 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "target-aware"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
+
+# reproduction-delta is the strict reproduction profile introduced by the
+# oss-fuzz-gen_reproduction_delta plan. It is paper-faithful but rejects every
+# local/deterministic fallback the earlier alpha/beta/gamma scaffolding
+# allowed (local introspector shim, coverage skip, GCS target download,
+# project-YAML fallback, bad-benchmark synthesis, selected-harness API
+# ranking, exact reference harness as example). reproduction-gamma remains
+# accepted as a backward-compatible alias.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta"}
 
 # Introspector modes that satisfy the "real Fuzz Introspector" requirement of
-# method-faithful profiles. ``real`` is the reproduction-gamma default; the
-# upstream ``remote`` mode is the historical alpha/paper default. ``local`` is
-# the compat-smoke shim and is never method-faithful.
+# method-faithful profiles. ``real`` is the reproduction-gamma/delta default;
+# the upstream ``remote`` mode is the historical alpha/paper default. ``local``
+# is the compat-smoke shim and is never method-faithful.
 REAL_INTROSPECTOR_MODES = {"real", "remote"}
 
 # Flags that are forbidden in method-faithful profiles because they collapse
@@ -83,6 +92,25 @@ def is_compat_smoke(profile: str) -> bool:
     return profile == "compat-smoke"
 
 
+# Compatibility fallback variants that may relax the paper-faithful contract
+# only when the row is explicitly excluded from the aggregate (plan section
+# 1.2).  The variant is recorded via HGB_METHOD_VARIANT and the exclusion via
+# HGB_EXCLUDE_FROM_AGGREGATE so validate_profile can admit the fallback without
+# silently downgrading a paper-faithful run.
+COMPAT_FALLBACK_VARIANTS = {
+    "compat_project_yaml_fallback",
+    "compat_bad_benchmark_synthesis",
+}
+
+
+def _compat_variant_recorded(env: dict[str, str]) -> bool:
+    """True when an explicit compat fallback variant is recorded and excluded."""
+    variant = (env.get("HGB_METHOD_VARIANT") or "").strip()
+    if variant not in COMPAT_FALLBACK_VARIANTS:
+        return False
+    return normalize_env_bool(env.get("HGB_EXCLUDE_FROM_AGGREGATE")) == "1"
+
+
 def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = None) -> list[str]:
     """Return a list of violation messages. Empty means valid."""
     env = env or dict(os.environ)
@@ -106,20 +134,41 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
         # paper-faithful contract with project-YAML fallback or bad-benchmark
         # synthesis. These collapse the reproduction into a softer variant and
         # are only allowed in an explicitly reported (non-default) run.
-        if profile in {"reproduction-gamma", "paper-faithful"}:
+        if profile in {"reproduction-gamma", "reproduction-delta", "paper-faithful"}:
             for key, bad_value in FORBIDDEN_GAMMA_ENV.items():
                 actual = normalize_env_bool(env.get(key))
                 if actual == bad_value:
+                    # reproduction-delta allows these only when an explicit
+                    # compat variant is recorded AND the row is excluded from
+                    # the aggregate (plan section 1.2). gamma/paper forbid them
+                    # outright by default.
+                    if profile in STRICT_REPRODUCTION_PROFILES and _compat_variant_recorded(env):
+                        continue
                     violations.append(
                         f"{key}={actual} is forbidden in {profile}; "
                         f"it silently relaxes the paper-faithful contract"
                     )
-            # reproduction-gamma pins the real introspector mode by default.
-            intro_mode = normalize_env_bool(env.get("OFG_INTROSPECTOR_MODE"), "real")
-            if intro_mode not in REAL_INTROSPECTOR_MODES:
+            # reproduction-gamma/delta pin the real introspector mode by
+            # default. paper-faithful/alpha allow the upstream remote mode.
+            if profile in {"reproduction-gamma", "reproduction-delta"}:
+                intro_mode = normalize_env_bool(env.get("OFG_INTROSPECTOR_MODE"), "real")
+                if intro_mode not in REAL_INTROSPECTOR_MODES:
+                    violations.append(
+                        f"OFG_INTROSPECTOR_MODE={intro_mode} is forbidden in {profile}; "
+                        f"expected one of {sorted(REAL_INTROSPECTOR_MODES)} (real Fuzz Introspector)"
+                    )
+        # reproduction-delta additionally forbids coverage skip and GCS target
+        # download by default (gamma only forbids them under blind-project).
+        if profile in STRICT_REPRODUCTION_PROFILES:
+            if normalize_env_bool(env.get("OFG_SKIP_COVERAGE_GAINS")) == "1":
                 violations.append(
-                    f"OFG_INTROSPECTOR_MODE={intro_mode} is forbidden in {profile}; "
-                    f"expected one of {sorted(REAL_INTROSPECTOR_MODES)} (real Fuzz Introspector)"
+                    f"OFG_SKIP_COVERAGE_GAINS=1 is forbidden in {profile}; "
+                    f"the strict profile requires real coverage gains"
+                )
+            if normalize_env_bool(env.get("OFG_ALLOW_GCS_TARGET_DOWNLOAD")) == "1":
+                violations.append(
+                    f"OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden in {profile}; "
+                    f"the current target answer must not be downloaded"
                 )
         # Tiny 1/1/1 budgets are compat-smoke, not alpha.
         for key, bad_value in FORBIDDEN_ALPHA_BUDGETS.items():
@@ -136,11 +185,16 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                     "HGB_ALLOW_REFERENCE_USAGE=1 is forbidden in blind-project; "
                     "exact reference harnesses are evaluator-only"
                 )
-            if normalize_env_bool(env.get("OFG_ALLOW_GCS_TARGET_DOWNLOAD")) == "1":
-                violations.append(
-                    "OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden in blind-project; "
-                    "the current target answer must not be downloaded"
-                )
+            # GCS target download is forbidden in blind-project for every
+            # method-faithful profile. reproduction-delta also forbids it for
+            # target-aware (checked in the strict block above), so skip the
+            # duplicate here.
+            if profile not in STRICT_REPRODUCTION_PROFILES:
+                if normalize_env_bool(env.get("OFG_ALLOW_GCS_TARGET_DOWNLOAD")) == "1":
+                    violations.append(
+                        "OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden in blind-project; "
+                        "the current target answer must not be downloaded"
+                    )
 
     if is_compat_smoke(profile):
         # compat-smoke must always be excluded from aggregate.
@@ -309,6 +363,145 @@ def audit_leakage(
         "hit_count": len(hits),
         "hits": hits[:50],
     }
+
+
+# ---------------------------------------------------------------------------
+# Prompt audit (plan section 3): prove the generator prompt did not embed the
+# exact reference harness or selected-harness API metadata.
+# ---------------------------------------------------------------------------
+
+
+def build_prompt_audit(
+    *,
+    examples: list[dict[str, str]] | None = None,
+    reference_canary: str = "",
+    prompt_artifacts: list[str | Path] | None = None,
+    selected_harness_api_metadata_used: bool = False,
+) -> dict[str, Any]:
+    """Build a ``prompt_audit.json`` record.
+
+    ``examples`` is the list of examples passed to the generator, each carrying
+    ``path`` and ``reason``. ``reference_canary`` is the canary token planted
+    in the exact reference harness; if any prompt artifact contains it the
+    audit flags ``exact_reference_harness_in_prompt``. ``prompt_artifacts`` is
+    the set of files whose contents formed the prompt (best-effort scan).
+    """
+    examples = examples or []
+    exact_in_prompt = False
+    canary_hits: list[dict[str, str]] = []
+    if reference_canary:
+        for artifact in prompt_artifacts or []:
+            p = Path(artifact)
+            if not p.is_file():
+                continue
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for context in scan_text_for_canary(text, reference_canary):
+                exact_in_prompt = True
+                canary_hits.append({"file": str(p), "context": context})
+    return {
+        "exact_reference_harness_in_prompt": exact_in_prompt,
+        "selected_harness_api_metadata_used": bool(selected_harness_api_metadata_used),
+        "examples": list(examples),
+        "canary": reference_canary,
+        "canary_hits": canary_hits,
+    }
+
+
+def write_prompt_audit(audit: dict[str, Any], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def validate_prompt_audit(audit: dict[str, Any], *, profile: str = "") -> list[str]:
+    """Return violation messages for a prompt audit. Empty means clean."""
+    violations: list[str] = []
+    if not isinstance(audit, dict):
+        return ["prompt_audit is not a dict"]
+    if audit.get("exact_reference_harness_in_prompt"):
+        violations.append(
+            "prompt_audit.exact_reference_harness_in_prompt == true; "
+            "the exact reference harness must not be embedded in the generator prompt"
+        )
+    if audit.get("selected_harness_api_metadata_used"):
+        violations.append(
+            "prompt_audit.selected_harness_api_metadata_used == true; "
+            "selected-harness API metadata is evaluator-only"
+        )
+    # reproduction-delta forbids both flags outright (plan section 3).
+    if profile in STRICT_REPRODUCTION_PROFILES:
+        if audit.get("exact_reference_harness_in_prompt"):
+            violations.append(
+                f"prompt_audit.exact_reference_harness_in_prompt is forbidden in {profile}"
+            )
+        if audit.get("selected_harness_api_metadata_used"):
+            violations.append(
+                f"prompt_audit.selected_harness_api_metadata_used is forbidden in {profile}"
+            )
+    return violations
+
+
+# ---------------------------------------------------------------------------
+# Introspector provenance (plan section 4): prove the Fuzz Introspector report
+# was real, project/target-scoped, and not a local shim.
+# ---------------------------------------------------------------------------
+
+
+def build_introspector_provenance(
+    *,
+    mode: str,
+    oss_fuzz_commit: str = "",
+    fuzzbench_commit: str = "",
+    project: str = "",
+    target: str = "",
+    function_count: int = 0,
+    source_files_count: int = 0,
+    used_local_shim: bool = False,
+) -> dict[str, Any]:
+    return {
+        "mode": mode,
+        "oss_fuzz_commit": oss_fuzz_commit,
+        "fuzzbench_commit": fuzzbench_commit,
+        "project": project,
+        "target": target,
+        "function_count": int(function_count),
+        "source_files_count": int(source_files_count),
+        "used_local_shim": bool(used_local_shim),
+    }
+
+
+def write_introspector_provenance(provenance: dict[str, Any], path: str | Path) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def validate_introspector_provenance(
+    provenance: dict[str, Any], *, profile: str = ""
+) -> list[str]:
+    """Return violation messages for an introspector provenance record."""
+    violations: list[str] = []
+    if not isinstance(provenance, dict):
+        return ["introspector_provenance is not a dict"]
+    mode = str(provenance.get("mode") or "")
+    if profile in METHOD_FAITHFUL_PROFILES and mode == "local":
+        violations.append(
+            f"introspector.mode=local is forbidden in {profile}; "
+            f"a real Fuzz Introspector report is required"
+        )
+    if int(provenance.get("function_count", 0) or 0) <= 0:
+        violations.append(
+            "introspector.function_count <= 0; the report contains no functions"
+        )
+    if provenance.get("used_local_shim"):
+        violations.append(
+            "introspector.used_local_shim == true; the local shim is forbidden "
+            "in method-faithful profiles"
+        )
+    return violations
 
 
 # ---------------------------------------------------------------------------

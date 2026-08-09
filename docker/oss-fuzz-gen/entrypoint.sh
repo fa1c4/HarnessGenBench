@@ -99,6 +99,31 @@ apply_profile_defaults() {
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
       export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
       ;;
+    reproduction-delta)
+      # reproduction-delta is the strict paper-faithful profile (plan
+      # oss-fuzz-gen_reproduction_delta.md section 1). It is stricter than
+      # reproduction-gamma: OFG_INTROSPECTOR_MODE defaults to real, coverage
+      # gains are never skipped, GCS target download is forbidden, project-YAML
+      # fallback and bad-benchmark synthesis are forbidden unless an explicit
+      # compat variant is recorded and the row is excluded from the aggregate.
+      # No selected-harness API rank/report and no exact reference harness as
+      # example are produced (enforced by ofg_run_wrapper.py / ofg_api_rank.py).
+      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
+      export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
+      export OFG_ALLOW_PROJECT_YAML_FALLBACK="${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}"
+      export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}"
+      export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
+      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+      export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
+      export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+      export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+      export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
+      export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
+      export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+      ;;
     compat-smoke)
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-1}"
@@ -577,6 +602,8 @@ write_final_result() {
   local method_variant excluded
   if [[ "$hgb_profile" == "compat-smoke" ]]; then
     method_variant="compat-smoke"; excluded=true
+  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" ]]; then
+    method_variant="paper-faithful"; excluded=false
   else
     method_variant="$hgb_profile"; excluded=false
   fi
@@ -612,6 +639,20 @@ try:
     metrics = ev.get("metrics") or {}
 except Exception:
     metrics = {}
+# Fold the prompt audit (plan section 3), introspector provenance (plan
+# section 4), and coverage diff (plan section 6) into the run result so the
+# matrix gate can prove the row is paper-equivalent.
+prompt_audit = {}
+try:
+    prompt_audit = json.loads(Path(os.environ.get("workspace", "/workspace") + "/generation/audit/prompt_audit.json").read_text(encoding="utf-8"))
+except Exception:
+    prompt_audit = {}
+introspector = {}
+try:
+    introspector = json.loads(Path(os.environ.get("workspace", "/workspace") + "/introspector/provenance.json").read_text(encoding="utf-8"))
+except Exception:
+    introspector = {"mode": intro_mode, "used_local_shim": intro_mode == "local", "function_count": 0}
+coverage_diff = metrics.get("coverage_diff") or {}
 result = {
     "schema_version": 2,
     "generator": "oss-fuzz-gen",
@@ -625,6 +666,9 @@ result = {
     "stages": stages,
     "artifacts": {},
     "metrics": metrics,
+    "prompt_audit": prompt_audit,
+    "introspector": introspector,
+    "coverage_diff": coverage_diff,
     "provenance": {
         "oss_fuzz_gen_commit": ofg_commit,
         "oss_fuzz_commit": oss_commit,

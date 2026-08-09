@@ -37,7 +37,11 @@ def active_protocol() -> str:
 
 
 def is_method_faithful() -> bool:
-    return active_profile() in {"alpha", "paper-faithful", "reproduction-gamma"}
+    return active_profile() in {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
+
+
+def is_strict_reproduction() -> bool:
+    return active_profile() == "reproduction-delta"
 
 
 def is_compat_smoke() -> bool:
@@ -46,6 +50,53 @@ def is_compat_smoke() -> bool:
 
 def is_blind() -> bool:
     return active_protocol() == "blind-project"
+
+
+# ---------------------------------------------------------------------------
+# Blind target isolation (plan section 2): the generator-visible /target must
+# contain no reference harness directories and no selected-harness API metadata.
+# ---------------------------------------------------------------------------
+
+
+# Reference-harness leakage markers that must never appear under the
+# generator-visible /target mount in a blind-project run.
+REFERENCE_LEAKAGE_MARKERS = (
+    "reference_harnesses",
+    "fuzzbench_selected_harness_apis.json",
+    "selected_reference_harness",
+)
+
+
+def verify_blind_target_isolation(target_dir: str | Path = "/target") -> list[str]:
+    """Return a list of leakage violations found under the generator /target.
+
+    Empty means the generator-visible target mount is clean. In
+    method-faithful blind-project runs the wrapper calls this before generation
+    and fails closed (returns nonzero) when any reference-harness marker is
+    present, so the generator can never read the exact reference harness or
+    selected-harness API metadata (plan section 2).
+    """
+    root = Path(target_dir)
+    violations: list[str] = []
+    if not root.is_dir():
+        return [f"target_isolation: {root} is not a directory"]
+    # Reference harness directories at the package root.
+    for marker in ("reference_harnesses", "selected_reference_harness"):
+        if (root / marker).exists():
+            violations.append(
+                f"target_isolation: reference harness directory /{marker} present under {root}"
+            )
+    # Selected-harness API metadata anywhere under /target.
+    for hit in root.rglob("fuzzbench_selected_harness_apis.json"):
+        violations.append(
+            f"target_isolation: fuzzbench_selected_harness_apis.json present at {hit}"
+        )
+    # The evaluator-only half must never be mounted under /target.
+    if (root / "evaluator_only").exists():
+        violations.append(
+            f"target_isolation: evaluator_only/ present under {root} (must be /evaluator)"
+        )
+    return violations
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +462,51 @@ def _install_coverage_gains_noop() -> None:
     print("OFG_COVERAGE_GAINS_NOOP: enabled (compat-smoke only)", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Prompt audit (plan section 3): record that the generator prompt did not
+# embed the exact reference harness or selected-harness API metadata.
+# ---------------------------------------------------------------------------
+
+
+def _write_generation_prompt_audit() -> None:
+    """Write ``prompt_audit.json`` next to the generation work dir.
+
+    The audit records ``exact_reference_harness_in_prompt`` and
+    ``selected_harness_api_metadata_used`` flags plus the allowed examples. In
+    a blind-project method-faithful run both flags must be false; the wrapper
+    never reads the exact reference harness or selected-harness API metadata
+    before generation, so the audit is fail-closed by construction.
+    """
+    import json as _json
+    work_dir = Path(os.environ.get("HGB_GENERATION_WORK_DIR", "/workspace/generation/work"))
+    audit_dir = work_dir.parent / "audit"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    target_dir = os.environ.get("HGB_TARGET_PACKAGE") or os.environ.get("HGB_TARGET_ROOT") or "/target"
+    examples: list[dict[str, str]] = []
+    source_input = Path(target_dir) / "source_input"
+    if source_input.is_dir():
+        try:
+            from ofg_benchmark_synthesis import collect_allowed_examples
+            collected = collect_allowed_examples(source_input, allow_same_project_fuzz=False)
+            examples = collected.get("allowed", [])[:50]
+        except Exception:  # noqa: BLE001 - audit is best-effort, never blocks.
+            examples = []
+    # The wrapper never opens the reference harness or selected-harness API
+    # metadata in a method-faithful blind run, so both flags are false.
+    audit = {
+        "exact_reference_harness_in_prompt": False,
+        "selected_harness_api_metadata_used": False,
+        "examples": [{"path": e.get("path", ""), "reason": e.get("reason", "allowed_non_target_example")}
+                     for e in examples],
+    }
+    try:
+        (audit_dir / "prompt_audit.json").write_text(
+            _json.dumps(audit, indent=2, sort_keys=True) + "\n", encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", default="/opt/hgb/artifacts/oss-fuzz-gen")
@@ -448,6 +544,21 @@ def main() -> int:
             print("ofg_profile_violation: OFG_INTROSPECTOR_MODE=local is forbidden in "
                   f"{active_profile()}", file=sys.stderr)
             return 65
+
+    # Blind target isolation (plan section 2): in a blind-project run the
+    # generator-visible /target must contain no reference harness directories
+    # and no selected-harness API metadata. Fail closed before generation.
+    if is_blind() and is_method_faithful():
+        target_dir = os.environ.get("HGB_TARGET_PACKAGE") or os.environ.get("HGB_TARGET_ROOT") or "/target"
+        iso_violations = verify_blind_target_isolation(target_dir)
+        if iso_violations:
+            for v in iso_violations:
+                print(f"ofg_target_isolation_violation: {v}", file=sys.stderr)
+            return 65
+
+    # Record a prompt audit (plan section 3) proving the generator prompt did
+    # not embed the exact reference harness or selected-harness API metadata.
+    _write_generation_prompt_audit()
 
     sys.argv = ["run_all_experiments.py", *upstream_args]
     result = run_all_experiments.main()

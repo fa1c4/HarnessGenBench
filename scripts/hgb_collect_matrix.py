@@ -267,6 +267,32 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
             overlay_audit = build.get("overlay_audit") or {}
             if overlay_audit and overlay_audit.get("matches_candidate") is not True:
                 violations.append("evaluated reproduction-delta row has build.overlay_audit.matches_candidate != true")
+        # OSS-Fuzz-Gen-specific delta invariants (plan
+        # oss-fuzz-gen_reproduction_delta.md section 7): a clean prompt audit,
+        # a real (non-shim) introspector with nonzero functions, and a valid
+        # runtime coverage diff (or an explicitly unavailable native control).
+        gen_name = str(meta.get("generator") or meta.get("fuzzer") or meta.get("baseline") or "")
+        if gen_name == "oss-fuzz-gen":
+            prompt_audit = meta.get("prompt_audit") or {}
+            if isinstance(prompt_audit, dict):
+                if prompt_audit.get("exact_reference_harness_in_prompt"):
+                    violations.append("evaluated reproduction-delta ofg row has prompt_audit.exact_reference_harness_in_prompt == true")
+                if prompt_audit.get("selected_harness_api_metadata_used"):
+                    violations.append("evaluated reproduction-delta ofg row has prompt_audit.selected_harness_api_metadata_used == true")
+            else:
+                violations.append("evaluated reproduction-delta ofg row has no prompt_audit")
+            introspector = meta.get("introspector") or meta.get("introspector_provenance") or {}
+            if isinstance(introspector, dict):
+                if introspector.get("used_local_shim"):
+                    violations.append("evaluated reproduction-delta ofg row has introspector.used_local_shim == true")
+                if int(introspector.get("function_count", 0) or 0) <= 0:
+                    violations.append("evaluated reproduction-delta ofg row has introspector.function_count <= 0")
+            else:
+                violations.append("evaluated reproduction-delta ofg row has no introspector provenance")
+            coverage_diff = meta.get("coverage_diff") or (meta.get("metrics") or {}).get("coverage_diff") or {}
+            if isinstance(coverage_diff, dict) and coverage_diff:
+                if coverage_diff.get("runtime_coverage_valid") is False:
+                    violations.append("evaluated reproduction-delta ofg row has coverage_diff.runtime_coverage_valid == false")
     return violations
 
 
@@ -353,6 +379,103 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         "near_duplicate_reference": bool(candidate.get("near_duplicate_reference")),
         "exact_copy": exact_copy,
         "matches_candidate": matches_candidate,
+        "paper_equivalent_delta": paper_equivalent_delta,
+        "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
+    }
+
+
+def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
+    """Extract the OSS-Fuzz-Gen reproduction-delta row fields from metadata.
+
+    Per plan oss-fuzz-gen_reproduction_delta.md section 7, an OFG row is
+    paper-equivalent only when every real stage has evidence: build success,
+    candidate overlay matching the candidate, nonzero campaign executions, real
+    coverage with covered lines > 0, a real (non-shim) introspector, a clean
+    prompt audit, and a valid runtime coverage diff (or an explicitly
+    unavailable native control reported separately).
+    """
+    stages = meta.get("stages") or {}
+    if not isinstance(stages, dict):
+        stages = {}
+    metrics = meta.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    cov = metrics.get("coverage") or meta.get("coverage") or {}
+    if not isinstance(cov, dict):
+        cov = {}
+    campaign = metrics.get("campaign") or meta.get("campaign") or {}
+    if not isinstance(campaign, dict):
+        campaign = {}
+    line_cov = cov.get("line_coverage") or {}
+    if not isinstance(line_cov, dict):
+        line_cov = {}
+    build = meta.get("build") or metrics.get("build") or {}
+    if not isinstance(build, dict):
+        build = {}
+    selected = meta.get("selected_candidate") or {}
+    if not isinstance(selected, dict):
+        selected = {}
+    sel_build = selected.get("build") or build or {}
+    overlay_audit = sel_build.get("overlay_audit") or meta.get("overlay_audit") or {}
+    if not isinstance(overlay_audit, dict):
+        overlay_audit = {}
+    prompt_audit = meta.get("prompt_audit") or {}
+    if not isinstance(prompt_audit, dict):
+        prompt_audit = {}
+    introspector = meta.get("introspector") or meta.get("introspector_provenance") or {}
+    if not isinstance(introspector, dict):
+        introspector = {}
+    coverage_diff = meta.get("coverage_diff") or metrics.get("coverage_diff") or {}
+    if not isinstance(coverage_diff, dict):
+        coverage_diff = {}
+    profile = str(meta.get("profile", ""))
+    method_variant = str(meta.get("method_variant", ""))
+    line_covered = line_cov.get("covered")
+    execs_done = int(campaign.get("execs_done", 0) or 0)
+    matches_candidate = overlay_audit.get("matches_candidate")
+    runtime_coverage_valid = coverage_diff.get("runtime_coverage_valid")
+    cov_diff_status = str(coverage_diff.get("status", ""))
+    # A row is coverage-diff-acceptable when the runtime coverage diff is
+    # valid, OR the native control could not be built and the diff is reported
+    # unavailable with a non-paper-equivalent flag (plan section 6.7).
+    cov_diff_ok = (
+        runtime_coverage_valid is True
+        or (cov_diff_status == "unavailable" and bool(meta.get("excluded_from_aggregate")))
+    )
+    paper_equivalent_delta = bool(
+        profile == "reproduction-delta"
+        and method_variant == "paper-faithful"
+        and str(meta.get("status", "")) == "evaluated"
+        and not bool(meta.get("excluded_from_aggregate"))
+        and isinstance(line_covered, int) and line_covered > 0
+        and execs_done > 0
+        and matches_candidate is True
+        and prompt_audit.get("exact_reference_harness_in_prompt") is False
+        and prompt_audit.get("selected_harness_api_metadata_used") is False
+        and introspector.get("used_local_shim") is False
+        and int(introspector.get("function_count", 0) or 0) > 0
+        and cov_diff_ok
+    )
+    return {
+        "target": meta.get("target", ""),
+        "status": str(meta.get("status", "")),
+        "applicability": str(meta.get("applicability", "")),
+        "profile": profile,
+        "method_variant": method_variant,
+        "candidate_overlay": str(stages.get("candidate_overlay", "")),
+        "candidate_build": str(stages.get("candidate_build", "")),
+        "sanitizer_smoke": str(stages.get("sanitizer_smoke", "")),
+        "campaign": str(stages.get("campaign", "")),
+        "coverage": str(stages.get("coverage", "")),
+        "line_coverage": line_covered,
+        "execs_done": execs_done,
+        "matches_candidate": matches_candidate,
+        "overlay_audit": overlay_audit,
+        "prompt_audit": prompt_audit,
+        "introspector": introspector,
+        "coverage_diff": coverage_diff,
+        "runtime_coverage_valid": runtime_coverage_valid,
+        "cov_diff_status": cov_diff_status,
         "paper_equivalent_delta": paper_equivalent_delta,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
@@ -629,6 +752,8 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
     applicable_infra_failure = 0
     coverage_by_applicable_evaluated: list[dict[str, Any]] = []
     ckgfuzzer_target_rows: list[dict[str, Any]] = []
+    # OSS-Fuzz-Gen reproduction-delta per-target rows (plan section 7).
+    ofg_target_rows: list[dict[str, Any]] = []
     # G2Fuzz paper-core/extension split (plan g2fuzz_reproduction_delta.md
     # section 7).  paper-core and extension results are aggregated separately
     # and never combined into one paper-equivalent ranking.
@@ -646,6 +771,10 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         # Collect per-target CKGFuzzer matrix rows (plan section 9).
         if gen == "ckgfuzzer":
             ckgfuzzer_target_rows.append(extract_ckgfuzzer_row(meta))
+        # Collect per-target OSS-Fuzz-Gen reproduction-delta rows (plan
+        # oss-fuzz-gen_reproduction_delta.md section 7).
+        if gen == "oss-fuzz-gen":
+            ofg_target_rows.append(extract_ofg_row(meta))
         # Aggregate artifact counts by task family so harness and input
         # generators never share a single counter.
         harness_counts[gen] += int(meta.get("generated_harness_count") or meta.get("generated_driver_count") or 0)
@@ -758,6 +887,16 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         "storage": storage_report(matrix_dir, records),
         "evaluated_row_violations": evaluated_violations,
         "ckgfuzzer_target_rows": ckgfuzzer_target_rows,
+        # OSS-Fuzz-Gen reproduction-delta per-target rows and the count of
+        # paper-equivalent rows (plan oss-fuzz-gen_reproduction_delta.md
+        # section 7).  Compatibility-fallback rows are reported separately and
+        # never counted as paper-equivalent.
+        "ofg_target_rows": ofg_target_rows,
+        "ofg_paper_equivalent_delta": sum(1 for r in ofg_target_rows if r.get("paper_equivalent_delta")),
+        "ofg_compat_fallback_rows": [
+            r for r in ofg_target_rows
+            if str(r.get("profile", "")) == "reproduction-delta" and bool(r.get("exclude_from_aggregate"))
+        ],
     }
 
 
