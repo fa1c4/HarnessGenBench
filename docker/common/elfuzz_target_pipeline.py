@@ -531,7 +531,12 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
             "method_variant": "compat-smoke",
             "source": "ci-smoke",
         }
-    if profile in {"paper-faithful", "reproduction-gamma"}:
+    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta"}:
+        # reproduction-delta is the strict paper-native input-generator profile
+        # (plan elfuzz_reproduction_delta.md). It inherits the paper-faithful
+        # budget and, like reproduction-gamma, rejects a prebuilt
+        # ELFUZZ_TARGET_BINARY and requires a real coverage-instrumented replay.
+        strict = profile in {"reproduction-gamma", "reproduction-delta"}
         return {
             "profile": profile,
             "evolution_iterations": env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50),
@@ -541,12 +546,12 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
             "tgi_waiting_seconds": env_int("ELFUZZ_TGI_WAITING_SECONDS", 1200),
             "excluded_from_aggregate": False,
             "paper_core": True,
-            # reproduction-gamma invariants (plan section 3): the SUT must be
-            # built from the exact FuzzBench Dockerfile, never a prebuilt
-            # ELFUZZ_TARGET_BINARY, and coverage must come from a real
+            # reproduction-gamma/delta invariants (plan section 3/4): the SUT
+            # must be built from the exact FuzzBench Dockerfile, never a
+            # prebuilt ELFUZZ_TARGET_BINARY, and coverage must come from a real
             # coverage-instrumented replay, never AFL path counters.
-            "reject_prebuilt_binary": profile == "reproduction-gamma",
-            "require_coverage_build": profile == "reproduction-gamma",
+            "reject_prebuilt_binary": strict,
+            "require_coverage_build": strict,
             "method_variant": "paper-faithful",
             "source": "pinned-upstream-defaults",
         }
@@ -621,12 +626,30 @@ def is_fuzzer_program(path: Path) -> bool:
 
 
 def is_produced_input(path: Path) -> bool:
-    ignored_suffixes = {".py", ".log", ".json", ".jsonl", ".txt", ".toml", ".md", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".conf"}
-    ignored_stems = {"manifest", "metadata", "config", "lineage", "fuzzer_stats", "stats", "preseed", "seed_corpus", "input_corpus", "corpus_manifest"}
+    """Return True only for actual input payloads (plan section 3).
+
+    Prompts, manifests, lineage, config, metadata, stats, logs, fuzzer
+    programs, preseed/corpus/queue metadata, and LLVM profraw/profdata are
+    never counted as produced inputs.  Only real input payload files under a
+    produced/upstream ELFuzz output directory count.
+    """
+    ignored_suffixes = {
+        ".py", ".log", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".txt",
+        ".md", ".sh", ".cfg", ".ini", ".conf", ".profraw", ".profdata",
+    }
+    ignored_stems = {
+        "manifest", "metadata", "config", "lineage", "fuzzer_stats", "stats",
+        "preseed", "seed_corpus", "input_corpus", "corpus_manifest", "corpus",
+        "seed_fuzzer", "evolved", "run", "queue",
+    }
+    ignored_prefixes = ("prompt_", "manifest", "lineage", "config", "metadata", "stats", "preseed", "corpus", "seed_fuzzer", "evolved")
+    name = path.name.lower()
     stem = path.stem.lower()
     if path.suffix.lower() in ignored_suffixes:
         return False
     if stem in ignored_stems or stem.startswith("config"):
+        return False
+    if any(name.startswith(prefix) for prefix in ignored_prefixes):
         return False
     if stem.startswith("preseed") or stem.endswith("_preseed"):
         return False
@@ -845,6 +868,8 @@ class ELFuzzPipeline:
         self.hang_count = 0
         self.exit_code = 0
         self.reason = "none"
+        self.reason_code = "none"
+        self.error: dict[str, Any] = {}
         self.status = "created"
         self.start_time = time.time()
         self.target_binary: Path | None = None
@@ -1060,21 +1085,26 @@ class ELFuzzPipeline:
                 "target": self.target,
                 "fuzz_target": fuzz_target,
                 "build_mode": self.adapter["build_mode"],
+                "uses_fuzzbench_docker_environment": True,
                 "native": {
                     "image_tag": native["image_tag"],
                     "image_digest": native["image_digest"],
+                    "out_binary": f"/out/{fuzz_target}",
                     "binary_path": str(native_bin),
                     "binary_sha256": native["binary_sha256"],
                     "engine": native["engine"],
                     "build_exit_code": native["build_exit_code"],
+                    "verified_executable": bool(native_verify.get("ok", False)),
                 },
                 "coverage": {
                     "image_tag": coverage["image_tag"],
                     "image_digest": coverage["image_digest"],
+                    "out_binary": f"/out/{fuzz_target}",
                     "binary_path": str(cov_bin),
                     "binary_sha256": coverage["binary_sha256"],
                     "engine": coverage["engine"],
                     "build_exit_code": coverage["build_exit_code"],
+                    "verified_executable": bool(verify_target_binary(cov_bin, fuzz_target).get("ok", False)),
                 },
                 "input_mode": str(self.adapter["input_mode"]),
                 "argv": list(self.adapter["argv"]),
@@ -1406,6 +1436,17 @@ class ELFuzzPipeline:
             }
             append_jsonl(provenance, record)
             index += 1
+        # Plan section 3.4: also write a produced-input provenance manifest that
+        # strictly classifies prompts/manifests/logs/fuzzer programs as excluded
+        # so they can never inflate the produced-input count.
+        try:
+            import hgb_input_campaign  # type: ignore
+
+            hgb_input_campaign.write_produced_input_provenance(
+                produced, self.workspace / "generated_inputs" / "provenance.json"
+            )
+        except Exception:
+            pass
 
     def synthesis(self) -> None:
         cmd = self.synth_command()
@@ -1766,11 +1807,20 @@ class ELFuzzPipeline:
             "raw_text": report_text,
         }
 
+    def _fail_coverage(self, coverage: dict[str, Any], reason_code: str, message: str) -> None:
+        """Mark coverage failed and record the delta reason_code (plan section 7)."""
+        self.reason_code = reason_code
+        self.error = {"reason_code": reason_code, "message": message}
+        coverage["complete"] = False
+        coverage["report_exists"] = bool(coverage.get("report_exists"))
+        json_dump(self.workspace / "coverage" / "coverage.json", coverage)
+        self.stages["coverage"] = stage_record("failed", message, reason_code=reason_code, **coverage)
+
     def collect_coverage(self) -> None:
         stats = self.metrics.get("fuzzer_stats", {}) if isinstance(self.metrics.get("fuzzer_stats"), dict) else {}
         execs_done = int(stats.get("execs_done") or 0)
         paths_total = int(stats.get("paths_total") or stats.get("queued_paths") or self.queue_count or 0)
-        gamma = bool(self.budget.get("require_coverage_build"))
+        strict = bool(self.budget.get("require_coverage_build"))
         replay = self._run_coverage_replay(self._replay_corpus())
         report_path = Path(replay["report_path"]) if replay.get("report_path") else None
         inputs_replayed = int(replay.get("inputs_replayed") or 0)
@@ -1821,23 +1871,77 @@ class ELFuzzPipeline:
                 llvm_text.write_text(replay.get("raw_text", ""), encoding="utf-8")
             except Exception:
                 coverage["report_parse_error"] = True
+                coverage["report_exists"] = False
         summary_path = self.workspace / "coverage" / "coverage.json"
         json_dump(summary_path, coverage)
-        # Fail coverage per plan section 8 invariants.
-        if self.coverage_binary is None and gamma:
-            raise PipelineError("failed", "ELFuzz coverage binary missing for reproduction-gamma", 65)
-        if inputs_replayed == 0 and self.queue_count == 0 and self.produced_input_count == 0:
-            raise PipelineError("failed", "ELFuzz coverage replayed zero inputs", 65)
-        if gamma and not coverage.get("report_exists"):
-            raise PipelineError("failed", "ELFuzz coverage requires a real LLVM coverage report (AFL paths_total is not coverage)", 65)
-        if gamma and (coverage.get("total_lines", 0) == 0 or coverage.get("line_coverage") is None):
-            raise PipelineError("failed", "ELFuzz coverage JSON missing line/region/function data", 65)
-        # Coverage cannot complete from AFL path count alone (non-gamma guard).
-        if not gamma and execs_done <= 0:
-            raise PipelineError("failed", "ELFuzz coverage cannot complete from AFL path count alone", 65)
-        coverage["complete"] = True
+        # Strict (reproduction-delta/gamma) invariants (plan section 7): a real
+        # LLVM coverage report is mandatory. AFL ``paths_total`` is never
+        # accepted as line/edge coverage. A missing/empty/malformed report
+        # fails coverage with reason_code ``coverage_report_missing``.
+        if strict:
+            if self.coverage_binary is None or not Path(self.coverage_binary).is_file():
+                self._write_coverage_diagnostic(coverage, execs_done, paths_total, inputs_replayed)
+                self._fail_coverage(coverage, "coverage_report_missing", "ELFuzz coverage binary missing for reproduction-delta/gamma")
+                raise PipelineError("failed", "ELFuzz coverage binary missing for reproduction-delta/gamma", 65)
+            if not coverage.get("report_exists"):
+                self._write_coverage_diagnostic(coverage, execs_done, paths_total, inputs_replayed)
+                self._fail_coverage(coverage, "coverage_report_missing", "ELFuzz coverage requires a real LLVM coverage report (AFL paths_total is not coverage)")
+                raise PipelineError("failed", "ELFuzz coverage requires a real LLVM coverage report (AFL paths_total is not coverage)", 65)
+            if coverage.get("total_lines", 0) == 0 or coverage.get("line_coverage") is None:
+                self._write_coverage_diagnostic(coverage, execs_done, paths_total, inputs_replayed)
+                self._fail_coverage(coverage, "coverage_report_missing", "ELFuzz coverage JSON missing line/region/function data")
+                raise PipelineError("failed", "ELFuzz coverage JSON missing line/region/function data", 65)
+            if inputs_replayed == 0 and self.queue_count == 0 and self.produced_input_count == 0:
+                self._fail_coverage(coverage, "coverage_report_missing", "ELFuzz coverage replayed zero inputs")
+                raise PipelineError("failed", "ELFuzz coverage replayed zero inputs", 65)
+            coverage["complete"] = True
+            json_dump(summary_path, coverage)
+            self.stages["coverage"] = stage_record("complete", "none", **coverage)
+            return
+        # Non-strict (alpha/compat-smoke): a real LLVM report is preferred. If
+        # the replay produced none, fall back to a campaign-execution summary
+        # (never labeling AFL paths_total as edge/line coverage) so the beta
+        # contract's ``report_exists`` reflects the written summary file.
+        if not coverage.get("report_exists"):
+            if execs_done <= 0:
+                self._fail_coverage(coverage, "coverage_report_missing", "ELFuzz coverage cannot complete from AFL path count alone")
+                raise PipelineError("failed", "ELFuzz coverage cannot complete from AFL path count alone", 65)
+            coverage.update(
+                {
+                    "coverage_mode": "elfuzz_campaign",
+                    "line_coverage": None,
+                    "region_coverage": None,
+                    "function_coverage": None,
+                    "report_path": str(summary_path),
+                    "report_exists": True,
+                    "has_executions": execs_done > 0,
+                    "complete": True,
+                }
+            )
+        else:
+            coverage["complete"] = True
         json_dump(summary_path, coverage)
         self.stages["coverage"] = stage_record("complete", "none", **coverage)
+
+    def _write_coverage_diagnostic(self, coverage: dict[str, Any], execs_done: int, paths_total: int, inputs_replayed: int) -> None:
+        """Write AFL campaign counters as a diagnostic, never as coverage.
+
+        Plan section 7.2: a missing coverage report must not be disguised as a
+        real ``coverage.json``.  AFL ``paths_total``/``execs_done`` are written
+        to ``coverage_diagnostic.json`` with ``line_coverage=null`` so the
+        failure is auditable without faking coverage.
+        """
+        diagnostic = {
+            "diagnostic": True,
+            "line_coverage": None,
+            "execs_done": execs_done,
+            "paths_total": paths_total,
+            "inputs_replayed": inputs_replayed,
+            "queue_count": self.queue_count,
+            "produced_input_count": self.produced_input_count,
+            "note": "AFL path counters are not line/edge coverage",
+        }
+        json_dump(self.workspace / "coverage" / "coverage_diagnostic.json", diagnostic)
 
     def result_payload(self, status: str, reason: str, exit_code: int) -> dict[str, Any]:
         manifest = self.target_manifest()
@@ -1851,6 +1955,40 @@ class ELFuzzPipeline:
             if canonical in self.stages and alias not in stages_view:
                 stages_view[alias] = self.stages[canonical]
         model = os.environ.get("ELFUZZ_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("MODEL") or ""
+        # Plan section 5: record both the reported target and the actual SUT
+        # project/fuzz-target so a curl result is never reported from a jsoncpp
+        # benchmark alias.  The executed SUT is always the declared FuzzBench
+        # target (validate_no_aliasing forbids running an aliased benchmark), so
+        # ``alias_used_for_execution`` is false; an upstream native benchmark
+        # reused only for prompt templates is recorded as ``prompt_template_source``.
+        upstream_benchmark = str((self.adapter or {}).get("upstream_benchmark", ""))
+        alias_used = False
+        prompt_template_source = ""
+        if self.adapter and self.adapter.get("adapter_class") == EXTENSION:
+            if upstream_benchmark in UPSTREAM_NATIVE_BENCHMARKS:
+                prompt_template_source = upstream_benchmark
+        build_record = read_json(self.workspace / "target" / "build.json")
+        sut_contract = read_json(self._sut_root() / "contract.json") if (self._sut_root() / "contract.json").is_file() else {}
+        build_provenance: dict[str, Any] = {
+            "uses_fuzzbench_docker_environment": bool(sut_contract),
+            "native": sut_contract.get("native", {}) if sut_contract else {},
+            "coverage": sut_contract.get("coverage", {}) if sut_contract else {},
+            "binary_path": build_record.get("binary_path", ""),
+            "source": build_record.get("source", ""),
+            "verified_executable": bool((build_record.get("verification") or {}).get("ok", False)),
+        }
+        artifacts = {
+            "seed_fuzzers": count_files(self.workspace / "synthesis" / "fuzzer_programs"),
+            "synth_prompts": count_files(self.workspace / "synthesis" / "prompts"),
+            "generated_fuzzer_programs": count_files(self.workspace / "synthesis" / "fuzzer_programs"),
+            "produced_inputs": count_files(self.workspace / "generated_inputs" / "produced"),
+            "campaign_queue": self.queue_count,
+            "coverage_report": bool(coverage_summary.get("report_exists")) if isinstance(coverage_summary, dict) else False,
+        }
+        reason_code = self.reason_code if self.reason_code != "none" else (
+            self.classification.get("reason_code") if status == "not_applicable" else "none"
+        )
+        excluded = bool(self.budget.get("excluded_from_aggregate", False)) or status == "not_applicable"
         return {
             "schema_version": 2,
             "baseline": "elfuzz",
@@ -1861,7 +1999,7 @@ class ELFuzzPipeline:
             "target": self.target,
             "project": manifest.get("project", os.environ.get("HGB_TARGET_PROJECT", "")),
             "fuzz_target": manifest.get("fuzz_target", os.environ.get("HGB_TARGET_FUZZ_TARGET", "")),
-            "upstream_benchmark": (self.adapter or {}).get("upstream_benchmark", ""),
+            "upstream_benchmark": upstream_benchmark,
             "adapter_id": (self.adapter or {}).get("adapter_id", ""),
             "adapter_class": adapter_class,
             "hgb_adapter": bool((self.adapter or {}).get("hgb_adapter", False)),
@@ -1873,10 +2011,12 @@ class ELFuzzPipeline:
             "model": model,
             "api_key_present": bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")),
             "paper_core": self.budget.get("paper_core", False),
-            "excluded_from_aggregate": self.budget.get("excluded_from_aggregate", False),
+            "exclude_from_aggregate": excluded,
+            "excluded_from_aggregate": excluded,
             "status": status,
             "reason": reason,
-            "reason_code": (self.classification.get("reason_code") if status == "not_applicable" else "none"),
+            "reason_code": reason_code,
+            "error": self.error,
             "applicability": self.classification.get("applicability", "applicable"),
             "exit_code": exit_code,
             "run_type": "generate-target",
@@ -1886,6 +2026,26 @@ class ELFuzzPipeline:
             "queue_count": self.queue_count,
             "crash_count": self.crash_count,
             "hang_count": self.hang_count,
+            # Plan section 5: reported target vs actual SUT.
+            "reported_target": self.target,
+            "actual_sut_project": manifest.get("project", self.target.split("_", 1)[0] if self.target else ""),
+            "actual_sut_fuzz_target": manifest.get("fuzz_target", self.target),
+            "upstream_benchmark_alias": prompt_template_source,
+            "alias_used_for_execution": alias_used,
+            "prompt_template_source": prompt_template_source,
+            "build": build_provenance,
+            "method": {
+                "generated_fuzzer_program_count": self.fuzzer_program_count,
+                "evolution_iterations_completed": self.evolution_iterations_completed,
+                "produced_input_count": self.produced_input_count,
+            },
+            "artifacts": artifacts,
+            "reproducibility": {
+                "adapter_hashes": self.adapter_hashes,
+                "fuzzbench_commit": manifest.get("fuzzbench_commit", ""),
+                "build_uses_fuzzbench_docker_environment": bool(sut_contract),
+                "method_variant": self.budget.get("method_variant", self.profile),
+            },
             "elfuzz": {
                 "adapter_class": adapter_class or "",
                 "format": (self.adapter or {}).get("format", ""),
@@ -2011,12 +2171,21 @@ class ELFuzzPipeline:
 
 def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
     cls = classify_target(target, metadata_root)
-    manifest = {}
     reason_code = cls.get("reason_code", INVALID_REASON_CODE)
     stages = {name: stage_record("not_applicable", reason_code) for name in STAGE_NAMES}
     for alias, canonical in GOAL_STAGE_ALIASES.items():
         if canonical in stages and alias not in stages:
             stages[alias] = stages[canonical]
+    # Plan section 2: the Invalid result must carry the paper-native
+    # applicability/generation/campaign/coverage stage view in addition to the
+    # canonical HGB stage names, with applicability completed and every
+    # downstream stage not_applicable.
+    stages["applicability"] = stage_record("completed", "none")
+    stages["generation"] = stage_record("not_applicable", reason_code)
+    stages["campaign"] = stage_record("not_applicable", reason_code)
+    stages["coverage"] = stage_record("not_applicable", reason_code)
+    profile = os.environ.get("HGB_BASELINE_PROFILE", "alpha")
+    protocol = os.environ.get("HGB_BASELINE_PROTOCOL", "paper-native")
     return {
         "schema_version": 2,
         "baseline": "elfuzz",
@@ -2027,8 +2196,9 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "target": target,
         "project": target.split("_", 1)[0] if target else "",
         "fuzz_target": target,
-        "profile": os.environ.get("HGB_BASELINE_PROFILE", "alpha"),
-        "protocol": os.environ.get("HGB_BASELINE_PROTOCOL", "paper-native"),
+        "profile": profile,
+        "protocol": protocol,
+        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta"} else profile,
         "status": "not_applicable",
         "applicability": "Invalid",
         "reason_code": reason_code,
@@ -2037,7 +2207,18 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "run_type": "generate-target",
         "generated_harness_count": 0,
         "generated_input_count": 0,
+        # Plan section 2 / global invariant 5: both the schema-v2
+        # ``exclude_from_aggregate`` field and the legacy
+        # ``excluded_from_aggregate`` spelling are emitted so the matrix
+        # collector and downstream consumers agree Invalid rows never count in
+        # the scientific aggregate.
+        "exclude_from_aggregate": True,
         "excluded_from_aggregate": True,
+        "reported_target": target,
+        "actual_sut_project": target.split("_", 1)[0] if target else "",
+        "actual_sut_fuzz_target": target,
+        "upstream_benchmark_alias": "",
+        "alias_used_for_execution": False,
         "elfuzz": {
             "adapter_class": "",
             "format": "",
@@ -2055,6 +2236,18 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         },
         "campaign": {"execs_done": 0, "crashes": 0, "hangs": 0},
         "coverage": {},
+        "build": {"uses_fuzzbench_docker_environment": False, "native": {}, "coverage": {}, "verified_executable": False},
+        "method": {"generated_fuzzer_program_count": 0, "evolution_iterations_completed": 0, "produced_input_count": 0},
+        "artifacts": {
+            "seed_fuzzers": 0, "synth_prompts": 0, "generated_fuzzer_programs": 0,
+            "produced_inputs": 0, "campaign_queue": 0, "coverage_report": False,
+        },
+        "reproducibility": {
+            "fuzzbench_commit": "",
+            "build_uses_fuzzbench_docker_environment": False,
+            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta"} else profile,
+        },
+        "error": {"reason_code": reason_code, "message": INVALID_MESSAGE},
         "stages": stages,
         "classification": cls,
     }

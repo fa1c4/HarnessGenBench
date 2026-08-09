@@ -261,8 +261,11 @@ if [[ "$mode" == "generate-target" ]]; then
   if [[ -z "${HGB_FUZZBENCH_BENCHMARK_DIR:-}" && -d "/opt/hgb/fuzzbench/benchmarks/$target_name" ]]; then
     export HGB_FUZZBENCH_BENCHMARK_DIR="/opt/hgb/fuzzbench/benchmarks/$target_name"
   fi
-  # reproduction-gamma preflight: verify G2Fuzz modified AFL++ components.
-  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" ]]; then
+  # reproduction-gamma/delta preflight: verify G2Fuzz modified AFL++ components.
+  # Delta is the strict paper-native profile; gamma is a backward-compatible
+  # alias. Both require the modified afl-fuzz (with -c CmpLog and -k G2FUZZ),
+  # afl-clang-fast/afl-clang-fast++, and program_gen.py (plan section 1.2/4.1).
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" ]]; then
     missing=()
     [[ -f "$artifact/program_gen.py" ]] || missing+=("program_gen.py")
     [[ -x "$artifact/afl-fuzz" ]] || missing+=("afl-fuzz")
@@ -272,19 +275,25 @@ if [[ "$mode" == "generate-target" ]]; then
     fi
     [[ -x "$artifact/afl-clang-fast" ]] || missing+=("afl-clang-fast")
     [[ -x "$artifact/afl-clang-fast++" ]] || missing+=("afl-clang-fast++")
+    # Delta additionally requires program_to_format.json and model_setting.json
+    # (plan section 4.1).
+    if [[ "$HGB_BASELINE_PROFILE" == "reproduction-delta" ]]; then
+      [[ -f "$artifact/program_to_format.json" ]] || missing+=("program_to_format.json")
+    fi
     if [[ ${#missing[@]} -gt 0 ]]; then
-      printf 'infra_missing: G2Fuzz reproduction-gamma preflight failed: missing %s\n' "${missing[*]}" >&2
+      printf 'infra_missing: G2Fuzz %s preflight failed: missing %s\n' "$HGB_BASELINE_PROFILE" "${missing[*]}" >&2
       mkdir -p "$workspace"
-      "$python" - "$workspace" "${missing[*]}" <<'PY_PREFLIGHT'
+      "$python" - "$workspace" "${missing[*]}" "$HGB_BASELINE_PROFILE" <<'PY_PREFLIGHT'
 import json, sys
 from pathlib import Path
 ws = Path(sys.argv[1])
 missing = sys.argv[2]
+profile = sys.argv[3] if len(sys.argv) > 3 else "reproduction-gamma"
 result = {
     "schema_version": 2, "baseline": "g2fuzz", "generator": "g2fuzz",
     "task_family": "input_generator", "status": "infra_missing",
-    "reason": f"G2Fuzz reproduction-gamma preflight failed: missing {missing}",
-    "exit_code": 127, "profile": "reproduction-gamma",
+    "reason": f"G2Fuzz {profile} preflight failed: missing {missing}",
+    "exit_code": 127, "profile": profile,
 }
 for name in ("result.json", "metadata.json"):
     (ws / name).write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")

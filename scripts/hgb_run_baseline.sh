@@ -125,22 +125,51 @@ export HGB_BASELINE_PROTOCOL="$protocol"
 case "$generator" in
   elfuzz)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
-      *) die "elfuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke) ;;
+      *) die "elfuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       paper-native|extension) ;;
       *) die "elfuzz: invalid protocol: $protocol (expected paper-native or extension)" ;;
     esac
-    # reproduction-gamma invariants: refuse a prebuilt ELFUZZ_TARGET_BINARY so
-    # the SUT is always built from the exact FuzzBench Dockerfile, and require
-    # a real coverage replay (never AFL path counters).
-    if [[ "$profile" == "reproduction-gamma" ]]; then
+    # reproduction-delta is the strict paper-native input-generator profile
+    # (plan elfuzz_reproduction_delta.md section 1). reproduction-gamma is kept
+    # as a backward-compatible alias. Both forbid a prebuilt
+    # ELFUZZ_TARGET_BINARY so the SUT is always built from the exact FuzzBench
+    # Dockerfile, require a real coverage replay (never AFL path counters), and
+    # require the Docker socket for applicable targets.
+    if [[ "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" ]]; then
       if [[ -n "${ELFUZZ_TARGET_BINARY:-}" ]]; then
-        die "elfuzz/reproduction-gamma: ELFUZZ_TARGET_BINARY is forbidden; the SUT must be built from the FuzzBench Dockerfile"
+        die "elfuzz/$profile: ELFUZZ_TARGET_BINARY is forbidden; the SUT must be built from the FuzzBench Dockerfile"
       fi
       export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-1}"
       export ELFUZZ_REQUIRE_GPU="${ELFUZZ_REQUIRE_GPU:-1}"
+    fi
+    # Plan section 1/2: non-text/unsupported targets must return Invalid before
+    # Docker image build, TGI, model download, or generation. Classify from the
+    # committed manifest before any Docker-socket requirement so an Invalid
+    # target never fails on missing Docker. Dry-run skips this (it only
+    # validates the profile/protocol combination).
+    if [[ "$dry_run" != "1" ]]; then
+      elfuzz_cls="$(python3 "$SCRIPT_DIR/../docker/common/elfuzz_target_pipeline.py" classify --target "$target" --metadata-root "$SCRIPT_DIR/../metadata" 2>/dev/null || true)"
+      elfuzz_applicability="$(printf '%s' "$elfuzz_cls" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("applicability",""))' 2>/dev/null || true)"
+      if [[ "$elfuzz_applicability" == "Invalid" ]]; then
+        _inv_id="${run_id:-$(make_timestamp)}"
+        _inv_ws="$(workspace_generator_target_run_dir "$generator" "$target" "$_inv_id" "$(repo_root)")"
+        ensure_dir "$_inv_ws/logs"
+        HGB_BASELINE_PROFILE="$profile" HGB_BASELINE_PROTOCOL="$protocol" \
+          python3 "$SCRIPT_DIR/../docker/common/elfuzz_target_pipeline.py" write-invalid \
+          --target "$target" --metadata-root "$SCRIPT_DIR/../metadata" --out "$_inv_ws/result.json" >/dev/null
+        cp "$_inv_ws/result.json" "$_inv_ws/metadata.json"
+        printf 'Invalid: ELFuzz supports text-input targets only\n' >&2
+        printf '%s\n' "$_inv_ws"
+        exit 0
+      fi
+      # Applicable reproduction-delta target: the Docker socket is mandatory to
+      # build the native and coverage SUTs from the FuzzBench Docker environment.
+      if [[ "$profile" == "reproduction-delta" && ! -S /var/run/docker.sock ]]; then
+        die "elfuzz/reproduction-delta: a Docker socket is required to build the native and coverage SUTs from the FuzzBench Docker environment"
+      fi
     fi
     export HGB_EXCLUDE_FROM_AGGREGATE=0
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1
@@ -267,20 +296,43 @@ case "$generator" in
     ;;
   g2fuzz)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|compat-smoke) ;;
-      *) die "g2fuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke) ;;
+      *) die "g2fuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       paper-native|extension) ;;
       *) die "g2fuzz: invalid protocol: $protocol (expected paper-native or extension)" ;;
     esac
-    # reproduction-gamma invariants: refuse prebuilt G2FUZZ_TARGET_DIR so the
-    # .afl/.cmp/.cov triple is always built from the FuzzBench Dockerfile, and
-    # do not patch G2FUZZ_TRY_NUM down to 1.
+    # reproduction-delta is the strict paper-native profile (plan
+    # g2fuzz_reproduction_delta.md section 1). reproduction-gamma is kept as a
+    # backward-compatible alias. Both forbid a prebuilt G2FUZZ_TARGET_DIR so the
+    # .afl/.cmp/.cov triple is always built from the FuzzBench Docker
+    # environment, require the Docker socket, do not patch G2FUZZ_TRY_NUM down
+    # to smoke values, and require a real coverage replay (never AFL paths).
     if [[ "$profile" == "reproduction-gamma" ]]; then
       if [[ -n "${G2FUZZ_TARGET_DIR:-}" ]]; then
         die "g2fuzz/reproduction-gamma: G2FUZZ_TARGET_DIR is forbidden; the .afl/.cmp/.cov triple must be built from the FuzzBench Docker environment"
       fi
+    fi
+    if [[ "$profile" == "reproduction-delta" ]]; then
+      if [[ -n "${G2FUZZ_TARGET_DIR:-}" ]]; then
+        die "g2fuzz/reproduction-delta: G2FUZZ_TARGET_DIR is forbidden; the .afl/.cmp/.cov triple must be built from the FuzzBench Docker environment"
+      fi
+    fi
+    if [[ "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" ]]; then
+      # Do not patch G2FUZZ_TRY_NUM down to a smoke value in the strict
+      # profiles; a smoke value (1) would weaken the paper-faithful loop.
+      if [[ "${G2FUZZ_TRY_NUM:-}" == "1" ]]; then
+        die "g2fuzz/$profile: G2FUZZ_TRY_NUM=1 is a smoke value; the strict profiles require the real paper budget (default 3)"
+      fi
+      # Coverage replay is mandatory in the strict profiles.
+      export G2FUZZ_COVERAGE_REPLAY_REQUIRED="${G2FUZZ_COVERAGE_REPLAY_REQUIRED:-1}"
+    fi
+    # reproduction-delta requires the Docker socket to build the triple from
+    # the FuzzBench Docker environment (plan section 1.2). A dry run only
+    # validates the profile/protocol combination and never starts Docker.
+    if [[ "$profile" == "reproduction-delta" && "$dry_run" != "1" && ! -S /var/run/docker.sock ]]; then
+      die "g2fuzz/reproduction-delta: a Docker socket is required to build the .afl/.cmp/.cov triple from the FuzzBench Docker environment"
     fi
     export HGB_EXCLUDE_FROM_AGGREGATE=0
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1

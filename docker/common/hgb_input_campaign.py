@@ -69,6 +69,92 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# Plan elfuzz_reproduction_delta.md section 3: strict produced-input
+# classification.  Prompts, manifests, lineage, config, metadata, stats, logs,
+# fuzzer programs, preseed/corpus/queue metadata, and LLVM profraw/profdata are
+# never counted as produced inputs.
+PRODUCED_INPUT_EXCLUDED_SUFFIXES = {
+    ".py", ".log", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".txt", ".md",
+    ".sh", ".cfg", ".ini", ".conf", ".profraw", ".profdata",
+}
+PRODUCED_INPUT_EXCLUDED_STEMS = {
+    "manifest", "metadata", "config", "lineage", "fuzzer_stats", "stats",
+    "preseed", "seed_corpus", "input_corpus", "corpus_manifest", "corpus",
+    "seed_fuzzer", "evolved", "run", "queue",
+}
+PRODUCED_INPUT_EXCLUDED_PREFIXES = (
+    "prompt_", "manifest", "lineage", "config", "metadata", "stats", "preseed",
+    "corpus", "seed_fuzzer", "evolved",
+)
+
+
+def is_produced_input(path: Path) -> bool:
+    """Return True only for actual input payloads (plan section 3)."""
+    name = path.name.lower()
+    stem = path.stem.lower()
+    if path.suffix.lower() in PRODUCED_INPUT_EXCLUDED_SUFFIXES:
+        return False
+    if stem in PRODUCED_INPUT_EXCLUDED_STEMS or stem.startswith("config"):
+        return False
+    if any(name.startswith(prefix) for prefix in PRODUCED_INPUT_EXCLUDED_PREFIXES):
+        return False
+    if stem.startswith("preseed") or stem.endswith("_preseed"):
+        return False
+    return path.is_file()
+
+
+def _excluded_reason(path: Path) -> str:
+    name = path.name.lower()
+    if name.startswith("prompt_"):
+        return "prompt_artifact"
+    if path.suffix.lower() == ".py" or name.startswith(("seed_fuzzer", "evolved")):
+        return "fuzzer_program"
+    if path.suffix.lower() in {".profraw", ".profdata"}:
+        return "coverage_profile"
+    if name.startswith(("manifest", "lineage", "config", "metadata", "stats")):
+        return "metadata_artifact"
+    if name.startswith(("preseed", "corpus")) or stem_starts_preseed(path):
+        return "seed_corpus_artifact"
+    return "non_input_file"
+
+
+def stem_starts_preseed(path: Path) -> bool:
+    return path.stem.lower().startswith("preseed") or path.stem.lower().endswith("_preseed")
+
+
+def write_produced_input_provenance(produced_dir: Path, dest: Path) -> dict[str, Any]:
+    """Write the plan-section-3.4 provenance manifest for produced inputs.
+
+    Counts only real input payloads, records excluded files with a reason, and
+    records accepted files with sha256/size.  ``prompt_001``-style prompts are
+    excluded so they can never inflate the produced-input count.
+    """
+    produced_dir = Path(produced_dir)
+    accepted: list[dict[str, Any]] = []
+    excluded: list[dict[str, Any]] = []
+    if produced_dir.is_dir():
+        for path in sorted(produced_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            if is_produced_input(path):
+                accepted.append({
+                    "path": str(path.relative_to(produced_dir)),
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                })
+            else:
+                excluded.append({"path": str(path.relative_to(produced_dir)), "reason": _excluded_reason(path)})
+    manifest = {
+        "produced_input_count": len(accepted),
+        "excluded_files": excluded,
+        "accepted_files": accepted,
+    }
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return manifest
+
+
 def build_final_corpus(
     *,
     seeds_dir: Path | None,

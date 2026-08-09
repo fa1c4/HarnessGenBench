@@ -23,6 +23,11 @@ targets:
     format_spec: repro/elfuzz/targets/curl_curl_fuzzer_http/format.md
     adapter_dir: repro/elfuzz/targets/curl_curl_fuzzer_http
     seed_template: repro/elfuzz/targets/curl_curl_fuzzer_http/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/curl_curl_fuzzer_http
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/curl_curl_fuzzer_http/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: http_response
     timeout_seconds: 5
   - target: jsoncpp_jsoncpp_fuzzer
@@ -38,6 +43,11 @@ targets:
     format_spec: repro/elfuzz/targets/jsoncpp_jsoncpp_fuzzer/format.md
     adapter_dir: repro/elfuzz/targets/jsoncpp_jsoncpp_fuzzer
     seed_template: repro/elfuzz/targets/jsoncpp_jsoncpp_fuzzer/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/jsoncpp_jsoncpp_fuzzer
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/jsoncpp_jsoncpp_fuzzer/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: json
     timeout_seconds: 5
   - target: libxml2_xml
@@ -53,6 +63,11 @@ targets:
     format_spec: repro/elfuzz/targets/libxml2_xml/format.md
     adapter_dir: repro/elfuzz/targets/libxml2_xml
     seed_template: repro/elfuzz/targets/libxml2_xml/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/libxml2_xml
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/libxml2_xml/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: xml
     timeout_seconds: 5
   - target: libxslt_xpath
@@ -69,6 +84,11 @@ targets:
     format_spec: repro/elfuzz/targets/libxslt_xpath/format.md
     adapter_dir: repro/elfuzz/targets/libxslt_xpath
     seed_template: repro/elfuzz/targets/libxslt_xpath/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/libxslt_xpath
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/libxslt_xpath/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: xml
     timeout_seconds: 5
   - target: mruby_mruby_fuzzer_8c8bbd
@@ -85,6 +105,11 @@ targets:
     format_spec: repro/elfuzz/targets/mruby_mruby_fuzzer_8c8bbd/format.md
     adapter_dir: repro/elfuzz/targets/mruby_mruby_fuzzer_8c8bbd
     seed_template: repro/elfuzz/targets/mruby_mruby_fuzzer_8c8bbd/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/mruby_mruby_fuzzer_8c8bbd
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/mruby_mruby_fuzzer_8c8bbd/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: ruby
     timeout_seconds: 5
   - target: php_php-fuzz-parser_0dbedb
@@ -101,6 +126,11 @@ targets:
     format_spec: repro/elfuzz/targets/php_php-fuzz-parser_0dbedb/format.md
     adapter_dir: repro/elfuzz/targets/php_php-fuzz-parser_0dbedb
     seed_template: repro/elfuzz/targets/php_php-fuzz-parser_0dbedb/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/php_php-fuzz-parser_0dbedb
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/php_php-fuzz-parser_0dbedb/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: php
     timeout_seconds: 5
   - target: re2_fuzzer
@@ -116,6 +146,11 @@ targets:
     format_spec: repro/elfuzz/targets/re2_fuzzer/format.md
     adapter_dir: repro/elfuzz/targets/re2_fuzzer
     seed_template: repro/elfuzz/targets/re2_fuzzer/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/re2_fuzzer
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/re2_fuzzer/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: regex
     timeout_seconds: 5
   - target: sqlite3_ossfuzz
@@ -131,6 +166,11 @@ targets:
     format_spec: repro/elfuzz/targets/sqlite3_ossfuzz/format.md
     adapter_dir: repro/elfuzz/targets/sqlite3_ossfuzz
     seed_template: repro/elfuzz/targets/sqlite3_ossfuzz/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/sqlite3_ossfuzz
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/sqlite3_ossfuzz/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: sql
     timeout_seconds: 5
   - target: systemd_fuzz-link-parser
@@ -147,6 +187,11 @@ targets:
     format_spec: repro/elfuzz/targets/systemd_fuzz-link-parser/format.md
     adapter_dir: repro/elfuzz/targets/systemd_fuzz-link-parser
     seed_template: repro/elfuzz/targets/systemd_fuzz-link-parser/seed_fuzzer.py
+    elfuzz_adapter_dir: repro/elfuzz/targets/systemd_fuzz-link-parser
+    argv_template: ["@@"]
+    seed_templates: ["repro/elfuzz/targets/systemd_fuzz-link-parser/seed_fuzzer.py"]
+    run_command: "/out/<fuzz_target> @@"
+    coverage_command: "LLVM_PROFILE_FILE=$COV_PROFRAW /out/<fuzz_target> -runs=0 $CORPUS_DIR"
     validity_check: ini
     timeout_seconds: 5
   - target: bloaty_fuzz_target

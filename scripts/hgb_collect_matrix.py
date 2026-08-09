@@ -152,19 +152,83 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
     if not isinstance(campaign, dict):
         campaign = {}
     if family == "input_generator":
+        gen = str(meta.get("generator") or meta.get("fuzzer") or meta.get("baseline") or "")
+        # ELFuzz input-generator contract (plan elfuzz_reproduction_delta.md
+        # section 6/7): evaluated requires at least one generated fuzzer
+        # program, at least one produced input, at least one valid input
+        # executed on the native SUT, a campaign with execs_done > 0, and a
+        # real coverage report (report_exists, line_coverage.covered > 0).
+        # AFL paths_total is never accepted as coverage.
+        if gen == "elfuzz":
+            elf = meta.get("elfuzz") or {}
+            if not isinstance(elf, dict):
+                elf = {}
+            input_gen = meta.get("input_generation", {})
+            if not isinstance(input_gen, dict):
+                input_gen = {}
+            if int(elf.get("fuzzer_programs", input_gen.get("fuzzer_program_count", 0)) or 0) <= 0:
+                violations.append("evaluated elfuzz row has no generated fuzzer program")
+            if int(meta.get("generated_input_count", elf.get("generated_inputs", 0)) or 0) <= 0:
+                violations.append("evaluated elfuzz row has no produced input")
+            if int(elf.get("valid_generated_inputs", input_gen.get("valid_generated_input_count", 0)) or 0) <= 0:
+                violations.append("evaluated elfuzz row has no valid generated input executed on the SUT")
+            if int(campaign.get("execs_done", 0) or 0) <= 0:
+                violations.append("evaluated row has campaign.execs_done <= 0")
+            cov_report = cov.get("report_exists")
+            if cov_report is not True:
+                violations.append("evaluated elfuzz row has coverage.report_exists != true")
+            if line_cov.get("covered") is None:
+                violations.append("evaluated row has coverage.line_coverage.covered == null")
+            elif int(line_cov.get("covered", 0) or 0) <= 0:
+                violations.append("evaluated elfuzz row has coverage.line_coverage.covered <= 0")
+            edge = cov.get("edge_coverage")
+            if isinstance(edge, dict) and edge.get("status") != "unavailable":
+                violations.append("evaluated elfuzz row must not report AFL paths as edge coverage")
+            if str(meta.get("profile", "")) == "reproduction-delta":
+                if str(meta.get("method_variant", "")) != "paper-faithful":
+                    violations.append("evaluated reproduction-delta elfuzz row has method_variant != paper-faithful")
+                if bool(meta.get("exclude_from_aggregate") or meta.get("excluded_from_aggregate")):
+                    violations.append("evaluated reproduction-delta elfuzz row is excluded_from_aggregate")
+                build = meta.get("build") or {}
+                if isinstance(build, dict) and not build.get("uses_fuzzbench_docker_environment"):
+                    violations.append("evaluated reproduction-delta elfuzz row did not build from the FuzzBench Docker environment")
+            return violations
         # G2Fuzz beta contract (plan section 11).
         target_pair = meta.get("target_pair_build", {})
         if isinstance(target_pair, dict) and target_pair.get("status") != "completed":
             violations.append("evaluated input-generator row has no completed target_pair_build")
         if not (target_pair.get("afl_binary") and target_pair.get("cmp_binary")):
             violations.append("evaluated input-generator row lacks .afl/.cmp build evidence")
-        # Gamma contract: also require .cov build evidence.
-        if str(meta.get("profile") or "") == "reproduction-gamma":
+        profile_s = str(meta.get("profile") or "")
+        # Gamma/delta contract: also require .cov build evidence.
+        if profile_s in ("reproduction-gamma", "reproduction-delta"):
             if not target_pair.get("cov_binary"):
-                violations.append("evaluated gamma input-generator row lacks .cov build evidence")
+                violations.append(f"evaluated {profile_s} input-generator row lacks .cov build evidence")
             cov_gamma = meta.get("coverage_gamma") or {}
             if isinstance(cov_gamma, dict) and int(cov_gamma.get("inputs_replayed", 0) or 0) <= 0:
-                violations.append("evaluated gamma input-generator row has coverage_gamma.inputs_replayed <= 0")
+                violations.append(f"evaluated {profile_s} input-generator row has coverage_gamma.inputs_replayed <= 0")
+        # Delta contract (plan g2fuzz_reproduction_delta.md section 7): the
+        # target triple must be verified, at least one generator and one
+        # G2-generated payload must exist, and covered lines must be > 0.
+        if profile_s == "reproduction-delta":
+            target_triple = meta.get("target_triple") or {}
+            if isinstance(target_triple, dict):
+                if not target_triple.get("uses_fuzzbench_docker_environment"):
+                    violations.append("evaluated reproduction-delta g2fuzz row did not build from the FuzzBench Docker environment")
+                variants = target_triple.get("variants") or {}
+                for v in ("afl", "cmp", "cov"):
+                    if not (isinstance(variants, dict) and variants.get(v, {}).get("verified")):
+                        violations.append(f"evaluated reproduction-delta g2fuzz row has target_triple.variants.{v}.verified != true")
+            else:
+                violations.append("evaluated reproduction-delta g2fuzz row lacks target_triple")
+            program_generation = meta.get("program_generation") or {}
+            if isinstance(program_generation, dict) and int(program_generation.get("generator_count", 0) or 0) <= 0:
+                violations.append("evaluated reproduction-delta g2fuzz row has program_generation.generator_count <= 0")
+            seed_prov = meta.get("seed_provenance_delta") or meta.get("seed_provenance") or {}
+            if isinstance(seed_prov, dict) and int(seed_prov.get("g2_generated_count", seed_prov.get("g2_generated", 0)) or 0) <= 0:
+                violations.append("evaluated reproduction-delta g2fuzz row has seed_provenance.g2_generated_count <= 0")
+            if line_cov.get("covered") is not None and int(line_cov.get("covered", 0) or 0) <= 0:
+                violations.append("evaluated reproduction-delta g2fuzz row has coverage.line_coverage.covered <= 0")
         input_gen = meta.get("input_generation", {})
         if not isinstance(input_gen, dict) or int(input_gen.get("valid_g2_generated_count", 0) or 0) <= 0:
             violations.append("evaluated input-generator row has no valid G2-generated input")
@@ -538,6 +602,14 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
                 completed += 1
     partial_completed = sum(agg_statuses[s] for s in PARTIAL_STATUSES)
     not_applicable = sum(agg_statuses[s] for s in NOT_APPLICABLE_STATUSES)
+    # not_applicable_pairs counts Invalid/not_applicable rows across ALL records
+    # (including excluded ones) so an excluded Invalid ELFuzz row still counts as
+    # not-applicable rather than vanishing from the valuable-set breakdown
+    # (plan elfuzz_reproduction_delta.md section 2).
+    not_applicable_pairs = sum(
+        1 for r in records
+        if (r["metadata"].get("status") or r["row"].get("status") or "missing_metadata") in NOT_APPLICABLE_STATUSES
+    )
     soft_skipped = sum(count for status, count in agg_statuses.items() if status in SOFT_STATUSES)
     missing_api_key = agg_statuses.get("missing_api_key", 0)
     excluded_count = len(excluded_records)
@@ -557,6 +629,13 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
     applicable_infra_failure = 0
     coverage_by_applicable_evaluated: list[dict[str, Any]] = []
     ckgfuzzer_target_rows: list[dict[str, Any]] = []
+    # G2Fuzz paper-core/extension split (plan g2fuzz_reproduction_delta.md
+    # section 7).  paper-core and extension results are aggregated separately
+    # and never combined into one paper-equivalent ranking.
+    g2fuzz_paper_core_evaluated = 0
+    g2fuzz_extension_evaluated = 0
+    g2fuzz_failures = 0
+    g2fuzz_infra_failures = 0
     for record in records:
         meta = record["metadata"]
         gen = meta.get("generator") or meta.get("fuzzer") or record["row"].get("generator") or "unknown"
@@ -595,7 +674,30 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
                 applicable_quality_failure += 1
             elif status_s == "infra_failure":
                 applicable_infra_failure += 1
-    applicable_pairs = len(aggregate_records) - not_applicable
+        # G2Fuzz paper-core/extension split (plan section 7).  Count only
+        # applicable, non-excluded rows.  method_variant distinguishes
+        # paper-core from extension; fall back to method_profile/paper_core.
+        if gen == "g2fuzz" and status_s not in NOT_APPLICABLE_STATUSES and not bool(meta.get("excluded_from_aggregate")) and str(meta.get("applicability", "")) != "Invalid":
+            variant = str(meta.get("method_variant") or "")
+            if not variant:
+                variant = "paper-core" if (meta.get("paper_core") or str(meta.get("method_profile", "")) == "paper-faithful") else "extension"
+            if status_s == "evaluated":
+                if variant == "paper-core":
+                    g2fuzz_paper_core_evaluated += 1
+                else:
+                    g2fuzz_extension_evaluated += 1
+            elif status_s == "infra_failure":
+                g2fuzz_infra_failures += 1
+            elif status_s not in COMPLETED_STATUSES and status_s not in PARTIAL_STATUSES and status_s not in SOFT_STATUSES:
+                g2fuzz_failures += 1
+    # applicable_pairs counts rows that are applicable (not not_applicable and
+    # not Invalid) across ALL records, mirroring not_applicable_pairs so the two
+    # sum to the valuable-set size regardless of exclude_from_aggregate.
+    applicable_pairs = sum(
+        1 for r in records
+        if (r["metadata"].get("status") or r["row"].get("status") or "missing_metadata") not in NOT_APPLICABLE_STATUSES
+        and str(r["metadata"].get("applicability", "")) != "Invalid"
+    )
     # method_profile split (G2Fuzz beta plan section 3): paper-faithful and
     # extension aggregates are reported separately when --split-by method_profile.
     method_profile_groups: dict[str, dict[str, Any]] = {}
@@ -627,11 +729,17 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         "failed_pairs": failed,
         "partial_completed_pairs": partial_completed,
         "soft_skipped_pairs": soft_skipped,
-        "not_applicable_pairs": not_applicable,
+        "not_applicable_pairs": not_applicable_pairs,
         "applicable_pairs": applicable_pairs,
         "applicable_evaluated_pairs": applicable_evaluated,
         "applicable_quality_failure_pairs": applicable_quality_failure,
         "applicable_infra_failure_pairs": applicable_infra_failure,
+        # G2Fuzz paper-core/extension split (plan g2fuzz_reproduction_delta.md
+        # section 7).  Reported separately; never combined into one ranking.
+        "g2fuzz_paper_core_evaluated": g2fuzz_paper_core_evaluated,
+        "g2fuzz_extension_evaluated": g2fuzz_extension_evaluated,
+        "g2fuzz_failures": g2fuzz_failures,
+        "g2fuzz_infra_failures": g2fuzz_infra_failures,
         "coverage_by_applicable_evaluated": coverage_by_applicable_evaluated,
         "missing_api_key_count": missing_api_key,
         "require_evaluated_violations": require_evaluated_violations,

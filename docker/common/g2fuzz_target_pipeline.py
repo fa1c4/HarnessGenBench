@@ -70,11 +70,33 @@ EXTENSION_METHOD_PROFILE = "extension"
 TASK_FAMILY = "input_generator"
 BUILD_MODE = "fuzzbench_native_afl_cmps"
 GAMMA_PROFILE = "reproduction-gamma"
+DELTA_PROFILE = "reproduction-delta"
 GAMMA_BUILD_MODE = "fuzzbench_docker_triple"
+# method_variant values reported in the delta result schema (plan section 7).
+PAPER_CORE_VARIANT = "paper-core"
+EXTENSION_VARIANT = "extension"
 
 
 def is_gamma_profile(profile: str) -> bool:
-    return profile == GAMMA_PROFILE
+    """Return True for the strict triple-build profiles.
+
+    ``reproduction-delta`` is the first-class strict profile (plan
+    ``g2fuzz_reproduction_delta.md``); ``reproduction-gamma`` is kept as a
+    backward-compatible alias.  Both share the exact FuzzBench Docker triple
+    build, contract probe, and real coverage replay code path.
+    """
+
+    return profile in (GAMMA_PROFILE, DELTA_PROFILE)
+
+
+def is_delta_profile(profile: str) -> bool:
+    return profile == DELTA_PROFILE
+
+
+def method_variant_for(adapter: dict[str, Any]) -> str:
+    """Map an adapter ``method_profile`` to a delta ``method_variant``."""
+
+    return PAPER_CORE_VARIANT if str(adapter.get("method_profile", "")) == PAPER_METHOD_PROFILE else EXTENSION_VARIANT
 
 
 # Coverage helpers are optional at import time; the offline pytest suite does
@@ -407,7 +429,9 @@ def try_num_for_profile(profile: str, env: dict[str, str] | None = None) -> str:
     env = env or os.environ
     if profile == "compat-smoke":
         return env.get("G2FUZZ_TRY_NUM", "1") or "1"
-    if profile == GAMMA_PROFILE:
+    # gamma and delta share the real paper budget (default 3).  Delta must not
+    # patch G2FUZZ_TRY_NUM down to a smoke value (plan section 1.2/4.2).
+    if is_gamma_profile(profile):
         return env.get("G2FUZZ_TRY_NUM", "3") or "3"
     return env.get("G2FUZZ_TRY_NUM", "3") or "3"
 
@@ -691,6 +715,8 @@ class G2FuzzPipeline:
         self.runner = None  # Docker runner; defaults to hgb_fuzzbench_builder._run when needed
         self.contract_result: dict[str, Any] = {}
         self.triple_build_results: dict[str, Any] = {}
+        self.triple_provenance: dict[str, Any] = {}
+        self.consumption_smoke: dict[str, Any] = {}
         self.invocation: dict[str, Any] | None = None
         self.input_contract: dict[str, Any] = {}
         self.build_source = "none"
@@ -1107,26 +1133,30 @@ class G2FuzzPipeline:
         """Build .afl/.cmp/.cov from the exact FuzzBench Docker environment.
 
         Refuses prebuilt ``G2FUZZ_TARGET_DIR`` and direct-host ``build.sh`` in
-        reproduction-gamma.  Uses ``docker build`` on the benchmark Dockerfile
+        the strict triple-build profiles (reproduction-delta and
+        reproduction-gamma).  Uses ``docker build`` on the benchmark Dockerfile
         with variant-specific build args (CmpLog for .cmp, coverage for .cov).
-        Runs the contract probe after the triple is built.
+        Runs the contract probe after the triple is built.  Delta additionally
+        writes ``target/triple_provenance.json``, containerized execution
+        wrappers, and a consumption smoke (plan sections 2/3).
         """
 
-        # Refuse prebuilt override in gamma.
+        label = "reproduction-delta" if is_delta_profile(self.profile) else "reproduction-gamma"
+        # Refuse prebuilt override in the strict triple-build profiles.
         if os.environ.get("G2FUZZ_TARGET_DIR"):
             raise PipelineError(
                 "infra_missing",
-                "G2Fuzz reproduction-gamma refuses prebuilt G2FUZZ_TARGET_DIR; "
+                f"G2Fuzz {label} refuses prebuilt G2FUZZ_TARGET_DIR; "
                 "the .afl/.cmp/.cov triple must be built from the FuzzBench Docker environment",
                 127,
             )
         if build_g2fuzz_target_triple is None or g2fuzz_target_triple_build_commands is None:
-            raise PipelineError("infra_missing", "G2Fuzz gamma: hgb_fuzzbench_builder triple functions are not available", 127)
+            raise PipelineError("infra_missing", f"G2Fuzz {label}: hgb_fuzzbench_builder triple functions are not available", 127)
 
         benchmark_dir = self._resolve_benchmark_dir()
         dockerfile = benchmark_dir / "Dockerfile"
         if not dockerfile.is_file():
-            raise PipelineError("infra_missing", f"G2Fuzz gamma: benchmark Dockerfile not found: {dockerfile}", 127)
+            raise PipelineError("infra_missing", f"G2Fuzz {label}: benchmark Dockerfile not found: {dockerfile}", 127)
 
         fuzz_target = self.target_manifest().get("fuzz_target", self.target)
         runner = self._resolve_runner()
@@ -1165,7 +1195,7 @@ class G2FuzzPipeline:
             if not binary_path or not Path(binary_path).is_file():
                 raise PipelineError(
                     "infra_failure",
-                    f"G2Fuzz gamma: {variant} build failed (exit {rec.get('build_exit_code', '?')}); "
+                    f"G2Fuzz {label}: {variant} build failed (exit {rec.get('build_exit_code', '?')}); "
                     f"no {fuzz_target} produced",
                     127,
                 )
@@ -1173,7 +1203,7 @@ class G2FuzzPipeline:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(binary_path, dest)
             if not executable(dest):
-                raise PipelineError("infra_failure", f"G2Fuzz gamma: {variant} built binary is not executable: {dest}", 127)
+                raise PipelineError("infra_failure", f"G2Fuzz {label}: {variant} built binary is not executable: {dest}", 127)
             # Also place in target_pair/ directory.
             pair_dest = self.target_pair_dir / dest_name
             shutil.copy2(binary_path, pair_dest)
@@ -1181,25 +1211,36 @@ class G2FuzzPipeline:
         # Verify all three.
         verify = verify_g2fuzz_target_triple(self.target_afl, self.target_cmp, self.target_cov)
         if not verify["ok"]:
-            raise PipelineError("infra_failure", f"G2Fuzz gamma: target triple verification failed: {verify}", 127)
+            raise PipelineError("infra_failure", f"G2Fuzz {label}: target triple verification failed: {verify}", 127)
 
         self.build_source = "fuzzbench_docker_triple"
         self.write_invocation()
 
-        # Run contract probe (gamma-specific).
+        # Delta: write triple provenance and containerized execution wrappers
+        # (plan section 2.4/2.5).
+        if is_delta_profile(self.profile):
+            self.write_triple_provenance(results, commands)
+            self.write_execution_wrappers(results)
+
+        # Run contract probe (gamma/delta).
         self.run_contract_probe()
+
+        # Delta: run a consumption smoke against the declared adapter contract
+        # (plan section 3) and persist target_contract/consumption_smoke.json.
+        if is_delta_profile(self.profile):
+            self.run_consumption_smoke()
 
         # Smoke pair on .afl and .cmp.
         smoke = self.smoke_pair()
-        for label in ("afl", "cmp"):
+        for label_ in ("afl", "cmp"):
             for name in ("empty", "seed"):
-                res = smoke.get(label, {}).get(name, {})
+                res = smoke.get(label_, {}).get(name, {})
                 if not res.get("ran", True) and res.get("error"):
-                    raise PipelineError("infra_failure", f"G2Fuzz pair smoke could not run {label}/{name}: {res.get('error')}", 127)
+                    raise PipelineError("infra_failure", f"G2Fuzz pair smoke could not run {label_}/{name}: {res.get('error')}", 127)
                 if _is_crash_exit(res.get("exit_code"), res.get("stderr_tail", "")):
                     raise PipelineError(
                         "infra_failure",
-                        f"G2Fuzz pair smoke crashed for {label}/{name} (exit {res.get('exit_code')})",
+                        f"G2Fuzz pair smoke crashed for {label_}/{name} (exit {res.get('exit_code')})",
                         127,
                     )
 
@@ -1253,6 +1294,122 @@ class G2FuzzPipeline:
             json_dump(contract_path, self.contract_result)
             raise PipelineError("infra_failure", f"G2Fuzz gamma: contract probe failed: {exc.reason}", 127)
         return self.contract_result
+
+    # -- delta: triple provenance / wrappers / consumption smoke ------------
+
+    def write_triple_provenance(self, results: dict[str, Any], commands: dict[str, Any]) -> None:
+        """Write ``target/triple_provenance.json`` (plan section 2.5).
+
+        Records that all three variants were built from the exact FuzzBench
+        Docker environment, with per-variant image tag, image digest, binary
+        sha256, and a verified flag set only when the binary exists and is
+        executable.
+        """
+
+        variants: dict[str, Any] = {}
+        for variant, dest_name in (("afl", "target.afl"), ("cmp", "target.cmp"), ("cov", "target.cov")):
+            rec = results.get(variant, {}) if isinstance(results, dict) else {}
+            cmd = commands.get(variant, {}) if isinstance(commands, dict) else {}
+            binary = self.workspace / "target" / dest_name
+            verified = binary.is_file() and executable(binary)
+            variants[variant] = {
+                "image_tag": str(cmd.get("image_tag", rec.get("image_tag", ""))),
+                "image_digest": str(rec.get("image_digest", "")),
+                "binary_sha256": sha256_file(binary) if verified else "",
+                "verified": verified,
+            }
+        provenance = {
+            "uses_fuzzbench_docker_environment": True,
+            "variants": variants,
+        }
+        json_dump(self.workspace / "target" / "triple_provenance.json", provenance)
+        json_dump(self.target_pair_dir / "triple_provenance.json", provenance)
+        self.triple_provenance = provenance
+
+    def write_execution_wrappers(self, results: dict[str, Any]) -> None:
+        """Write containerized execution wrappers for each variant (plan 2.4).
+
+        ``run_afl.sh``/``run_cmp.sh``/``run_cov.sh`` run the target inside the
+        corresponding built image with mounted input/corpus paths.  The campaign
+        may use exported binaries directly only when runtime verification passes;
+        otherwise it must use these wrappers.
+        """
+
+        target_dir = self.workspace / "target"
+        for variant, dest_name in (("afl", "target.afl"), ("cmp", "target.cmp"), ("cov", "target.cov")):
+            rec = results.get(variant, {}) if isinstance(results, dict) else {}
+            image_tag = str(rec.get("image_tag", ""))
+            wrapper = target_dir / f"run_{variant}.sh"
+            argv_tail = " ".join(str(a) for a in self.adapter.get("argv", ["@@"]))
+            input_mode = str(self.adapter.get("input_mode", "file"))
+            if input_mode == "stdin":
+                # Wrapper reads input from the first positional arg and pipes it.
+                script = (
+                    "#!/usr/bin/env bash\n"
+                    f"# Containerized execution wrapper for the {variant} target variant.\n"
+                    f"set -euo pipefail\n"
+                    f'IMAGE="${{HGB_G2FUZZ_{variant.upper()}_IMAGE:-{image_tag}}}"\n'
+                    f'INPUT="${{1:-}}"\n'
+                    f'docker run --rm -i "$IMAGE" /out/{self.target_manifest().get("fuzz_target", self.target)} {argv_tail} < "$INPUT"\n'
+                )
+            else:
+                script = (
+                    "#!/usr/bin/env bash\n"
+                    f"# Containerized execution wrapper for the {variant} target variant.\n"
+                    f"set -euo pipefail\n"
+                    f'IMAGE="${{HGB_G2FUZZ_{variant.upper()}_IMAGE:-{image_tag}}}"\n'
+                    f'INPUT="${{1:-}}"\n'
+                    f'docker run --rm -v "$INPUT:/tmp/hgb_input:ro" "$IMAGE" /out/{self.target_manifest().get("fuzz_target", self.target)} {argv_tail.replace("@@", "/tmp/hgb_input")}\n'
+                )
+            wrapper.write_text(script, encoding="utf-8")
+            wrapper.chmod(0o755)
+
+    def run_consumption_smoke(self) -> dict[str, Any]:
+        """Run a consumption smoke against the declared adapter (plan section 3).
+
+        Verifies the target actually consumes inputs under its adapter contract:
+        a valid sample must execute successfully or with an accepted libFuzzer
+        no-crash code, and for file mode replacing ``@@`` with a sample path
+        must pass.  Persists ``target_contract/consumption_smoke.json`` and
+        fails the target contract when ``consumed_input`` is False.
+        """
+
+        assert self.invocation is not None
+        contract_dir = self.workspace / "target_contract"
+        contract_dir.mkdir(parents=True, exist_ok=True)
+        fmt = self.formats[0] if self.formats else "custom"
+        sample = bootstrap_bytes(fmt)
+        sample_path = contract_dir / "valid_sample.bin"
+        sample_path.write_bytes(sample)
+        input_mode = self.invocation["input_mode"]
+        adapter_argv = list(self.invocation["adapter_argv"])
+        timeout = int(self.invocation.get("timeout_seconds", 5))
+        if input_mode == "stdin":
+            cmd = [str(self.target_afl)] + [a for a in adapter_argv if a != "@@"]
+            proc = subprocess.run(cmd, input=sample, capture_output=True, timeout=timeout, check=False)
+        else:
+            cmd = [str(self.target_afl)] + [str(a) if a != "@@" else str(sample_path) for a in adapter_argv]
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
+        accepted = proc.returncode in (0, 1, 77) or proc.returncode is None
+        crash = _is_crash_exit(proc.returncode, (proc.stderr or b"").decode("utf-8", "replace"))
+        consumed = bool(proc.returncode is not None) and not crash
+        result = {
+            "command": cmd,
+            "exit_code": proc.returncode,
+            "accepted_no_crash_code": accepted,
+            "stderr_excerpt": (proc.stderr or b"").decode("utf-8", "replace")[-800:],
+            "input_mode": input_mode,
+            "valid_sample": str(sample_path),
+            "consumed_input": consumed,
+        }
+        json_dump(contract_dir / "consumption_smoke.json", result)
+        if not consumed:
+            raise PipelineError(
+                "infra_failure",
+                f"G2Fuzz delta: target contract failed; {self.target} did not consume input under {input_mode} mode (exit {proc.returncode})",
+                127,
+            )
+        return result
 
     # -- seed corpus / generation ------------------------------------------
 
@@ -1337,6 +1494,10 @@ class G2FuzzPipeline:
         self.collect_program_gen_outputs(output_dir)
         if self.generated_input_count <= 0:
             raise PipelineError("failed", "G2Fuzz program_gen completed without generated input files", 65)
+        # Delta invariant (plan section 4.4): zero Python generators is a
+        # generation failure, not a soft skip.
+        if is_delta_profile(self.profile) and self.generated_generator_count <= 0:
+            raise PipelineError("failed", "G2Fuzz program_gen completed without generated Python generators", 65)
         self.stages["input_generators_created"] = stage_record(
             "complete",
             "none",
@@ -1370,6 +1531,16 @@ class G2FuzzPipeline:
                 copied_seeds += 1
         self.generated_generator_count = copied_generators
         self.generated_input_count = copied_seeds
+        # Record g2_programs ancillary logs (plan section 4.3): llm_trace.jsonl,
+        # dependency_install.log, and program_gen.log when produced upstream.
+        g2_programs_logs = self.workspace / "g2_programs"
+        g2_programs_logs.mkdir(parents=True, exist_ok=True)
+        for log_name in ("llm_trace.jsonl", "dependency_install.log", "program_gen.log"):
+            for root in (output_dir, output_dir / "default"):
+                candidate = root / log_name
+                if candidate.is_file():
+                    shutil.copy2(candidate, unique_dest(g2_programs_logs, log_name))
+                    break
         json_dump(
             self.workspace / "generators" / "source" / "manifest.json",
             {
@@ -1490,6 +1661,11 @@ class G2FuzzPipeline:
         assert self.invocation is not None
         initial = self.assemble_initial_corpus()
         afl_fuzz = self.afl_fuzz_path()
+        # Delta invariant (plan section 5): the AFL command must use G2Fuzz's
+        # modified afl-fuzz with a CmpLog target (-c) and the G2Fuzz repo (-k).
+        # A missing -c CmpLog argument must fail.
+        if not self.target_cmp.is_file():
+            raise PipelineError("infra_missing", "G2Fuzz campaign requires a CmpLog target.cmp binary", 127)
         out = self.workspace / "campaign" / "output"
         cmd = [
             str(afl_fuzz),
@@ -1507,6 +1683,9 @@ class G2FuzzPipeline:
             str(self.target_afl),
             *self.invocation["adapter_argv"],
         ]
+        # Guard: the constructed command must contain the CmpLog -c argument.
+        if "-c" not in cmd or str(self.target_cmp) not in cmd:
+            raise PipelineError("infra_missing", "G2Fuzz campaign command is missing the -c CmpLog argument", 127)
         (self.workspace / "campaign" / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
         env = os.environ.copy()
         env.update(
@@ -1752,6 +1931,26 @@ class G2FuzzPipeline:
                 return False
             if int(self.coverage_summary.get("inputs_replayed") or 0) <= 0:
                 return False
+        # Delta invariants (plan section 7): the target triple must be verified,
+        # at least one generator must be produced, at least one G2-generated
+        # payload must exist, and the covered-line count must be strictly > 0.
+        if is_delta_profile(self.profile):
+            if self.generated_generator_count <= 0:
+                return False
+            if self.generated_input_count <= 0:
+                return False
+            variants = self.triple_provenance.get("variants", {}) if isinstance(self.triple_provenance, dict) else {}
+            if not all(
+                bool(variants.get(v, {}).get("verified"))
+                for v in ("afl", "cmp", "cov")
+            ):
+                return False
+            if not self.triple_provenance.get("uses_fuzzbench_docker_environment"):
+                return False
+            if not self.consumption_smoke.get("consumed_input", True):
+                return False
+            if isinstance(line_cov.get("covered"), int) and int(line_cov["covered"]) <= 0:
+                return False
         return True
 
     def result_payload(self, status: str, reason: str, exit_code: int) -> dict[str, Any]:
@@ -1828,6 +2027,55 @@ class G2FuzzPipeline:
         protocol = self.protocol
         if is_gamma_profile(self.profile):
             protocol = "paper-native" if self.adapter["method_profile"] == PAPER_METHOD_PROFILE else "extension"
+        # Delta nested schema (plan section 7).  method_variant distinguishes
+        # paper-core (paper-faithful adapters) from extension adapters so the
+        # matrix collector can aggregate the two subsets separately.
+        method_variant = method_variant_for(self.adapter)
+        variants_provenance = self.triple_provenance.get("variants", {}) if isinstance(self.triple_provenance, dict) else {}
+        target_triple = {
+            "uses_fuzzbench_docker_environment": bool(self.triple_provenance.get("uses_fuzzbench_docker_environment")) if isinstance(self.triple_provenance, dict) else False,
+            "variants": {
+                v: {
+                    "image_tag": str(variants_provenance.get(v, {}).get("image_tag", "")),
+                    "image_digest": str(variants_provenance.get(v, {}).get("image_digest", "")),
+                    "binary_sha256": str(variants_provenance.get(v, {}).get("binary_sha256", "")),
+                    "verified": bool(variants_provenance.get(v, {}).get("verified")),
+                }
+                for v in ("afl", "cmp", "cov")
+            },
+        }
+        program_generation = {
+            "generator_count": self.generated_generator_count,
+            "g2_generated_count": self.generated_input_count,
+            "valid_g2_generated_count": self.valid_generated_input_count,
+        }
+        seed_provenance_delta = {
+            "common_initial": self.seed_counts.get("common_initial", 0),
+            "bootstrap": self.seed_counts.get("bootstrap", 0),
+            "g2_generated_count": self.seed_counts.get("g2_generated", 0),
+            "g2_generated": self.seed_counts.get("g2_generated", 0),
+            "afl_queue": self.seed_counts.get("afl_queue", 0),
+            "excluded_artifacts": ["*.py", "*.json", "logs"],
+        }
+        build_record = {
+            "uses_fuzzbench_docker_environment": bool(target_triple["uses_fuzzbench_docker_environment"]),
+            "build_source": self.build_source,
+            "build_mode": GAMMA_BUILD_MODE if is_gamma_profile(self.profile) else BUILD_MODE,
+        }
+        artifacts = {
+            "generators_dir": str(self.workspace / "generators" / "source"),
+            "g2_generated_seeds_dir": str(self.workspace / "seeds" / "g2_generated"),
+            "afl_queue_dir": str(self.workspace / "seeds" / "afl_queue"),
+            "coverage_dir": str(self.workspace / "coverage"),
+            "generator_count": self.generated_generator_count,
+            "g2_generated_count": self.generated_input_count,
+        }
+        reproducibility = {
+            "target_triple_verified": all(target_triple["variants"][v]["verified"] for v in ("afl", "cmp", "cov")),
+            "consumed_input": bool(self.consumption_smoke.get("consumed_input", True)) if self.consumption_smoke else True,
+            "contract_valid": bool(self.contract_result.get("valid")) if self.contract_result else False,
+        }
+        error_record = {"reason": reason, "exit_code": exit_code} if status not in ("evaluated", "dry_run_ok") else None
         return {
             "schema_version": 2,
             "baseline": "g2fuzz",
@@ -1844,10 +2092,12 @@ class G2FuzzPipeline:
             "profile": self.profile,
             "protocol": protocol,
             "method_profile": self.adapter["method_profile"],
+            "method_variant": method_variant,
             "model": os.environ.get("G2FUZZ_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("MODEL") or "",
             "api_key_present": bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("API_KEY")),
             "paper_core": self.adapter["method_profile"] == PAPER_METHOD_PROFILE,
             "excluded_from_aggregate": self.profile == "compat-smoke",
+            "exclude_from_aggregate": self.profile == "compat-smoke",
             "excluded_from_paper_aggregate": self.adapter["method_profile"] != PAPER_METHOD_PROFILE,
             "status": status,
             "reason": reason,
@@ -1860,6 +2110,11 @@ class G2FuzzPipeline:
             "queue_count": int(self.metrics.get("queue_count") or 0),
             "crash_count": int(self.metrics.get("crash_count") or 0),
             "hang_count": int(self.metrics.get("hang_count") or 0),
+            # Global invariant 5 fields.
+            "build": build_record,
+            "artifacts": artifacts,
+            "reproducibility": reproducibility,
+            "error": error_record,
             # Nested beta schema (plan section 11).
             "target_pair_build": target_pair_build,
             "input_generation": {
@@ -1887,6 +2142,10 @@ class G2FuzzPipeline:
             "target_pair": target_pair_gamma,
             "campaign_gamma": campaign_gamma,
             "coverage_gamma": coverage_gamma,
+            # Delta nested schema (plan section 7).
+            "target_triple": target_triple,
+            "program_generation": program_generation,
+            "seed_provenance_delta": seed_provenance_delta,
         }
 
     def write_outputs(self, status: str, reason: str, exit_code: int) -> None:

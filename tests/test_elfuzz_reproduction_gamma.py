@@ -504,7 +504,7 @@ def test_evaluated_requires_full_closed_loop(tmp_path: Path) -> None:
     assert metadata["elfuzz"]["valid_generated_inputs"] >= 1
     assert metadata["elfuzz"]["evolution_iterations"] >= 1
     # Real SUT execution: native + coverage binaries exist.
-    assert Path(metadata["elfuzz"]["adapter_class"]).__class__ is str
+    assert isinstance(metadata["elfuzz"]["adapter_class"], str)
     contract = json.loads((tmp_path / "workspace" / "sut" / "contract.json").read_text(encoding="utf-8"))
     assert Path(contract["native"]["binary_path"]).is_file()
     assert Path(contract["coverage"]["binary_path"]).is_file()
