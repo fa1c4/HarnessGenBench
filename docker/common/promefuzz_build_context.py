@@ -525,10 +525,11 @@ def capture_build_context(
     methods: list[str]
     if capture_method == "auto":
         methods = ["cmake_export", "bear_replay"]
-    elif capture_method == "exact_fuzzbench":
-        # Gamma plan section 6: prefer the exact FuzzBench build.sh replay
-        # (bear/intercept-build) over a generic CMake export so the compile
-        # database provably originates from the FuzzBench build command.
+    elif capture_method in ("exact_fuzzbench", "fuzzbench_replay"):
+        # Gamma plan section 6 / delta plan section 3: prefer the exact
+        # FuzzBench build.sh replay (bear/intercept-build) over a generic
+        # CMake export so the compile database provably originates from the
+        # FuzzBench build command. ``fuzzbench_replay`` is the delta name.
         methods = ["bear_replay", "cmake_export"]
     else:
         methods = [capture_method]
@@ -702,6 +703,33 @@ def capture_build_context(
     }
     (build_context_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    # Delta plan section 3: write build_context/provenance.json so the
+    # entrypoint and tests can prove the compile DB originated from the exact
+    # FuzzBench build (bear_replay replays build.sh inside the FuzzBench env),
+    # not a generic top-level CMake best-effort build.
+    benchmark_dockerfile = target_root / "fuzzbench_benchmark" / "Dockerfile"
+    provenance = {
+        "strategy": "fuzzbench_replay" if chosen_method == "bear_replay" else (
+            "cmake_export" if chosen_method == "cmake_export" else (
+                "synthetic" if synthetic else "unknown")),
+        "benchmark_dockerfile_sha256": _sha256_file(benchmark_dockerfile) if benchmark_dockerfile.is_file() else "missing",
+        "build_sh_sha256": _sha256_file(build_script) if build_script.is_file() else "missing",
+        "compile_commands_count": len(filtered),
+        "uses_fuzzbench_env": chosen_method == "bear_replay",
+        "cc": os.environ.get("CC", "clang"),
+        "cxx": os.environ.get("CXX", "clang++"),
+        "cflags": os.environ.get("CFLAGS", ""),
+        "cxxflags": os.environ.get("CXXFLAGS", ""),
+        "out_artifacts": [str(p) for p in sorted(
+            (build_context_dir / "out").glob("*")) if p.is_file()] if (build_context_dir / "out").is_dir() else [],
+        "capture_method": chosen_method,
+        "synthetic": synthetic,
+        "exact_replay": exact_replay,
+    }
+    (build_context_dir / "provenance.json").write_text(
+        json.dumps(provenance, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest["provenance_path"] = str(build_context_dir / "provenance.json")
     return manifest
 
 
@@ -902,7 +930,7 @@ def main() -> int:
     parser.add_argument("--language", default="")
     parser.add_argument("--profile", default="alpha")
     parser.add_argument("--allow-synthetic", action="store_true")
-    parser.add_argument("--capture-method", default="auto", choices=("auto", "cmake_export", "bear_replay", "exact_fuzzbench"))
+    parser.add_argument("--capture-method", default="auto", choices=("auto", "cmake_export", "bear_replay", "exact_fuzzbench", "fuzzbench_replay"))
     parser.add_argument("--build-workdir-relative", default="")
     parser.add_argument("--build-timeout", type=int, default=1800)
     args = parser.parse_args()
@@ -918,8 +946,23 @@ def main() -> int:
         build_timeout=args.build_timeout,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
-    if args.profile in {"alpha", "paper-faithful"} and not manifest["valid"]:
+    if args.profile in {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"} and not manifest["valid"]:
         return 1
+    # Delta plan section 3: a CMake-only compile DB without FuzzBench provenance
+    # is rejected under reproduction-delta.
+    if args.profile == "reproduction-delta":
+        prov_path = Path(manifest.get("provenance_path", ""))
+        if prov_path.is_file():
+            try:
+                prov = json.loads(prov_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                prov = {}
+            if prov.get("strategy") not in {"fuzzbench_replay"} and not prov.get("synthetic"):
+                # A cmake_export DB is only acceptable under delta when it is
+                # proven to be the same source tree as the FuzzBench build
+                # (uses_fuzzbench_env). A generic CMake-only DB is rejected.
+                if not prov.get("uses_fuzzbench_env"):
+                    return 1
     return 0
 
 

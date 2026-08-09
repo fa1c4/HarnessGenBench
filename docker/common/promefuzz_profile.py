@@ -25,9 +25,14 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"}
+# Strict reproduction profile introduced by the reproduction-delta plan. It is
+# paper-faithful but rejects every synthetic/mock/hash fallback the earlier
+# scaffolding allowed. reproduction-gamma remains accepted as a backward-
+# compatible alias of reproduction-delta.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta"}
 
 # Beta plan section 10: allowed run-level statuses for a PromeFuzz
 # harness_generator row. ``evaluated`` requires a verified candidate, real
@@ -140,6 +145,12 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 f"PROME_FUZZ_EMBEDDING_LLM_TYPE={embedding_type!r} is forbidden in {profile}; "
                 f"only a real embedding provider is allowed"
             )
+        # An empty embedding type is forbidden in method-faithful profiles too.
+        if embedding_type == "":
+            violations.append(
+                f"PROME_FUZZ_EMBEDDING_LLM_TYPE is empty in {profile}; "
+                f"only a real embedding provider is allowed"
+            )
         # Reference-harness leakage is forbidden in blind-project.
         if protocol == "blind-project":
             if normalize_env_bool(env.get("HGB_ALLOW_REFERENCE_USAGE")) == "1":
@@ -152,6 +163,40 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                     "HGB_PROMEFUZZ_ALLOW_REFERENCE_HARNESS=1 is forbidden in blind-project; "
                     "the target reference harness body must never feed build-context capture"
                 )
+
+    # reproduction-delta is the strictest profile (plan section 1): forbid every
+    # synthetic/mock/hash fallback even when an alias env var is set, and reject
+    # the selected-harness API modes and report modes.
+    if profile in STRICT_REPRODUCTION_PROFILES:
+        if normalize_env_bool(env.get("HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB")) == "1":
+            violations.append(
+                "HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden in reproduction-delta; "
+                "a real compile database captured from the FuzzBench build is required"
+            )
+        emb_type = (env.get("PROME_FUZZ_EMBEDDING_LLM_TYPE") or "").strip().lower()
+        if emb_type in {"mock", "local", "hash", ""}:
+            violations.append(
+                f"PROME_FUZZ_EMBEDDING_LLM_TYPE={emb_type!r} is forbidden in reproduction-delta; "
+                f"a real semantic embedding provider (openai or ollama) is required"
+            )
+        emb_model = (env.get("PROME_FUZZ_EMBEDDING_MODEL") or "").strip()
+        if not emb_model or emb_model == "hgb-hash-embedding":
+            violations.append(
+                f"PROME_FUZZ_EMBEDDING_MODEL={emb_model!r} is forbidden in reproduction-delta; "
+                f"a real semantic embedding model is required"
+            )
+        api_mode = (env.get("HGB_API_SELECTION_MODE") or "").strip()
+        if api_mode in {"selected_harness", "selected_harness_fallback"}:
+            violations.append(
+                f"HGB_API_SELECTION_MODE={api_mode} is forbidden in reproduction-delta; "
+                f"reference-harness API filtering is evaluator-only"
+            )
+        report_mode = (env.get("HGB_API_REPORT_MODE") or "").strip()
+        if report_mode in {"report_first", "report_only"}:
+            violations.append(
+                f"HGB_API_REPORT_MODE={report_mode} is forbidden in reproduction-delta; "
+                f"the selected-harness API report is evaluator-only"
+            )
 
     if is_compat_smoke(profile):
         # compat-smoke must always be excluded from aggregate.
@@ -217,6 +262,7 @@ def build_result(
     excluded_from_aggregate: bool = False,
     selected_candidate: dict[str, Any] | None = None,
     candidate_count: int = 0,
+    method: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stages = stages if stages is not None else default_stages()
     if status is None:
@@ -228,6 +274,11 @@ def build_result(
         # compat-smoke never reaches the scientific ``evaluated`` status.
         if status == STATUS_EVALUATED:
             status = STATUS_COMPAT_SMOKE_COMPLETED
+    # reproduction-delta/gamma map to the paper-faithful method variant.
+    if profile in {"reproduction-gamma", "reproduction-delta"} and not method_variant:
+        method_variant = "paper-faithful"
+    if profile in {"reproduction-gamma", "reproduction-delta"} and method_variant == profile:
+        method_variant = "paper-faithful"
     return {
         "schema_version": 3,
         "generator": generator,
@@ -247,6 +298,7 @@ def build_result(
         "excluded_from_aggregate": excluded_from_aggregate,
         "selected_candidate": selected_candidate or {},
         "candidate_count": candidate_count,
+        "method": method or {},
     }
 
 

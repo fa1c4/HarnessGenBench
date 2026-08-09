@@ -227,16 +227,16 @@ case "$generator" in
     ;;
   promefuzz)
     case "$profile" in
-      alpha|paper-faithful|compat-smoke) ;;
-      *) die "promefuzz: invalid profile: $profile (expected alpha, paper-faithful, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|compat-smoke) ;;
+      *) die "promefuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|api-oracle) ;;
       *) die "promefuzz: invalid protocol: $protocol (expected blind-project or api-oracle)" ;;
     esac
-    # In alpha/paper-faithful, refuse legacy compat env before an LLM call so
-    # alpha cannot be silently downgraded to compat-smoke behavior.
-    if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" ]]; then
+    # In alpha/paper-faithful/reproduction-gamma, refuse legacy compat env before
+    # an LLM call so alpha cannot be silently downgraded to compat-smoke behavior.
+    if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" ]]; then
       if [[ "${HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB:-0}" == "1" ]]; then
         die "promefuzz/$profile: HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden; use compat-smoke for the synthetic compile database"
       fi
@@ -254,6 +254,33 @@ case "$generator" in
       case "${HGB_API_REPORT_MODE:-}" in
         report_first|report_only) die "promefuzz/$profile: HGB_API_REPORT_MODE=$HGB_API_REPORT_MODE is forbidden; the selected-harness API report is evaluator-only" ;;
       esac
+    fi
+    # reproduction-delta is the strictest profile (plan
+    # promefuzz_reproduction_delta.md section 1). It inherits the gamma
+    # forbiddens and additionally refuses the synthetic compile DB, empty
+    # embedding type/model, and selected-harness API modes. The env-content
+    # guards are "before an LLM call" guards, so a dry run (which makes no
+    # LLM/embedding calls) only validates that the profile/protocol
+    # combination is accepted.
+    if [[ "$profile" == "reproduction-delta" && "$dry_run" != "1" ]]; then
+      if [[ "${HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB:-0}" == "1" ]]; then
+        die "promefuzz/reproduction-delta: HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden; the strict profile requires a real compile database captured from the FuzzBench build"
+      fi
+      emb_type="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-}"
+      if [[ -z "$emb_type" || "$emb_type" == "mock" || "$emb_type" == "local" || "$emb_type" == "hash" ]]; then
+        die "promefuzz/reproduction-delta: PROME_FUZZ_EMBEDDING_LLM_TYPE must be a real embedding provider (openai or ollama), not mock/local/hash/empty"
+      fi
+      emb_model="${PROME_FUZZ_EMBEDDING_MODEL:-}"
+      if [[ -z "$emb_model" || "$emb_model" == "hgb-hash-embedding" ]]; then
+        die "promefuzz/reproduction-delta: PROME_FUZZ_EMBEDDING_MODEL must be a real semantic embedding model, not hgb-hash-embedding/empty"
+      fi
+      case "${HGB_API_SELECTION_MODE:-}" in
+        selected_harness|selected_harness_fallback) die "promefuzz/reproduction-delta: HGB_API_SELECTION_MODE=$HGB_API_SELECTION_MODE is forbidden; reference-harness API filtering is evaluator-only" ;;
+      esac
+      case "${HGB_API_REPORT_MODE:-}" in
+        report_first|report_only) die "promefuzz/reproduction-delta: HGB_API_REPORT_MODE=$HGB_API_REPORT_MODE is forbidden; the selected-harness API report is evaluator-only" ;;
+      esac
+      export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-fuzzbench_replay}"
     fi
     export HGB_EXCLUDE_FROM_AGGREGATE=0
     [[ "$profile" == "compat-smoke" ]] && export HGB_EXCLUDE_FROM_AGGREGATE=1

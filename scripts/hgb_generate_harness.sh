@@ -139,6 +139,11 @@ artifacts=(fuzzbench "$artifact_name")
 ensure_artifacts_present "$root" "${artifacts[@]}"
 
 run_id="${run_id:-$(make_timestamp)}"
+# Export profile/protocol before target package preparation so
+# hgb_targets.py package infers require_split for reproduction-delta blind
+# harness generators (fail-closed split contract).
+if [[ -n "$profile" ]]; then export HGB_BASELINE_PROFILE="$profile"; fi
+if [[ -n "$protocol" ]]; then export HGB_BASELINE_PROTOCOL="$protocol"; fi
 if [[ -z "$target_package" ]]; then
   prepare_args=(--target "$target" --run-id "$run_id" --layout "$target_layout")
   [[ "$force" == "1" ]] && prepare_args+=(--force)

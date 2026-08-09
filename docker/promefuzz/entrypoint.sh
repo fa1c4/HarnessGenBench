@@ -343,6 +343,7 @@ promefuzz_write_final_result() {
   local method_variant="$profile" excluded=false
   [[ "$profile" == "compat-smoke" ]] && { method_variant="compat-smoke"; excluded=true; }
   [[ "$profile" == "reproduction-gamma" ]] && method_variant="paper-faithful"
+  [[ "$profile" == "reproduction-delta" ]] && method_variant="paper-faithful"
   PROME_FUZZ_PROFILE="$profile" PROME_FUZZ_PROTOCOL="$protocol" PROME_FUZZ_TARGET="$target" \
   PROME_FUZZ_STATUS="$status" PROME_FUZZ_REASON="$reason" PROME_FUZZ_CODE="$exit_code" \
   PROME_FUZZ_METHOD="$method_variant" PROME_FUZZ_EXCLUDED="$excluded" \
@@ -405,6 +406,24 @@ result = promefuzz_profile.build_result(
         "max_candidates": os.environ.get("PROME_MAX_CANDIDATES", ""),
         "campaign_seconds": os.environ.get("HGB_CAMPAIGN_SECONDS", ""),
         "consumer_cases_status": os.environ.get("PROME_FUZZ_CONSUMER_CASES_STATUS", ""),
+    },
+    method={
+        "compile_db": {
+            "strategy": os.environ.get("PROME_FUZZ_COMPILE_DB_STRATEGY", ""),
+            "count": int(os.environ.get("PROME_FUZZ_COMPILE_DB_COUNT", "0") or "0"),
+        },
+        "link_context": {
+            "driver_build_args_count": int(os.environ.get("PROME_FUZZ_DRIVER_BUILD_ARGS_COUNT", "0") or "0"),
+        },
+        "consumer_knowledge": {
+            "enabled": os.environ.get("PROME_FUZZ_CONSUMER_CASES_STATUS", "") == "available",
+            "artifacts_nonempty": os.environ.get("PROME_FUZZ_CONSUMER_ARTIFACTS_NONEMPTY", "") == "true",
+        },
+        "embedding": {
+            "provider": os.environ.get("PROME_FUZZ_EMBEDDING_LLM_TYPE", ""),
+            "model": os.environ.get("PROME_FUZZ_EMBEDDING_MODEL", ""),
+        },
+        "generation_mode": os.environ.get("PROME_FUZZ_GENERATION_MODE", "ALL-COVER"),
     },
 )
 out.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -483,18 +502,24 @@ if [[ "$mode" == "generate-target" ]]; then
     exit 65
   fi
   case "$promefuzz_profile" in
-    alpha|paper-faithful|reproduction-gamma)
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta)
       promefuzz_method_faithful=1
       export PROME_FUZZ_EMBEDDING_LLM_TYPE="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-openai}"
       export PROME_FUZZ_EMBEDDING_MODEL="${PROME_FUZZ_EMBEDDING_MODEL:-text-embedding-3-small}"
       export HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=0
       export HGB_EXCLUDE_FROM_AGGREGATE=0
       promefuzz_allow_synthetic=0
-      # Gamma plan section 2.3: reproduction-gamma defaults to the exact
-      # FuzzBench build.sh replay so the compile DB provably originates from
-      # the FuzzBench build command, not a generic top-level CMake export.
+      # Gamma plan section 2.3 / delta plan section 3: reproduction-gamma and
+      # reproduction-delta default to the exact FuzzBench build.sh replay so
+      # the compile DB provably originates from the FuzzBench build command,
+      # not a generic top-level CMake export.
       if [[ "$promefuzz_profile" == "reproduction-gamma" ]]; then
         export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-exact_fuzzbench}"
+      fi
+      # Delta plan section 3: reproduction-delta uses the fuzzbench_replay
+      # strategy name so provenance.json records the exact FuzzBench build.
+      if [[ "$promefuzz_profile" == "reproduction-delta" ]]; then
+        export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-fuzzbench_replay}"
       fi
       ;;
     compat-smoke)
@@ -525,6 +550,56 @@ if [[ "$mode" == "generate-target" ]]; then
   project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
   fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
   safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
+  # --- Delta plan section 2: fail-closed split package assertions ---
+  # In blind-project + reproduction-delta, the generator mount must be the
+  # sanitized generator_input half and must never expose reference_harnesses,
+  # selected_reference_harnesses, or fuzzbench_selected_harness_apis.json.
+  # The evaluator half must provide evaluator_manifest.json.
+  if [[ "$promefuzz_profile" == "reproduction-delta" && "$promefuzz_protocol" == "blind-project" ]]; then
+    if ! test -f /target/target_manifest.json; then
+      reason="promefuzz_delta_manifest_missing: /target/target_manifest.json is missing; the generator_input half was not mounted"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+    if test -e /target/reference_harnesses || test -e /target/selected_reference_harnesses || test -e /target/fuzzbench_selected_harness_apis.json; then
+      reason="promefuzz_delta_reference_leak: reference_harnesses/selected_reference_harnesses/fuzzbench_selected_harness_apis.json leaked into the generator mount"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+    if ! test -f /evaluator/evaluator_manifest.json; then
+      reason="promefuzz_delta_evaluator_manifest_missing: /evaluator/evaluator_manifest.json is missing; the evaluator_only half was not mounted"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+    # Delta plan section 2.4: leakage audit before any LLM/embedding call.
+    # Scan /target for reference_harnesses tokens, selected harness paths,
+    # native harness source, or the canary. A hit is infra_failure.
+    promefuzz_leakage_preaudit='{"leaked":false}'
+    if [[ -n "${HGB_REF_CANARY:-}" ]]; then
+      if grep -RqF -- "${HGB_REF_CANARY}" /target 2>/dev/null; then
+        promefuzz_leakage_preaudit='{"leaked":true,"reason":"canary_in_target"}'
+      fi
+    fi
+    if grep -RqE -- 'reference_harnesses|selected_reference_harnesses|fuzzbench_selected_harness_apis' /target 2>/dev/null; then
+      promefuzz_leakage_preaudit='{"leaked":true,"reason":"reference_token_in_target"}'
+    fi
+    if printf '%s' "$promefuzz_leakage_preaudit" | grep -q '"leaked": *true'; then
+      printf 'PromeFuzz delta pre-audit FAILED: reference leakage detected in /target\n' >"$workspace/logs/leakage_preaudit.log"
+      printf '%s\n' "$promefuzz_leakage_preaudit" >>"$workspace/logs/leakage_preaudit.log"
+      reason="promefuzz_delta_reference_leak_preaudit: reference harness content leaked into the generator mount before any LLM/embedding call"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+    printf 'PromeFuzz delta pre-audit passed: no reference leakage in /target\n' >"$workspace/logs/leakage_preaudit.log"
+  fi
   # --- Blind-project / api-oracle isolation ---
   # The PromeFuzz generator must never see the exact target reference harness,
   # the selected-harness-APIs report, or reference-derived API filtering.
@@ -1354,6 +1429,26 @@ PY_PROMEFUZZ_FINAL_STATUS
   export PROME_FUZZ_EVALUATOR_SELECTED="$evaluator_selected_json"
   export PROME_FUZZ_CANDIDATE_COUNT="${generated_harness_count:-0}"
   export PROME_FUZZ_CONSUMER_CASES_STATUS="$consumer_cases_status"
+  # Delta plan section 6: method evidence for the result row.
+  export PROME_FUZZ_DRIVER_BUILD_ARGS_COUNT="$driver_build_args_count"
+  promefuzz_compile_db_strategy=""
+  promefuzz_compile_db_count=0
+  if [[ -f "$workspace/build_context/provenance.json" ]]; then
+    promefuzz_compile_db_strategy="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("strategy",""))' "$workspace/build_context/provenance.json" 2>/dev/null || printf '')"
+    promefuzz_compile_db_count="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("compile_commands_count",0))' "$workspace/build_context/provenance.json" 2>/dev/null || printf '0')"
+  fi
+  export PROME_FUZZ_COMPILE_DB_STRATEGY="$promefuzz_compile_db_strategy"
+  export PROME_FUZZ_COMPILE_DB_COUNT="$promefuzz_compile_db_count"
+  # Consumer knowledge artifacts nonempty: true when comprehend produced
+  # knowledge files AND consumer cases were available.
+  promefuzz_consumer_artifacts_nonempty=false
+  if [[ "$consumer_cases_status" == "available" && -f "$workspace/logs/comprehend_knowledge_audit.log" ]]; then
+    if grep -q 'knowledge_artifacts=[1-9]' "$workspace/logs/comprehend_knowledge_audit.log" 2>/dev/null; then
+      promefuzz_consumer_artifacts_nonempty=true
+    fi
+  fi
+  export PROME_FUZZ_CONSUMER_ARTIFACTS_NONEMPTY="$promefuzz_consumer_artifacts_nonempty"
+  export PROME_FUZZ_GENERATION_MODE="ALL-COVER"
   promefuzz_write_final_result "$status" "$reason" "$code" "$promefuzz_leakage_audit"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"
