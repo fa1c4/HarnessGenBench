@@ -236,6 +236,14 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
                 violations.append(f"evaluated {profile_s} g2fuzz row has seed_provenance.g2_generated_count <= 0")
             if line_cov.get("covered") is not None and int(line_cov.get("covered", 0) or 0) <= 0:
                 violations.append(f"evaluated {profile_s} g2fuzz row has coverage.line_coverage.covered <= 0")
+            # Epsilon G2-2/G2-3: the instrumentation check must pass and a
+            # runtime environment record must exist.
+            instr = meta.get("instrumentation_check") or {}
+            if isinstance(instr, dict) and not instr.get("all_passed"):
+                violations.append(f"evaluated {profile_s} g2fuzz row has instrumentation_check.all_passed != true")
+            runtime_env = meta.get("runtime_environment") or {}
+            if isinstance(runtime_env, dict) and not runtime_env:
+                violations.append(f"evaluated {profile_s} g2fuzz row has no runtime_environment record")
         input_gen = meta.get("input_generation", {})
         if not isinstance(input_gen, dict) or int(input_gen.get("valid_g2_generated_count", 0) or 0) <= 0:
             violations.append("evaluated input-generator row has no valid G2-generated input")

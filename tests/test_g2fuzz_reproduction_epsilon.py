@@ -1,22 +1,28 @@
-"""Delta reproduction tests for the G2Fuzz input-generator pipeline.
+"""Epsilon reproduction tests for the G2Fuzz input-generator pipeline.
 
 These tests exercise the strict paper-native G2Fuzz reproduction contract from
-``plans/g2fuzz_reproduction_delta.md`` with fake Docker/CLI fixtures so they
+``plans/g2fuzz_reproduction_epsilon.md`` with fake Docker/CLI fixtures so they
 pass without real external checkouts, Docker, AFL++ builds, or model access.
 
 G2Fuzz is an ``input_generator`` (it synthesizes Python input generators and
 seeds for a fixed native FuzzBench target triple, then drives its modified
-AFL++ with CmpLog), never a harness generator.
+AFL++ with CmpLog), never a harness generator. It is kept out of the
+harness-generator leaderboard.
 
-The tests target the exact HGB5 issues called out by the plan:
-- profile not accepted by the host runner,
-- prebuilt ``G2FUZZ_TARGET_DIR`` leaking a non-FuzzBench triple,
-- a fake builder that does not verify ``/out/<target>``,
-- coverage report missing but status evaluated,
-- zero-exec campaigns,
-- missing CmpLog ``-c`` argument,
-- ``G2FUZZ_TRY_NUM`` patched down to a smoke value,
-- paper-core vs extension matrix split.
+The epsilon plan shares its foundation with the other reproduction-epsilon
+baselines (profile wiring, fail-closed split packages, smoke/campaign/coverage
+evidence). These tests additionally cover the G2Fuzz-specific tasks:
+
+* G2-1: strict profile routing, prohibit prebuilt target pairs.
+* G2-2: build .afl/.cmp/.cov with FuzzBench Docker semantics + instrumentation
+  check + per-target build artifacts.
+* G2-3: preserve runtime environment for extracted targets.
+* G2-4: run the full G2Fuzz method (program_gen -> validate -> merge -> AFL++
+  with CmpLog -> coverage replay).
+* G2-5: seed provenance and validation (count only real SUT inputs).
+* G2-6: core vs extension target aggregation (applicability_group).
+* G2-7: coverage and result semantics (no coverage -> not evaluated).
+* G2-8: valuable-target matrix semantics.
 """
 
 from __future__ import annotations
@@ -46,10 +52,10 @@ def load_module(name: str, path: Path):
     return module
 
 
-g2 = load_module("g2fuzz_target_pipeline_delta", ROOT / "docker/common/g2fuzz_target_pipeline.py")
-builder = load_module("hgb_fuzzbench_builder_delta", ROOT / "docker/common/hgb_fuzzbench_builder.py")
-contract_mod = load_module("g2fuzz_contract_delta", ROOT / "docker/common/g2fuzz_contract.py")
-matrix_collector = load_module("hgb_collect_matrix_delta", ROOT / "scripts/hgb_collect_matrix.py")
+g2 = load_module("g2fuzz_target_pipeline_epsilon", ROOT / "docker/common/g2fuzz_target_pipeline.py")
+builder = load_module("hgb_fuzzbench_builder_epsilon", ROOT / "docker/common/hgb_fuzzbench_builder.py")
+contract_mod = load_module("g2fuzz_contract_epsilon", ROOT / "docker/common/g2fuzz_contract.py")
+matrix_collector = load_module("hgb_collect_matrix_epsilon", ROOT / "scripts/hgb_collect_matrix.py")
 
 
 COVERAGE_JSON = json.dumps({
@@ -217,7 +223,7 @@ def make_pipeline(
         target_package=package,
         artifact_dir=tmp_path / "artifact",
         metadata_root=ROOT / "metadata",
-        profile="reproduction-delta",
+        profile="reproduction-epsilon",
         protocol="paper-native",
     )
     if runner is not None:
@@ -249,24 +255,93 @@ def run_full(tmp_path, target="libpng_libpng_read_fuzzer", runner=None, *, cover
     return code, metadata, pipeline, tmp_path / "workspace"
 
 
-# 1. reproduction-delta profile is accepted by the host runner (dry run)
-def test_reproduction_delta_profile_accepted_by_host_runner():
-    run_baseline = (ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "reproduction-delta" in run_baseline
-    assert "g2fuzz/$profile: G2FUZZ_TARGET_DIR is forbidden" in run_baseline
-    assert "reproduction-epsilon" in run_baseline
-    # A dry run validates the profile/protocol without Docker or LLM calls.
+def _run_env():
+    env = dict(os.environ)
+    env["PATH"] = str(ROOT / "scripts") + os.pathsep + env.get("PATH", "")
+    return env
+
+
+# ---------------------------------------------------------------------------
+# E0. Profile acceptance and strictness
+# ---------------------------------------------------------------------------
+
+
+def test_reproduction_epsilon_is_a_strict_profile():
+    assert g2.is_gamma_profile("reproduction-epsilon") is True
+    assert g2.is_delta_profile("reproduction-epsilon") is True
+    # reproduction-delta remains a backward-compatible alias.
+    assert g2.is_delta_profile("reproduction-delta") is True
+    assert g2.is_gamma_profile("reproduction-gamma") is True
+
+
+def test_reproduction_epsilon_profile_accepted_by_host_runner():
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",
          "--generator", "g2fuzz", "--target", "libpng_libpng_read_fuzzer",
-         "--profile", "reproduction-delta", "--protocol", "paper-native"],
-        cwd=ROOT, text=True, capture_output=True, check=False,
+         "--profile", "reproduction-epsilon", "--protocol", "paper-native"],
+        cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
     )
     assert proc.returncode == 0, proc.stderr
 
 
-# 2. Prebuilt G2FUZZ_TARGET_DIR is forbidden under delta before generation
-def test_delta_refuses_prebuilt_target_dir(tmp_path: Path):
+def test_dry_run_reports_input_generator_task_family():
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",
+         "--generator", "g2fuzz", "--target", "libpng_libpng_read_fuzzer",
+         "--profile", "reproduction-epsilon", "--protocol", "paper-native"],
+        cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
+    )
+    assert proc.returncode == 0, proc.stderr
+    workspace = proc.stdout.strip().splitlines()[-1]
+    result = json.loads((Path(workspace) / "result.json").read_text(encoding="utf-8"))
+    assert result["task_family"] == "input_generator"
+    assert result["profile"] == "reproduction-epsilon"
+    assert result["method_variant"] == "paper-faithful"
+
+
+def test_unknown_profile_exits_with_code_2():
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",
+         "--generator", "g2fuzz", "--target", "libpng_libpng_read_fuzzer",
+         "--profile", "reproduction-zeta", "--protocol", "paper-native"],
+        cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "invalid profile" in proc.stderr
+
+
+def test_hgb_generate_harness_rejects_unknown_profile_with_code_2():
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/hgb_generate_harness.sh"), "--generator", "g2fuzz",
+         "--target", "libpng_libpng_read_fuzzer", "--profile", "reproduction-zeta", "--dry-run"],
+        cwd=ROOT, capture_output=True, text=True, env=_run_env(), timeout=120,
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "unknown profile" in proc.stderr
+
+
+def test_hgb_generate_harness_accepts_reproduction_epsilon():
+    proc = subprocess.run(
+        ["bash", str(ROOT / "scripts/hgb_generate_harness.sh"), "--generator", "g2fuzz",
+         "--target", "libpng_libpng_read_fuzzer", "--profile", "reproduction-epsilon", "--dry-run"],
+        cwd=ROOT, capture_output=True, text=True, env=_run_env(), timeout=120,
+    )
+    assert proc.returncode != 2
+    assert "unknown profile" not in proc.stderr
+
+
+def test_entrypoint_accepts_reproduction_epsilon():
+    entrypoint = (ROOT / "docker/g2fuzz/entrypoint.sh").read_text(encoding="utf-8")
+    assert "reproduction-epsilon" in entrypoint
+    assert '"$HGB_BASELINE_PROFILE" == "reproduction-epsilon"' in entrypoint
+
+
+# ---------------------------------------------------------------------------
+# G2-1. Strict profile routing: prohibit prebuilt target pairs
+# ---------------------------------------------------------------------------
+
+
+def test_epsilon_refuses_prebuilt_target_dir(tmp_path: Path):
     pair = tmp_path / "pair"
     pair.mkdir()
     make_executable(pair / "libpng_libpng_read_fuzzer.afl", "#!/usr/bin/env bash\nexit 0\n")
@@ -284,7 +359,7 @@ def test_delta_refuses_prebuilt_target_dir(tmp_path: Path):
             "--target-package", str(package),
             "--artifact-dir", str(tmp_path / "artifact"),
             "--metadata-root", str(ROOT / "metadata"),
-            "--profile", "reproduction-delta",
+            "--profile", "reproduction-epsilon",
             "--protocol", "paper-native",
         ],
         cwd=ROOT, env=env, text=True, capture_output=True, check=False,
@@ -295,7 +370,11 @@ def test_delta_refuses_prebuilt_target_dir(tmp_path: Path):
     assert proc.returncode != 0
 
 
-# 3. Triple provenance shows all three variants verified and FuzzBench Docker env
+# ---------------------------------------------------------------------------
+# G2-2. Build .afl/.cmp/.cov with FuzzBench Docker semantics + artifacts
+# ---------------------------------------------------------------------------
+
+
 def test_triple_provenance_all_variants_verified(tmp_path: Path):
     code, metadata, pipeline, workspace = run_full(tmp_path)
     assert code == 0, metadata.get("reason")
@@ -304,23 +383,106 @@ def test_triple_provenance_all_variants_verified(tmp_path: Path):
     for variant in ("afl", "cmp", "cov"):
         assert provenance["variants"][variant]["verified"] is True
         assert provenance["variants"][variant]["binary_sha256"]
-    # The result payload carries the same triple under target_triple.
     assert metadata["target_triple"]["uses_fuzzbench_docker_environment"] is True
     for variant in ("afl", "cmp", "cov"):
         assert metadata["target_triple"]["variants"][variant]["verified"] is True
 
 
-# 4. A fake builder that does not verify /out/<target> must fail
+def test_build_artifacts_per_target(tmp_path: Path):
+    code, metadata, pipeline, workspace = run_full(tmp_path)
+    assert code == 0, metadata.get("reason")
+    pair = workspace / "target_pair"
+    # G2-2 required artifacts.
+    for variant in ("afl", "cmp", "cov"):
+        assert (pair / f"{variant}_image_tag.txt").is_file(), variant
+        assert (pair / f"{variant}_binary_path.txt").is_file(), variant
+        assert (pair / f"build_{variant}.log").is_file(), variant
+        assert (pair / f"{variant}_image_tag.txt").read_text(encoding="utf-8").strip()
+        assert (pair / f"{variant}_binary_path.txt").read_text(encoding="utf-8").strip()
+
+
+def test_instrumentation_check_all_passed(tmp_path: Path):
+    code, metadata, pipeline, workspace = run_full(tmp_path)
+    assert code == 0, metadata.get("reason")
+    assert metadata["status"] == "evaluated"
+    instr = json.loads((workspace / "target_pair" / "instrumentation_check.json").read_text(encoding="utf-8"))
+    assert instr["afl_seed_executed"] is True
+    assert instr["cmplog_binary_present"] is True
+    assert instr["cmplog_accepted_by_afl"] is True
+    assert instr["cov_binary_present"] is True
+    assert instr["cov_produces_profraw"] is True
+    assert instr["cov_export_nonempty"] is True
+    assert instr["all_passed"] is True
+    # The result payload carries the instrumentation check.
+    assert metadata["instrumentation_check"]["all_passed"] is True
+
+
 def test_fake_builder_not_verifying_out_fails(tmp_path: Path):
     runner = FakeDockerRunner(write_binary=False)
     code, metadata, pipeline, workspace = run_full(tmp_path, runner=runner)
     assert code != 0
     assert metadata["status"] != "evaluated"
-    # The triple build should have failed because no binary was produced.
     assert metadata["stages"]["target_pair_built"]["status"] != "complete"
 
 
-# 5. Generated seed count excludes .py/.json/log files; at least one payload
+# ---------------------------------------------------------------------------
+# G2-3. Preserve runtime environment for extracted targets
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_environment_recorded(tmp_path: Path):
+    code, metadata, pipeline, workspace = run_full(tmp_path)
+    assert code == 0, metadata.get("reason")
+    env = json.loads((workspace / "target_pair" / "runtime_environment.json").read_text(encoding="utf-8"))
+    assert env["uses_fuzzbench_docker_environment"] is True
+    assert env["strategy"] in ("extracted_out_closure", "containerized_wrapper")
+    for variant in ("afl", "cmp", "cov"):
+        assert variant in env["variants"]
+        assert env["variants"][variant]["image_tag"]
+        assert env["variants"][variant]["binary_path"]
+    # The result payload carries the runtime environment record.
+    assert metadata["runtime_environment"]["uses_fuzzbench_docker_environment"] is True
+
+
+# ---------------------------------------------------------------------------
+# G2-4. Run the full G2Fuzz method
+# ---------------------------------------------------------------------------
+
+
+def test_campaign_command_uses_cmplog_minus_c(tmp_path: Path):
+    code, metadata, pipeline, workspace = run_full(tmp_path)
+    assert code == 0, metadata.get("reason")
+    cmd_text = (workspace / "campaign" / "command.txt").read_text(encoding="utf-8")
+    assert " -c " in cmd_text
+    assert (workspace / "target" / "target.cmp").is_file()
+
+
+def test_campaign_requires_cmplog_binary(tmp_path: Path):
+    pipeline = make_pipeline(tmp_path, runner=FakeDockerRunner())
+    (tmp_path / "artifact").mkdir(parents=True, exist_ok=True)
+    make_executable(tmp_path / "artifact" / "afl-fuzz", "#!/usr/bin/env bash\nexit 0\n")
+    pipeline.invocation = g2.resolved_invocation(pipeline.adapter, pipeline.target_afl)
+    pipeline.target_afl.parent.mkdir(parents=True, exist_ok=True)
+    make_executable(pipeline.target_afl, "#!/usr/bin/env bash\nexit 0\n")
+    assert not pipeline.target_cmp.is_file()
+    with pytest.raises(g2.PipelineError) as exc_info:
+        pipeline.run_campaign()
+    assert exc_info.value.status == "infra_missing"
+    assert "CmpLog" in exc_info.value.reason
+
+
+def test_try_num_one_forbidden_under_epsilon():
+    assert g2.try_num_for_profile("reproduction-epsilon", {"G2FUZZ_TRY_NUM": "3"}) == "3"
+    assert g2.try_num_for_profile("reproduction-epsilon", {}) == "3"
+    run_baseline = (ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
+    assert "G2FUZZ_TRY_NUM=1 is a smoke value" in run_baseline
+
+
+# ---------------------------------------------------------------------------
+# G2-5. Seed provenance and validation
+# ---------------------------------------------------------------------------
+
+
 def test_generated_seed_count_excludes_non_inputs(tmp_path: Path):
     produced = tmp_path / "gen_seeds"
     produced.mkdir()
@@ -336,7 +498,6 @@ def test_generated_seed_count_excludes_non_inputs(tmp_path: Path):
     assert not g2.is_generated_input_candidate(produced / "config.yaml")
 
 
-# 6. Zero-exec campaign fails and never reaches evaluated
 def test_zero_exec_campaign_fails(tmp_path: Path):
     runner = FakeDockerRunner()
     program_gen = fake_program_gen(tmp_path / "program_gen.py")
@@ -360,7 +521,6 @@ def test_zero_exec_campaign_fails(tmp_path: Path):
     assert metadata["status"] != "evaluated"
 
 
-# 7. Coverage report missing but status evaluated must fail
 def test_coverage_report_missing_fails(tmp_path: Path):
     code, metadata, pipeline, workspace = run_full(tmp_path, coverage_stdout="", set_coverage_report=False)
     assert code != 0
@@ -370,113 +530,8 @@ def test_coverage_report_missing_fails(tmp_path: Path):
     assert metadata["coverage"]["edge_coverage"]["status"] == "unavailable"
 
 
-# 8. Missing -c CmpLog argument fails
-def test_missing_cmplog_argument_fails(tmp_path: Path):
+def test_zero_generators_fails_under_epsilon(tmp_path: Path):
     runner = FakeDockerRunner()
-    program_gen = fake_program_gen(tmp_path / "program_gen.py")
-    # An afl-fuzz that does not accept -c/-k but still produces output.
-    afl = make_executable(
-        tmp_path / "afl-fuzz",
-        """#!/usr/bin/env python3
-import sys
-from pathlib import Path
-out = None
-for index, arg in enumerate(sys.argv):
-    if arg == "-o" and index + 1 < len(sys.argv):
-        out = Path(sys.argv[index + 1])
-if out is None:
-    raise SystemExit(2)
-queue = out / "default" / "queue"
-(queue).mkdir(parents=True, exist_ok=True)
-(queue / 'id:000000,orig:seed').write_bytes(b'queued')
-(out / "default" / "fuzzer_stats").write_text("execs_done : 100\\npaths_total : 3\\n", encoding="utf-8")
-raise SystemExit(0)
-""",
-    )
-    coverage = fake_coverage_report(tmp_path / "coverage.json")
-    pipeline = make_pipeline(tmp_path, runner=runner)
-    saved = dict(os.environ)
-    os.environ["G2FUZZ_PROGRAM_GEN"] = str(program_gen)
-    os.environ["G2FUZZ_AFL_FUZZ"] = str(afl)
-    os.environ["G2FUZZ_COVERAGE_REPORT"] = str(coverage)
-    os.environ["G2FUZZ_AFL_TIMEOUT_SECONDS"] = "5"
-    try:
-        code = pipeline.full()
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
-    metadata = json.loads((tmp_path / "workspace" / "metadata.json").read_text(encoding="utf-8"))
-    # The campaign command is constructed with -c by the pipeline; the guard
-    # verifies -c is present. The command file must contain -c.
-    cmd_text = (tmp_path / "workspace" / "campaign" / "command.txt").read_text(encoding="utf-8")
-    assert " -c " in cmd_text
-    # The pipeline must require a CmpLog target.cmp binary; if it were missing
-    # the campaign would fail with infra_missing.
-    assert (tmp_path / "workspace" / "target" / "target.cmp").is_file()
-
-
-def test_campaign_requires_cmplog_binary(tmp_path: Path):
-    pipeline = make_pipeline(tmp_path, runner=FakeDockerRunner())
-    # Provide a fake afl-fuzz in the artifact dir so afl_fuzz_path() passes;
-    # the campaign must then fail on the missing target.cmp CmpLog binary.
-    (tmp_path / "artifact").mkdir(parents=True, exist_ok=True)
-    make_executable(tmp_path / "artifact" / "afl-fuzz", "#!/usr/bin/env bash\nexit 0\n")
-    pipeline.invocation = g2.resolved_invocation(pipeline.adapter, pipeline.target_afl)
-    pipeline.target_afl.parent.mkdir(parents=True, exist_ok=True)
-    make_executable(pipeline.target_afl, "#!/usr/bin/env bash\nexit 0\n")
-    # target.cmp does not exist.
-    assert not pipeline.target_cmp.is_file()
-    with pytest.raises(g2.PipelineError) as exc_info:
-        pipeline.run_campaign()
-    assert exc_info.value.status == "infra_missing"
-    assert "CmpLog" in exc_info.value.reason
-
-
-# 9. evaluated requires the full closed loop (real evidence) with delta schema
-def test_evaluated_requires_full_closed_loop(tmp_path: Path):
-    code, metadata, pipeline, workspace = run_full(tmp_path)
-    assert code == 0, metadata.get("reason")
-    assert metadata["status"] == "evaluated"
-    assert metadata["task_family"] == "input_generator"
-    assert metadata["profile"] == "reproduction-delta"
-    # Delta schema fields (plan section 7).
-    assert metadata["method_variant"] == "paper-core"
-    assert metadata["target_triple"]["uses_fuzzbench_docker_environment"] is True
-    for variant in ("afl", "cmp", "cov"):
-        assert metadata["target_triple"]["variants"][variant]["verified"] is True
-    assert metadata["program_generation"]["generator_count"] > 0
-    assert metadata["program_generation"]["g2_generated_count"] > 0
-    assert metadata["seed_provenance_delta"]["g2_generated_count"] > 0
-    assert metadata["campaign"]["execs_done"] > 0
-    assert metadata["campaign"]["queue_count"] > 0
-    assert metadata["coverage"]["line_coverage"]["covered"] > 0
-    # Global invariant 5 fields.
-    for key in ("task_family", "profile", "protocol", "method_variant", "status",
-                "applicability", "stages", "artifacts", "build", "campaign",
-                "coverage", "reproducibility", "error", "exclude_from_aggregate"):
-        assert key in metadata, key
-    # Delta must not be excluded from aggregate.
-    assert metadata["exclude_from_aggregate"] is False
-    # Build provenance from the FuzzBench Docker environment.
-    assert metadata["build"]["uses_fuzzbench_docker_environment"] is True
-    # All stages complete.
-    for stage in g2.STAGE_NAMES:
-        assert metadata["stages"][stage]["status"] == "complete", stage
-    # Consumption smoke persisted and consumed input.
-    smoke = json.loads((workspace / "target_contract" / "consumption_smoke.json").read_text(encoding="utf-8"))
-    assert smoke["consumed_input"] is True
-    # Execution wrappers exist.
-    for variant in ("afl", "cmp", "cov"):
-        assert (workspace / "target" / f"run_{variant}.sh").is_file()
-    # g2_programs generators/seeds recorded (plan section 4.3).
-    assert (workspace / "generators" / "source").is_dir()
-    assert any((workspace / "seeds" / "g2_generated").iterdir())
-
-
-# 9b. Zero Python generators fails under delta (plan section 4.4)
-def test_zero_generators_fails_under_delta(tmp_path: Path):
-    runner = FakeDockerRunner()
-    # A program_gen that produces seeds but no .py generators.
     no_gen = make_executable(
         tmp_path / "program_gen.py",
         """#!/usr/bin/env python3
@@ -510,52 +565,53 @@ root = Path(args.output) / "default"
     assert "generators" in metadata.get("reason", "")
 
 
-# 9c. Zero generated seeds fails under delta (plan section 4.4)
-def test_zero_generated_seeds_fails_under_delta(tmp_path: Path):
-    runner = FakeDockerRunner()
-    no_seed = make_executable(
-        tmp_path / "program_gen.py",
-        """#!/usr/bin/env python3
-import argparse
-from pathlib import Path
-parser = argparse.ArgumentParser()
-parser.add_argument("--output", required=True)
-parser.add_argument("--program", required=True)
-args = parser.parse_args()
-root = Path(args.output) / "default"
-(root / "generators").mkdir(parents=True, exist_ok=True)
-(root / "generators" / "g.py").write_text("x=1\\n", encoding="utf-8")
-# No gen_seeds directory -> zero seeds.
-""",
-    )
-    afl = fake_afl_fuzz(tmp_path / "afl-fuzz")
-    coverage = fake_coverage_report(tmp_path / "coverage.json")
-    pipeline = make_pipeline(tmp_path, runner=runner)
-    saved = dict(os.environ)
-    os.environ["G2FUZZ_PROGRAM_GEN"] = str(no_seed)
-    os.environ["G2FUZZ_AFL_FUZZ"] = str(afl)
-    os.environ["G2FUZZ_COVERAGE_REPORT"] = str(coverage)
-    os.environ["G2FUZZ_AFL_TIMEOUT_SECONDS"] = "5"
-    try:
-        code = pipeline.full()
-    finally:
-        os.environ.clear()
-        os.environ.update(saved)
-    metadata = json.loads((tmp_path / "workspace" / "metadata.json").read_text(encoding="utf-8"))
-    assert code != 0
-    assert metadata["status"] != "evaluated"
-    assert "generated input" in metadata.get("reason", "")
+# ---------------------------------------------------------------------------
+# G2-6. Core vs extension target aggregation
+# ---------------------------------------------------------------------------
 
 
-# 10. method_variant is extension for extension adapters
+def test_evaluated_requires_full_closed_loop(tmp_path: Path):
+    code, metadata, pipeline, workspace = run_full(tmp_path)
+    assert code == 0, metadata.get("reason")
+    assert metadata["status"] == "evaluated"
+    assert metadata["task_family"] == "input_generator"
+    assert metadata["profile"] == "reproduction-epsilon"
+    assert metadata["method_variant"] == "paper-core"
+    assert metadata["applicability_group"] == "paper-core"
+    assert metadata["target_triple"]["uses_fuzzbench_docker_environment"] is True
+    for variant in ("afl", "cmp", "cov"):
+        assert metadata["target_triple"]["variants"][variant]["verified"] is True
+    assert metadata["program_generation"]["generator_count"] > 0
+    assert metadata["program_generation"]["g2_generated_count"] > 0
+    assert metadata["seed_provenance_delta"]["g2_generated_count"] > 0
+    assert metadata["campaign"]["execs_done"] > 0
+    assert metadata["campaign"]["queue_count"] > 0
+    assert metadata["coverage"]["line_coverage"]["covered"] > 0
+    # All stages complete.
+    for stage in g2.STAGE_NAMES:
+        assert metadata["stages"][stage]["status"] == "complete", stage
+    # Epsilon artifacts.
+    assert metadata["instrumentation_check"]["all_passed"] is True
+    assert metadata["runtime_environment"]["uses_fuzzbench_docker_environment"] is True
+    # Consumption smoke persisted and consumed input.
+    smoke = json.loads((workspace / "target_contract" / "consumption_smoke.json").read_text(encoding="utf-8"))
+    assert smoke["consumed_input"] is True
+    # Execution wrappers exist.
+    for variant in ("afl", "cmp", "cov"):
+        assert (workspace / "target" / f"run_{variant}.sh").is_file()
+    # g2_programs generators/seeds recorded.
+    assert (workspace / "generators" / "source").is_dir()
+    assert any((workspace / "seeds" / "g2_generated").iterdir())
+
+
 def test_method_variant_extension_for_extension_targets(tmp_path: Path):
-    # jsoncpp_jsoncpp_fuzzer is an extension adapter.
     code, metadata, pipeline, workspace = run_full(tmp_path, target="jsoncpp_jsoncpp_fuzzer")
     assert code == 0, metadata.get("reason")
     assert metadata["status"] == "evaluated"
     assert metadata["method_variant"] == "extension"
     assert metadata["method_profile"] == "extension"
     assert metadata["paper_core"] is False
+    assert metadata["applicability_group"] == "extension"
 
 
 def test_method_variant_helper_maps_profiles():
@@ -563,16 +619,11 @@ def test_method_variant_helper_maps_profiles():
     assert g2.method_variant_for({"method_profile": "extension"}) == "extension"
 
 
-# 11. G2FUZZ_TRY_NUM=1 is forbidden under delta (no smoke-value patching)
-def test_try_num_one_forbidden_under_delta():
-    assert g2.try_num_for_profile("reproduction-delta", {"G2FUZZ_TRY_NUM": "3"}) == "3"
-    # The default for delta is the real budget (3), not a smoke value.
-    assert g2.try_num_for_profile("reproduction-delta", {}) == "3"
-    run_baseline = (ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "G2FUZZ_TRY_NUM=1 is a smoke value" in run_baseline
+# ---------------------------------------------------------------------------
+# G2-8. Valuable-target matrix semantics
+# ---------------------------------------------------------------------------
 
 
-# 12. Matrix collector: paper-core and extension split + g2fuzz counters
 def test_matrix_collector_g2fuzz_paper_core_extension_split(tmp_path: Path):
     matrix_dir = tmp_path / "matrix" / "run"
     matrix_dir.mkdir(parents=True)
@@ -585,7 +636,7 @@ def test_matrix_collector_g2fuzz_paper_core_extension_split(tmp_path: Path):
     base_eval = {
         "baseline": "g2fuzz", "generator": "g2fuzz", "status": "evaluated",
         "task_family": "input_generator", "applicability": "applicable",
-        "excluded_from_aggregate": False, "profile": "reproduction-delta",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
         "campaign": {"execs_done": 100, "queue_count": 2},
         "coverage": {"report_exists": True, "line_coverage": {"covered": 30, "total": 50},
                      "edge_coverage": {"status": "unavailable"}},
@@ -596,19 +647,21 @@ def test_matrix_collector_g2fuzz_paper_core_extension_split(tmp_path: Path):
                           "variants": {"afl": {"verified": True}, "cmp": {"verified": True}, "cov": {"verified": True}}},
         "program_generation": {"generator_count": 1},
         "seed_provenance_delta": {"g2_generated_count": 1},
+        "instrumentation_check": {"all_passed": True},
+        "runtime_environment": {"strategy": "extracted_out_closure", "uses_fuzzbench_docker_environment": True},
     }
-    core_meta = dict(base_eval, target="libpng_libpng_read_fuzzer", method_variant="paper-core", method_profile="paper-faithful")
-    ext_meta = dict(base_eval, target="jsoncpp_jsoncpp_fuzzer", method_variant="extension", method_profile="extension")
+    core_meta = dict(base_eval, target="libpng_libpng_read_fuzzer", method_variant="paper-core", method_profile="paper-faithful", applicability_group="paper-core")
+    ext_meta = dict(base_eval, target="jsoncpp_jsoncpp_fuzzer", method_variant="extension", method_profile="extension", applicability_group="extension")
     fail_meta = {
         "baseline": "g2fuzz", "generator": "g2fuzz", "status": "failed",
         "task_family": "input_generator", "applicability": "applicable",
-        "excluded_from_aggregate": False, "profile": "reproduction-delta",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
         "method_variant": "paper-core", "campaign": {"execs_done": 0},
     }
     infra_meta = {
         "baseline": "g2fuzz", "generator": "g2fuzz", "status": "infra_failure",
         "task_family": "input_generator", "applicability": "applicable",
-        "excluded_from_aggregate": False, "profile": "reproduction-delta",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
         "method_variant": "paper-core",
     }
     (core_ws / "metadata.json").write_text(json.dumps(core_meta), encoding="utf-8")
@@ -623,15 +676,14 @@ def test_matrix_collector_g2fuzz_paper_core_extension_split(tmp_path: Path):
         f"g2fuzz\tbloaty_fuzz_target\tsomething\t{infra_ws}\t{infra_ws / 'metadata.json'}\t\n",
         encoding="utf-8",
     )
-    summary = matrix_collector.collect(matrix_dir, generator="g2fuzz", profile="reproduction-delta")
+    summary = matrix_collector.collect(matrix_dir, generator="g2fuzz", profile="reproduction-epsilon")
     assert summary["g2fuzz_paper_core_evaluated"] == 1
     assert summary["g2fuzz_extension_evaluated"] == 1
     assert summary["g2fuzz_infra_failures"] == 1
     assert summary["g2fuzz_failures"] == 1
 
 
-# 13. Strict matrix collector: a real evaluated delta row has no violations
-def test_matrix_strict_no_violations_for_real_evaluated_delta_row(tmp_path: Path):
+def test_matrix_strict_no_violations_for_real_evaluated_epsilon_row(tmp_path: Path):
     matrix_dir = tmp_path / "matrix" / "run"
     matrix_dir.mkdir(parents=True)
     app_ws = matrix_dir / "app"
@@ -639,8 +691,9 @@ def test_matrix_strict_no_violations_for_real_evaluated_delta_row(tmp_path: Path
     (app_ws / "metadata.json").write_text(json.dumps({
         "baseline": "g2fuzz", "generator": "g2fuzz", "status": "evaluated",
         "task_family": "input_generator", "applicability": "applicable",
-        "excluded_from_aggregate": False, "profile": "reproduction-delta",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
         "method_variant": "paper-core", "method_profile": "paper-faithful",
+        "applicability_group": "paper-core",
         "campaign": {"execs_done": 100, "queue_count": 2},
         "coverage": {"report_exists": True, "line_coverage": {"covered": 30, "total": 50},
                      "edge_coverage": {"status": "unavailable"}},
@@ -659,12 +712,11 @@ def test_matrix_strict_no_violations_for_real_evaluated_delta_row(tmp_path: Path
         f"g2fuzz\tlibpng_libpng_read_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
         encoding="utf-8",
     )
-    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-delta")
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-epsilon")
     assert summary["evaluated_row_violations"] == []
 
 
-# 14. Strict matrix collector: coverage-missing evaluated delta row is flagged
-def test_matrix_strict_flags_coverage_missing_delta_row(tmp_path: Path):
+def test_matrix_strict_flags_coverage_missing_epsilon_row(tmp_path: Path):
     matrix_dir = tmp_path / "matrix" / "run"
     matrix_dir.mkdir(parents=True)
     app_ws = matrix_dir / "app"
@@ -672,7 +724,7 @@ def test_matrix_strict_flags_coverage_missing_delta_row(tmp_path: Path):
     (app_ws / "metadata.json").write_text(json.dumps({
         "baseline": "g2fuzz", "generator": "g2fuzz", "status": "evaluated",
         "task_family": "input_generator", "applicability": "applicable",
-        "excluded_from_aggregate": False, "profile": "reproduction-delta",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
         "method_variant": "paper-core", "campaign": {"execs_done": 100, "queue_count": 2},
         "coverage": {"report_exists": False, "line_coverage": None,
                      "edge_coverage": {"status": "unavailable"}},
@@ -683,19 +735,20 @@ def test_matrix_strict_flags_coverage_missing_delta_row(tmp_path: Path):
                           "variants": {"afl": {"verified": True}, "cmp": {"verified": True}, "cov": {"verified": True}}},
         "program_generation": {"generator_count": 1},
         "seed_provenance_delta": {"g2_generated_count": 1},
+        "instrumentation_check": {"all_passed": True},
+        "runtime_environment": {"strategy": "extracted_out_closure", "uses_fuzzbench_docker_environment": True},
     }), encoding="utf-8")
     (matrix_dir / "matrix.tsv").write_text(
         "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
         f"g2fuzz\tlibpng_libpng_read_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
         encoding="utf-8",
     )
-    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-delta")
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-epsilon")
     assert summary["evaluated_row_violations"]
     violations = summary["evaluated_row_violations"][0]["violations"]
     assert any("line_coverage.covered" in v for v in violations)
 
 
-# 15. Strict matrix collector: an unverified triple variant is flagged
 def test_matrix_strict_flags_unverified_triple(tmp_path: Path):
     matrix_dir = tmp_path / "matrix" / "run"
     matrix_dir.mkdir(parents=True)
@@ -704,7 +757,7 @@ def test_matrix_strict_flags_unverified_triple(tmp_path: Path):
     (app_ws / "metadata.json").write_text(json.dumps({
         "baseline": "g2fuzz", "generator": "g2fuzz", "status": "evaluated",
         "task_family": "input_generator", "applicability": "applicable",
-        "excluded_from_aggregate": False, "profile": "reproduction-delta",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
         "method_variant": "paper-core", "campaign": {"execs_done": 100, "queue_count": 2},
         "coverage": {"report_exists": True, "line_coverage": {"covered": 30, "total": 50},
                      "edge_coverage": {"status": "unavailable"}},
@@ -723,15 +776,66 @@ def test_matrix_strict_flags_unverified_triple(tmp_path: Path):
         f"g2fuzz\tlibpng_libpng_read_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
         encoding="utf-8",
     )
-    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-delta")
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-epsilon")
     assert summary["evaluated_row_violations"]
     violations = summary["evaluated_row_violations"][0]["violations"]
     assert any("variants.cmp.verified" in v for v in violations)
 
 
-# 16. is_gamma_profile is a backward-compatible alias for delta (shared path)
-def test_is_gamma_profile_aliases_delta():
-    assert g2.is_gamma_profile("reproduction-gamma") is True
-    assert g2.is_gamma_profile("reproduction-delta") is True
-    assert g2.is_delta_profile("reproduction-delta") is True
-    assert g2.is_delta_profile("reproduction-gamma") is False
+def test_matrix_strict_flags_missing_instrumentation_check(tmp_path: Path):
+    matrix_dir = tmp_path / "matrix" / "run"
+    matrix_dir.mkdir(parents=True)
+    app_ws = matrix_dir / "app"
+    app_ws.mkdir()
+    (app_ws / "metadata.json").write_text(json.dumps({
+        "baseline": "g2fuzz", "generator": "g2fuzz", "status": "evaluated",
+        "task_family": "input_generator", "applicability": "applicable",
+        "excluded_from_aggregate": False, "profile": "reproduction-epsilon",
+        "method_variant": "paper-core", "campaign": {"execs_done": 100, "queue_count": 2},
+        "coverage": {"report_exists": True, "line_coverage": {"covered": 30, "total": 50},
+                     "edge_coverage": {"status": "unavailable"}},
+        "input_generation": {"valid_g2_generated_count": 1},
+        "target_pair_build": {"status": "completed", "afl_binary": "/x", "cmp_binary": "/y", "cov_binary": "/z"},
+        "coverage_gamma": {"inputs_replayed": 2},
+        "target_triple": {"uses_fuzzbench_docker_environment": True,
+                          "variants": {"afl": {"verified": True}, "cmp": {"verified": True}, "cov": {"verified": True}}},
+        "program_generation": {"generator_count": 1},
+        "seed_provenance_delta": {"g2_generated_count": 1},
+        "instrumentation_check": {"all_passed": False},
+        "runtime_environment": {"strategy": "extracted_out_closure", "uses_fuzzbench_docker_environment": True},
+    }), encoding="utf-8")
+    (matrix_dir / "matrix.tsv").write_text(
+        "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
+        f"g2fuzz\tlibpng_libpng_read_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
+        encoding="utf-8",
+    )
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="g2fuzz", profile="reproduction-epsilon")
+    assert summary["evaluated_row_violations"]
+    violations = summary["evaluated_row_violations"][0]["violations"]
+    assert any("instrumentation_check" in v for v in violations)
+
+
+def test_valuable_target_set_has_twenty_targets():
+    hgb_targets = load_module("hgb_targets_epsilon", ROOT / "scripts/hgb_targets.py")
+    registry = hgb_targets.load_registry(ROOT)
+    valuable = hgb_targets.targets_for_set(registry, "valuable")
+    assert len(valuable) == 20
+
+
+def test_all_valuable_targets_have_adapters():
+    valuable = g2.valuable_targets(ROOT / "metadata")
+    adapters = g2.load_adapters(ROOT / "metadata")
+    assert len(valuable) == 20
+    assert set(valuable) == set(adapters)
+    for adapter in adapters.values():
+        assert adapter.get("contract_probe") is True
+        assert adapter["applicability"] == "applicable"
+
+
+def test_matrix_runner_wrapper_accepts_epsilon_args():
+    wrapper = (ROOT / "scripts/hgb_run_baseline_matrix.sh").read_text(encoding="utf-8")
+    assert "hgb_generate_matrix.sh" in wrapper
+    assert "--profile" in wrapper
+    assert "--campaign-seconds" in wrapper
+    assert '--generators "$generators"' in wrapper
+    assert '--profile "$profile"' in wrapper

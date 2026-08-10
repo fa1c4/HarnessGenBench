@@ -1233,6 +1233,13 @@ class G2FuzzPipeline:
         # (plan section 3) and persist target_contract/consumption_smoke.json.
         if is_delta_profile(self.profile):
             self.run_consumption_smoke()
+            # Delta/epsilon: write the per-target build artifacts (image tags,
+            # binary paths, build logs), the runtime environment record, and a
+            # preliminary instrumentation check (plan G2-2/G2-3). The cov part
+            # of the instrumentation check is finalized after coverage replay.
+            self.write_build_artifacts(results, commands)
+            self.write_runtime_environment(results)
+            self.write_instrumentation_check()
 
         # Smoke pair on .afl and .cmp.
         smoke = self.smoke_pair()
@@ -1406,6 +1413,7 @@ class G2FuzzPipeline:
             "valid_sample": str(sample_path),
             "consumed_input": consumed,
         }
+        self.consumption_smoke = result
         json_dump(contract_dir / "consumption_smoke.json", result)
         if not consumed:
             raise PipelineError(
@@ -1414,6 +1422,135 @@ class G2FuzzPipeline:
                 127,
             )
         return result
+
+    def write_build_artifacts(self, results: dict[str, Any], commands: dict[str, Any]) -> None:
+        """Write the per-target build-artifact text files (plan G2-2).
+
+        Records one file per field so the triple build provenance is
+        machine-readable without parsing ``build.json``:
+        ``target_pair/<variant>_image_tag.txt``,
+        ``target_pair/<variant>_binary_path.txt``, and
+        ``target_pair/build_<variant>.log`` (alongside the canonical
+        ``build.<variant>.log`` produced by the builder).
+        """
+
+        pair = self.target_pair_dir
+        pair.mkdir(parents=True, exist_ok=True)
+        for variant, dest_name in (("afl", "target.afl"), ("cmp", "target.cmp"), ("cov", "target.cov")):
+            rec = results.get(variant, {}) if isinstance(results, dict) else {}
+            cmd = commands.get(variant, {}) if isinstance(commands, dict) else {}
+            (pair / f"{variant}_image_tag.txt").write_text(
+                str(cmd.get("image_tag", rec.get("image_tag", ""))) + "\n", encoding="utf-8"
+            )
+            (pair / f"{variant}_binary_path.txt").write_text(
+                str(rec.get("binary_path", "")) + "\n", encoding="utf-8"
+            )
+            log_src = Path(rec.get("log", pair / f"build.{variant}.log"))
+            if log_src.is_file():
+                shutil.copy2(log_src, pair / f"build_{variant}.log")
+
+    def write_runtime_environment(self, results: dict[str, Any]) -> dict[str, Any]:
+        """Record the runtime execution strategy (plan G2-3).
+
+        Extracted FuzzBench binaries are not executed inside the G2Fuzz
+        container unless runtime dependencies are proven available.  This
+        records the chosen strategy (``extracted_out_closure`` when the
+        exported ``/out`` runtime closure is used with ``ldd`` verification,
+        or ``containerized_wrapper`` when the execution wrappers run the
+        target inside the built image) and the per-variant image tags so the
+        reproduction is traceable.
+        """
+
+        pair = self.target_pair_dir
+        pair.mkdir(parents=True, exist_ok=True)
+        strategy = os.environ.get("G2FUZZ_RUNTIME_STRATEGY", "extracted_out_closure")
+        variants: dict[str, Any] = {}
+        for variant, dest_name in (("afl", "target.afl"), ("cmp", "target.cmp"), ("cov", "target.cov")):
+            rec = results.get(variant, {}) if isinstance(results, dict) else {}
+            binary = self.workspace / "target" / dest_name
+            ldd_ok = True
+            ldd_output = ""
+            if binary.is_file() and strategy == "extracted_out_closure":
+                try:
+                    proc = subprocess.run(
+                        ["ldd", str(binary)],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        check=False,
+                    )
+                    ldd_output = proc.stdout
+                    ldd_ok = "not found" not in (proc.stdout + proc.stderr).lower() and proc.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    ldd_ok = False
+                    ldd_output = ""
+            variants[variant] = {
+                "image_tag": str(rec.get("image_tag", "")),
+                "binary_path": str(binary),
+                "ldd_verified": ldd_ok,
+                "ldd_output": ldd_output[-2000:],
+            }
+        env_record = {
+            "strategy": strategy,
+            "ld_library_path": os.environ.get("LD_LIBRARY_PATH", ""),
+            "uses_fuzzbench_docker_environment": True,
+            "variants": variants,
+        }
+        json_dump(pair / "runtime_environment.json", env_record)
+        json_dump(self.workspace / "target" / "runtime_environment.json", env_record)
+        return env_record
+
+    def write_instrumentation_check(self, *, cov_check: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Write ``instrumentation_check.json`` (plan G2-2).
+
+        Proves the AFL/default binary executes a seed (consumption smoke),
+        the CmpLog binary exists and AFL++ accepts it with ``-c`` (campaign
+        ran with ``-c <target.cmp>`` and ``execs_done > 0``), and the coverage
+        binary produces ``.profraw`` plus non-empty ``llvm-cov export`` JSON
+        when replaying at least one seed (coverage replay).  The cov checks
+        are merged in by ``collect_coverage`` after the replay succeeds.
+        """
+
+        pair = self.target_pair_dir
+        pair.mkdir(parents=True, exist_ok=True)
+        path = pair / "instrumentation_check.json"
+        existing = read_json(path) if path.is_file() else {}
+        afl_seed_executed = bool(self.consumption_smoke.get("consumed_input"))
+        cmplog_binary_present = self.target_cmp.is_file() and executable(self.target_cmp)
+        cmplog_accepted_by_afl = bool(
+            int(self.metrics.get("execs_done") or 0) > 0
+            and self.target_cmp.is_file()
+        )
+        check = {
+            "afl_seed_executed": afl_seed_executed,
+            "cmplog_binary_present": cmplog_binary_present,
+            "cmplog_accepted_by_afl": cmplog_accepted_by_afl,
+            "cov_binary_present": self.target_cov.is_file() and executable(self.target_cov),
+            "cov_produces_profraw": existing.get("cov_produces_profraw", False),
+            "cov_export_nonempty": existing.get("cov_export_nonempty", False),
+            "cov_inputs_replayed": existing.get("cov_inputs_replayed", 0),
+            "all_passed": bool(
+                afl_seed_executed
+                and cmplog_binary_present
+                and cmplog_accepted_by_afl
+                and existing.get("cov_produces_profraw", False)
+                and existing.get("cov_export_nonempty", False)
+            ),
+        }
+        if cov_check is not None:
+            check["cov_produces_profraw"] = bool(cov_check.get("produces_profraw", False))
+            check["cov_export_nonempty"] = bool(cov_check.get("export_nonempty", False))
+            check["cov_inputs_replayed"] = int(cov_check.get("inputs_replayed", 0) or 0)
+            check["all_passed"] = bool(
+                check["afl_seed_executed"]
+                and check["cmplog_binary_present"]
+                and check["cmplog_accepted_by_afl"]
+                and check["cov_produces_profraw"]
+                and check["cov_export_nonempty"]
+            )
+        json_dump(path, check)
+        json_dump(self.workspace / "target" / "instrumentation_check.json", check)
+        return check
 
     # -- seed corpus / generation ------------------------------------------
 
@@ -1912,6 +2049,19 @@ class G2FuzzPipeline:
         if is_gamma_profile(self.profile) and inputs_replayed <= 0:
             self.stages["coverage"] = stage_record("failed", "G2Fuzz gamma coverage requires inputs_replayed > 0", **coverage)
             raise PipelineError("failed", "G2Fuzz gamma coverage requires inputs_replayed > 0", 65)
+        # Delta/epsilon: finalize the instrumentation check with the coverage
+        # replay proof (plan G2-2). The .cov binary must produce a .profraw
+        # and a non-empty llvm-cov export JSON when replaying >= 1 seed.
+        if is_delta_profile(self.profile):
+            cov_check = {
+                "produces_profraw": bool(coverage.get("report_exists")),
+                "export_nonempty": bool(
+                    isinstance(coverage.get("line_coverage"), dict)
+                    and coverage["line_coverage"].get("covered") is not None
+                ),
+                "inputs_replayed": int(inputs_replayed or 0),
+            }
+            self.write_instrumentation_check(cov_check=cov_check)
         self.stages["coverage"] = stage_record("complete", "none", **coverage)
 
     # -- result ------------------------------------------------------------
@@ -1954,6 +2104,15 @@ class G2FuzzPipeline:
             if not self.consumption_smoke.get("consumed_input", True):
                 return False
             if isinstance(line_cov.get("covered"), int) and int(line_cov["covered"]) <= 0:
+                return False
+            # G2-2/G2-7: the instrumentation check must prove all three
+            # variants (afl seed exec, cmplog accepted by afl -c, cov replay).
+            instr_path = self.target_pair_dir / "instrumentation_check.json"
+            instr = read_json(instr_path) if instr_path.is_file() else {}
+            if not instr.get("all_passed"):
+                return False
+            # G2-3: a runtime environment record must exist.
+            if not (self.target_pair_dir / "runtime_environment.json").is_file():
                 return False
         return True
 
@@ -2097,6 +2256,10 @@ class G2FuzzPipeline:
             "protocol": protocol,
             "method_profile": self.adapter["method_profile"],
             "method_variant": method_variant,
+            # G2-6: applicability_group separates paper-core (paper-faithful)
+            # from extension targets so matrix aggregation never mixes the two
+            # without a label.
+            "applicability_group": PAPER_CORE_VARIANT if method_variant == PAPER_CORE_VARIANT else EXTENSION_VARIANT,
             "model": os.environ.get("G2FUZZ_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("MODEL") or "",
             "api_key_present": bool(os.environ.get("OPENAI_API_KEY") or os.environ.get("API_KEY")),
             "paper_core": self.adapter["method_profile"] == PAPER_METHOD_PROFILE,
@@ -2150,6 +2313,13 @@ class G2FuzzPipeline:
             "target_triple": target_triple,
             "program_generation": program_generation,
             "seed_provenance_delta": seed_provenance_delta,
+            # Epsilon G2-2/G2-3: instrumentation check and runtime environment
+            # proof, read back from the persisted records so the matrix
+            # collector can verify them per evaluated row.
+            "instrumentation_check": read_json(self.target_pair_dir / "instrumentation_check.json")
+            if (self.target_pair_dir / "instrumentation_check.json").is_file() else {},
+            "runtime_environment": read_json(self.target_pair_dir / "runtime_environment.json")
+            if (self.target_pair_dir / "runtime_environment.json").is_file() else {},
         }
 
     def write_outputs(self, status: str, reason: str, exit_code: int) -> None:
