@@ -402,13 +402,18 @@ import json
 import sys
 from pathlib import Path
 workspace, generator, target, profile, protocol = sys.argv[1:6]
+# ELFuzz and G2Fuzz are input generators (they synthesize/evolve input-producing
+# fuzzers), never harness generators. The dry-run result must carry the correct
+# task_family so matrix aggregation keeps input generators out of the harness
+# leaderboard (epsilon plan ELF baseline classification).
+task_family = "input_generator" if generator in ("elfuzz", "g2fuzz") else "harness_generator"
 meta = {
     "schema_version": 1,
     "generator": generator,
     "target": target,
     "run_type": "generate-target",
-    "capability": "harness_generator",
-    "task_family": "harness_generator",
+    "capability": task_family,
+    "task_family": task_family,
     "profile": profile,
     "protocol": protocol,
     "applicability": "applicable",
@@ -419,7 +424,7 @@ meta = {
 result = {
     "schema_version": 2,
     "generator": generator,
-    "task_family": "harness_generator",
+    "task_family": task_family,
     "profile": profile,
     "protocol": protocol,
     "target": target,

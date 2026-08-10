@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -805,19 +806,87 @@ def elfuzz_cli_command() -> list[str]:
     return ["elfuzz"]
 
 
+def test_mode_cap() -> int | None:
+    """Return a strict test-mode timeout cap, or None when not in test mode.
+
+    ELFuzz reproduction budgets are large (campaign_seconds=86400 in
+    paper-faithful mode). Fake fuzzers used in tests that respect ``--time``
+    would hang for that long. ``ELFUZZ_TEST_MODE_SECONDS`` caps the effective
+    subprocess timeout for every stage so ``pytest -q`` always terminates,
+    without affecting real reproduction budgets (it is only set by the test
+    suite, never by the production entrypoint).
+    """
+    raw = os.environ.get("ELFUZZ_TEST_MODE_SECONDS")
+    if raw is None or raw == "":
+        return None
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return None
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate the whole process group of ``proc`` so child processes that
+    ignore SIGTERM (e.g. a fake fuzzer that sleeps on ``--time``) cannot survive
+    a timeout (epsilon plan ELF-2)."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = proc.pid
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        # Give the group a moment to exit before escalating.
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, str] | None = None) -> tuple[int, bool]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     timed_out = False
+    # Test-mode cap (ELF-2): keep fake fuzzers from hanging pytest on the large
+    # paper-faithful budgets without touching real reproduction timeouts.
+    cap = test_mode_cap()
+    if cap is not None and (timeout is None or timeout <= 0 or timeout > cap):
+        timeout = cap
     effective_timeout = timeout if timeout and timeout > 0 else None
+    proc: subprocess.Popen | None = None
     try:
-        with log_path.open("wb") as log:
-            proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=effective_timeout, check=False)
-        code = proc.returncode
+        log_file = log_path.open("wb")
+        # start_new_session=True puts the child in its own process group so a
+        # timeout can kill the entire group (ELF-2), not just the shell parent.
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        code = proc.wait(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
+        if proc is not None:
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        # A timeout is always reported as exit code 124 regardless of the
+        # signal used to kill the group, matching the historical contract the
+        # stage handlers rely on (synthesis/campaign check code == 124).
         code = 124
     except FileNotFoundError:
         code = 127
+    finally:
+        try:
+            log_file.close()
+        except (NameError, UnboundLocalError):
+            pass
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n[exit={code} timed_out={timed_out}]\n")
     return code, timed_out
@@ -1019,6 +1088,10 @@ class ELFuzzPipeline:
         log_src = Path(record.get("log", work_dir / "build.log"))
         if log_src.is_file():
             shutil.copy2(log_src, logs_dir / f"{variant}.log")
+            # Plan ELF-3 required build artifacts: sut/build.log (native) and
+            # sut/coverage_build.log (coverage) at the SUT root.
+            plan_log_name = "build.log" if variant == "native" else "coverage_build.log"
+            shutil.copy2(log_src, sut_root / plan_log_name)
         return record
 
     def build_target(self) -> None:
@@ -1116,6 +1189,13 @@ class ELFuzzPipeline:
             }
             json_dump(self._sut_root() / "contract.json", contract)
             self.sut_record = contract
+            # Plan ELF-3 required build artifacts: one file per field so the SUT
+            # build provenance is machine-readable without parsing the contract.
+            sut = self._sut_root()
+            (sut / "native_image_tag.txt").write_text(str(native["image_tag"]) + "\n", encoding="utf-8")
+            (sut / "coverage_image_tag.txt").write_text(str(coverage["image_tag"]) + "\n", encoding="utf-8")
+            (sut / "native_binary_path.txt").write_text(str(native_bin) + "\n", encoding="utf-8")
+            (sut / "coverage_binary_path.txt").write_text(str(cov_bin) + "\n", encoding="utf-8")
             record = {
                 "binary": str(native_bin),
                 "binary_sha256": native["binary_sha256"],
