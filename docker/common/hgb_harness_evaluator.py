@@ -236,6 +236,8 @@ def _prepare_sealed_context(
     evaluator_root: Path,
     work_dir: Path,
     context_provider: Callable[..., Any] | None,
+    *,
+    strict: bool = False,
 ) -> dict[str, Any]:
     """Build the sealed Docker context for the evaluator.
 
@@ -245,6 +247,10 @@ def _prepare_sealed_context(
     half (``/evaluator``).  Passing either half alone into the monolithic
     ``prepare_verification_context`` fails because each half is missing files
     the other provides.
+
+    In strict profiles (reproduction-zeta/epsilon/delta) a split-package
+    failure must fail closed: never fall through to a monolithic package or
+    evaluator half that could contain reference harnesses (zeta plan §3).
     """
 
     if context_provider is not None:
@@ -258,7 +264,12 @@ def _prepare_sealed_context(
             try:
                 ctx = hgb_split_context.SplitTargetContext.load(target_root, evaluator_root)
                 return hgb_split_context.create_sealed_build_context(ctx, work_dir)
-            except hgb_split_context.VerificationContextError:
+            except hgb_split_context.VerificationContextError as exc:
+                if strict:
+                    # Fail closed: a strict blind-project split error must not
+                    # fall through to a monolithic package or evaluator half
+                    # that could contain reference harnesses.
+                    raise
                 pass  # fall through to monolithic path
     # Monolithic fallback (non-split packages).
     if ckgfuzzer_verifier_context is None:
@@ -427,6 +438,13 @@ def evaluate_candidate(
         hgb_result.mark_stage(rec.stages, "campaign", "failed")
         rec.error = "campaign recorded execs_done <= 0"
         return rec
+    # In strict profiles the campaign must produce a nonempty final corpus;
+    # never fall back to the seed corpus for coverage replay (zeta plan §2/§3).
+    final_corpus_file_count = int(campaign.get("final_corpus_file_count", 0) or 0)
+    if strict and final_corpus_file_count <= 0:
+        hgb_result.mark_stage(rec.stages, "campaign", "failed")
+        rec.error = "campaign final corpus is empty; strict profiles never fall back to the seed corpus"
+        return rec
     hgb_result.mark_stage(rec.stages, "campaign", "completed")
 
     # 6.5 Coverage (real LLVM source-based coverage with function detail).
@@ -436,6 +454,12 @@ def evaluate_candidate(
     # for source-based coverage unless explicitly built with coverage flags.
     coverage_corpus_dir = Path(campaign.get("corpus_dir", "")) if campaign.get("corpus_dir") else corpus_dir
     if not coverage_corpus_dir.is_dir() or not any(coverage_corpus_dir.iterdir()):
+        # In strict mode do not fall back to the seed corpus when the campaign
+        # final corpus is missing/empty (zeta plan §3).
+        if strict:
+            hgb_result.mark_stage(rec.stages, "coverage", "failed")
+            rec.error = "coverage corpus missing/empty; strict profiles never fall back to the seed corpus"
+            return rec
         coverage_corpus_dir = corpus_dir
     cov_image = image_tag
     if build_coverage_image and coverage_image_tag:
@@ -448,8 +472,23 @@ def evaluate_candidate(
             runner=runner,
             timeout_seconds=build_timeout_seconds,
         )
-        if cov_build.build_exit_code == 0 and cov_build.binary_verified:
-            cov_image = coverage_image_tag
+        # If a coverage image was requested but its build failed or the
+        # coverage binary was not verified, fail coverage immediately. Do NOT
+        # silently reuse the address/libFuzzer image (zeta plan §3).
+        if cov_build.build_exit_code != 0 or not cov_build.binary_verified:
+            hgb_result.mark_stage(rec.stages, "coverage", "failed")
+            rec.error = (
+                f"coverage image build failed (exit={cov_build.build_exit_code}, "
+                f"binary_verified={cov_build.binary_verified}); not reusing the address image"
+            )
+            rec.coverage = {
+                "report_exists": False,
+                "line_coverage": {"covered": None},
+                "build_exit_code": cov_build.build_exit_code,
+                "binary_verified": cov_build.binary_verified,
+            }
+            return rec
+        cov_image = coverage_image_tag
     cov = hgb_fuzzbench_builder.run_coverage(
         image_tag=cov_image,
         binary_path=build.binary_path,
@@ -459,22 +498,32 @@ def evaluate_candidate(
     )
     raw_text = cov.get("raw_text", "")
     cov_summary: dict[str, Any] | None = None
+    coverage_report_path = cov.get("coverage_report_path", "")
     if raw_text.strip():
         try:
             cov_path = candidate_work / "coverage" / "coverage.json"
             cov_path.parent.mkdir(parents=True, exist_ok=True)
             cov_path.write_text(raw_text, encoding="utf-8")
+            coverage_report_path = str(cov_path)
             parser = coverage_parser or hgb_coverage.summarize_coverage_report
             cov_summary = parser(cov_path)
             hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary, raw_text)
         except hgb_coverage.CoverageError as exc:
             rec.error = f"coverage report invalid: {exc}"
+    # Attach the coverage-phase audit so invariants can require report_exists.
+    if cov_summary is not None:
+        cov_summary = dict(cov_summary)
+        cov_summary["report_exists"] = bool(cov.get("report_exists", False)) or bool(raw_text.strip())
+        cov_summary["inputs_replayed"] = int(cov.get("inputs_replayed", 0) or 0)
+        cov_summary["copy_in_ok"] = bool(cov.get("copy_in_ok", True))
+        cov_summary["copy_out_ok"] = bool(cov.get("copy_out_ok", True))
+    rec.coverage = cov_summary or {}
+    rec.coverage["coverage_report_path"] = coverage_report_path
     if cov_summary is None or cov_summary.get("line_coverage", {}).get("covered") is None:
         hgb_result.mark_stage(rec.stages, "coverage", "failed")
         if not rec.error:
             rec.error = "coverage report missing or empty"
         return rec
-    rec.coverage = cov_summary
     hgb_result.mark_stage(rec.stages, "coverage", "completed")
 
     # 6.6 API reachability (real runtime evidence, never fabricated).
@@ -696,7 +745,7 @@ def evaluate(
         return _emit(result)
 
     try:
-        sealed_context = _prepare_sealed_context(target_root, evaluator_root, work_dir / "sealed_context", context_provider)
+        sealed_context = _prepare_sealed_context(target_root, evaluator_root, work_dir / "sealed_context", context_provider, strict=strict)
     except Exception as exc:
         stages = hgb_result.default_stages()
         result = hgb_result.build_result(
@@ -764,6 +813,10 @@ def evaluate(
             build_timeout_seconds=build_timeout_seconds,
         )
         records.append(rec)
+        # Flatten key audit/provenance fields onto the candidate dict so the
+        # selected_candidate record carries copy_audit, overlay_audit,
+        # coverage_report_path, campaign_log, final_corpus_dir, and build_logs
+        # (zeta plan §3).
         cand_dict = {
             "candidate_id": rec.candidate_id,
             "candidate_path": rec.candidate_path,
@@ -779,6 +832,15 @@ def evaluate(
             "native_coverage": rec.native_coverage,
             "build": rec.build,
             "copy_audit": rec.copy_audit,
+            "overlay_audit": (rec.build or {}).get("overlay_audit", {}),
+            "coverage_report_path": (rec.coverage or {}).get("coverage_report_path", ""),
+            "campaign_log": (rec.campaign or {}).get("log", ""),
+            "final_corpus_dir": (rec.campaign or {}).get("final_corpus_dir", "")
+            or (rec.campaign or {}).get("corpus_dir", ""),
+            "build_logs": {
+                "image_build_log": (rec.build or {}).get("log", ""),
+                "campaign_log": (rec.campaign or {}).get("log", ""),
+            },
             "error": rec.error,
             "image_tag": image_tag,
         }

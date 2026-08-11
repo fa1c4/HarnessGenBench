@@ -22,6 +22,12 @@ from typing import Callable, Sequence
 
 Runner = Callable[[Sequence[str], int], "CommandResult"]
 
+# Container-side marker emitted to stderr before the target binary execs. A
+# smoke/campaign/coverage phase is only considered to have executed the target
+# if this marker appears in the captured logs AND the required ``docker cp``
+# input copy succeeded (zeta plan §2).
+HGB_TARGET_START_MARKER = "HGB_TARGET_START"
+
 
 @dataclass
 class CommandResult:
@@ -29,6 +35,13 @@ class CommandResult:
     exit_code: int
     stdout: str
     stderr: str
+    # Phased copy/execution audit (zeta plan §2). These are attached by
+    # ``_container_run`` so smoke/campaign/coverage callers can prove the
+    # required ``docker cp`` inputs/outputs succeeded and the target actually
+    # started, rather than inferring execution from an exit code alone.
+    copy_in_ok: bool = True
+    start_exit_code: int | None = None
+    copy_out_ok: bool = True
 
 
 def _run(command: Sequence[str], timeout_seconds: int) -> CommandResult:
@@ -320,11 +333,21 @@ def _container_run(
     create_result = _run_phase(runner, create, timeout_seconds, f"create {phase}")
     phases.append(("create", create_result))
     result = create_result
+    # Track the phased copy/execution audit (zeta plan §2). A required
+    # ``docker cp`` input that fails must fail the whole phase: the target
+    # cannot be considered executed if its input was never copied in.
+    copy_in_ok = True
+    start_exit_code: int | None = None
+    copy_out_ok = True
     try:
         if create_result.exit_code == 0:
             for host_path, container_path in (copy_in or []):
                 host_p = Path(host_path)
                 if not host_p.is_file():
+                    # A required input that does not exist on the host is a
+                    # failed copy_in; the target cannot run on the intended
+                    # input.
+                    copy_in_ok = False
                     continue
                 cp_in = _run_phase(
                     runner,
@@ -333,15 +356,28 @@ def _container_run(
                     f"copy_in {phase}",
                 )
                 phases.append(("copy_in", cp_in))
-            start_result = _run_phase(runner, ["docker", "start", "-a", container_name], timeout_seconds, f"run {phase}")
-            phases.append(("run", start_result))
-            result = start_result
+                if cp_in.exit_code != 0:
+                    copy_in_ok = False
+            # If a required input copy failed, do not start the target: the
+            # phase is failed and the marker can never legitimately appear.
+            if copy_in_ok:
+                start_result = _run_phase(runner, ["docker", "start", "-a", container_name], timeout_seconds, f"run {phase}")
+                phases.append(("run", start_result))
+                result = start_result
+                start_exit_code = start_result.exit_code
+            else:
+                start_result = CommandResult(list(command), 1, "", f"copy_in failed for {phase}; target not started")
+                phases.append(("run", start_result))
+                result = start_result
+                start_exit_code = 1
             if copy_out:
                 container_src, dst = copy_out
                 docker_cp_src = f"{container_name}:{container_src}"
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 cp = _run_phase(runner, ["docker", "cp", docker_cp_src, str(dst)], timeout_seconds, f"copy {phase}")
                 phases.append(("copy", cp))
+                if cp.exit_code != 0:
+                    copy_out_ok = False
     finally:
         rm = _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {phase}")
         phases.append(("cleanup", rm))
@@ -356,6 +392,14 @@ def _container_run(
         )
     log_path.write_text("\n\n".join(chunks), encoding="utf-8")
     result.command = [image_tag, *command]
+    # Attach the phased audit so callers can distinguish "the container ran"
+    # from "the target actually executed on the copied input" (zeta plan §2).
+    try:
+        result.copy_in_ok = copy_in_ok
+        result.start_exit_code = start_exit_code
+        result.copy_out_ok = copy_out_ok
+    except AttributeError:
+        pass
     return result
 
 
@@ -387,19 +431,26 @@ def run_smoke(
     any_executed = False
     for host_input, label in invocations:
         container_input = f"/tmp/smoke_{label}"
+        # The container echoes the start marker to stderr, then execs the
+        # target on the copied input. Execution is proven ONLY by the marker
+        # plus a successful input copy -- never by the exit code or nonempty
+        # stderr alone (zeta plan §2).
         result = _container_run(
             image_tag=image_tag,
             work_dir=work_dir / "smoke" / label,
             runner=runner,
             timeout_seconds=timeout_seconds,
-            command=["sh", "-lc", f"test -f {container_input} && {binary_path} {container_input}"],
+            command=["sh", "-lc", f"echo {HGB_TARGET_START_MARKER} >&2; exec {binary_path} {container_input}"],
             phase=f"smoke_{label}",
             copy_in=[(host_input, container_input)],
         )
-        # The target executed if the input file was present and the binary ran.
-        executed = result.exit_code in (0, 1, 77) or bool(result.stdout) or bool(result.stderr)
+        copy_in_ok = bool(getattr(result, "copy_in_ok", True))
+        combined_log = (result.stderr or "") + (result.stdout or "")
+        marker_seen = HGB_TARGET_START_MARKER in combined_log
+        executed = copy_in_ok and marker_seen
         # A sanitizer-misuse crash is indicated by a non-zero exit (libFuzzer
-        # returns 77 for a misuse crash on a single input).
+        # returns 77 for a misuse crash on a single input).  Timeouts (124)
+        # are not crashes.
         crashed = result.exit_code not in (0, 1, 124)
         if "AddressSanitizer" in result.stderr or "UndefinedBehaviorSanitizer" in result.stderr:
             crashed = True
@@ -407,7 +458,15 @@ def run_smoke(
             misuse_crash = True
         if executed:
             any_executed = True
-        samples.append({"label": label, "exit_code": result.exit_code, "crashed": crashed, "executed": executed, "stderr": result.stderr[:4000]})
+        samples.append({
+            "label": label,
+            "exit_code": result.exit_code,
+            "crashed": crashed,
+            "executed": executed,
+            "copy_in_ok": copy_in_ok,
+            "marker_seen": marker_seen,
+            "stderr": result.stderr[:4000],
+        })
     return {"samples": samples, "misuse_crash": misuse_crash, "any_executed": any_executed}
 
 
@@ -466,12 +525,27 @@ def run_campaign(
         copy_out=("/tmp/corpus.tar", campaign_work / "corpus.tar"),
     )
     # Extract the final campaign corpus so the coverage stage can replay it.
+    # The tar contains a top-level ``corpus/`` directory; strip that component
+    # so the final corpus files land directly in final_corpus_dir and are
+    # counted recursively (zeta plan §2: the old extraction left files under
+    # ``corpus/`` while queue_count only counted top-level files).
     import tarfile
     corpus_tar = campaign_work / "corpus.tar"
     if corpus_tar.is_file():
         try:
             with tarfile.open(corpus_tar) as tf:
-                tf.extractall(final_corpus_dir)
+                for member in tf.getmembers():
+                    name = member.name
+                    # Strip the leading directory component (``corpus/``).
+                    if "/" in name:
+                        name = name.split("/", 1)[1]
+                    if not name or name.endswith("/"):
+                        continue
+                    stripped = member.replace(name=name)
+                    try:
+                        tf.extract(stripped, final_corpus_dir, filter="data")
+                    except TypeError:
+                        tf.extract(stripped, final_corpus_dir)
         except (OSError, tarfile.TarError):
             pass
     (campaign_work / "campaign.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
@@ -479,9 +553,10 @@ def run_campaign(
     execs_done = _parse_execs_done(log)
     new_units = _parse_new_units(log)
     crashes = int("SUMMARY: AddressSanitizer" in log or "SUMMARY: UndefinedBehaviorSanitizer" in log)
-    queue_count = 0
+    final_corpus_file_count = 0
     if final_corpus_dir.is_dir():
-        queue_count = sum(1 for p in final_corpus_dir.iterdir() if p.is_file())
+        final_corpus_file_count = sum(1 for p in final_corpus_dir.rglob("*") if p.is_file())
+    copy_out_ok = bool(getattr(result, "copy_out_ok", True))
     return {
         "execs_done": execs_done,
         "new_units": new_units,
@@ -492,7 +567,10 @@ def run_campaign(
         "exit_code": result.exit_code,
         "log": str(campaign_work / "campaign.log"),
         "corpus_dir": str(final_corpus_dir),
-        "queue_count": queue_count,
+        "final_corpus_dir": str(final_corpus_dir),
+        "queue_count": final_corpus_file_count,
+        "final_corpus_file_count": final_corpus_file_count,
+        "copy_out_ok": copy_out_ok,
     }
 
 
@@ -569,10 +647,21 @@ def run_coverage(
         copy_in=copy_in if copy_in else None,
         copy_out=("/tmp/cov/coverage.json", cov_work / "coverage.json"),
     )
+    copy_in_ok = bool(getattr(result, "copy_in_ok", True))
+    copy_out_ok = bool(getattr(result, "copy_out_ok", True))
+    cov_path = cov_work / "coverage.json"
+    # A successful coverage phase requires a real coverage.json copied from
+    # the container OR nonempty stdout plus a parseable report (zeta plan §2).
+    report_exists = cov_path.is_file() or bool((result.stdout or "").strip())
     return {
         "exit_code": result.exit_code,
         "raw_text": result.stdout,
         "log": str(cov_work / "coverage.log"),
+        "coverage_report_path": str(cov_path) if cov_path.is_file() else "",
+        "copy_in_ok": copy_in_ok,
+        "copy_out_ok": copy_out_ok,
+        "report_exists": report_exists,
+        "inputs_replayed": len(copy_in),
     }
 
 

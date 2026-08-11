@@ -26,10 +26,11 @@ die_profile() {
 }
 
 # Return 0 if the given profile is a strict reproduction profile
-# (reproduction-epsilon or its backward-compatible alias reproduction-delta).
+# (reproduction-zeta, the canonical strict profile from the zeta plan, or its
+# backward-compatible aliases reproduction-epsilon and reproduction-delta).
 hgb_profile_is_strict_reproduction() {
   local p="${1:-}"
-  [[ "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" ]]
+  [[ "$p" == "reproduction-zeta" || "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" ]]
 }
 
 # Universal set of host-runner profiles accepted across all generators. A
@@ -37,7 +38,7 @@ hgb_profile_is_strict_reproduction() {
 hgb_known_profile() {
   local p="${1:-}"
   case "$p" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke) return 0 ;;
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -72,6 +73,7 @@ BUILD_MODE = "fuzzbench_native_afl_cmps"
 GAMMA_PROFILE = "reproduction-gamma"
 DELTA_PROFILE = "reproduction-delta"
 EPSILON_PROFILE = "reproduction-epsilon"
+ZETA_PROFILE = "reproduction-zeta"
 GAMMA_BUILD_MODE = "fuzzbench_docker_triple"
 # method_variant values reported in the delta result schema (plan section 7).
 PAPER_CORE_VARIANT = "paper-core"
@@ -81,20 +83,27 @@ EXTENSION_VARIANT = "extension"
 def is_gamma_profile(profile: str) -> bool:
     """Return True for the strict triple-build profiles.
 
-    ``reproduction-epsilon`` is the canonical strict profile (plan
-    ``ckgfuzzer_reproduction_epsilon.md`` shared foundation); ``reproduction-delta``
-    is its backward-compatible alias (plan ``g2fuzz_reproduction_delta.md``);
-    ``reproduction-gamma`` is kept as a backward-compatible alias.  All three
-    share the exact FuzzBench Docker triple build, contract probe, and real
-    coverage replay code path.
+    ``reproduction-zeta`` is the canonical strict profile (plan
+    ``g2fuzz_reproduction_zeta.md``); ``reproduction-epsilon`` is the strict
+    profile from the epsilon plan (plan
+    ``ckgfuzzer_reproduction_epsilon.md`` shared foundation);
+    ``reproduction-delta`` is its backward-compatible alias (plan
+    ``g2fuzz_reproduction_delta.md``); ``reproduction-gamma`` is kept as a
+    backward-compatible alias.  All four share the exact FuzzBench Docker
+    triple build, contract probe, and real coverage replay code path.
     """
 
-    return profile in (GAMMA_PROFILE, DELTA_PROFILE, EPSILON_PROFILE)
+    return profile in (GAMMA_PROFILE, DELTA_PROFILE, EPSILON_PROFILE, ZETA_PROFILE)
 
 
 def is_delta_profile(profile: str) -> bool:
-    """Return True for the strictest triple-build profiles (delta + epsilon)."""
-    return profile in (DELTA_PROFILE, EPSILON_PROFILE)
+    """Return True for the strictest triple-build profiles (delta + epsilon + zeta)."""
+    return profile in (DELTA_PROFILE, EPSILON_PROFILE, ZETA_PROFILE)
+
+
+def is_zeta_profile(profile: str) -> bool:
+    """Return True for the zeta profile (the strictest)."""
+    return profile == ZETA_PROFILE
 
 
 def method_variant_for(adapter: dict[str, Any]) -> str:
@@ -526,6 +535,106 @@ def stage_record(status: str, reason: str = "none", **extra: Any) -> dict[str, A
     record = {"status": status, "reason": reason}
     record.update(extra)
     return record
+
+
+def _test_mode_cap() -> int | None:
+    """Return a strict test-mode timeout cap, or None when not in test mode.
+
+    G2Fuzz reproduction budgets are large (AFL campaign seconds in the
+    thousands). Fake AFL/program_gen scripts used in tests that respect
+    ``--time`` would hang for that long. ``G2FUZZ_TEST_MODE_SECONDS`` caps the
+    effective subprocess timeout for the campaign/program_gen stages so
+    ``pytest -q`` always terminates, without affecting real reproduction
+    budgets (it is only set by the test suite, never by the production
+    entrypoint).
+
+    When running under pytest (``PYTEST_CURRENT_TEST`` is set) and no explicit
+    cap is configured, a small default cap is applied so a fake long-running
+    subprocess (e.g. a sleeping fake AFL) is killed within the cap and leaves
+    no child process behind (zeta plan §2). Set ``G2FUZZ_TEST_MODE_SECONDS=0``
+    to disable the auto-cap.
+    """
+
+    raw = os.environ.get("G2FUZZ_TEST_MODE_SECONDS")
+    if raw is not None and raw != "":
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return max(1, value) if value > 0 else None
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return 30
+    return None
+
+
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    """Terminate the whole process group of ``proc`` so child processes that
+    ignore SIGTERM (e.g. a fake AFL that sleeps) cannot survive a timeout
+    (zeta plan §2)."""
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except (ProcessLookupError, OSError):
+        pgid = proc.pid
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        try:
+            proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, str] | None = None, *, cwd: str | Path | None = None) -> tuple[int, bool]:
+    """Run a subprocess in its own process group and kill the whole group on timeout.
+
+    Returns ``(exit_code, timed_out)``. A timeout is always reported as exit
+    code 124. Under pytest a small default cap is applied so fake long-running
+    subprocesses are killed quickly (zeta plan §2).
+    """
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timed_out = False
+    cap = _test_mode_cap()
+    if cap is not None and (timeout is None or timeout <= 0 or timeout > cap):
+        timeout = cap
+    effective_timeout = timeout if timeout and timeout > 0 else None
+    proc: subprocess.Popen | None = None
+    log_file = None
+    try:
+        log_file = log_path.open("wb")
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=cwd,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        code = proc.wait(timeout=effective_timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        if proc is not None:
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        code = 124
+    except FileNotFoundError:
+        code = 127
+    finally:
+        if log_file is not None:
+            try:
+                log_file.close()
+            except (OSError, ValueError):
+                pass
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write(f"\n[exit={code} timed_out={timed_out}]\n")
+    return code, timed_out
 
 
 def is_generated_input_candidate(path: Path) -> bool:
@@ -1615,17 +1724,11 @@ class G2FuzzPipeline:
         if self.profile == "compat-smoke":
             env["G2FUZZ_MAX_FORMATS"] = str(len(self.formats))
         timeout = int(env.get("G2FUZZ_PER_FORMAT_TIMEOUT_SECONDS") or env.get("HGB_GENERATION_TIMEOUT_SECONDS") or "10800")
+        code, _timed_out = run_subprocess(cmd, self.workspace / "logs" / "program_gen.log", timeout, env=env, cwd=runtime)
         try:
-            with (self.workspace / "logs" / "program_gen.log").open("wb") as log:
-                proc = subprocess.run(cmd, cwd=runtime, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            code = 124
-        finally:
-            try:
-                key_file.unlink()
-            except OSError:
-                pass
+            key_file.unlink()
+        except OSError:
+            pass
         if code == 124:
             self.collect_program_gen_outputs(output_dir)
             raise PipelineError("failed", "program_gen timed out; partial inputs are not evaluated", 124)
@@ -1837,14 +1940,7 @@ class G2FuzzPipeline:
             }
         )
         timeout = int(os.environ.get("G2FUZZ_AFL_TIMEOUT_SECONDS", "3600") or "3600")
-        timed_out = False
-        try:
-            with (self.workspace / "logs" / "afl.log").open("wb") as log:
-                proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-            code = proc.returncode
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            code = 124
+        code, timed_out = run_subprocess(cmd, self.workspace / "logs" / "afl.log", timeout, env=env)
         queue_dir = out / "default" / "queue"
         crashes_dir = out / "default" / "crashes"
         hangs_dir = out / "default" / "hangs"
@@ -1954,8 +2050,17 @@ class G2FuzzPipeline:
         raw_text = ""
         inputs_replayed = 0
         # 1. Explicit coverage report hook (test/CI or precomputed report).
+        # zeta plan §8: in production (no PYTEST_CURRENT_TEST) zeta must reject
+        # a precomputed G2FUZZ_COVERAGE_REPORT; only fixture tests may use it.
         env_report = os.environ.get("G2FUZZ_COVERAGE_REPORT")
         if env_report and Path(env_report).is_file():
+            if is_zeta_profile(self.profile) and not os.environ.get("PYTEST_CURRENT_TEST"):
+                raise PipelineError(
+                    "failed",
+                    "G2Fuzz reproduction-zeta forbids G2FUZZ_COVERAGE_REPORT in production; "
+                    "coverage must come from a real coverage replay",
+                    65,
+                )
             report_path = Path(env_report)
         # Count replayable inputs (from afl_queue and g2_generated) for gamma.
         if is_gamma_profile(self.profile):

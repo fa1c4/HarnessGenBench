@@ -235,7 +235,7 @@ def test_baseline_sh_accepts_reproduction_delta_for_promefuzz() -> None:
     assert "reproduction-delta" in baseline
     # The promefuzz case must list reproduction-delta (and its epsilon alias)
     # as valid strict profiles.
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke" in baseline
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke" in baseline
 
 
 def test_baseline_sh_rejects_synthetic_compile_db_for_delta() -> None:
@@ -618,7 +618,7 @@ class _DeltaFakeRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    return _FakeDockerResult(cmd, 0, "smoke ok", "")
+                    return _FakeDockerResult(cmd, 0, "smoke ok", "HGB_TARGET_START\n")
                 if phase == "campaign":
                     out = f"#{self.campaign_execs} INITED\nstat::number_of_executed_units: {self.campaign_execs}\n"
                     return _FakeDockerResult(cmd, 0, out, "")
@@ -626,6 +626,17 @@ class _DeltaFakeRunner:
                     return _FakeDockerResult(cmd, 0, self.coverage_stdout, "")
                 return _FakeDockerResult(cmd, 0, "", "")
             if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return _FakeDockerResult(cmd, 0, "", "")
             if sub == "rm":
                 return _FakeDockerResult(cmd, 0, "", "")

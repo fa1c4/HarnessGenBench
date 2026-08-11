@@ -170,7 +170,9 @@ class FakeRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    stderr = "AddressSanitizer: crash\n" if self.smoke_crash else ""
+                    stderr = "HGB_TARGET_START\n"
+                    if self.smoke_crash:
+                        stderr += "AddressSanitizer: crash\n"
                     return FakeResult(cmd, 77 if self.smoke_crash else 0, "", stderr)
                 if phase == "campaign":
                     out = f"#{self.campaign_execs} INITED\n#{self.campaign_execs} DONE\n"
@@ -180,6 +182,17 @@ class FakeRunner:
                     return FakeResult(cmd, 0, self.coverage_stdout, "")
                 return FakeResult(cmd, 0, "", "")
             if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return FakeResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeResult(cmd, 0, "", "")
@@ -766,7 +779,7 @@ def test_entrypoint_has_reproduction_gamma_profile_defaults() -> None:
 
 def test_run_baseline_accepts_reproduction_gamma_for_ofg() -> None:
     script = (REPO_ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke)" in script
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke)" in script
     assert "oss-fuzz-gen/reproduction-gamma: OFG_ALLOW_PROJECT_YAML_FALLBACK=1 is forbidden" in script
     assert "oss-fuzz-gen/reproduction-gamma: OFG_SYNTHESIZE_ON_BAD_BENCHMARK=1 is forbidden" in script
 

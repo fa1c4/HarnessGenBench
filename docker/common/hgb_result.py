@@ -161,6 +161,8 @@ def build_result(
         method_variant = "paper-faithful"
     if profile == "reproduction-epsilon" and not method_variant:
         method_variant = "paper-faithful"
+    if profile == "reproduction-zeta" and not method_variant:
+        method_variant = "paper-faithful"
     if status not in ALLOWED_STATUSES and status not in {"failed", "partial_completed", "missing_api_key"}:
         # Normalize legacy statuses into the beta contract.  A bare "failed"
         # from the legacy entrypoint is preserved for backwards compatibility
@@ -217,8 +219,11 @@ def select_best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any] | 
             return False
         # Reject candidates that are exact or near-exact copies of a reference
         # harness, or that contain the reference canary token (gamma §2.2).
+        # A near_duplicate_reference is treated identically to an exact_copy:
+        # the candidate is rejected, excluded from the aggregate, and cannot be
+        # selected (zeta plan §3/§4).
         audit = c.get("copy_audit", {})
-        if audit.get("exact_copy") or audit.get("contains_reference_canary"):
+        if audit.get("exact_copy") or audit.get("near_duplicate_reference") or audit.get("contains_reference_canary"):
             return False
         smoke = c.get("sanitizer_smoke", {})
         if smoke.get("misuse_crash"):
@@ -257,17 +262,32 @@ def assert_evaluated_invariants(result: dict[str, Any]) -> list[str]:
     for stage in STAGE_NAMES:
         if stages.get(stage) != "completed":
             violations.append(f"stage {stage} is not completed for an evaluated row")
-    cov = result.get("metrics", {}).get("coverage", {}) or result.get("selected_candidate", {}).get("coverage", {})
+    metrics = result.get("metrics", {}) or {}
+    cov = metrics.get("coverage", {}) or result.get("selected_candidate", {}).get("coverage", {})
     line_cov = cov.get("line_coverage", {}) if isinstance(cov, dict) else {}
-    if line_cov.get("covered") is None:
+    covered_lines = line_cov.get("covered")
+    if covered_lines is None:
         violations.append("evaluated row has coverage.line_coverage.covered == null")
-    campaign = result.get("metrics", {}).get("campaign", {}) or result.get("selected_candidate", {}).get("campaign", {})
+    elif int(covered_lines or 0) <= 0:
+        violations.append("evaluated row has coverage.line_coverage.covered <= 0")
+    # A real coverage report must have been produced (zeta plan §4).
+    if cov.get("report_exists") is False:
+        violations.append("evaluated row has coverage.report_exists=false")
+    campaign = metrics.get("campaign", {}) or result.get("selected_candidate", {}).get("campaign", {})
     if int(campaign.get("execs_done", 0) or 0) <= 0:
         violations.append("evaluated row has campaign.execs_done <= 0")
+    final_corpus = int(campaign.get("final_corpus_file_count", 0) or 0)
+    if final_corpus <= 0:
+        violations.append("evaluated row has empty campaign final corpus")
     if not result.get("selected_candidate"):
         violations.append("evaluated row has no per-candidate evaluator JSON")
     if not result.get("selected_candidate", {}).get("overlaid"):
         violations.append("evaluated row did not overlay the candidate")
+    sel_audit = result.get("selected_candidate", {}).get("copy_audit", {}) or {}
+    if sel_audit.get("near_duplicate_reference"):
+        violations.append("evaluated row selected a near-duplicate reference candidate")
+    elif sel_audit.get("exact_copy"):
+        violations.append("evaluated row selected an exact-copy reference candidate")
     return violations
 
 

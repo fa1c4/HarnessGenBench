@@ -303,7 +303,7 @@ def test_unknown_profile_exits_with_code_2():
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",
          "--generator", "g2fuzz", "--target", "libpng_libpng_read_fuzzer",
-         "--profile", "reproduction-zeta", "--protocol", "paper-native"],
+         "--profile", "reproduction-nonexistent", "--protocol", "paper-native"],
         cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
     )
     assert proc.returncode == 2, proc.stderr
@@ -313,7 +313,7 @@ def test_unknown_profile_exits_with_code_2():
 def test_hgb_generate_harness_rejects_unknown_profile_with_code_2():
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_generate_harness.sh"), "--generator", "g2fuzz",
-         "--target", "libpng_libpng_read_fuzzer", "--profile", "reproduction-zeta", "--dry-run"],
+         "--target", "libpng_libpng_read_fuzzer", "--profile", "reproduction-nonexistent", "--dry-run"],
         cwd=ROOT, capture_output=True, text=True, env=_run_env(), timeout=120,
     )
     assert proc.returncode == 2, proc.stderr

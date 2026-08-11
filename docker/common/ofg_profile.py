@@ -17,19 +17,28 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "target-aware"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
 
-# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
-# strict profile introduced by the reproduction-epsilon plan. It is
-# paper-faithful but rejects every local/deterministic fallback the earlier
-# alpha/beta/gamma scaffolding allowed (local introspector shim, coverage
-# skip, GCS target download, project-YAML fallback, bad-benchmark synthesis,
-# selected-harness API ranking, exact reference harness as example).
+# Strict reproduction profiles. ``reproduction-zeta`` is the canonical strict
+# profile introduced by the reproduction-zeta plan (plan
+# ``oss-fuzz-gen_reproduction_zeta.md``). It is paper-faithful and rejects
+# every local/deterministic fallback and compatibility fallback the earlier
+# profiles allowed, plus it forces a sealed split package and real OSS-Fuzz
+# project context. ``reproduction-epsilon`` is the canonical strict profile
+# introduced by the reproduction-epsilon plan. It is paper-faithful but
+# rejects every local/deterministic fallback the earlier alpha/beta/gamma
+# scaffolding allowed (local introspector shim, coverage skip, GCS target
+# download, project-YAML fallback, bad-benchmark synthesis, selected-harness
+# API ranking, exact reference harness as example).
 # ``reproduction-delta`` remains accepted as a backward-compatible alias.
 # ``reproduction-gamma`` remains a method-faithful but non-strict alias.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
+# Zeta is the strictest profile: it forces real OSS-Fuzz project context,
+# real Introspector, no reference examples, no selected-harness API ranking,
+# repair loop, coverage, and a sealed split package (zeta plan §1).
+ZETA_PROFILES = {"reproduction-zeta"}
 
 # Introspector modes that satisfy the "real Fuzz Introspector" requirement of
 # method-faithful profiles. ``real`` is the reproduction-gamma/delta default;
@@ -149,9 +158,10 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                         f"{key}={actual} is forbidden in {profile}; "
                         f"it silently relaxes the paper-faithful contract"
                     )
-            # reproduction-gamma/delta/epsilon pin the real introspector mode by
-            # default. paper-faithful/alpha allow the upstream remote mode.
-            if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}:
+            # reproduction-gamma/delta/epsilon/zeta pin the real introspector
+            # mode by default. paper-faithful/alpha allow the upstream remote
+            # mode.
+            if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}:
                 intro_mode = normalize_env_bool(env.get("OFG_INTROSPECTOR_MODE"), "real")
                 if intro_mode not in REAL_INTROSPECTOR_MODES:
                     violations.append(
@@ -170,6 +180,41 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 violations.append(
                     f"OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden in {profile}; "
                     f"the current target answer must not be downloaded"
+                )
+        # zeta plan §1: zeta is the strictest profile. It forces real OSS-Fuzz
+        # project context, real Introspector, no reference examples, no
+        # selected-harness API ranking, repair loop, coverage, and a sealed
+        # split package. These are required env values, not merely forbidden.
+        if profile in ZETA_PROFILES:
+            if normalize_env_bool(env.get("OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM")) == "1":
+                violations.append(
+                    "OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM=1 is forbidden in reproduction-zeta; "
+                    "a real Fuzz Introspector report is required"
+                )
+            if normalize_env_bool(env.get("OFG_ALLOW_REFERENCE_EXAMPLES")) == "1":
+                violations.append(
+                    "OFG_ALLOW_REFERENCE_EXAMPLES=1 is forbidden in reproduction-zeta; "
+                    "reference harness examples must not be visible to generation"
+                )
+            if normalize_env_bool(env.get("OFG_ALLOW_SELECTED_HARNESS_API_RANKING")) == "1":
+                violations.append(
+                    "OFG_ALLOW_SELECTED_HARNESS_API_RANKING=1 is forbidden in reproduction-zeta; "
+                    "selected-harness API ranking is evaluator-only"
+                )
+            if normalize_env_bool(env.get("OFG_ENABLE_REPAIR_LOOP"), "1") == "0":
+                violations.append(
+                    "OFG_ENABLE_REPAIR_LOOP=0 is forbidden in reproduction-zeta; "
+                    "the upstream OSS-Fuzz-Gen repair loop must run"
+                )
+            if normalize_env_bool(env.get("OFG_ENABLE_COVERAGE"), "1") == "0":
+                violations.append(
+                    "OFG_ENABLE_COVERAGE=0 is forbidden in reproduction-zeta; "
+                    "real coverage evaluation is required"
+                )
+            if normalize_env_bool(env.get("HGB_TARGET_REQUIRE_SPLIT")) != "1":
+                violations.append(
+                    "HGB_TARGET_REQUIRE_SPLIT=1 is required for reproduction-zeta; "
+                    "the target package must be physically split into generator/evaluator halves"
                 )
         # Tiny 1/1/1 budgets are compat-smoke, not alpha.
         for key, bad_value in FORBIDDEN_ALPHA_BUDGETS.items():

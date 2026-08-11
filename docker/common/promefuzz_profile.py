@@ -25,16 +25,25 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
-# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
-# strict profile introduced by the reproduction-epsilon plan. It is
-# paper-faithful but rejects every synthetic/mock/hash fallback the earlier
-# scaffolding allowed. ``reproduction-delta`` remains accepted as a backward-
-# compatible alias. ``reproduction-gamma`` remains a method-faithful but
-# non-strict alias.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
+# Strict reproduction profiles. ``reproduction-zeta`` is the canonical strict
+# profile introduced by the reproduction-zeta plan (plan
+# ``promefuzz_reproduction_zeta.md``). It is paper-faithful and rejects every
+# synthetic/mock/hash fallback and compatibility fallback, plus it forces
+# exact FuzzBench compile context, verified link args, consumer cases, and a
+# sealed split package. ``reproduction-epsilon`` is the canonical strict
+# profile introduced by the reproduction-epsilon plan. It is paper-faithful
+# but rejects every synthetic/mock/hash fallback the earlier scaffolding
+# allowed. ``reproduction-delta`` remains accepted as a backward-compatible
+# alias. ``reproduction-gamma`` remains a method-faithful but non-strict
+# alias.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
+# Zeta is the strictest profile: it forces exact FuzzBench compile context,
+# verified link args, consumer cases, real embedding, and a sealed split
+# package (zeta plan §1).
+ZETA_PROFILES = {"reproduction-zeta"}
 
 # Beta plan section 10: allowed run-level statuses for a PromeFuzz
 # harness_generator row. ``evaluated`` requires a verified candidate, real
@@ -199,6 +208,43 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
             violations.append(
                 f"HGB_API_REPORT_MODE={report_mode} is forbidden in {profile}; "
                 f"the selected-harness API report is evaluator-only"
+            )
+
+    # Zeta plan §1: zeta is the strictest profile. It forces exact FuzzBench
+    # compile context, verified link args, consumer cases, real embedding, and
+    # a sealed split package. These are required env values, not merely
+    # forbidden ones.
+    if profile in ZETA_PROFILES:
+        if normalize_env_bool(env.get("PROMEFUZZ_ALLOW_HASH_EMBEDDING")) == "1":
+            violations.append(
+                "PROMEFUZZ_ALLOW_HASH_EMBEDDING=1 is forbidden in reproduction-zeta; "
+                "a real semantic embedding provider is required"
+            )
+        if normalize_env_bool(env.get("PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB")) == "1":
+            violations.append(
+                "PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB=1 is forbidden in reproduction-zeta; "
+                "the compile DB must be captured from the exact FuzzBench Docker build"
+            )
+        if normalize_env_bool(env.get("PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS")) == "1":
+            violations.append(
+                "PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS=1 is forbidden in reproduction-zeta; "
+                "driver_build_args must be nonempty unless the target is verified header-only"
+            )
+        if normalize_env_bool(env.get("PROMEFUZZ_REQUIRE_CONSUMER_CASES"), "1") != "1":
+            violations.append(
+                "PROMEFUZZ_REQUIRE_CONSUMER_CASES=1 is required for reproduction-zeta; "
+                "consumer/API usage knowledge must be wired into generation"
+            )
+        build_ctx = (env.get("PROME_FUZZ_BUILD_CONTEXT_METHOD") or "").strip()
+        if build_ctx and build_ctx not in {"exact_fuzzbench", "fuzzbench_replay"}:
+            violations.append(
+                f"PROME_FUZZ_BUILD_CONTEXT_METHOD={build_ctx!r} is forbidden in reproduction-zeta; "
+                f"the compile context must come from the exact FuzzBench Docker build"
+            )
+        if normalize_env_bool(env.get("HGB_TARGET_REQUIRE_SPLIT")) != "1":
+            violations.append(
+                "HGB_TARGET_REQUIRE_SPLIT=1 is required for reproduction-zeta; "
+                "the target package must be physically split into generator/evaluator halves"
             )
 
     if is_compat_smoke(profile):

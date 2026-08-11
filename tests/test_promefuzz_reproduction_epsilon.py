@@ -243,7 +243,7 @@ class _EpsilonFakeRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    return _FakeDockerResult(cmd, 0, "smoke ok", "")
+                    return _FakeDockerResult(cmd, 0, "smoke ok", "HGB_TARGET_START\n")
                 if phase == "campaign":
                     out = f"#{self.campaign_execs} INITED\nstat::number_of_executed_units: {self.campaign_execs}\n"
                     return _FakeDockerResult(cmd, 0, out, "")
@@ -251,6 +251,17 @@ class _EpsilonFakeRunner:
                     return _FakeDockerResult(cmd, 0, self.coverage_stdout, "")
                 return _FakeDockerResult(cmd, 0, "", "")
             if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return _FakeDockerResult(cmd, 0, "", "")
             if sub == "rm":
                 return _FakeDockerResult(cmd, 0, "", "")
@@ -400,7 +411,7 @@ def test_dry_run_canonical_command_passes_profile_validation(tmp_path: Path) -> 
 def test_unknown_profile_exits_with_code_2() -> None:
     proc = subprocess.run(
         ["bash", "scripts/hgb_run_baseline.sh", "--generator", "promefuzz",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-zeta",
+         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent",
          "--protocol", "blind-project", "--dry-run"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=_run_env(), timeout=120,
     )
@@ -411,7 +422,7 @@ def test_unknown_profile_exits_with_code_2() -> None:
 def test_hgb_generate_harness_rejects_unknown_profile_with_code_2() -> None:
     proc = subprocess.run(
         ["bash", "scripts/hgb_generate_harness.sh", "--generator", "promefuzz",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-zeta", "--dry-run"],
+         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent", "--dry-run"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=_run_env(), timeout=120,
     )
     assert proc.returncode == 2, proc.stderr
@@ -430,7 +441,7 @@ def test_hgb_generate_harness_accepts_reproduction_epsilon() -> None:
 
 def test_baseline_sh_accepts_reproduction_epsilon_for_promefuzz() -> None:
     baseline = _baseline_sh()
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke" in baseline
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke" in baseline
     assert "promefuzz/$profile: HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden" in baseline
 
 
@@ -1069,7 +1080,7 @@ def _promefuzz_epsilon_base_meta(**overrides) -> dict:
         )},
         "metrics": {
             "coverage": {"line_coverage": {"covered": 27}},
-            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0},
+            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0, "final_corpus_file_count": 4},
         },
         "build": {"overlay_audit": {"matches_candidate": True}},
         "selected_candidate": {

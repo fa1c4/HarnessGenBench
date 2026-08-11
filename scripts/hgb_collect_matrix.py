@@ -39,10 +39,11 @@ NOT_APPLICABLE_STATUSES = {"not_applicable", "target_not_supported_by_elfuzz"}
 # successful evaluations for harness-generator rows.
 HARNESS_GENERATOR_STRICT_COMPLETED = {"evaluated"}
 
-# Strict reproduction profiles. ``reproduction-epsilon`` is the canonical
-# strict profile (epsilon plan); ``reproduction-delta`` is its backward-
-# compatible alias. Both enforce the same paper-equivalent invariants.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon"}
+# Strict reproduction profiles. ``reproduction-zeta`` is the canonical strict
+# profile (zeta plan); ``reproduction-epsilon`` is the strict profile from the
+# epsilon plan and ``reproduction-delta`` is its backward-compatible alias. All
+# three enforce the same paper-equivalent invariants.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
 # For input generators and non-strict harness runs, the broader set applies.
 COMPLETED_STATUSES = {"completed", "dry_run_ok", "evaluated"}
 # Statuses that must never be counted as successful.
@@ -198,6 +199,17 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
                 build = meta.get("build") or {}
                 if isinstance(build, dict) and not build.get("uses_fuzzbench_docker_environment"):
                     violations.append(f"evaluated {elfuzz_profile} elfuzz row did not build from the FuzzBench Docker environment")
+                # zeta plan §5/§8: evolution_iterations >= 2 and the reported
+                # target must match the actual SUT fuzz target.
+                elfuzz_evo = int(elf.get("evolution_iterations", input_gen.get("evolution_iterations_completed", 0)) or 0)
+                if elfuzz_profile == "reproduction-zeta" and elfuzz_evo < 2:
+                    violations.append(f"evaluated {elfuzz_profile} elfuzz row has evolution_iterations < 2")
+                actual_sut = str(meta.get("actual_sut_fuzz_target", ""))
+                reported = str(meta.get("reported_target", meta.get("target", "")))
+                if elfuzz_profile == "reproduction-zeta" and actual_sut and reported and actual_sut != reported:
+                    violations.append(f"evaluated {elfuzz_profile} elfuzz row actual_sut_fuzz_target != reported target")
+                if isinstance(build, dict) and elfuzz_profile == "reproduction-zeta" and not build.get("containerized_sut_runtime"):
+                    violations.append(f"evaluated {elfuzz_profile} elfuzz row did not use containerized SUT runtime")
             return violations
         # G2Fuzz beta contract (plan section 11).
         target_pair = meta.get("target_pair_build", {})
@@ -206,8 +218,8 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
         if not (target_pair.get("afl_binary") and target_pair.get("cmp_binary")):
             violations.append("evaluated input-generator row lacks .afl/.cmp build evidence")
         profile_s = str(meta.get("profile") or "")
-        # Gamma/delta/epsilon contract: also require .cov build evidence.
-        if profile_s in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon"):
+        # Gamma/delta/epsilon/zeta contract: also require .cov build evidence.
+        if profile_s in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"):
             if not target_pair.get("cov_binary"):
                 violations.append(f"evaluated {profile_s} input-generator row lacks .cov build evidence")
             cov_gamma = meta.get("coverage_gamma") or {}
@@ -280,10 +292,15 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
             copy_audit = sel.get("copy_audit") or {}
             if copy_audit.get("exact_copy"):
                 violations.append(f"evaluated {profile_str} row has copy_audit.exact_copy == true")
+            if copy_audit.get("near_duplicate_reference"):
+                violations.append(f"evaluated {profile_str} row has copy_audit.near_duplicate_reference == true")
             build = sel.get("build") or {}
             overlay_audit = build.get("overlay_audit") or {}
             if overlay_audit and overlay_audit.get("matches_candidate") is not True:
                 violations.append(f"evaluated {profile_str} row has build.overlay_audit.matches_candidate != true")
+        sel_campaign = (sel or {}).get("campaign") or campaign
+        if int(sel_campaign.get("final_corpus_file_count", 0) or 0) <= 0:
+            violations.append(f"evaluated {profile_str} row has empty campaign final corpus")
         # OSS-Fuzz-Gen-specific strict invariants (plan
         # oss-fuzz-gen_reproduction_delta.md section 7): a clean prompt audit,
         # a real (non-shim) introspector with nonzero functions, and a valid
@@ -355,29 +372,38 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(copy_audit, dict):
         copy_audit = {}
     exact_copy = bool(copy_audit.get("exact_copy", candidate.get("exact_copy", False)))
+    near_duplicate_reference = bool(
+        copy_audit.get("near_duplicate_reference", candidate.get("near_duplicate_reference", False))
+    )
     matches_candidate = overlay_audit.get("matches_candidate")
     profile = str(meta.get("profile", ""))
     method_variant = str(meta.get("method_variant", ""))
     line_covered = line_cov.get("covered") if isinstance(line_cov, dict) else None
     execs_done = int(campaign.get("execs_done", 0) or 0)
-    # Strict reproduction paper-equivalent gate (plan section 7 / E7).
-    # reproduction-epsilon is the canonical strict profile; reproduction-delta
-    # is its backward-compatible alias. A row is paper-equivalent only when it
-    # is evaluated, paper-faithful, not excluded, has real coverage (lines > 0),
-    # real campaign executions (> 0), no exact reference copy, and a candidate
-    # overlay that matches the candidate SHA256.
+    final_corpus_file_count = int(campaign.get("final_corpus_file_count", 0) or 0)
+    # Strict reproduction paper-equivalent gate (plan section 7 / E7 / zeta §6).
+    # reproduction-zeta is the canonical strict profile; reproduction-epsilon is
+    # the epsilon strict profile and reproduction-delta is its backward alias. A
+    # row is paper-equivalent only when it is evaluated, paper-faithful, not
+    # excluded, has real coverage (lines > 0), a real coverage report, real
+    # campaign executions (> 0), a nonempty final corpus, no exact or
+    # near-duplicate reference copy, and a candidate overlay that matches the
+    # candidate SHA256.
     _strict_paper_equivalent = (
         method_variant == "paper-faithful"
         and str(meta.get("status", "")) == "evaluated"
         and not bool(meta.get("excluded_from_aggregate"))
         and isinstance(line_covered, int) and line_covered > 0
         and execs_done > 0
+        and final_corpus_file_count > 0
         and not exact_copy
+        and not near_duplicate_reference
         and matches_candidate is True
     )
     paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
     paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
-    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon)
+    paper_equivalent_zeta = bool(profile == "reproduction-zeta" and _strict_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta)
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
@@ -400,11 +426,13 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         "codeql_graph_nodes": int(ckg.get("codeql_graph_nodes", meta.get("codeql_graph_nodes", 0) or 0) or 0),
         "codeql_graph_edges": int(ckg.get("codeql_graph_edges", meta.get("codeql_graph_edges", 0) or 0) or 0),
         "reference_canary_leak": bool(candidate.get("contains_reference_canary") or leak_audit.get("leaked")),
-        "near_duplicate_reference": bool(candidate.get("near_duplicate_reference")),
+        "near_duplicate_reference": near_duplicate_reference,
         "exact_copy": exact_copy,
         "matches_candidate": matches_candidate,
+        "final_corpus_file_count": final_corpus_file_count,
         "paper_equivalent_delta": paper_equivalent_delta,
         "paper_equivalent_epsilon": paper_equivalent_epsilon,
+        "paper_equivalent_zeta": paper_equivalent_zeta,
         "paper_equivalent_strict": paper_equivalent_strict,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
@@ -483,7 +511,8 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
     )
     paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
     paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
-    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon)
+    paper_equivalent_zeta = bool(profile == "reproduction-zeta" and _strict_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta)
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
@@ -497,6 +526,7 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         "coverage": str(stages.get("coverage", "")),
         "line_coverage": line_covered,
         "execs_done": execs_done,
+        "final_corpus_file_count": int(campaign.get("final_corpus_file_count", 0) or 0),
         "matches_candidate": matches_candidate,
         "overlay_audit": overlay_audit,
         "prompt_audit": prompt_audit,
@@ -506,6 +536,7 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         "cov_diff_status": cov_diff_status,
         "paper_equivalent_delta": paper_equivalent_delta,
         "paper_equivalent_epsilon": paper_equivalent_epsilon,
+        "paper_equivalent_zeta": paper_equivalent_zeta,
         "paper_equivalent_strict": paper_equivalent_strict,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }

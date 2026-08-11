@@ -141,7 +141,7 @@ class DeltaFakeRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    return FakeResult(cmd, 0, "smoke ok", "")
+                    return FakeResult(cmd, 0, "smoke ok", "HGB_TARGET_START\n")
                 if phase == "campaign":
                     out = f"#{self.campaign_execs} INITED\nstat::number_of_executed_units: {self.campaign_execs}\n"
                     return FakeResult(cmd, 0, out, "")
@@ -149,6 +149,17 @@ class DeltaFakeRunner:
                     return FakeResult(cmd, 0, self.coverage_stdout, "")
                 return FakeResult(cmd, 0, "", "")
             if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return FakeResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeResult(cmd, 0, "", "")
@@ -568,10 +579,10 @@ def test_matrix_paper_equivalent_delta_gate() -> None:
         "stages": {n: "completed" for n in ("candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage")},
         "metrics": {
             "coverage": {"line_coverage": {"covered": 27}, "function_coverage": {"covered": 5}, "region_coverage": {"covered": 12}},
-            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0},
+            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0, "final_corpus_file_count": 3},
         },
         "build": {"overlay_audit": {"matches_candidate": True}},
-        "selected_candidate": {"copy_audit": {"exact_copy": False}, "build": {"overlay_audit": {"matches_candidate": True}}},
+        "selected_candidate": {"copy_audit": {"exact_copy": False}, "build": {"overlay_audit": {"matches_candidate": True}}, "campaign": {"final_corpus_file_count": 3}},
         "candidate": {"contains_reference_canary": False, "near_duplicate_reference": False},
     }
     row = collector.extract_ckgfuzzer_row(base)

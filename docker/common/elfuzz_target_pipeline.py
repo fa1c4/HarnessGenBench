@@ -532,15 +532,20 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
             "method_variant": "compat-smoke",
             "source": "ci-smoke",
         }
-    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}:
-        # reproduction-epsilon is the canonical strict paper-native
-        # input-generator profile (plan ckgfuzzer_reproduction_epsilon.md shared
-        # foundation); reproduction-delta is its backward-compatible alias (plan
-        # elfuzz_reproduction_delta.md). It inherits the paper-faithful budget
-        # and, like reproduction-gamma, rejects a prebuilt ELFUZZ_TARGET_BINARY
-        # and requires a real coverage-instrumented replay.
-        strict = profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"}
-        return {
+    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}:
+        # reproduction-zeta is the canonical strict paper-native
+        # input-generator profile (plan elfuzz_reproduction_zeta.md). It
+        # inherits the epsilon strict invariants and additionally requires the
+        # SUT to run inside the FuzzBench Docker runtime (containerized
+        # wrappers), never as a host-extracted binary. reproduction-epsilon is
+        # the strict profile from the epsilon plan; reproduction-delta is its
+        # backward-compatible alias (plan elfuzz_reproduction_delta.md). It
+        # inherits the paper-faithful budget and, like reproduction-gamma,
+        # rejects a prebuilt ELFUZZ_TARGET_BINARY and requires a real
+        # coverage-instrumented replay.
+        strict = profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
+        zeta = profile == "reproduction-zeta"
+        budget = {
             "profile": profile,
             "evolution_iterations": env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50),
             "evolution_seconds": env_int("ELFUZZ_EVOLUTION_SECONDS", 1800),
@@ -549,15 +554,20 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
             "tgi_waiting_seconds": env_int("ELFUZZ_TGI_WAITING_SECONDS", 1200),
             "excluded_from_aggregate": False,
             "paper_core": True,
-            # reproduction-gamma/delta invariants (plan section 3/4): the SUT
-            # must be built from the exact FuzzBench Dockerfile, never a
-            # prebuilt ELFUZZ_TARGET_BINARY, and coverage must come from a real
-            # coverage-instrumented replay, never AFL path counters.
+            # reproduction-gamma/delta/epsilon/zeta invariants (plan section
+            # 3/4): the SUT must be built from the exact FuzzBench Dockerfile,
+            # never a prebuilt ELFUZZ_TARGET_BINARY, and coverage must come from
+            # a real coverage-instrumented replay, never AFL path counters.
             "reject_prebuilt_binary": strict,
             "require_coverage_build": strict,
+            # zeta plan §3: the SUT must run inside the FuzzBench Docker
+            # runtime via containerized wrappers, never as a host-extracted
+            # binary that can miss runtime libraries.
+            "require_containerized_sut_runtime": zeta,
             "method_variant": "paper-faithful",
             "source": "pinned-upstream-defaults",
         }
+        return budget
     # alpha: nontrivial upstream-default-or-greater; never the 1/60 smoke defaults.
     evo = env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50)
     produce = env_int("ELFUZZ_PRODUCE_SECONDS", 600)
@@ -815,14 +825,25 @@ def test_mode_cap() -> int | None:
     subprocess timeout for every stage so ``pytest -q`` always terminates,
     without affecting real reproduction budgets (it is only set by the test
     suite, never by the production entrypoint).
+
+    When running under pytest (``PYTEST_CURRENT_TEST`` is set) and no explicit
+    cap is configured, a small default cap is applied so a fake long-running
+    subprocess (e.g. ``elfuzz run --time 86400``) is killed within the cap and
+    leaves no child process behind (zeta plan §2). Set
+    ``ELFUZZ_TEST_MODE_SECONDS=0`` to disable the auto-cap.
     """
+
     raw = os.environ.get("ELFUZZ_TEST_MODE_SECONDS")
-    if raw is None or raw == "":
-        return None
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return None
+    if raw is not None and raw != "":
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return max(1, value) if value > 0 else None
+    # Auto-detect pytest and apply a small default cap (zeta plan §2).
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return 30
+    return None
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -1094,6 +1115,71 @@ class ELFuzzPipeline:
             shutil.copy2(log_src, sut_root / plan_log_name)
         return record
 
+    def _write_containerized_sut_wrappers(self, native_tag: str, coverage_tag: str, fuzz_target: str) -> None:
+        """Emit containerized SUT wrappers (zeta plan §3).
+
+        The wrappers mount an input or corpus directory and execute
+        ``/out/<fuzz_target>`` inside the exact built Docker image so the SUT
+        runs in the FuzzBench runtime environment. Host-extracted binary
+        execution is rejected for zeta; the wrappers are the only accepted way
+        to run the SUT for input validation, campaign target invocation, and
+        coverage replay.
+        """
+
+        sut = self._sut_root()
+        wrappers = sut / "wrappers"
+        wrappers.mkdir(parents=True, exist_ok=True)
+        input_mode = str(self.adapter.get("input_mode", "file"))
+        argv = list(self.adapter.get("argv", ["@@"]))
+        binary = f"/out/{fuzz_target}"
+        # run_native_one.sh <input> -- runs one input through the native image.
+        native_lines = [
+            "#!/usr/bin/env bash",
+            "# Containerized SUT wrapper (zeta plan §3). Runs one input through",
+            "# the native FuzzBench image so the SUT executes in its real runtime.",
+            "set -euo pipefail",
+            'input="${1:-}"',
+            'if [[ -z "$input" ]]; then echo "usage: run_native_one.sh <input>" >&2; exit 64; fi',
+            'abs="$(cd "$(dirname "$input")" && pwd)/$(basename "$input")"',
+            f'image="{native_tag}"',
+            f'binary="{binary}"',
+        ]
+        if input_mode == "stdin":
+            native_lines.append('docker run --rm -i -v "$abs:$abs:ro" "$image" sh -lc "cat $abs | $binary"')
+        else:
+            args = " ".join(f'"{a}"' if a != "@@" else '"$abs"' for a in argv)
+            native_lines.append(f'docker run --rm -v "$abs:$abs:ro" "$image" sh -lc "$binary {args}"')
+        native_path = wrappers / "run_native_one.sh"
+        native_path.write_text("\n".join(native_lines) + "\n", encoding="utf-8")
+        native_path.chmod(0o755)
+        # run_coverage_corpus.sh <corpus_dir> -- replays a corpus in the cov image.
+        cov_lines = [
+            "#!/usr/bin/env bash",
+            "# Containerized coverage SUT wrapper (zeta plan §3/§7). Replays a",
+            "# corpus directory through the coverage-instrumented FuzzBench image.",
+            "set -euo pipefail",
+            'corpus="${1:-}"',
+            'if [[ -z "$corpus" ]]; then echo "usage: run_coverage_corpus.sh <corpus_dir>" >&2; exit 64; fi',
+            'abs="$(cd "$corpus" && pwd)"',
+            f'image="{coverage_tag}"',
+            f'binary="{binary}"',
+            'docker run --rm -v "$abs:/tmp/corpus:ro" "$image" sh -lc '
+            '"mkdir -p /tmp/cov; LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw $binary -runs=0 /tmp/corpus && '
+            'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && '
+            'llvm-cov export -format=text $binary -instr-profile=/tmp/cov/merged.profdata"',
+        ]
+        cov_path = wrappers / "run_coverage_corpus.sh"
+        cov_path.write_text("\n".join(cov_lines) + "\n", encoding="utf-8")
+        cov_path.chmod(0o755)
+        json_dump(sut / "containerized_wrappers.json", {
+            "native_wrapper": str(native_path),
+            "coverage_wrapper": str(cov_path),
+            "native_image": native_tag,
+            "coverage_image": coverage_tag,
+            "fuzz_target": fuzz_target,
+            "containerized": True,
+        })
+
     def build_target(self) -> None:
         # A listed text target with missing adapter files is infra_missing, not Invalid.
         repo = repo_root_from(self.metadata_root)
@@ -1210,6 +1296,12 @@ class ELFuzzPipeline:
                 "contract_path": str(self._sut_root() / "contract.json"),
             }
             json_dump(self.workspace / "target" / "build.json", record)
+            # zeta plan §3: emit containerized SUT wrappers that run
+            # /out/<fuzz_target> inside the exact built image. Host-extracted
+            # binary execution is rejected for zeta; the wrappers mount the
+            # input/corpus directory and execute the SUT in the FuzzBench
+            # runtime so runtime libraries cannot be missed.
+            self._write_containerized_sut_wrappers(native["image_tag"], coverage["image_tag"], fuzz_target)
             self.stages["target_build"] = stage_record("complete", "none", **record)
             return
         binary = self.resolve_target_binary()
@@ -1626,7 +1718,14 @@ class ELFuzzPipeline:
         )
 
     def _invoke_target(self, sample: bytes, timeout: int | None = None) -> dict[str, Any]:
-        """Run one sample through the native target via the adapter input contract."""
+        """Run one sample through the native target via the adapter input contract.
+
+        For ``reproduction-zeta`` (``require_containerized_sut_runtime``), the
+        sample is run inside the FuzzBench Docker image via ``docker run`` so
+        the SUT executes in its real runtime, never as a host-extracted binary
+        (zeta plan §3). The invocation goes through ``self.runner`` so offline
+        tests can substitute a fake Docker runner.
+        """
 
         if not self.target_binary:
             return {"ran": False, "exit_code": 127, "error": "no target binary"}
@@ -1639,13 +1738,34 @@ class ELFuzzPipeline:
             tmp.write(sample)
             sample_path = Path(tmp.name)
         try:
+            # zeta plan §3: when containerized SUT runtime is required, run
+            # the target inside the FuzzBench Docker image via ``docker run``
+            # through the pluggable runner (not a host-extracted binary).
+            if bool(self.budget.get("require_containerized_sut_runtime")) and self.sut_record:
+                native_tag = self.sut_record.get("native", {}).get("image_tag", "")
+                fuzz_target = self.sut_record.get("fuzz_target", "")
+                binary = f"/out/{fuzz_target}" if fuzz_target else str(self.target_binary)
+                if native_tag:
+                    abs_input = str(sample_path.resolve())
+                    if input_mode == "stdin":
+                        shell = f"cat {abs_input} | {binary}"
+                        cmd = ["docker", "run", "--rm", "-i", "-v", f"{abs_input}:{abs_input}:ro", native_tag, "sh", "-lc", shell]
+                    else:
+                        args = " ".join(a if a != "@@" else abs_input for a in argv)
+                        shell = f"{binary} {args}"
+                        cmd = ["docker", "run", "--rm", "-v", f"{abs_input}:{abs_input}:ro", native_tag, "sh", "-lc", shell]
+                    try:
+                        result = self.runner(cmd, timeout)
+                        return {"ran": True, "exit_code": getattr(result, "exit_code", 0), "timed_out": False, "containerized": True}
+                    except Exception as exc:
+                        return {"ran": False, "exit_code": 127, "timed_out": False, "error": str(exc), "containerized": True}
             if input_mode == "stdin":
                 cmd = [str(self.target_binary)] + [a for a in argv if a != "@@"]
                 proc = subprocess.run(cmd, input=sample, capture_output=True, timeout=timeout, check=False)
             else:
                 cmd = [str(self.target_binary)] + [str(a) if a != "@@" else str(sample_path) for a in argv]
                 proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False)
-            return {"ran": True, "exit_code": proc.returncode, "timed_out": False}
+            return {"ran": True, "exit_code": proc.returncode, "timed_out": False, "containerized": False}
         except subprocess.TimeoutExpired:
             return {"ran": True, "exit_code": 124, "timed_out": True}
         except OSError as exc:
@@ -1819,6 +1939,27 @@ class ELFuzzPipeline:
             execs_done=execs_done,
             deadline_reached=deadline_reached,
         )
+        # zeta plan §6: record campaign evidence artifacts. The campaign log,
+        # fuzzer_stats, queue directory, and command.txt must persist so a
+        # missing/empty campaign cannot be disguised as completed.
+        campaign_dir = self.workspace / "campaign"
+        campaign_dir.mkdir(parents=True, exist_ok=True)
+        log_src = self.workspace / "logs" / "campaign.log"
+        if log_src.is_file():
+            shutil.copy2(log_src, campaign_dir / "target_runtime.log")
+        stats_src = campaign_dir / "stats" / "fuzzer_stats"
+        if stats_src.is_file():
+            shutil.copy2(stats_src, campaign_dir / "fuzzer_stats")
+        # Prove the actual target wrapper/binary was invoked (zeta plan §6).
+        runtime_evidence = {
+            "command": " ".join(cmd),
+            "execs_done": execs_done,
+            "queue_count": self.queue_count,
+            "deadline_reached": deadline_reached,
+            "target_binary": str(self.target_binary) if self.target_binary else "",
+            "containerized": bool(self.budget.get("require_containerized_sut_runtime")),
+        }
+        json_dump(campaign_dir / "target_runtime.json", runtime_evidence)
 
     def _replay_corpus(self) -> Path:
         """Assemble the replay corpus from generated inputs and campaign queue.
@@ -2051,6 +2192,7 @@ class ELFuzzPipeline:
                 prompt_template_source = upstream_benchmark
         build_record = read_json(self.workspace / "target" / "build.json")
         sut_contract = read_json(self._sut_root() / "contract.json") if (self._sut_root() / "contract.json").is_file() else {}
+        wrapper_manifest = read_json(self._sut_root() / "containerized_wrappers.json") if (self._sut_root() / "containerized_wrappers.json").is_file() else {}
         build_provenance: dict[str, Any] = {
             "uses_fuzzbench_docker_environment": bool(sut_contract),
             "native": sut_contract.get("native", {}) if sut_contract else {},
@@ -2058,6 +2200,10 @@ class ELFuzzPipeline:
             "binary_path": build_record.get("binary_path", ""),
             "source": build_record.get("source", ""),
             "verified_executable": bool((build_record.get("verification") or {}).get("ok", False)),
+            # zeta plan §3/§8: record whether the SUT ran inside the FuzzBench
+            # Docker runtime via containerized wrappers.
+            "containerized_sut_runtime": bool(wrapper_manifest.get("containerized", False)),
+            "containerized_wrappers": wrapper_manifest,
         }
         artifacts = {
             "seed_fuzzers": count_files(self.workspace / "synthesis" / "fuzzer_programs"),
@@ -2198,6 +2344,9 @@ class ELFuzzPipeline:
         input validation, real SUT execution, and a real coverage replay.
 
         A build-only or fake-coverage result must never be marked ``evaluated``.
+        For ``reproduction-zeta`` additionally require the containerized SUT
+        wrappers, ``evolution_iterations >= 2``, and a nonempty campaign
+        queue (zeta plan §5/§6/§8).
         """
 
         if self.fuzzer_program_count <= 0:
@@ -2218,6 +2367,27 @@ class ELFuzzPipeline:
                 raise PipelineError("failed", "evaluated requires real LLVM line/region/function coverage", 65)
             if int(cov.get("inputs_replayed", 0) or 0) <= 0:
                 raise PipelineError("failed", "evaluated requires replayed inputs on the coverage SUT", 65)
+        # zeta plan §5/§6/§8: stricter invariants for the zeta profile.
+        if bool(self.budget.get("require_containerized_sut_runtime")):
+            if self.evolution_iterations_completed < 2:
+                raise PipelineError(
+                    "failed",
+                    "reproduction-zeta evaluated requires evolution_iterations >= 2",
+                    65,
+                )
+            if self.queue_count <= 0:
+                raise PipelineError(
+                    "failed",
+                    "reproduction-zeta evaluated requires a nonempty campaign queue",
+                    65,
+                )
+            wrapper = self._sut_root() / "wrappers" / "run_native_one.sh"
+            if not wrapper.is_file():
+                raise PipelineError(
+                    "failed",
+                    "reproduction-zeta evaluated requires containerized SUT wrappers",
+                    65,
+                )
 
     def full(self) -> int:
         try:
@@ -2280,7 +2450,7 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "fuzz_target": target,
         "profile": profile,
         "protocol": protocol,
-        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} else profile,
+        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"} else profile,
         "status": "not_applicable",
         "applicability": "Invalid",
         "reason_code": reason_code,
@@ -2327,7 +2497,7 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "reproducibility": {
             "fuzzbench_commit": "",
             "build_uses_fuzzbench_docker_environment": False,
-            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} else profile,
+            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"} else profile,
         },
         "error": {"reason_code": reason_code, "message": INVALID_MESSAGE},
         "stages": stages,

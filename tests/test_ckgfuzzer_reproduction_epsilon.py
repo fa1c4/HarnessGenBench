@@ -140,7 +140,7 @@ class EpsilonFakeRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    return FakeResult(cmd, 0, "smoke ok", "")
+                    return FakeResult(cmd, 0, "smoke ok", "HGB_TARGET_START\n")
                 if phase == "campaign":
                     out = f"#{self.campaign_execs} INITED\nstat::number_of_executed_units: {self.campaign_execs}\n"
                     return FakeResult(cmd, 0, out, "")
@@ -148,6 +148,20 @@ class EpsilonFakeRunner:
                     return FakeResult(cmd, 0, self.coverage_stdout, "")
                 return FakeResult(cmd, 0, "", "")
             if sub == "cp":
+                # Materialize a real final-corpus tar for the campaign copy_out
+                # so the hardened run_campaign extraction records a nonempty
+                # final_corpus_file_count (zeta plan §2).
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return FakeResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeResult(cmd, 0, "", "")
@@ -265,7 +279,7 @@ def test_dry_run_canonical_command_passes_profile_validation(tmp_path: Path) -> 
 def test_unknown_profile_exits_with_code_2() -> None:
     proc = subprocess.run(
         ["bash", "scripts/hgb_run_baseline.sh", "--generator", "ckgfuzzer",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-zeta",
+         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent",
          "--protocol", "blind-project", "--dry-run"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=_run_env(), timeout=120,
     )
@@ -276,7 +290,7 @@ def test_unknown_profile_exits_with_code_2() -> None:
 def test_hgb_generate_harness_rejects_unknown_profile_with_code_2() -> None:
     proc = subprocess.run(
         ["bash", "scripts/hgb_generate_harness.sh", "--generator", "ckgfuzzer",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-zeta", "--dry-run"],
+         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent", "--dry-run"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=_run_env(), timeout=120,
     )
     assert proc.returncode == 2, proc.stderr
@@ -472,8 +486,13 @@ def test_entrypoint_epsilon_enforces_method_evidence_and_coverage_image() -> Non
     for evidence in ("codeql_db.json", "api_list.json", "api_summaries.jsonl", "api_combinations.jsonl", "llm_trace.jsonl"):
         assert evidence in entrypoint
     assert "ckg_method_evidence_missing" in entrypoint
-    # The evidence guard and coverage-image guard both cover epsilon.
-    assert 'ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]' in entrypoint
+    # The evidence guard and coverage-image guard both cover epsilon (the
+    # guards now also cover the stricter reproduction-zeta alias).
+    evidence_lines = [ln for ln in entrypoint.splitlines() if "ckg_method_evidence_missing" in ln or "codeql_graph" in ln]
+    guard_lines = [ln for ln in entrypoint.splitlines() if "reproduction-epsilon" in ln]
+    assert any('reproduction-epsilon' in ln for ln in guard_lines)
+    cov_img_lines = [ln for ln in entrypoint.splitlines() if "--build-coverage-image" in ln]
+    assert any('reproduction-epsilon' in ln for ln in cov_img_lines)
     assert '--build-coverage-image' in entrypoint
 
 
@@ -606,10 +625,10 @@ def test_matrix_paper_equivalent_epsilon_gate() -> None:
         "method_variant": "paper-faithful",
         "excluded_from_aggregate": False,
         "stages": {n: "completed" for n in ("candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage")},
-        "metrics": {
-            "coverage": {"line_coverage": {"covered": 27}, "function_coverage": {"covered": 5}, "region_coverage": {"covered": 12}},
-            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0},
-        },
+            "metrics": {
+                "coverage": {"line_coverage": {"covered": 27}, "function_coverage": {"covered": 5}, "region_coverage": {"covered": 12}},
+                "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0, "final_corpus_file_count": 3},
+            },
         "build": {"overlay_audit": {"matches_candidate": True}},
         "selected_candidate": {"copy_audit": {"exact_copy": False}, "build": {"overlay_audit": {"matches_candidate": True}}},
         "candidate": {"contains_reference_canary": False, "near_duplicate_reference": False},

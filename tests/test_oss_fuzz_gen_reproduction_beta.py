@@ -141,7 +141,9 @@ class FakeRunner:
                 entry = self._containers.get(name, ("unknown", False))
                 phase, is_native = entry if isinstance(entry, tuple) else (entry, False)
                 if phase == "smoke":
-                    stderr = "AddressSanitizer: crash\n" if self.smoke_crash else ""
+                    stderr = "HGB_TARGET_START\n"
+                    if self.smoke_crash:
+                        stderr += "AddressSanitizer: crash\n"
                     return FakeResult(cmd, 77 if self.smoke_crash else 0, "", stderr)
                 if phase == "verify":
                     return FakeResult(cmd, 0, "", "")
@@ -155,6 +157,17 @@ class FakeRunner:
                     return FakeResult(cmd, 0, stdout, "")
                 return FakeResult(cmd, 0, "", "")
             if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return FakeResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeResult(cmd, 0, "", "")

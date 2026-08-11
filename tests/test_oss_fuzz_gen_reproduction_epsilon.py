@@ -208,7 +208,7 @@ class EpsilonFakeRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    return FakeResult(cmd, 0, "smoke ok", "")
+                    return FakeResult(cmd, 0, "smoke ok", "HGB_TARGET_START\n")
                 if phase == "campaign":
                     out = f"#{self.campaign_execs} INITED\nstat::number_of_executed_units: {self.campaign_execs}\n"
                     return FakeResult(cmd, 0, out, "")
@@ -219,6 +219,17 @@ class EpsilonFakeRunner:
                     return FakeResult(cmd, 0, cov, "")
                 return FakeResult(cmd, 0, "", "")
             if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
                 return FakeResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeResult(cmd, 0, "", "")
@@ -348,7 +359,7 @@ def test_dry_run_canonical_command_passes_profile_validation(tmp_path: Path) -> 
 def test_unknown_profile_exits_with_code_2() -> None:
     proc = subprocess.run(
         ["bash", "scripts/hgb_run_baseline.sh", "--generator", "oss-fuzz-gen",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-zeta",
+         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent",
          "--protocol", "blind-project", "--dry-run"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=_run_env(), timeout=120,
     )
@@ -359,7 +370,7 @@ def test_unknown_profile_exits_with_code_2() -> None:
 def test_hgb_generate_harness_rejects_unknown_profile_with_code_2() -> None:
     proc = subprocess.run(
         ["bash", "scripts/hgb_generate_harness.sh", "--generator", "oss-fuzz-gen",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-zeta", "--dry-run"],
+         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent", "--dry-run"],
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=_run_env(), timeout=120,
     )
     assert proc.returncode == 2, proc.stderr
@@ -556,7 +567,7 @@ def test_copy_audit_rejects_exact_canary_and_near_duplicate(tmp_path: Path) -> N
 
 def test_entrypoint_has_reproduction_epsilon_profile_defaults() -> None:
     entrypoint = (REPO_ROOT / "docker/oss-fuzz-gen/entrypoint.sh").read_text(encoding="utf-8")
-    assert "reproduction-delta|reproduction-epsilon)" in entrypoint
+    assert "reproduction-delta|reproduction-epsilon|reproduction-zeta)" in entrypoint
     assert 'OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"' in entrypoint
     assert 'OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"' in entrypoint
 
@@ -575,7 +586,7 @@ def test_entrypoint_epsilon_routes_to_method_faithful_result() -> None:
 
 def test_run_baseline_accepts_reproduction_epsilon_for_ofg() -> None:
     script = (REPO_ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke)" in script
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke)" in script
     assert "oss-fuzz-gen/$profile: OFG_SKIP_COVERAGE_GAINS=1 is forbidden" in script
     assert "oss-fuzz-gen/$profile: OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden" in script
     assert "oss-fuzz-gen/$profile: OFG_INTROSPECTOR_MODE=local is forbidden" in script
@@ -966,7 +977,7 @@ def _ofg_epsilon_base_meta(**overrides) -> dict:
         )},
         "metrics": {
             "coverage": {"line_coverage": {"covered": 31}},
-            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0},
+            "campaign": {"execs_done": 500, "crashes": 0, "timeouts": 0, "final_corpus_file_count": 4},
             "coverage_diff": {"runtime_coverage_valid": True, "status": "available"},
         },
         "build": {"overlay_audit": {"matches_candidate": True}},

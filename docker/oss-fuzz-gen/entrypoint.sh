@@ -99,17 +99,18 @@ apply_profile_defaults() {
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
       export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
       ;;
-    reproduction-delta|reproduction-epsilon)
-      # Strict reproduction profiles. reproduction-epsilon is the canonical
-      # strict profile (epsilon plan shared foundation); reproduction-delta is
-      # its backward-compatible alias (plan oss-fuzz-gen_reproduction_delta.md
-      # section 1). Both are stricter than reproduction-gamma:
-      # OFG_INTROSPECTOR_MODE defaults to real, coverage gains are never
-      # skipped, GCS target download is forbidden, project-YAML fallback and
-      # bad-benchmark synthesis are forbidden unless an explicit compat variant
-      # is recorded and the row is excluded from the aggregate. No
-      # selected-harness API rank/report and no exact reference harness as
-      # example are produced (enforced by ofg_run_wrapper.py / ofg_api_rank.py).
+    reproduction-delta|reproduction-epsilon|reproduction-zeta)
+      # Strict reproduction profiles. reproduction-zeta is the canonical
+      # strict profile (zeta plan); reproduction-epsilon is the strict profile
+      # from the epsilon plan; reproduction-delta is its backward-compatible
+      # alias (plan oss-fuzz-gen_reproduction_delta.md section 1). All are
+      # stricter than reproduction-gamma: OFG_INTROSPECTOR_MODE defaults to
+      # real, coverage gains are never skipped, GCS target download is
+      # forbidden, project-YAML fallback and bad-benchmark synthesis are
+      # forbidden unless an explicit compat variant is recorded and the row
+      # is excluded from the aggregate. No selected-harness API rank/report
+      # and no exact reference harness as example are produced (enforced by
+      # ofg_run_wrapper.py / ofg_api_rank.py).
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
       export OFG_ALLOW_PROJECT_YAML_FALLBACK="${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}"
@@ -125,6 +126,20 @@ apply_profile_defaults() {
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+      ;;
+    reproduction-zeta)
+      # zeta plan §1: zeta is the strictest profile. It inherits the strict
+      # reproduction defaults and additionally forces real OSS-Fuzz project
+      # context, real Introspector, no reference examples, no selected-harness
+      # API ranking, repair loop, coverage, and a sealed split package.
+      export OFG_USE_REAL_OSS_FUZZ="${OFG_USE_REAL_OSS_FUZZ:-1}"
+      export OFG_USE_REAL_INTROSPECTOR="${OFG_USE_REAL_INTROSPECTOR:-1}"
+      export OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM="${OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM:-0}"
+      export OFG_ALLOW_REFERENCE_EXAMPLES="${OFG_ALLOW_REFERENCE_EXAMPLES:-0}"
+      export OFG_ALLOW_SELECTED_HARNESS_API_RANKING="${OFG_ALLOW_SELECTED_HARNESS_API_RANKING:-0}"
+      export OFG_ENABLE_REPAIR_LOOP="${OFG_ENABLE_REPAIR_LOOP:-1}"
+      export OFG_ENABLE_COVERAGE="${OFG_ENABLE_COVERAGE:-1}"
+      export HGB_TARGET_REQUIRE_SPLIT=1
       ;;
     compat-smoke)
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
@@ -604,7 +619,7 @@ write_final_result() {
   local method_variant excluded
   if [[ "$hgb_profile" == "compat-smoke" ]]; then
     method_variant="compat-smoke"; excluded=true
-  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" || "$hgb_profile" == "reproduction-epsilon" ]]; then
+  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" || "$hgb_profile" == "reproduction-epsilon" || "$hgb_profile" == "reproduction-zeta" ]]; then
     method_variant="paper-faithful"; excluded=false
   else
     method_variant="$hgb_profile"; excluded=false

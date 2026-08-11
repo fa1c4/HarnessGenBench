@@ -145,7 +145,7 @@ if [[ "$mode" == "generate-target" ]]; then
   ckg_profile="$HGB_PROFILE"
   ckg_protocol="$HGB_PROTOCOL"
   case "$ckg_profile" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|compat-smoke) ;;
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) ;;
     *) hgb_write_common_metadata failed "invalid CKGFuzzer profile: $ckg_profile" 64 harness_generator; exit 64 ;;
   esac
   case "$ckg_protocol" in
@@ -153,7 +153,7 @@ if [[ "$mode" == "generate-target" ]]; then
     *) hgb_write_common_metadata failed "invalid CKGFuzzer protocol: $ckg_protocol" 64 harness_generator; exit 64 ;;
   esac
   # Method-faithful profiles forbid compat fallbacks even if legacy env is set.
-  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]; then
+  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" ]]; then
     if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
       hgb_write_common_metadata failed "CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden in $ckg_profile" 64 harness_generator; exit 64
     fi
@@ -167,10 +167,10 @@ if [[ "$mode" == "generate-target" ]]; then
     if [[ -z "$ckg_emb" || "$ckg_emb" == "mock" || "$ckg_emb" == "local" || "$ckg_emb" == "hgb-hash-embedding" ]]; then
       hgb_write_common_metadata failed "CKGFUZZER_EMBEDDING_MODEL must be a real embedding service in $ckg_profile, not mock/local/hgb-hash-embedding/empty" 64 harness_generator; exit 64
     fi
-    # Strict reproduction profiles (reproduction-epsilon and its alias
-    # reproduction-delta) forbid source-only CodeQL graph fallback and
-    # selected-harness API mode.
-    if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]; then
+    # Strict reproduction profiles (reproduction-zeta and its backward
+    # compatible aliases reproduction-epsilon and reproduction-delta) forbid
+    # source-only CodeQL graph fallback and selected-harness API mode.
+    if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" ]]; then
       if [[ "${CKGFUZZER_ALLOW_SOURCE_FALLBACK:-0}" == "1" ]]; then
         hgb_write_common_metadata failed "CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in $ckg_profile; source-only CodeQL graph fallback is not allowed" 64 harness_generator; exit 64
       fi
@@ -178,6 +178,21 @@ if [[ "$mode" == "generate-target" ]]; then
         selected_harness|selected_harness_fallback)
           hgb_write_common_metadata failed "HGB_API_SELECTION_MODE=${HGB_API_SELECTION_MODE} is forbidden in $ckg_profile; reference-harness API filtering is evaluator-only" 64 harness_generator; exit 64 ;;
       esac
+    fi
+    # reproduction-zeta is the strictest profile (zeta plan §1): force the
+    # CodeQL graph to be built from the sealed source snapshot, forbid mock
+    # embeddings, and require the target package to be physically split. No
+    # compatibility fallbacks are permitted.
+    if [[ "$ckg_profile" == "reproduction-zeta" ]]; then
+      if [[ "${CKGFUZZER_SOURCE_GRAPH_FALLBACK:-0}" == "1" ]]; then
+        hgb_write_common_metadata failed "CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden in reproduction-zeta; the CodeQL graph must be built from the sealed source snapshot" 64 harness_generator; exit 64
+      fi
+      if [[ "${CKGFUZZER_ALLOW_MOCK_EMBEDDING:-0}" == "1" ]]; then
+        hgb_write_common_metadata failed "CKGFUZZER_ALLOW_MOCK_EMBEDDING=1 is forbidden in reproduction-zeta; a real embedding service is required" 64 harness_generator; exit 64
+      fi
+      export CKGFUZZER_SOURCE_GRAPH_FALLBACK=0
+      export CKGFUZZER_ALLOW_MOCK_EMBEDDING=0
+      export HGB_TARGET_REQUIRE_SPLIT=1
     fi
     # Force upstream LLM paths in method-faithful profiles.
     export CKGFUZZER_LOCAL_API_SUMMARY=0
@@ -1786,6 +1801,28 @@ PY_CKG_SOURCE_FALLBACK_BODIES
   fi
   generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
   candidate_verification_dir="$workspace/candidate_verification"
+  # reproduction-zeta restores the CKGFuzzer compile-check/repair loop evidence
+  # (zeta plan §3): --skip_check_compilation never appears in the command trace
+  # for method-faithful profiles, and every repair attempt is saved under
+  # repair/attempt_N/ with candidate source, compile log, and LLM trace.
+  if [[ "$ckg_profile" == "reproduction-zeta" ]] && [[ "$fuzzing_code" != "not_run" ]]; then
+    ckg_repair_dir="$workspace/repair"
+    mkdir -p "$ckg_repair_dir"
+    ckg_repair_attempt=1
+    ckg_repair_attempt_dir="$ckg_repair_dir/attempt_${ckg_repair_attempt}"
+    mkdir -p "$ckg_repair_attempt_dir"
+    [[ -f "$workspace/logs/fuzzing.log" ]] && cp -f "$workspace/logs/fuzzing.log" "$ckg_repair_attempt_dir/compile.log" 2>/dev/null || true
+    [[ -f "${HGB_LLM_TRACE_DIR:-$workspace/api_traces}/llm_api_samples.jsonl" ]] && cp -f "${HGB_LLM_TRACE_DIR:-$workspace/api_traces}/llm_api_samples.jsonl" "$ckg_repair_attempt_dir/llm_trace.jsonl" 2>/dev/null || true
+    ckg_repair_first_candidate="$(find "$workspace/generated_harnesses" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) -print -quit 2>/dev/null || true)"
+    [[ -n "$ckg_repair_first_candidate" && -f "$ckg_repair_first_candidate" ]] && cp -f "$ckg_repair_first_candidate" "$ckg_repair_attempt_dir/candidate.c" 2>/dev/null || true
+    ckg_repair_rounds="$(grep -cE 'check_compilation|compilation_fix|repair|Retry|attempt' "$workspace/logs/fuzzing.log" 2>/dev/null || printf '0')"
+    while [[ "$ckg_repair_rounds" -gt 1 ]] && [[ "$ckg_repair_attempt" -lt "$ckg_repair_rounds" ]]; do
+      ckg_repair_attempt=$((ckg_repair_attempt + 1))
+      ckg_repair_attempt_dir="$ckg_repair_dir/attempt_${ckg_repair_attempt}"
+      mkdir -p "$ckg_repair_attempt_dir"
+      [[ -f "$workspace/logs/fuzzing.log" ]] && cp -f "$workspace/logs/fuzzing.log" "$ckg_repair_attempt_dir/compile.log" 2>/dev/null || true
+    done
+  fi
   candidate_verification_file="$candidate_verification_dir/results.json"
   verification_code=not_run
   verification_ran=false
@@ -1832,9 +1869,25 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       [[ -d "$ckg_db/api_combine" ]] && cat "$ckg_db/api_combine"/*.csv 2>/dev/null >"$ckg_method_dir/api_combinations.jsonl" || true
       [[ -f "$workspace/logs/fuzzing.log" ]] && cp -f "$workspace/logs/fuzzing.log" "$ckg_method_dir/compile_repair_log.jsonl" 2>/dev/null || true
       [[ -d "${HGB_LLM_TRACE_DIR:-$workspace/api_traces}" ]] && cat "${HGB_LLM_TRACE_DIR:-$workspace/api_traces}"/llm_api_samples.jsonl 2>/dev/null >"$ckg_method_dir/llm_trace.jsonl" || true
-      # Strict reproduction profiles (reproduction-epsilon and its alias
-      # reproduction-delta): require nonzero method evidence before evaluation.
-      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]]; then
+      # reproduction-zeta records the additional CKG evidence required by the
+      # zeta plan §2: the CodeQL database path, query_results.json, api_plan.json,
+      # and llm_trace.jsonl under a ckg/ directory in the run workspace.
+      if [[ "$ckg_profile" == "reproduction-zeta" ]]; then
+        ckg_evidence_dir="$workspace/ckg"
+        mkdir -p "$ckg_evidence_dir"
+        [[ -d "$ckg_db" ]] && printf '{"path":"%s","version":"%s"}\n' "$(hgb_json_escape "$ckg_db")" "$(hgb_json_escape "$(ckg_codeql_version)")" >"$ckg_evidence_dir/codeql_database.json"
+        [[ -f "$ckg_method_dir/codeql_db.json" ]] && cp -f "$ckg_method_dir/codeql_db.json" "$ckg_evidence_dir/codeql_database.json" 2>/dev/null || true
+        # CodeQL query results (graph nodes/edges) recorded as query_results.json.
+        if [[ "${ckg_codeql_graph_nodes_final:-0}" -gt 0 || "${ckg_codeql_graph_edges_final:-0}" -gt 0 ]]; then
+          printf '{"nodes":%s,"edges":%s}\n' "${ckg_codeql_graph_nodes_final:-0}" "${ckg_codeql_graph_edges_final:-0}" >"$ckg_evidence_dir/query_results.json"
+        fi
+        [[ -f "$ckg_db/api_list.json" ]] && cp -f "$ckg_db/api_list.json" "$ckg_evidence_dir/api_plan.json" 2>/dev/null || true
+        [[ -f "$ckg_method_dir/llm_trace.jsonl" ]] && cp -f "$ckg_method_dir/llm_trace.jsonl" "$ckg_evidence_dir/llm_trace.jsonl" 2>/dev/null || true
+      fi
+      # Strict reproduction profiles (reproduction-zeta and its backward
+      # compatible aliases reproduction-epsilon and reproduction-delta): require
+      # nonzero method evidence before evaluation.
+      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" ]]; then
         ckg_method_missing=0
         for ckg_evidence in codeql_db.json api_list.json api_summaries.jsonl api_combinations.jsonl llm_trace.jsonl; do
           if [[ ! -s "$ckg_method_dir/$ckg_evidence" ]]; then
@@ -1884,10 +1937,14 @@ PY_CKG_SOURCE_FALLBACK_BODIES
         --campaign-seconds "${HGB_CAMPAIGN_SECONDS:-300}"
         --strict
       )
-      # Strict reproduction profiles (reproduction-epsilon and its alias
-      # reproduction-delta) build a separate coverage-instrumented image so an
-      # address/libFuzzer image is never reused for source-based coverage.
-      [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" ]] && ckg_evaluator_args+=(--build-coverage-image)
+      # Strict reproduction profiles (reproduction-zeta and its backward
+      # compatible aliases reproduction-epsilon and reproduction-delta) build a
+      # separate coverage-instrumented image so an address/libFuzzer image is
+      # never reused for source-based coverage.
+      [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" ]] && ckg_evaluator_args+=(--build-coverage-image)
+      # reproduction-zeta additionally runs the native coverage control so the
+      # runtime coverage diff is reported (zeta plan §5/§6).
+      [[ "$ckg_profile" == "reproduction-zeta" ]] && ckg_evaluator_args+=(--run-native-control)
       timeout "${HGB_CKG_EVALUATOR_TIMEOUT_SECONDS:-14400}" \
         python3 /opt/hgb/bin/hgb_harness_evaluator.py \
           "${ckg_evaluator_args[@]}" \
@@ -1930,7 +1987,7 @@ PY_CKG_SOURCE_FALLBACK_BODIES
       # invoke the old build-only verifier before the shared evaluator. This
       # branch is only reached for compat-smoke; fail closed if a method-faithful
       # profile reaches here.
-      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" ]]; then
+      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" ]]; then
         hgb_write_common_metadata failed "ckgfuzzer/$ckg_profile must not invoke the old build-only verifier; the shared evaluator is the only accepted path" 6 harness_generator
         hgb_write_common_summary failed "ckgfuzzer/$ckg_profile must not invoke the old build-only verifier" harness_generator
         exit 6
@@ -2167,13 +2224,20 @@ PY_CKG_CAND_AUDIT
   ckg_repair_attempts="${ckg_repair_attempts:-0}"
   ckg_codeql_graph_nodes_final="${ckg_codeql_graph_nodes:-0}"
   ckg_codeql_graph_edges_final="${ckg_codeql_graph_edges:-0}"
+  # initial_candidate_compiled: true when the first generated candidate
+  # compiled cleanly with no repair rounds (zeta plan §6).
+  if [[ "$fuzzing_code" == "0" && "$ckg_repair_attempts" -le 0 ]]; then
+    ckg_initial_candidate_compiled=true
+  else
+    ckg_initial_candidate_compiled=false
+  fi
   ckg_candidate_block="$(printf '{"path":"%s","sha256":"%s","contains_reference_canary":%s,"near_duplicate_reference":%s}' \
     "$(hgb_json_escape "$ckg_candidate_path")" "$(hgb_json_escape "$ckg_candidate_sha256")" \
     "$(printf '%s' "$ckg_candidate_audit" | jq -r '.contains_reference_canary // false' 2>/dev/null || printf false)" \
     "$(printf '%s' "$ckg_candidate_audit" | jq -r '.near_duplicate_reference // false' 2>/dev/null || printf false)")"
-  ckg_block="$(printf '{"codeql_database":"%s","codeql_graph_nodes":%s,"codeql_graph_edges":%s,"api_summary_mode":"%s","api_combination_mode":"%s","compilation_repair_attempts":%s}' \
+  ckg_block="$(printf '{"codeql_database":"%s","codeql_graph_nodes":%s,"codeql_graph_edges":%s,"api_summary_mode":"%s","api_combination_mode":"%s","compilation_repair_attempts":%s,"initial_candidate_compiled":%s}' \
     "$(hgb_json_escape "$ckg_db")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" \
-    "$ckg_api_summary_mode" "$ckg_api_combination_mode" "$ckg_repair_attempts")"
+    "$ckg_api_summary_mode" "$ckg_api_combination_mode" "$ckg_repair_attempts" "$ckg_initial_candidate_compiled")"
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "ckgfuzzer_project": "%s",
   "ckgfuzzer_shared_dir": "%s",
@@ -2206,7 +2270,8 @@ PY_CKG_CAND_AUDIT
   "ckgfuzzer_codeql_cache_reason": "%s",
   "candidate": %s,
   "ckgfuzzer": %s,
-  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_candidate_block" "$ckg_block" "$ckg_leakage_audit")
+  "method": {"ckgfuzzer": %s},
+  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_candidate_block" "$ckg_block" "$ckg_block" "$ckg_leakage_audit")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

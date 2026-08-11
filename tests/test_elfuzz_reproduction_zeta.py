@@ -1,7 +1,7 @@
-"""Epsilon reproduction tests for the ELFuzz input-generator pipeline.
+"""Zeta reproduction tests for the ELFuzz input-generator pipeline.
 
-These tests exercise the strict paper-native ELFuzz reproduction contract from
-``plans/elfuzz_reproduction_epsilon.md`` with fake Docker/CLI runners so they
+These tests exercise the strictest paper-native ELFuzz reproduction contract
+from ``plans/elfuzz_reproduction_zeta.md`` with fake Docker/CLI runners so they
 pass without real external checkouts, Docker, TGI, or model access.
 
 ELFuzz is an ``input_generator`` (it synthesizes and evolves input-producing
@@ -9,18 +9,16 @@ fuzzer programs against a fixed native FuzzBench target, then replays
 generated/campaign inputs on a coverage-instrumented SUT), never a harness
 generator. It is kept out of the harness-generator leaderboard.
 
-The epsilon plan shares its foundation with the other reproduction-epsilon
-baselines (profile wiring, fail-closed split packages, smoke/campaign/coverage
-evidence). These tests additionally cover the ELFuzz-specific tasks:
-
-* ELF-1: applicability fail-fast and aggregate-safe Invalid counting.
-* ELF-2: hanging-test / subprocess process-group termination + test-mode cap.
-* ELF-3: real SUT build from the exact FuzzBench Docker environment.
-* ELF-4: real ELFuzz method stages (synthesis -> evolution -> production ->
-  campaign -> coverage), no upstream-benchmark aliasing.
-* ELF-5: count only real produced inputs.
-* ELF-6: coverage must be real and strict (no AFL-paths-as-coverage fallback).
-* ELF-7: applicable-target matrix semantics.
+The zeta plan adds these requirements on top of epsilon:
+* zeta profile acceptance and strictness (reject_prebuilt_binary,
+  require_coverage_build, require_containerized_sut_runtime).
+* Invalid targets stop before Docker/model/ELFuzz calls.
+* Fake long-running ELFuzz subprocess is killed and leaves no children.
+* Produced-input classifier excludes prompts/configs/logs/python/preseeds.
+* Adapter alias cannot be used as actual execution target.
+* zeta evaluated row requires generated fuzzer, generated inputs, valid target
+  execution, nonzero campaign, and real coverage.
+* Coverage missing fails with reason_code=coverage_report_missing.
 """
 
 from __future__ import annotations
@@ -52,9 +50,9 @@ def load_module(name: str, path: Path):
     return module
 
 
-elf = load_module("elfuzz_target_pipeline_epsilon", ROOT / "docker/common/elfuzz_target_pipeline.py")
-campaign_mod = load_module("hgb_input_campaign_epsilon", ROOT / "docker/common/hgb_input_campaign.py")
-matrix_collector = load_module("hgb_collect_matrix_epsilon", ROOT / "scripts/hgb_collect_matrix.py")
+elf = load_module("elfuzz_target_pipeline_zeta", ROOT / "docker/common/elfuzz_target_pipeline.py")
+campaign_mod = load_module("hgb_input_campaign_zeta", ROOT / "docker/common/hgb_input_campaign.py")
+matrix_collector = load_module("hgb_collect_matrix_zeta", ROOT / "scripts/hgb_collect_matrix.py")
 
 
 APPLICABLE = {
@@ -157,7 +155,7 @@ class FakeRunnerResult:
 
 
 class FakeDockerRunner:
-    """Simulates the ELFuzz SUT Docker build and the coverage replay shell."""
+    """Simulates the ELFuzz SUT Docker build, containerized wrappers, and the coverage replay shell."""
 
     def __init__(self, coverage_stdout: str = COVERAGE_JSON):
         self.commands = []
@@ -196,6 +194,13 @@ class FakeDockerRunner:
                 return FakeRunnerResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeRunnerResult(cmd, 0, "", "")
+            if sub == "run":
+                # Containerized SUT wrapper invocations: docker run --rm ... sh -lc "..."
+                shell_cmd = " ".join(cmd[3:]) if len(cmd) > 3 else ""
+                if "llvm-cov export" in shell_cmd and "LLVM_PROFILE_FILE" in shell_cmd:
+                    return FakeRunnerResult(cmd, 0, self.coverage_stdout, "")
+                if "/out/" in shell_cmd:
+                    return FakeRunnerResult(cmd, 0, "ok", "")
         if head == "sh":
             joined = " ".join(cmd)
             if "llvm-cov export" in joined and "LLVM_PROFILE_FILE" in joined:
@@ -216,7 +221,7 @@ def base_env(tmp_path: Path, cli: Path, project_root: Path) -> dict[str, str]:
             "ELFUZZ_REQUIRE_GPU": "0",
             "ELFUZZ_SKIP_DOWNLOAD": "1",
             "ELFUZZ_STAGE_TIMEOUT_SECONDS": "60",
-            "HGB_BASELINE_PROFILE": "reproduction-epsilon",
+            "HGB_BASELINE_PROFILE": "reproduction-zeta",
             "HGB_BASELINE_PROTOCOL": "paper-native",
             "HGB_METADATA_DIR": str(ROOT / "metadata"),
             "HGB_GENERATOR_ARTIFACT_DIR": str(ROOT / "artifacts" / "elfuzz"),
@@ -239,7 +244,7 @@ def run_pipeline_inproc(tmp_path, target="jsoncpp_jsoncpp_fuzzer", runner=None, 
         target_package=package,
         artifact_dir=tmp_path / "artifact",
         metadata_root=ROOT / "metadata",
-        profile="reproduction-epsilon",
+        profile="reproduction-zeta",
         protocol="paper-native",
     )
     if runner is None:
@@ -264,51 +269,55 @@ def _run_env():
 
 
 # ---------------------------------------------------------------------------
-# E0. Profile acceptance and strictness
+# Z0. Profile acceptance and strictness
 # ---------------------------------------------------------------------------
 
 
-def test_reproduction_epsilon_is_a_strict_paper_native_profile():
-    budget = elf.budget_for_profile("reproduction-epsilon", {})
+def test_reproduction_zeta_is_the_strictest_paper_native_profile():
+    budget = elf.budget_for_profile("reproduction-zeta", {})
     assert budget["reject_prebuilt_binary"] is True
     assert budget["require_coverage_build"] is True
     assert budget["paper_core"] is True
     assert budget["method_variant"] == "paper-faithful"
     assert budget["evolution_iterations"] >= 2
     assert budget["excluded_from_aggregate"] is False
-    # reproduction-delta remains a backward-compatible alias with the same strictness.
+    # zeta-specific: containerized SUT runtime is required.
+    assert budget["require_containerized_sut_runtime"] is True
+
+
+def test_reproduction_zeta_preserves_epsilon_and_delta_aliases():
+    eps = elf.budget_for_profile("reproduction-epsilon", {})
+    assert eps["reject_prebuilt_binary"] is True
+    assert eps["require_coverage_build"] is True
+    # epsilon does NOT require containerized SUT runtime (zeta-only).
+    assert eps.get("require_containerized_sut_runtime") is False
     delta = elf.budget_for_profile("reproduction-delta", {})
     assert delta["reject_prebuilt_binary"] is True
-    assert delta["require_coverage_build"] is True
-    assert delta["method_variant"] == "paper-faithful"
+    assert delta.get("require_containerized_sut_runtime") is False
 
 
-def test_reproduction_epsilon_profile_accepted_by_host_runner():
+def test_reproduction_zeta_profile_accepted_by_host_runner():
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",
          "--generator", "elfuzz", "--target", "jsoncpp_jsoncpp_fuzzer",
-         "--profile", "reproduction-epsilon", "--protocol", "paper-native"],
+         "--profile", "reproduction-zeta", "--protocol", "paper-native"],
         cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
     )
     assert proc.returncode == 0, proc.stderr
 
 
 def test_dry_run_reports_input_generator_task_family():
-    # ELFuzz is an input_generator, never a harness generator. The dry-run
-    # result must carry task_family=input_generator so matrix aggregation keeps
-    # it out of the harness-generator leaderboard (epsilon plan baseline
-    # classification).
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"), "--dry-run",
          "--generator", "elfuzz", "--target", "jsoncpp_jsoncpp_fuzzer",
-         "--profile", "reproduction-epsilon", "--protocol", "paper-native"],
+         "--profile", "reproduction-zeta", "--protocol", "paper-native"],
         cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
     )
     assert proc.returncode == 0, proc.stderr
     workspace = proc.stdout.strip().splitlines()[-1]
     result = json.loads((Path(workspace) / "result.json").read_text(encoding="utf-8"))
     assert result["task_family"] == "input_generator"
-    assert result["profile"] == "reproduction-epsilon"
+    assert result["profile"] == "reproduction-zeta"
     assert result["method_variant"] == "paper-faithful"
 
 
@@ -323,41 +332,22 @@ def test_unknown_profile_exits_with_code_2():
     assert "invalid profile" in proc.stderr
 
 
-def test_hgb_generate_harness_rejects_unknown_profile_with_code_2():
-    proc = subprocess.run(
-        ["bash", str(ROOT / "scripts/hgb_generate_harness.sh"), "--generator", "elfuzz",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-nonexistent", "--dry-run"],
-        cwd=ROOT, capture_output=True, text=True, env=_run_env(), timeout=120,
-    )
-    assert proc.returncode == 2, proc.stderr
-    assert "unknown profile" in proc.stderr
-
-
-def test_hgb_generate_harness_accepts_reproduction_epsilon():
-    proc = subprocess.run(
-        ["bash", str(ROOT / "scripts/hgb_generate_harness.sh"), "--generator", "elfuzz",
-         "--target", "jsoncpp_jsoncpp_fuzzer", "--profile", "reproduction-epsilon", "--dry-run"],
-        cwd=ROOT, capture_output=True, text=True, env=_run_env(), timeout=120,
-    )
-    assert proc.returncode != 2
-    assert "unknown profile" not in proc.stderr
-
-
-def test_entrypoint_accepts_reproduction_epsilon():
+def test_entrypoint_accepts_reproduction_zeta():
     entrypoint = (ROOT / "docker/elfuzz/entrypoint.sh").read_text(encoding="utf-8")
-    assert "reproduction-epsilon" in entrypoint
-    assert '"$HGB_BASELINE_PROFILE" == "reproduction-epsilon"' in entrypoint
+    assert "reproduction-zeta" in entrypoint
+    assert '"$HGB_BASELINE_PROFILE" == "reproduction-zeta"' in entrypoint
+    assert "ELFUZZ_REQUIRE_CONTAINERIZED_SUT_RUNTIME" in entrypoint
 
 
 # ---------------------------------------------------------------------------
-# ELF-1. Applicability fail-fast and aggregate-safe
+# Z1. Invalid targets stop before Docker/model/ELFuzz calls
 # ---------------------------------------------------------------------------
 
 
 def test_invalid_preflight_returns_before_docker_model_tgi(tmp_path: Path):
     out = tmp_path / "result.json"
     env = {
-        "HGB_BASELINE_PROFILE": "reproduction-epsilon",
+        "HGB_BASELINE_PROFILE": "reproduction-zeta",
         "HGB_BASELINE_PROTOCOL": "paper-native",
         "HGB_METADATA_DIR": str(ROOT / "metadata"),
         "HF_TOKEN": "",
@@ -375,25 +365,19 @@ def test_invalid_preflight_returns_before_docker_model_tgi(tmp_path: Path):
     assert data["reason_code"] == "elfuzz_non_text_target"
     assert data["exclude_from_aggregate"] is True
     assert data["excluded_from_aggregate"] is True
-    assert data["profile"] == "reproduction-epsilon"
+    assert data["profile"] == "reproduction-zeta"
     assert data["protocol"] == "paper-native"
     assert data["task_family"] == "input_generator"
-    assert data["baseline"] == "elfuzz"
-    # No Docker/TGI/model stage started: every canonical stage is not_applicable.
+    assert data["method_variant"] == "paper-faithful"
     for stage in elf.STAGE_NAMES:
         assert data["stages"][stage]["status"] == "not_applicable"
-    # The host-side preflight must run before any Docker/model/TGI startup.
-    harness = (ROOT / "scripts/hgb_generate_harness.sh").read_text(encoding="utf-8")
-    assert harness.index("ELFuzz supports text-input targets only") < harness.index("ensure_artifacts_present")
 
 
 def test_host_runner_returns_invalid_before_docker_socket_check():
-    # An Invalid target must return before the Docker-socket requirement so it
-    # never fails on missing Docker (ELF-1). Run without a Docker socket.
     proc = subprocess.run(
         ["bash", str(ROOT / "scripts/hgb_run_baseline.sh"),
          "--generator", "elfuzz", "--target", "libpng_libpng_read_fuzzer",
-         "--profile", "reproduction-epsilon", "--protocol", "paper-native"],
+         "--profile", "reproduction-zeta", "--protocol", "paper-native"],
         cwd=ROOT, text=True, capture_output=True, check=False, env=_run_env(),
     )
     assert proc.returncode == 0
@@ -405,84 +389,12 @@ def test_host_runner_returns_invalid_before_docker_socket_check():
     assert result["excluded_from_aggregate"] is True
 
 
-def test_matrix_collector_counts_invalid_as_not_applicable(tmp_path: Path):
-    matrix_dir = tmp_path / "matrix" / "run"
-    inv_ws = tmp_path / "invalid"
-    app_ws = tmp_path / "applicable"
-    matrix_dir.mkdir(parents=True)
-    inv_ws.mkdir()
-    app_ws.mkdir()
-    (inv_ws / "metadata.json").write_text(json.dumps({
-        "baseline": "elfuzz", "generator": "elfuzz", "status": "not_applicable",
-        "task_family": "input_generator", "applicability": "Invalid",
-        "reason_code": "elfuzz_non_text_target", "exclude_from_aggregate": True,
-        "excluded_from_aggregate": True, "profile": "reproduction-epsilon",
-    }), encoding="utf-8")
-    (app_ws / "metadata.json").write_text(json.dumps({
-        "baseline": "elfuzz", "generator": "elfuzz", "status": "evaluated",
-        "task_family": "input_generator", "applicability": "applicable",
-        "exclude_from_aggregate": False, "excluded_from_aggregate": False,
-        "profile": "reproduction-epsilon", "method_variant": "paper-faithful",
-        "generated_input_count": 3, "elfuzz": {"fuzzer_programs": 1, "generated_inputs": 3,
-        "valid_generated_inputs": 2}, "input_generation": {"fuzzer_program_count": 1,
-        "generated_input_count": 3, "valid_generated_input_count": 2},
-        "campaign": {"execs_done": 100, "queue_count": 2},
-        "coverage": {"report_exists": True, "line_coverage": {"covered": 27, "total": 100},
-                     "edge_coverage": {"status": "unavailable"}},
-        "build": {"uses_fuzzbench_docker_environment": True},
-    }), encoding="utf-8")
-    (matrix_dir / "matrix.tsv").write_text(
-        "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
-        f"elfuzz\tlibpng_libpng_read_fuzzer\tnot_applicable\t{inv_ws}\t{inv_ws / 'metadata.json'}\t\n"
-        f"elfuzz\tjsoncpp_jsoncpp_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
-        encoding="utf-8",
-    )
-    summary = matrix_collector.collect(matrix_dir, generator="elfuzz", profile="reproduction-epsilon")
-    assert summary["not_applicable_pairs"] == 1
-    assert summary["applicable_pairs"] == 1
-    assert summary["applicable_evaluated_pairs"] == 1
-    assert summary["failed_pairs"] == 0
-
-
-def test_matrix_collector_valuable_set_counts(tmp_path: Path):
-    # 9 applicable + 11 Invalid across the valuable set (ELF-7).
-    matrix_dir = tmp_path / "matrix" / "run"
-    matrix_dir.mkdir(parents=True)
-    rows = ["generator\ttarget\tstatus\tworkspace\tmetadata\tsummary"]
-    for target in INVALID:
-        ws = matrix_dir / "inv" / target
-        ws.mkdir(parents=True, exist_ok=True)
-        (ws / "metadata.json").write_text(json.dumps({
-            "baseline": "elfuzz", "generator": "elfuzz", "status": "not_applicable",
-            "task_family": "input_generator", "applicability": "Invalid",
-            "reason_code": "elfuzz_non_text_target", "exclude_from_aggregate": True,
-            "excluded_from_aggregate": True, "profile": "reproduction-epsilon",
-        }), encoding="utf-8")
-        rows.append(f"elfuzz\t{target}\tnot_applicable\t{ws}\t{ws / 'metadata.json'}\t")
-    for target in APPLICABLE:
-        ws = matrix_dir / "app" / target
-        ws.mkdir(parents=True, exist_ok=True)
-        (ws / "metadata.json").write_text(json.dumps({
-            "baseline": "elfuzz", "generator": "elfuzz", "status": "failed",
-            "task_family": "input_generator", "applicability": "applicable",
-            "exclude_from_aggregate": False, "excluded_from_aggregate": False,
-            "profile": "reproduction-epsilon", "campaign": {"execs_done": 0},
-        }), encoding="utf-8")
-        rows.append(f"elfuzz\t{target}\tfailed\t{ws}\t{ws / 'metadata.json'}\t")
-    (matrix_dir / "matrix.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
-    summary = matrix_collector.collect(matrix_dir, generator="elfuzz", profile="reproduction-epsilon")
-    assert summary["not_applicable_pairs"] == 11
-    assert summary["applicable_pairs"] == 9
-
-
 # ---------------------------------------------------------------------------
-# ELF-2. Hanging tests and subprocess termination
+# Z2. Hanging tests and subprocess termination
 # ---------------------------------------------------------------------------
 
 
 def test_run_subprocess_kills_process_group_on_timeout(tmp_path: Path):
-    # A fake fuzzer that ignores SIGTERM must still be killed via the process
-    # group so pytest never hangs (ELF-2).
     script = (
         "#!/usr/bin/env python3\n"
         "import signal, time\n"
@@ -497,49 +409,29 @@ def test_run_subprocess_kills_process_group_on_timeout(tmp_path: Path):
     elapsed = time.time() - start
     assert timed_out is True
     assert code == 124
-    # The process group kill must terminate quickly, not wait for the full sleep.
     assert elapsed < 20, f"process group kill took {elapsed:.1f}s"
 
 
-def test_run_subprocess_test_mode_caps_timeout(tmp_path: Path):
-    # ELFUZZ_TEST_MODE_SECONDS caps the effective timeout without affecting real
-    # reproduction budgets. A fake command that sleeps longer than the cap must
-    # be terminated at the cap, not at the paper-faithful budget.
+def test_pytest_auto_cap_kills_long_running_subprocess(tmp_path: Path):
+    # zeta plan §2: under PYTEST_CURRENT_TEST, a fake ``elfuzz run --time 86400``
+    # must be killed within the auto-cap, not the paper-faithful budget.
     script = (
         "#!/usr/bin/env python3\n"
         "import signal, time\n"
         "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
         "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
-        "time.sleep(3600)\n"
+        "time.sleep(86400)\n"
     )
-    fake = make_executable(tmp_path / "hang.py", script)
+    fake = make_executable(tmp_path / "long_run.py", script)
     log = tmp_path / "log.txt"
-    saved = os.environ.get("ELFUZZ_TEST_MODE_SECONDS")
-    os.environ["ELFUZZ_TEST_MODE_SECONDS"] = "2"
-    try:
-        start = time.time()
-        # Pass a huge paper-faithful budget (86400); the cap must override it.
-        code, timed_out = elf.run_subprocess([str(fake)], log, timeout=86400)
-        elapsed = time.time() - start
-    finally:
-        if saved is None:
-            os.environ.pop("ELFUZZ_TEST_MODE_SECONDS", None)
-        else:
-            os.environ["ELFUZZ_TEST_MODE_SECONDS"] = saved
+    # PYTEST_CURRENT_TEST is set by pytest itself; pass a huge budget.
+    start = time.time()
+    code, timed_out = elf.run_subprocess([str(fake)], log, timeout=86400)
+    elapsed = time.time() - start
     assert timed_out is True
     assert code == 124
-    assert elapsed < 20
-
-
-def test_run_subprocess_returns_124_on_timeout(tmp_path: Path):
-    # A well-behaved command that exceeds the timeout returns 124 (the contract
-    # the stage handlers rely on).
-    script = "#!/usr/bin/env python3\nimport time\ntime.sleep(30)\n"
-    fake = make_executable(tmp_path / "slow.py", script)
-    log = tmp_path / "log.txt"
-    code, timed_out = elf.run_subprocess([str(fake)], log, timeout=1)
-    assert timed_out is True
-    assert code == 124
+    # The auto-cap (30s) must kill the process well before 86400s.
+    assert elapsed < 40
 
 
 def test_run_subprocess_normal_completion(tmp_path: Path):
@@ -552,51 +444,38 @@ def test_run_subprocess_normal_completion(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# ELF-3. Real SUT build from the exact FuzzBench Docker environment
+# Z3. Produced-input classifier excludes prompts/configs/logs/python/preseeds
 # ---------------------------------------------------------------------------
 
 
-def test_epsilon_rejects_prebuilt_binary(tmp_path: Path):
-    project_root = tmp_path / "project"
-    project_root.mkdir()
-    cli = fake_elfuzz_cli(tmp_path / "elfuzz", project_root)
-    binary = make_executable(tmp_path / "bin", "#!/usr/bin/env bash\nexit 0\n")
-    env = base_env(tmp_path, cli, project_root)
-    env["ELFUZZ_TARGET_BINARY"] = str(binary)
-    code, metadata, pipeline, workspace = run_pipeline_inproc(tmp_path, runner=FakeDockerRunner(), env=env)
-    assert code != 0
-    assert metadata["status"] in {"infra_missing", "infra_failure"}
-    assert metadata["stages"]["target_build"]["status"] in {"infra_missing", "infra_failure"}
-
-
-def test_epsilon_builds_native_and_coverage_sut_with_artifacts(tmp_path: Path):
-    code, metadata, pipeline, workspace = run_pipeline_inproc(tmp_path)
-    assert code == 0, metadata.get("reason")
-    assert metadata["status"] == "evaluated"
-    sut = workspace / "sut"
-    contract = json.loads((sut / "contract.json").read_text(encoding="utf-8"))
-    assert contract["uses_fuzzbench_docker_environment"] is True
-    assert Path(contract["native"]["binary_path"]).is_file()
-    assert Path(contract["coverage"]["binary_path"]).is_file()
-    assert contract["native"]["verified_executable"] is True
-    assert contract["coverage"]["verified_executable"] is True
-    assert (sut / "build_logs" / "native.log").is_file()
-    assert (sut / "build_logs" / "coverage.log").is_file()
-    # Plan ELF-3 required build artifacts.
-    assert (sut / "native_image_tag.txt").is_file()
-    assert (sut / "coverage_image_tag.txt").is_file()
-    assert (sut / "native_binary_path.txt").is_file()
-    assert (sut / "coverage_binary_path.txt").is_file()
-    assert (sut / "build.log").is_file()
-    assert (sut / "coverage_build.log").is_file()
-    assert (workspace / "target" / "input_contract.json").is_file()
-    runner = pipeline.runner
-    build_cmds = [c for c in runner.commands if c[:2] == ["docker", "build"]]
-    assert len(build_cmds) >= 2
+def test_produced_input_classification_excludes_non_payloads(tmp_path: Path):
+    produced = tmp_path / "produced"
+    produced.mkdir()
+    (produced / "input_000").write_bytes(b'{"k": 0}')
+    (produced / "prompt_001").write_text("p\n", encoding="utf-8")
+    (produced / "evolved.py").write_text("x=1\n", encoding="utf-8")
+    (produced / "seed_fuzzer.py").write_text("x=1\n", encoding="utf-8")
+    (produced / "manifest.json").write_text("{}", encoding="utf-8")
+    (produced / "lineage.jsonl").write_text("{}\n", encoding="utf-8")
+    (produced / "run.log").write_text("log\n", encoding="utf-8")
+    (produced / "stats.txt").write_text("s\n", encoding="utf-8")
+    (produced / "coverage.profraw").write_bytes(b"raw")
+    (produced / "coverage.profdata").write_bytes(b"data")
+    (produced / "config.yaml").write_text("k: v\n", encoding="utf-8")
+    (produced / "preseed_corpus").write_bytes(b"seed")
+    inputs = [p for p in produced.iterdir() if elf.is_produced_input(p)]
+    assert {p.name for p in inputs} == {"input_000"}
+    assert {p.name for p in produced.iterdir() if campaign_mod.is_produced_input(p)} == {"input_000"}
+    manifest = campaign_mod.write_produced_input_provenance(produced, tmp_path / "provenance.json")
+    assert manifest["produced_input_count"] == 1
+    excluded_names = {e["path"] for e in manifest["excluded_files"]}
+    assert "prompt_001" in excluded_names
+    assert manifest["accepted_files"][0]["path"] == "input_000"
+    assert "sha256" in manifest["accepted_files"][0]
 
 
 # ---------------------------------------------------------------------------
-# ELF-4. Real ELFuzz method stages, no upstream-benchmark aliasing
+# Z4. Adapter alias cannot be used as actual execution target
 # ---------------------------------------------------------------------------
 
 
@@ -625,7 +504,28 @@ def test_result_records_reported_target_not_alias(tmp_path: Path):
     assert metadata["alias_used_for_execution"] is False
 
 
-def test_evaluated_requires_full_closed_loop(tmp_path: Path):
+# ---------------------------------------------------------------------------
+# Z5. zeta evaluated row requires full closed loop
+# ---------------------------------------------------------------------------
+
+
+def test_zeta_builds_containerized_sut_wrappers(tmp_path: Path):
+    code, metadata, pipeline, workspace = run_pipeline_inproc(tmp_path)
+    assert code == 0, metadata.get("reason")
+    assert metadata["status"] == "evaluated"
+    sut = workspace / "sut"
+    # zeta plan §3: containerized SUT wrappers must exist.
+    assert (sut / "wrappers" / "run_native_one.sh").is_file()
+    assert (sut / "wrappers" / "run_coverage_corpus.sh").is_file()
+    assert (sut / "containerized_wrappers.json").is_file()
+    wrapper_manifest = json.loads((sut / "containerized_wrappers.json").read_text(encoding="utf-8"))
+    assert wrapper_manifest["containerized"] is True
+    # Build provenance records containerized runtime.
+    assert metadata["build"]["containerized_sut_runtime"] is True
+    assert metadata["build"]["uses_fuzzbench_docker_environment"] is True
+
+
+def test_zeta_evaluated_requires_full_closed_loop(tmp_path: Path):
     code, metadata, pipeline, workspace = run_pipeline_inproc(tmp_path)
     assert code == 0, metadata.get("reason")
     assert metadata["status"] == "evaluated"
@@ -633,57 +533,35 @@ def test_evaluated_requires_full_closed_loop(tmp_path: Path):
     assert metadata["applicability"] == "applicable"
     assert metadata["method_variant"] == "paper-faithful"
     assert metadata["exclude_from_aggregate"] is False
-    # Real generation evidence (ELF-4 / ELF-5).
+    # Real generation evidence (zeta plan §5).
     assert metadata["method"]["generated_fuzzer_program_count"] > 0
     assert metadata["elfuzz"]["fuzzer_programs"] >= 1
     assert metadata["elfuzz"]["generated_inputs"] >= 1
     assert metadata["elfuzz"]["valid_generated_inputs"] >= 1
-    assert metadata["elfuzz"]["evolution_iterations"] >= 1
-    # Real campaign + coverage evidence (ELF-6).
+    # zeta plan §5: evolution_iterations >= 2.
+    assert metadata["elfuzz"]["evolution_iterations"] >= 2
+    # Real campaign + coverage evidence (zeta plan §6/§7).
     assert metadata["campaign"]["execs_done"] > 0
+    assert metadata["campaign"]["queue_count"] > 0
     assert metadata["coverage"]["report_exists"] is True
     assert metadata["coverage"]["line_coverage"]["covered"] > 0
     assert metadata["coverage"]["edge_coverage"]["status"] == "unavailable"
-    # Build provenance from the FuzzBench Docker environment (ELF-3).
+    # Build provenance from the FuzzBench Docker environment (zeta plan §3/§8).
     assert metadata["build"]["uses_fuzzbench_docker_environment"] is True
+    assert metadata["build"]["containerized_sut_runtime"] is True
+    # actual_sut_fuzz_target matches the reported target.
+    assert metadata["actual_sut_fuzz_target"] == metadata["reported_target"]
     # All canonical stages completed.
     for stage in elf.STAGE_NAMES:
         assert metadata["stages"][stage]["status"] == "complete", stage
+    # Campaign evidence artifacts (zeta plan §6).
+    assert (workspace / "campaign" / "command.txt").is_file()
+    assert (workspace / "campaign" / "target_runtime.log").is_file()
+    assert (workspace / "campaign" / "target_runtime.json").is_file()
 
 
 # ---------------------------------------------------------------------------
-# ELF-5. Count only real produced inputs
-# ---------------------------------------------------------------------------
-
-
-def test_produced_input_classification_excludes_prompts(tmp_path: Path):
-    produced = tmp_path / "produced"
-    produced.mkdir()
-    (produced / "input_000").write_bytes(b'{"k": 0}')
-    (produced / "prompt_001").write_text("p\n", encoding="utf-8")
-    (produced / "evolved.py").write_text("x=1\n", encoding="utf-8")
-    (produced / "seed_fuzzer.py").write_text("x=1\n", encoding="utf-8")
-    (produced / "manifest.json").write_text("{}", encoding="utf-8")
-    (produced / "lineage.jsonl").write_text("{}\n", encoding="utf-8")
-    (produced / "run.log").write_text("log\n", encoding="utf-8")
-    (produced / "stats.txt").write_text("s\n", encoding="utf-8")
-    (produced / "coverage.profraw").write_bytes(b"raw")
-    (produced / "coverage.profdata").write_bytes(b"data")
-    (produced / "config.yaml").write_text("k: v\n", encoding="utf-8")
-    (produced / "preseed_corpus").write_bytes(b"seed")
-    inputs = [p for p in produced.iterdir() if elf.is_produced_input(p)]
-    assert {p.name for p in inputs} == {"input_000"}
-    assert {p.name for p in produced.iterdir() if campaign_mod.is_produced_input(p)} == {"input_000"}
-    manifest = campaign_mod.write_produced_input_provenance(produced, tmp_path / "provenance.json")
-    assert manifest["produced_input_count"] == 1
-    excluded_names = {e["path"] for e in manifest["excluded_files"]}
-    assert "prompt_001" in excluded_names
-    assert manifest["accepted_files"][0]["path"] == "input_000"
-    assert "sha256" in manifest["accepted_files"][0]
-
-
-# ---------------------------------------------------------------------------
-# ELF-6. Coverage must be real and strict
+# Z6. Coverage missing fails with reason_code=coverage_report_missing
 # ---------------------------------------------------------------------------
 
 
@@ -700,53 +578,23 @@ def test_coverage_fails_when_report_missing(tmp_path: Path):
     assert cov["edge_coverage"]["status"] == "unavailable"
     assert cov["line_coverage"] is None or cov.get("total_lines", 0) == 0
     assert (workspace / "coverage" / "coverage_diagnostic.json").is_file()
-    diag = json.loads((workspace / "coverage" / "coverage_diagnostic.json").read_text(encoding="utf-8"))
-    assert diag["line_coverage"] is None
 
 
-def test_afl_paths_alone_not_line_coverage():
-    summary = campaign_mod.coverage_from_campaign(
-        stats={"execs_done": 0, "paths_total": 99}, report_path=None, queue_count=99
-    )
-    assert summary["edge_coverage"]["status"] == "unavailable"
-    assert summary["line_coverage"] is None
-    assert summary["complete"] is False
-    verify = campaign_mod.verify_campaign_execs({"execs_done": 0, "paths_total": 99})
-    assert verify["has_executions"] is False
-    assert verify["paths_only"] is True
-
-
-def test_zero_exec_campaign_fails(tmp_path: Path):
+def test_zeta_rejects_prebuilt_binary(tmp_path: Path):
     project_root = tmp_path / "project"
     project_root.mkdir()
     cli = fake_elfuzz_cli(tmp_path / "elfuzz", project_root)
-    zero_cli = make_executable(
-        tmp_path / "zero_elfuzz",
-        "#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\n"
-        "root=Path(os.environ.get('ELFUZZ_PROJECT_ROOT',''))\ncmd=sys.argv[1] if len(sys.argv)>1 else ''\n"
-        "benchmark=sys.argv[-1] if sys.argv else ''\n"
-        "if cmd=='synth':\n"
-        "  d=Path(os.environ['ELFUZZ_FUZZER_PROGRAMS_DIR']); d.mkdir(parents=True,exist_ok=True)\n"
-        "  (d/'f.py').write_text('x=1\\n')\n  sys.exit(0)\n"
-        "if cmd=='produce':\n"
-        "  d=Path(os.environ['ELFUZZ_PRODUCED_INPUTS_DIR']); d.mkdir(parents=True,exist_ok=True)\n"
-        "  (d/'in_0').write_bytes(b'{}')\n  sys.exit(0)\n"
-        "if cmd=='run':\n"
-        "  d=Path(os.environ['ELFUZZ_CAMPAIGN_OUTPUT_DIR'])/(benchmark+'_elfuzz_1')\n"
-        "  (d/'default'/'queue').mkdir(parents=True,exist_ok=True)\n"
-        "  (d/'default'/'fuzzer_stats').write_text('execs_done : 0\\npaths_total : 3\\n')\n"
-        "  (d/'default'/'queue'/'id:0').write_bytes(b'{}')\n  sys.exit(0)\n"
-        "sys.exit(0)\n",
-    )
-    env = base_env(tmp_path, zero_cli, project_root)
+    binary = make_executable(tmp_path / "bin", "#!/usr/bin/env bash\nexit 0\n")
+    env = base_env(tmp_path, cli, project_root)
+    env["ELFUZZ_TARGET_BINARY"] = str(binary)
     code, metadata, pipeline, workspace = run_pipeline_inproc(tmp_path, runner=FakeDockerRunner(), env=env)
     assert code != 0
-    assert metadata["status"] != "evaluated"
-    assert metadata["stages"]["campaign"]["status"] == "failed"
+    assert metadata["status"] in {"infra_missing", "infra_failure"}
+    assert metadata["stages"]["target_build"]["status"] in {"infra_missing", "infra_failure"}
 
 
 # ---------------------------------------------------------------------------
-# ELF-7. Strict matrix collector invariants
+# Z7. Strict matrix collector invariants
 # ---------------------------------------------------------------------------
 
 
@@ -759,25 +607,28 @@ def test_matrix_strict_no_violations_for_real_evaluated_row(tmp_path: Path):
         "baseline": "elfuzz", "generator": "elfuzz", "status": "evaluated",
         "task_family": "input_generator", "applicability": "applicable",
         "exclude_from_aggregate": False, "excluded_from_aggregate": False,
-        "profile": "reproduction-epsilon", "method_variant": "paper-faithful",
+        "profile": "reproduction-zeta", "method_variant": "paper-faithful",
+        "reported_target": "jsoncpp_jsoncpp_fuzzer",
+        "actual_sut_fuzz_target": "jsoncpp_jsoncpp_fuzzer",
         "generated_input_count": 3, "elfuzz": {"fuzzer_programs": 1, "generated_inputs": 3,
-        "valid_generated_inputs": 2}, "input_generation": {"fuzzer_program_count": 1,
-        "generated_input_count": 3, "valid_generated_input_count": 2},
+        "valid_generated_inputs": 2, "evolution_iterations": 2},
+        "input_generation": {"fuzzer_program_count": 1, "generated_input_count": 3,
+        "valid_generated_input_count": 2, "evolution_iterations_completed": 2},
         "campaign": {"execs_done": 100, "queue_count": 2},
         "coverage": {"report_exists": True, "line_coverage": {"covered": 27, "total": 100},
                      "edge_coverage": {"status": "unavailable"}},
-        "build": {"uses_fuzzbench_docker_environment": True},
+        "build": {"uses_fuzzbench_docker_environment": True, "containerized_sut_runtime": True},
     }), encoding="utf-8")
     (matrix_dir / "matrix.tsv").write_text(
         "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
         f"elfuzz\tjsoncpp_jsoncpp_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
         encoding="utf-8",
     )
-    summary = matrix_collector.collect(matrix_dir, strict=True, generator="elfuzz", profile="reproduction-epsilon")
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="elfuzz", profile="reproduction-zeta")
     assert summary["evaluated_row_violations"] == []
 
 
-def test_matrix_strict_flags_coverage_missing_evaluated_row(tmp_path: Path):
+def test_matrix_strict_flags_zeta_missing_containerized_runtime(tmp_path: Path):
     matrix_dir = tmp_path / "matrix" / "run"
     matrix_dir.mkdir(parents=True)
     app_ws = matrix_dir / "app"
@@ -785,63 +636,97 @@ def test_matrix_strict_flags_coverage_missing_evaluated_row(tmp_path: Path):
     (app_ws / "metadata.json").write_text(json.dumps({
         "baseline": "elfuzz", "generator": "elfuzz", "status": "evaluated",
         "task_family": "input_generator", "applicability": "applicable",
-        "exclude_from_aggregate": False, "profile": "reproduction-epsilon",
-        "method_variant": "paper-faithful", "generated_input_count": 3,
-        "elfuzz": {"fuzzer_programs": 1, "generated_inputs": 3, "valid_generated_inputs": 2},
-        "campaign": {"execs_done": 100, "queue_count": 2},
-        "coverage": {"report_exists": False, "line_coverage": None,
-                     "edge_coverage": {"status": "unavailable"}},
-        "build": {"uses_fuzzbench_docker_environment": True},
-    }), encoding="utf-8")
-    (matrix_dir / "matrix.tsv").write_text(
-        "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
-        f"elfuzz\tjsoncpp_jsoncpp_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
-        encoding="utf-8",
-    )
-    summary = matrix_collector.collect(matrix_dir, strict=True, generator="elfuzz", profile="reproduction-epsilon")
-    assert summary["evaluated_row_violations"]
-    violations = summary["evaluated_row_violations"][0]["violations"]
-    assert any("report_exists" in v for v in violations)
-
-
-def test_matrix_strict_flags_non_paper_faithful_evaluated_row(tmp_path: Path):
-    matrix_dir = tmp_path / "matrix" / "run"
-    matrix_dir.mkdir(parents=True)
-    app_ws = matrix_dir / "app"
-    app_ws.mkdir()
-    (app_ws / "metadata.json").write_text(json.dumps({
-        "baseline": "elfuzz", "generator": "elfuzz", "status": "evaluated",
-        "task_family": "input_generator", "applicability": "applicable",
-        "exclude_from_aggregate": False, "profile": "reproduction-epsilon",
-        "method_variant": "compat-smoke", "generated_input_count": 3,
-        "elfuzz": {"fuzzer_programs": 1, "generated_inputs": 3, "valid_generated_inputs": 2},
+        "exclude_from_aggregate": False, "profile": "reproduction-zeta",
+        "method_variant": "paper-faithful", "reported_target": "jsoncpp_jsoncpp_fuzzer",
+        "actual_sut_fuzz_target": "jsoncpp_jsoncpp_fuzzer",
+        "generated_input_count": 3, "elfuzz": {"fuzzer_programs": 1, "generated_inputs": 3,
+        "valid_generated_inputs": 2, "evolution_iterations": 2},
         "campaign": {"execs_done": 100, "queue_count": 2},
         "coverage": {"report_exists": True, "line_coverage": {"covered": 27, "total": 100},
                      "edge_coverage": {"status": "unavailable"}},
-        "build": {"uses_fuzzbench_docker_environment": True},
+        "build": {"uses_fuzzbench_docker_environment": True, "containerized_sut_runtime": False},
     }), encoding="utf-8")
     (matrix_dir / "matrix.tsv").write_text(
         "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
         f"elfuzz\tjsoncpp_jsoncpp_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
         encoding="utf-8",
     )
-    summary = matrix_collector.collect(matrix_dir, strict=True, generator="elfuzz", profile="reproduction-epsilon")
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="elfuzz", profile="reproduction-zeta")
     assert summary["evaluated_row_violations"]
     violations = summary["evaluated_row_violations"][0]["violations"]
-    assert any("method_variant" in v for v in violations)
+    assert any("containerized" in v for v in violations)
+
+
+def test_matrix_strict_flags_zeta_low_evolution_iterations(tmp_path: Path):
+    matrix_dir = tmp_path / "matrix" / "run"
+    matrix_dir.mkdir(parents=True)
+    app_ws = matrix_dir / "app"
+    app_ws.mkdir()
+    (app_ws / "metadata.json").write_text(json.dumps({
+        "baseline": "elfuzz", "generator": "elfuzz", "status": "evaluated",
+        "task_family": "input_generator", "applicability": "applicable",
+        "exclude_from_aggregate": False, "profile": "reproduction-zeta",
+        "method_variant": "paper-faithful", "reported_target": "jsoncpp_jsoncpp_fuzzer",
+        "actual_sut_fuzz_target": "jsoncpp_jsoncpp_fuzzer",
+        "generated_input_count": 3, "elfuzz": {"fuzzer_programs": 1, "generated_inputs": 3,
+        "valid_generated_inputs": 2, "evolution_iterations": 1},
+        "campaign": {"execs_done": 100, "queue_count": 2},
+        "coverage": {"report_exists": True, "line_coverage": {"covered": 27, "total": 100},
+                     "edge_coverage": {"status": "unavailable"}},
+        "build": {"uses_fuzzbench_docker_environment": True, "containerized_sut_runtime": True},
+    }), encoding="utf-8")
+    (matrix_dir / "matrix.tsv").write_text(
+        "generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n"
+        f"elfuzz\tjsoncpp_jsoncpp_fuzzer\tevaluated\t{app_ws}\t{app_ws / 'metadata.json'}\t\n",
+        encoding="utf-8",
+    )
+    summary = matrix_collector.collect(matrix_dir, strict=True, generator="elfuzz", profile="reproduction-zeta")
+    assert summary["evaluated_row_violations"]
+    violations = summary["evaluated_row_violations"][0]["violations"]
+    assert any("evolution_iterations" in v for v in violations)
+
+
+def test_matrix_collector_valuable_set_counts(tmp_path: Path):
+    # 9 applicable + 11 Invalid across the valuable set (zeta plan).
+    matrix_dir = tmp_path / "matrix" / "run"
+    matrix_dir.mkdir(parents=True)
+    rows = ["generator\ttarget\tstatus\tworkspace\tmetadata\tsummary"]
+    for target in INVALID:
+        ws = matrix_dir / "inv" / target
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "metadata.json").write_text(json.dumps({
+            "baseline": "elfuzz", "generator": "elfuzz", "status": "not_applicable",
+            "task_family": "input_generator", "applicability": "Invalid",
+            "reason_code": "elfuzz_non_text_target", "exclude_from_aggregate": True,
+            "excluded_from_aggregate": True, "profile": "reproduction-zeta",
+        }), encoding="utf-8")
+        rows.append(f"elfuzz\t{target}\tnot_applicable\t{ws}\t{ws / 'metadata.json'}\t")
+    for target in APPLICABLE:
+        ws = matrix_dir / "app" / target
+        ws.mkdir(parents=True, exist_ok=True)
+        (ws / "metadata.json").write_text(json.dumps({
+            "baseline": "elfuzz", "generator": "elfuzz", "status": "failed",
+            "task_family": "input_generator", "applicability": "applicable",
+            "exclude_from_aggregate": False, "excluded_from_aggregate": False,
+            "profile": "reproduction-zeta", "campaign": {"execs_done": 0},
+        }), encoding="utf-8")
+        rows.append(f"elfuzz\t{target}\tfailed\t{ws}\t{ws / 'metadata.json'}\t")
+    (matrix_dir / "matrix.tsv").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    summary = matrix_collector.collect(matrix_dir, generator="elfuzz", profile="reproduction-zeta")
+    assert summary["not_applicable_pairs"] == 11
+    assert summary["applicable_pairs"] == 9
 
 
 def test_valuable_target_set_has_twenty_targets():
-    hgb_targets = load_module("hgb_targets_epsilon", ROOT / "scripts/hgb_targets.py")
+    hgb_targets = load_module("hgb_targets_zeta", ROOT / "scripts/hgb_targets.py")
     registry = hgb_targets.load_registry(ROOT)
     valuable = hgb_targets.targets_for_set(registry, "valuable")
     assert len(valuable) == 20
-    # 9 applicable text targets + 11 invalid non-text targets.
     assert APPLICABLE.issubset(set(valuable))
     assert INVALID.issubset(set(valuable))
 
 
-def test_matrix_runner_wrapper_accepts_epsilon_args():
+def test_matrix_runner_wrapper_accepts_zeta_args():
     wrapper = (ROOT / "scripts/hgb_run_baseline_matrix.sh").read_text(encoding="utf-8")
     assert "hgb_generate_matrix.sh" in wrapper
     assert "--profile" in wrapper

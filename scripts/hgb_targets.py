@@ -1697,14 +1697,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "package":
         require_split = args.require_split
         # Infer require_split for blind-project harness generators when not
-        # explicitly set (reproduction-epsilon / reproduction-delta fail-closed
-        # contract).
+        # explicitly set (reproduction-zeta / reproduction-epsilon /
+        # reproduction-delta fail-closed contract).
         if not require_split:
             baseline_profile = os.environ.get("HGB_BASELINE_PROFILE", "")
             baseline_protocol = os.environ.get("HGB_BASELINE_PROTOCOL", "")
             if baseline_protocol == "blind-project" and (
                 os.environ.get("HGB_TARGET_REQUIRE_SPLIT", "0") == "1"
-                or baseline_profile in ("reproduction-delta", "reproduction-epsilon")
+                or baseline_profile in ("reproduction-delta", "reproduction-epsilon", "reproduction-zeta")
             ):
                 require_split = True
         try:

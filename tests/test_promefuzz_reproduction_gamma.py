@@ -873,7 +873,9 @@ class _FakeDockerRunner:
                 name = cmd[-1]
                 phase = self._containers.get(name, "unknown")
                 if phase == "smoke":
-                    stderr = "AddressSanitizer: crash\n" if self.smoke_crash else ""
+                    stderr = "HGB_TARGET_START\n"
+                    if self.smoke_crash:
+                        stderr += "AddressSanitizer: crash\n"
                     return _FakeDockerResult(cmd, 77 if self.smoke_crash else 0, "", stderr)
                 if phase == "campaign":
                     if self.campaign_stdout is not None:
@@ -885,7 +887,20 @@ class _FakeDockerRunner:
                 if phase == "coverage":
                     return _FakeDockerResult(cmd, 0, self.coverage_stdout, "")
                 return _FakeDockerResult(cmd, 0, "", "")
-            if sub in ("cp", "rm"):
+            if sub == "cp":
+                cp_src = cmd[2] if len(cmd) > 2 else ""
+                cp_dst = cmd[3] if len(cmd) > 3 else ""
+                if "corpus.tar" in cp_src and cp_dst:
+                    import io
+                    import tarfile
+                    Path(cp_dst).parent.mkdir(parents=True, exist_ok=True)
+                    data = b"corpus-input-1"
+                    with tarfile.open(cp_dst, "w") as tf:
+                        info = tarfile.TarInfo(name="corpus/seed_0000")
+                        info.size = len(data)
+                        tf.addfile(info, io.BytesIO(data))
+                return _FakeDockerResult(cmd, 0, "", "")
+            if sub == "rm":
                 return _FakeDockerResult(cmd, 0, "", "")
         return _FakeDockerResult(cmd, 0, "", "")
 
