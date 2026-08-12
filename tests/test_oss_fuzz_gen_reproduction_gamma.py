@@ -779,7 +779,7 @@ def test_entrypoint_has_reproduction_gamma_profile_defaults() -> None:
 
 def test_run_baseline_accepts_reproduction_gamma_for_ofg() -> None:
     script = (REPO_ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke)" in script
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke)" in script
     assert "oss-fuzz-gen/reproduction-gamma: OFG_ALLOW_PROJECT_YAML_FALLBACK=1 is forbidden" in script
     assert "oss-fuzz-gen/reproduction-gamma: OFG_SYNTHESIZE_ON_BAD_BENCHMARK=1 is forbidden" in script
 

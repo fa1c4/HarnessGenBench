@@ -122,24 +122,26 @@ if [[ "$mode" == "generate-target" ]]; then
   export ELFUZZ_SANITIZER="${ELFUZZ_SANITIZER:-address}"
   # reproduction-gamma (plan elfuzz_reproduction_gamma.md), reproduction-delta
   # (plan elfuzz_reproduction_delta.md), reproduction-epsilon (epsilon plan
-  # shared foundation), and reproduction-zeta (zeta plan): build exact
-  # FuzzBench native+coverage SUTs, replay generated/campaign inputs on the
-  # coverage SUT, and require a real LLVM coverage report. The SUT build needs
-  # the Docker socket (base-builder environment) and is never satisfied by a
-  # prebuilt ELFUZZ_TARGET_BINARY.
-  # reproduction-zeta is the canonical strict paper-native input-generator
-  # profile (zeta plan); reproduction-epsilon is the epsilon strict profile;
+  # shared foundation), reproduction-zeta (zeta plan), and reproduction-eta
+  # (eta plan): build exact FuzzBench native+coverage SUTs, replay
+  # generated/campaign inputs on the coverage SUT, and require a real LLVM
+  # coverage report. The SUT build needs the Docker socket (base-builder
+  # environment) and is never satisfied by a prebuilt ELFUZZ_TARGET_BINARY.
+  # reproduction-eta is the canonical strictest paper-native input-generator
+  # profile (eta plan); reproduction-zeta is the zeta strict profile;
+  # reproduction-epsilon is the epsilon strict profile;
   # reproduction-delta is its backward-compatible alias;
   # reproduction-gamma remains a backward-compatible alias.
-  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" || "$HGB_BASELINE_PROFILE" == "reproduction-zeta" ]]; then
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" || "$HGB_BASELINE_PROFILE" == "reproduction-zeta" || "$HGB_BASELINE_PROFILE" == "reproduction-eta" ]]; then
     export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-1}"
     export ELFUZZ_REQUIRE_GPU="${ELFUZZ_REQUIRE_GPU:-1}"
     export ELFUZZ_ALLOW_SUT_BUILD="${ELFUZZ_ALLOW_SUT_BUILD:-1}"
   fi
-  # reproduction-zeta is the strictest profile (zeta plan §1): force the SUT
-  # to be built from the FuzzBench Docker environment and require containerized
-  # SUT runtime so host-binary execution is never accepted.
-  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-zeta" ]]; then
+  # reproduction-eta and reproduction-zeta are the strictest profiles
+  # (eta/zeta plan §1): force the SUT to be built from the FuzzBench Docker
+  # environment and require containerized SUT runtime so host-binary execution
+  # is never accepted.
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-zeta" || "$HGB_BASELINE_PROFILE" == "reproduction-eta" ]]; then
     export ELFUZZ_REQUIRE_CONTAINERIZED_SUT_RUNTIME="${ELFUZZ_REQUIRE_CONTAINERIZED_SUT_RUNTIME:-1}"
     export ELFUZZ_REQUIRE_EVOLUTION_ITERATIONS="${ELFUZZ_REQUIRE_EVOLUTION_ITERATIONS:-2}"
   fi

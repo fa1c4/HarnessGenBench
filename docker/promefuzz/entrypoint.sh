@@ -346,6 +346,7 @@ promefuzz_write_final_result() {
   [[ "$profile" == "reproduction-delta" ]] && method_variant="paper-faithful"
   [[ "$profile" == "reproduction-epsilon" ]] && method_variant="paper-faithful"
   [[ "$profile" == "reproduction-zeta" ]] && method_variant="paper-faithful"
+  [[ "$profile" == "reproduction-eta" ]] && method_variant="paper-faithful"
   PROME_FUZZ_PROFILE="$profile" PROME_FUZZ_PROTOCOL="$protocol" PROME_FUZZ_TARGET="$target" \
   PROME_FUZZ_STATUS="$status" PROME_FUZZ_REASON="$reason" PROME_FUZZ_CODE="$exit_code" \
   PROME_FUZZ_METHOD="$method_variant" PROME_FUZZ_EXCLUDED="$excluded" \
@@ -504,7 +505,7 @@ if [[ "$mode" == "generate-target" ]]; then
     exit 65
   fi
   case "$promefuzz_profile" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta)
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
       promefuzz_method_faithful=1
       export PROME_FUZZ_EMBEDDING_LLM_TYPE="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-openai}"
       export PROME_FUZZ_EMBEDDING_MODEL="${PROME_FUZZ_EMBEDDING_MODEL:-text-embedding-3-small}"
@@ -518,16 +519,18 @@ if [[ "$mode" == "generate-target" ]]; then
       if [[ "$promefuzz_profile" == "reproduction-gamma" ]]; then
         export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-exact_fuzzbench}"
       fi
-      # Delta/epsilon/zeta plan section 3: reproduction-delta, reproduction-epsilon,
-      # and reproduction-zeta use the fuzzbench_replay strategy name so
-      # provenance.json records the exact FuzzBench build.
-      if [[ "$promefuzz_profile" == "reproduction-delta" || "$promefuzz_profile" == "reproduction-epsilon" || "$promefuzz_profile" == "reproduction-zeta" ]]; then
+      # Delta/epsilon/zeta/eta plan section 3: reproduction-delta,
+      # reproduction-epsilon, reproduction-zeta, and reproduction-eta use the
+      # fuzzbench_replay strategy name so provenance.json records the exact
+      # FuzzBench build.
+      if [[ "$promefuzz_profile" == "reproduction-delta" || "$promefuzz_profile" == "reproduction-epsilon" || "$promefuzz_profile" == "reproduction-zeta" || "$promefuzz_profile" == "reproduction-eta" ]]; then
         export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-fuzzbench_replay}"
       fi
-      # Zeta plan §1: zeta is the strictest profile. Force exact FuzzBench
-      # compile context, verified link args, consumer cases, real embedding,
-      # and a sealed split package.
-      if [[ "$promefuzz_profile" == "reproduction-zeta" ]]; then
+      # Zeta plan §1 / eta plan §1: zeta and eta are the strictest profiles.
+      # Force exact FuzzBench compile context, verified link args, consumer
+      # cases, real embedding, and a sealed split package. Eta is the canonical
+      # strict profile and inherits all zeta required env values.
+      if [[ "$promefuzz_profile" == "reproduction-zeta" || "$promefuzz_profile" == "reproduction-eta" ]]; then
         export PROMEFUZZ_EMBEDDING_PROVIDER="${PROMEFUZZ_EMBEDDING_PROVIDER:-real}"
         export PROMEFUZZ_ALLOW_HASH_EMBEDDING=0
         export PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB=0
@@ -571,7 +574,7 @@ if [[ "$mode" == "generate-target" ]]; then
   # sanitized generator_input half and must never expose reference_harnesses,
   # selected_reference_harnesses, or fuzzbench_selected_harness_apis.json.
   # The evaluator half must provide evaluator_manifest.json.
-  if [[ "$promefuzz_profile" == "reproduction-delta" || "$promefuzz_profile" == "reproduction-epsilon" || "$promefuzz_profile" == "reproduction-zeta" ]] && [[ "$promefuzz_protocol" == "blind-project" ]]; then
+  if [[ "$promefuzz_profile" == "reproduction-delta" || "$promefuzz_profile" == "reproduction-epsilon" || "$promefuzz_profile" == "reproduction-zeta" || "$promefuzz_profile" == "reproduction-eta" ]] && [[ "$promefuzz_protocol" == "blind-project" ]]; then
     if ! test -f /target/target_manifest.json; then
       reason="promefuzz_delta_manifest_missing: /target/target_manifest.json is missing; the generator_input half was not mounted"
       hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
@@ -1216,6 +1219,36 @@ PY_PROMEFUZZ_COMPREHEND_AUDIT
         exit 1
       fi
       promefuzz_set_stage knowledge completed
+      # Eta plan §4: record knowledge_usage.json proving counts of documents,
+      # API usage patterns, call correlations, retrieved examples, and APIs
+      # used in final prompts. This is required for eta and recorded for all
+      # method-faithful profiles.
+      "$python" - "$workspace/promefuzz_out/$safe_target" "$consumer_cases_status" "${selected_api_count:-0}" <<'PY_PROMEFUZZ_KNOWLEDGE_USAGE' 2>"$workspace/logs/knowledge_usage.log" || true
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+try:
+    import promefuzz_build_context as pbc
+    knowledge_dir = Path(sys.argv[1])
+    consumer_status = sys.argv[2]
+    selected_api_count = int(sys.argv[3] or 0)
+    consumer_count = 0
+    consumer_cases_path = Path("/workspace/knowledge/consumer_cases.json")
+    if consumer_cases_path.is_file():
+        try:
+            consumer_count = json.loads(consumer_cases_path.read_text(encoding="utf-8")).get("consumer_count", 0)
+        except Exception:
+            consumer_count = 0
+    pbc.write_knowledge_usage(
+        knowledge_dir,
+        consumer_cases_status=consumer_status,
+        consumer_count=consumer_count,
+        selected_api_count=selected_api_count,
+    )
+except Exception as exc:
+    print(f"knowledge_usage_write_failed: {exc}", file=sys.stderr)
+PY_PROMEFUZZ_KNOWLEDGE_USAGE
     elif [[ "$stage" == "generate" ]]; then
       promefuzz_set_stage generation completed
     fi
@@ -1325,6 +1358,20 @@ PY_PROMEFUZZ_INTENDED_APIS
       --strict
     )
     [[ -n "$intended_apis_arg" ]] && evaluator_args+=(--intended-apis "$intended_apis_arg")
+    # HGB8 blocker fix / eta plan §2: strict reproduction profiles must build
+    # a separate coverage-instrumented image so coverage comes from a real
+    # coverage build, not a stdout fallback. zeta/eta additionally run the
+    # native coverage control to produce a line-coverage diff (eta plan §5).
+    case "$promefuzz_profile" in
+      reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
+        evaluator_args+=(--build-coverage-image)
+        ;;
+    esac
+    case "$promefuzz_profile" in
+      reproduction-zeta|reproduction-eta)
+        evaluator_args+=(--run-native-control)
+        ;;
+    esac
     "$python" "${evaluator_args[@]}" >"$workspace/logs/evaluator.log" 2>&1 || verification_code=$?
     eval_result="$eval_dir/result.json"
     if [[ -f "$eval_result" ]]; then

@@ -820,7 +820,8 @@ def test_full_evaluated_loop_succeeds_for_delta(tmp_path: Path) -> None:
 def test_entrypoint_has_reproduction_delta_profile_defaults() -> None:
     entrypoint = (REPO_ROOT / "docker/oss-fuzz-gen/entrypoint.sh").read_text(encoding="utf-8")
     # The strict reproduction branch covers reproduction-delta and its epsilon alias.
-    assert "reproduction-delta|reproduction-epsilon|reproduction-zeta)" in entrypoint
+    # zeta/eta have their own cases that layer additional env on top.
+    assert "reproduction-delta|reproduction-epsilon)" in entrypoint
     assert 'OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"' in entrypoint
     assert 'OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"' in entrypoint
 
@@ -833,7 +834,7 @@ def test_entrypoint_evaluator_passes_protocol_and_build_timeout() -> None:
 
 def test_run_baseline_accepts_reproduction_delta_for_ofg() -> None:
     script = (REPO_ROOT / "scripts/hgb_run_baseline.sh").read_text(encoding="utf-8")
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke)" in script
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke)" in script
     assert "oss-fuzz-gen/$profile: OFG_SKIP_COVERAGE_GAINS=1 is forbidden" in script
     assert "oss-fuzz-gen/$profile: OFG_ALLOW_GCS_TARGET_DOWNLOAD=1 is forbidden" in script
     assert "oss-fuzz-gen/$profile: OFG_INTROSPECTOR_MODE=local is forbidden" in script

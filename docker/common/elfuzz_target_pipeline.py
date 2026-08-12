@@ -532,19 +532,20 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
             "method_variant": "compat-smoke",
             "source": "ci-smoke",
         }
-    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}:
-        # reproduction-zeta is the canonical strict paper-native
-        # input-generator profile (plan elfuzz_reproduction_zeta.md). It
-        # inherits the epsilon strict invariants and additionally requires the
+    if profile in {"paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}:
+        # reproduction-eta is the canonical strictest paper-native
+        # input-generator profile (plan elfuzz_reproduction_eta.md). It
+        # inherits the zeta strict invariants and additionally requires the
         # SUT to run inside the FuzzBench Docker runtime (containerized
-        # wrappers), never as a host-extracted binary. reproduction-epsilon is
-        # the strict profile from the epsilon plan; reproduction-delta is its
+        # wrappers), never as a host-extracted binary. reproduction-zeta is
+        # the strict profile from the zeta plan; reproduction-epsilon is the
+        # strict profile from the epsilon plan; reproduction-delta is its
         # backward-compatible alias (plan elfuzz_reproduction_delta.md). It
         # inherits the paper-faithful budget and, like reproduction-gamma,
         # rejects a prebuilt ELFUZZ_TARGET_BINARY and requires a real
         # coverage-instrumented replay.
-        strict = profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
-        zeta = profile == "reproduction-zeta"
+        strict = profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+        zeta = profile in {"reproduction-zeta", "reproduction-eta"}
         budget = {
             "profile": profile,
             "evolution_iterations": env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50),
@@ -2344,9 +2345,9 @@ class ELFuzzPipeline:
         input validation, real SUT execution, and a real coverage replay.
 
         A build-only or fake-coverage result must never be marked ``evaluated``.
-        For ``reproduction-zeta`` additionally require the containerized SUT
-        wrappers, ``evolution_iterations >= 2``, and a nonempty campaign
-        queue (zeta plan §5/§6/§8).
+        For ``reproduction-eta`` and ``reproduction-zeta`` additionally require
+        the containerized SUT wrappers, ``evolution_iterations >= 2``, and a
+        nonempty campaign queue (eta/zeta plan §5/§6/§8).
         """
 
         if self.fuzzer_program_count <= 0:
@@ -2367,25 +2368,26 @@ class ELFuzzPipeline:
                 raise PipelineError("failed", "evaluated requires real LLVM line/region/function coverage", 65)
             if int(cov.get("inputs_replayed", 0) or 0) <= 0:
                 raise PipelineError("failed", "evaluated requires replayed inputs on the coverage SUT", 65)
-        # zeta plan §5/§6/§8: stricter invariants for the zeta profile.
+        # eta/zeta plan §5/§6/§8: stricter invariants for the eta/zeta profiles.
         if bool(self.budget.get("require_containerized_sut_runtime")):
+            _profile = self.budget.get("profile", "reproduction-zeta")
             if self.evolution_iterations_completed < 2:
                 raise PipelineError(
                     "failed",
-                    "reproduction-zeta evaluated requires evolution_iterations >= 2",
+                    f"{_profile} evaluated requires evolution_iterations >= 2",
                     65,
                 )
             if self.queue_count <= 0:
                 raise PipelineError(
                     "failed",
-                    "reproduction-zeta evaluated requires a nonempty campaign queue",
+                    f"{_profile} evaluated requires a nonempty campaign queue",
                     65,
                 )
             wrapper = self._sut_root() / "wrappers" / "run_native_one.sh"
             if not wrapper.is_file():
                 raise PipelineError(
                     "failed",
-                    "reproduction-zeta evaluated requires containerized SUT wrappers",
+                    f"{_profile} evaluated requires containerized SUT wrappers",
                     65,
                 )
 
@@ -2450,7 +2452,7 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "fuzz_target": target,
         "profile": profile,
         "protocol": protocol,
-        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"} else profile,
+        "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"} else profile,
         "status": "not_applicable",
         "applicability": "Invalid",
         "reason_code": reason_code,
@@ -2497,7 +2499,7 @@ def invalid_payload(target: str, metadata_root: Path) -> dict[str, Any]:
         "reproducibility": {
             "fuzzbench_commit": "",
             "build_uses_fuzzbench_docker_environment": False,
-            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"} else profile,
+            "method_variant": "paper-faithful" if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"} else profile,
         },
         "error": {"reason_code": reason_code, "message": INVALID_MESSAGE},
         "stages": stages,

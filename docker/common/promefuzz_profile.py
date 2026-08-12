@@ -25,21 +25,34 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
-# Strict reproduction profiles. ``reproduction-zeta`` is the canonical strict
-# profile introduced by the reproduction-zeta plan (plan
-# ``promefuzz_reproduction_zeta.md``). It is paper-faithful and rejects every
-# synthetic/mock/hash fallback and compatibility fallback, plus it forces
-# exact FuzzBench compile context, verified link args, consumer cases, and a
-# sealed split package. ``reproduction-epsilon`` is the canonical strict
-# profile introduced by the reproduction-epsilon plan. It is paper-faithful
-# but rejects every synthetic/mock/hash fallback the earlier scaffolding
-# allowed. ``reproduction-delta`` remains accepted as a backward-compatible
-# alias. ``reproduction-gamma`` remains a method-faithful but non-strict
-# alias.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+# Strict reproduction profiles. ``reproduction-eta`` is the canonical strict
+# profile introduced by the reproduction-eta plan: it is paper-faithful and
+# rejects every synthetic/mock/hash fallback and compatibility fallback,
+# forces exact FuzzBench compile context, verified link args, consumer cases,
+# real embedding, a sealed split package, and additionally requires a separate
+# coverage-instrumented build that replays the final campaign corpus with a
+# copied ``coverage.json`` (no stdout fallback) plus a native coverage control
+# that produces a line-coverage diff.
+# ``reproduction-zeta`` is the canonical strict profile introduced by the
+# reproduction-zeta plan (plan ``promefuzz_reproduction_zeta.md``). It is
+# paper-faithful and rejects every synthetic/mock/hash fallback and
+# compatibility fallback, plus it forces exact FuzzBench compile context,
+# verified link args, consumer cases, and a sealed split package.
+# ``reproduction-epsilon`` is the canonical strict profile introduced by the
+# reproduction-epsilon plan. It is paper-faithful but rejects every
+# synthetic/mock/hash fallback the earlier scaffolding allowed.
+# ``reproduction-delta`` remains accepted as a backward-compatible alias.
+# ``reproduction-gamma`` remains a method-faithful but non-strict alias.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+# Eta is the canonical strictest profile (eta plan): it adds fail-closed
+# split-package, exact-FuzzBench-compile-DB, nonempty-link-args,
+# real-embedding, consumer-knowledge, and copied-coverage-report requirements
+# on top of the zeta strict invariants. Zeta remains accepted with its
+# existing behavior; eta is the new canonical profile.
+ETA_PROFILES = {"reproduction-eta"}
 # Zeta is the strictest profile: it forces exact FuzzBench compile context,
 # verified link args, consumer cases, real embedding, and a sealed split
 # package (zeta plan §1).
@@ -210,41 +223,42 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 f"the selected-harness API report is evaluator-only"
             )
 
-    # Zeta plan §1: zeta is the strictest profile. It forces exact FuzzBench
-    # compile context, verified link args, consumer cases, real embedding, and
-    # a sealed split package. These are required env values, not merely
-    # forbidden ones.
-    if profile in ZETA_PROFILES:
+    # Zeta plan §1 / eta plan §1: zeta and eta are the strictest profiles.
+    # They force exact FuzzBench compile context, verified link args, consumer
+    # cases, real embedding, and a sealed split package. Eta is the canonical
+    # strict profile (eta plan) and inherits all zeta required env values;
+    # these are required env values, not merely forbidden ones.
+    if profile in ZETA_PROFILES or profile in ETA_PROFILES:
         if normalize_env_bool(env.get("PROMEFUZZ_ALLOW_HASH_EMBEDDING")) == "1":
             violations.append(
-                "PROMEFUZZ_ALLOW_HASH_EMBEDDING=1 is forbidden in reproduction-zeta; "
-                "a real semantic embedding provider is required"
+                f"PROMEFUZZ_ALLOW_HASH_EMBEDDING=1 is forbidden in {profile}; "
+                f"a real semantic embedding provider is required"
             )
         if normalize_env_bool(env.get("PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB")) == "1":
             violations.append(
-                "PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB=1 is forbidden in reproduction-zeta; "
-                "the compile DB must be captured from the exact FuzzBench Docker build"
+                f"PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB=1 is forbidden in {profile}; "
+                f"the compile DB must be captured from the exact FuzzBench Docker build"
             )
         if normalize_env_bool(env.get("PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS")) == "1":
             violations.append(
-                "PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS=1 is forbidden in reproduction-zeta; "
-                "driver_build_args must be nonempty unless the target is verified header-only"
+                f"PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS=1 is forbidden in {profile}; "
+                f"driver_build_args must be nonempty unless the target is verified header-only"
             )
         if normalize_env_bool(env.get("PROMEFUZZ_REQUIRE_CONSUMER_CASES"), "1") != "1":
             violations.append(
-                "PROMEFUZZ_REQUIRE_CONSUMER_CASES=1 is required for reproduction-zeta; "
-                "consumer/API usage knowledge must be wired into generation"
+                f"PROMEFUZZ_REQUIRE_CONSUMER_CASES=1 is required for {profile}; "
+                f"consumer/API usage knowledge must be wired into generation"
             )
         build_ctx = (env.get("PROME_FUZZ_BUILD_CONTEXT_METHOD") or "").strip()
         if build_ctx and build_ctx not in {"exact_fuzzbench", "fuzzbench_replay"}:
             violations.append(
-                f"PROME_FUZZ_BUILD_CONTEXT_METHOD={build_ctx!r} is forbidden in reproduction-zeta; "
+                f"PROME_FUZZ_BUILD_CONTEXT_METHOD={build_ctx!r} is forbidden in {profile}; "
                 f"the compile context must come from the exact FuzzBench Docker build"
             )
         if normalize_env_bool(env.get("HGB_TARGET_REQUIRE_SPLIT")) != "1":
             violations.append(
-                "HGB_TARGET_REQUIRE_SPLIT=1 is required for reproduction-zeta; "
-                "the target package must be physically split into generator/evaluator halves"
+                f"HGB_TARGET_REQUIRE_SPLIT=1 is required for {profile}; "
+                f"the target package must be physically split into generator/evaluator halves"
             )
 
     if is_compat_smoke(profile):
@@ -323,10 +337,10 @@ def build_result(
         # compat-smoke never reaches the scientific ``evaluated`` status.
         if status == STATUS_EVALUATED:
             status = STATUS_COMPAT_SMOKE_COMPLETED
-    # reproduction-delta/gamma/epsilon map to the paper-faithful method variant.
-    if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} and not method_variant:
+    # reproduction-delta/gamma/epsilon/zeta/eta map to the paper-faithful method variant.
+    if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"} and not method_variant:
         method_variant = "paper-faithful"
-    if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon"} and method_variant == profile:
+    if profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"} and method_variant == profile:
         method_variant = "paper-faithful"
     return {
         "schema_version": 3,

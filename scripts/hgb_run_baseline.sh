@@ -26,6 +26,7 @@ EOF
 
 generator=""
 target=""
+target_set=""
 profile=""
 protocol=""
 run_id=""
@@ -43,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --target|-t)
       target="${2:-}"
+      shift 2
+      ;;
+    --target-set)
+      target_set="${2:-}"
       shift 2
       ;;
     --profile)
@@ -87,6 +92,22 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# When --target-set is used instead of --target, delegate to the matrix runner
+# so the plan's canonical matrix command works:
+#   hgb_run_baseline.sh --generator ckgfuzzer --profile reproduction-eta \
+#     --target-set valuable --strict
+if [[ -n "$target_set" ]]; then
+  [[ -n "$generator" ]] || { usage; exit 64; }
+  valid_hgb_generator "$generator" || die "unknown generator: $generator"
+  matrix_args=(--generator "$generator" --target-set "$target_set")
+  [[ -n "$profile" ]] && matrix_args+=(--profile "$profile")
+  [[ -n "$protocol" ]] && matrix_args+=(--protocol "$protocol")
+  [[ -n "${HGB_CAMPAIGN_SECONDS:-}" ]] && matrix_args+=(--campaign-seconds "$HGB_CAMPAIGN_SECONDS")
+  [[ "$strict" == "1" ]] && matrix_args+=(--strict)
+  [[ "$dry_run" == "1" ]] && matrix_args+=(--dry-run)
+  exec bash "$SCRIPT_DIR/hgb_run_baseline_matrix.sh" "${matrix_args[@]}"
+fi
+
 [[ -n "$generator" && -n "$target" ]] || { usage; exit 64; }
 valid_hgb_generator "$generator" || die "unknown generator: $generator"
 
@@ -125,21 +146,22 @@ export HGB_BASELINE_PROTOCOL="$protocol"
 case "$generator" in
   elfuzz)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) ;;
-      *) die_profile "elfuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
+      *) die_profile "elfuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       paper-native|extension) ;;
       *) die_profile "elfuzz: invalid protocol: $protocol (expected paper-native or extension)" ;;
     esac
-    # reproduction-epsilon is the canonical strict paper-native input-generator
-    # profile (epsilon plan shared foundation); reproduction-delta is its
-    # backward-compatible alias (plan elfuzz_reproduction_delta.md section 1).
-    # reproduction-gamma is kept as a backward-compatible alias. All three
+    # reproduction-eta is the canonical strictest paper-native input-generator
+    # profile (eta plan); reproduction-zeta is the zeta strict profile;
+    # reproduction-epsilon is the epsilon strict profile; reproduction-delta is
+    # its backward-compatible alias (plan elfuzz_reproduction_delta.md section 1).
+    # reproduction-gamma is kept as a backward-compatible alias. All five
     # forbid a prebuilt ELFUZZ_TARGET_BINARY so the SUT is always built from the
     # exact FuzzBench Dockerfile, require a real coverage replay (never AFL path
     # counters), and require the Docker socket for applicable targets.
-    if [[ "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]]; then
+    if [[ "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
       if [[ -n "${ELFUZZ_TARGET_BINARY:-}" ]]; then
         die "elfuzz/$profile: ELFUZZ_TARGET_BINARY is forbidden; the SUT must be built from the FuzzBench Dockerfile"
       fi
@@ -166,10 +188,10 @@ case "$generator" in
         printf '%s\n' "$_inv_ws"
         exit 0
       fi
-      # Applicable strict reproduction (reproduction-delta/epsilon) target: the
-      # Docker socket is mandatory to build the native and coverage SUTs from
-      # the FuzzBench Docker environment.
-      if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]] && [[ ! -S /var/run/docker.sock ]]; then
+      # Applicable strict reproduction (reproduction-eta/zeta/epsilon/delta)
+      # target: the Docker socket is mandatory to build the native and coverage
+      # SUTs from the FuzzBench Docker environment.
+      if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]] && [[ ! -S /var/run/docker.sock ]]; then
         die "elfuzz/$profile: a Docker socket is required to build the native and coverage SUTs from the FuzzBench Docker environment"
       fi
     fi
@@ -178,14 +200,15 @@ case "$generator" in
     ;;
   ckgfuzzer)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) ;;
-      *) die_profile "ckgfuzzer: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
+      *) die_profile "ckgfuzzer: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|api-oracle) ;;
       *) die_profile "ckgfuzzer: invalid protocol: $protocol (expected blind-project or api-oracle)" ;;
     esac
-    # reproduction-epsilon is the canonical strict profile (epsilon plan);
+    # reproduction-eta is the canonical strict profile (eta plan);
+    # reproduction-zeta is the strict profile from the zeta plan and
     # reproduction-delta is its backward-compatible alias. Both inherit the
     # alpha/paper-faithful forbiddens and additionally refuse selected-harness
     # API mode and compatibility query rewrite unless the patch is pinned. The
@@ -193,7 +216,7 @@ case "$generator" in
     # makes no LLM/embedding calls) only validates that the profile/protocol
     # combination is accepted.
     if [[ "$dry_run" != "1" ]]; then
-      if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]]; then
+      if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
         if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
           die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden; use compat-smoke for local summaries"
         fi
@@ -211,11 +234,11 @@ case "$generator" in
           selected_harness|selected_harness_fallback) die "ckgfuzzer/$profile: HGB_API_SELECTION_MODE=$HGB_API_SELECTION_MODE is forbidden; reference-harness API filtering is evaluator-only" ;;
         esac
       fi
-      # Strict reproduction profiles (reproduction-zeta and its backward
-      # compatible aliases reproduction-epsilon and reproduction-delta) forbid
-      # the source-only CodeQL graph fallback and unrecorded compatibility
-      # query rewrites.
-      if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]]; then
+      # Strict reproduction profiles (reproduction-eta and its backward
+      # compatible aliases reproduction-zeta, reproduction-epsilon, and
+      # reproduction-delta) forbid the source-only CodeQL graph fallback and
+      # unrecorded compatibility query rewrites.
+      if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
         if [[ "${CKGFUZZER_ALLOW_SOURCE_FALLBACK:-0}" == "1" ]]; then
           die "ckgfuzzer/$profile: CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden; source-only CodeQL graph fallback is not allowed"
         fi
@@ -226,15 +249,16 @@ case "$generator" in
           export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-1}"
         fi
       fi
-      # reproduction-zeta is the strictest profile (zeta plan §1): force the
+      # reproduction-eta is the canonical strictest profile (eta plan §1) and
+      # reproduction-zeta is the strict profile from the zeta plan: force the
       # CodeQL graph to be built from the sealed source snapshot, forbid mock
       # embeddings, and require the target package to be physically split.
-      if [[ "$profile" == "reproduction-zeta" ]]; then
+      if [[ "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
         if [[ "${CKGFUZZER_SOURCE_GRAPH_FALLBACK:-0}" == "1" ]]; then
-          die "ckgfuzzer/reproduction-zeta: CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden; the CodeQL graph must be built from the sealed source snapshot"
+          die "ckgfuzzer/$profile: CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden; the CodeQL graph must be built from the sealed source snapshot"
         fi
         if [[ "${CKGFUZZER_ALLOW_MOCK_EMBEDDING:-0}" == "1" ]]; then
-          die "ckgfuzzer/reproduction-zeta: CKGFUZZER_ALLOW_MOCK_EMBEDDING=1 is forbidden; a real embedding service is required"
+          die "ckgfuzzer/$profile: CKGFUZZER_ALLOW_MOCK_EMBEDDING=1 is forbidden; a real embedding service is required"
         fi
         export CKGFUZZER_SOURCE_GRAPH_FALLBACK=0
         export CKGFUZZER_ALLOW_MOCK_EMBEDDING=0
@@ -249,8 +273,8 @@ case "$generator" in
     ;;
   promefuzz)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) ;;
-      *) die_profile "promefuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
+      *) die_profile "promefuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|api-oracle) ;;
@@ -277,15 +301,15 @@ case "$generator" in
         report_first|report_only) die "promefuzz/$profile: HGB_API_REPORT_MODE=$HGB_API_REPORT_MODE is forbidden; the selected-harness API report is evaluator-only" ;;
       esac
     fi
-    # Strict reproduction profiles (reproduction-zeta and its backward
+    # Strict reproduction profiles (reproduction-zeta/eta and their backward
     # compatible aliases reproduction-epsilon and reproduction-delta) are the
-    # strictest (plan promefuzz_reproduction_delta.md section 1 / zeta plan).
-    # They inherit the gamma forbiddens and additionally refuse the synthetic
-    # compile DB, empty embedding type/model, and selected-harness API modes.
-    # The env-content guards are "before an LLM call" guards, so a dry run
-    # (which makes no LLM/embedding calls) only validates that the
+    # strictest (plan promefuzz_reproduction_delta.md section 1 / zeta plan /
+    # eta plan). They inherit the gamma forbiddens and additionally refuse the
+    # synthetic compile DB, empty embedding type/model, and selected-harness
+    # API modes. The env-content guards are "before an LLM call" guards, so a
+    # dry run (which makes no LLM/embedding calls) only validates that the
     # profile/protocol combination is accepted.
-    if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]] && [[ "$dry_run" != "1" ]]; then
+    if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]] && [[ "$dry_run" != "1" ]]; then
       if [[ "${HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB:-0}" == "1" ]]; then
         die "promefuzz/$profile: HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden; the strict profile requires a real compile database captured from the FuzzBench build"
       fi
@@ -305,10 +329,11 @@ case "$generator" in
       esac
       export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-fuzzbench_replay}"
     fi
-    # Zeta plan §1: zeta is the strictest profile. Force exact FuzzBench
-    # compile context, verified link args, consumer cases, real embedding,
-    # and a sealed split package.
-    if [[ "$profile" == "reproduction-zeta" ]]; then
+    # Zeta plan §1 / eta plan §1: zeta and eta are the strictest profiles.
+    # Force exact FuzzBench compile context, verified link args, consumer
+    # cases, real embedding, and a sealed split package. Eta is the canonical
+    # strict profile (eta plan) and inherits all zeta required env values.
+    if [[ "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
       export PROMEFUZZ_EMBEDDING_PROVIDER="${PROMEFUZZ_EMBEDDING_PROVIDER:-real}"
       export PROMEFUZZ_ALLOW_HASH_EMBEDDING=0
       export PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB=0
@@ -321,8 +346,8 @@ case "$generator" in
     ;;
   oss-fuzz-gen)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) ;;
-      *) die_profile "oss-fuzz-gen: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
+      *) die_profile "oss-fuzz-gen: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|target-aware) ;;
@@ -348,7 +373,7 @@ case "$generator" in
     # GCS target download, project-YAML fallback, and bad-benchmark synthesis
     # unless an explicit compat variant is recorded and the row is excluded
     # from the aggregate.
-    if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]]; then
+    if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
       if [[ "${OFG_SKIP_COVERAGE_GAINS:-0}" == "1" ]]; then
         die "oss-fuzz-gen/$profile: OFG_SKIP_COVERAGE_GAINS=1 is forbidden; the strict profile requires real coverage gains"
       fi
@@ -366,18 +391,20 @@ case "$generator" in
       fi
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
     fi
-    # zeta plan §1: zeta is the strictest profile. Force real OSS-Fuzz project
-    # context, real Introspector, no reference examples, no selected-harness
-    # API ranking, repair loop, coverage, and a sealed split package.
-    if [[ "$profile" == "reproduction-zeta" ]]; then
+    # zeta plan §1 / eta plan §1: zeta and eta are the strictest profiles.
+    # Force real OSS-Fuzz project context, real Introspector, no reference
+    # examples, no selected-harness API ranking, repair loop, coverage, and a
+    # sealed split package. Eta is the canonical strict profile (eta plan) and
+    # inherits all zeta required env values.
+    if [[ "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
       if [[ "${OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM:-0}" == "1" ]]; then
-        die "oss-fuzz-gen/reproduction-zeta: OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM=1 is forbidden; a real Fuzz Introspector report is required"
+        die "oss-fuzz-gen/$profile: OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM=1 is forbidden; a real Fuzz Introspector report is required"
       fi
       if [[ "${OFG_ALLOW_REFERENCE_EXAMPLES:-0}" == "1" ]]; then
-        die "oss-fuzz-gen/reproduction-zeta: OFG_ALLOW_REFERENCE_EXAMPLES=1 is forbidden; reference harness examples must not be visible to generation"
+        die "oss-fuzz-gen/$profile: OFG_ALLOW_REFERENCE_EXAMPLES=1 is forbidden; reference harness examples must not be visible to generation"
       fi
       if [[ "${OFG_ALLOW_SELECTED_HARNESS_API_RANKING:-0}" == "1" ]]; then
-        die "oss-fuzz-gen/reproduction-zeta: OFG_ALLOW_SELECTED_HARNESS_API_RANKING=1 is forbidden; selected-harness API ranking is evaluator-only"
+        die "oss-fuzz-gen/$profile: OFG_ALLOW_SELECTED_HARNESS_API_RANKING=1 is forbidden; selected-harness API ranking is evaluator-only"
       fi
       export OFG_USE_REAL_OSS_FUZZ="${OFG_USE_REAL_OSS_FUZZ:-1}"
       export OFG_USE_REAL_INTROSPECTOR="${OFG_USE_REAL_INTROSPECTOR:-1}"
@@ -404,23 +431,24 @@ case "$generator" in
     ;;
   g2fuzz)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) ;;
-      *) die_profile "g2fuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
+      *) die_profile "g2fuzz: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       paper-native|extension) ;;
       *) die_profile "g2fuzz: invalid protocol: $protocol (expected paper-native or extension)" ;;
     esac
-    # reproduction-zeta is the canonical strict paper-native profile (zeta
+    # reproduction-eta is the canonical strictest paper-native profile (eta
+    # plan); reproduction-zeta is the strict profile from the zeta plan (zeta
     # plan); reproduction-epsilon is the strict profile from the epsilon plan
     # (epsilon plan shared foundation); reproduction-delta is its backward-
     # compatible alias (plan g2fuzz_reproduction_delta.md section 1);
-    # reproduction-gamma is kept as a backward-compatible alias. All four
+    # reproduction-gamma is kept as a backward-compatible alias. All five
     # forbid a prebuilt G2FUZZ_TARGET_DIR so the .afl/.cmp/.cov triple is
     # always built from the FuzzBench Docker environment, do not patch
     # G2FUZZ_TRY_NUM down to smoke values, and require a real coverage replay
     # (never AFL paths).
-    if [[ "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]]; then
+    if [[ "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
       if [[ -n "${G2FUZZ_TARGET_DIR:-}" ]]; then
         die "g2fuzz/$profile: G2FUZZ_TARGET_DIR is forbidden; the .afl/.cmp/.cov triple must be built from the FuzzBench Docker environment"
       fi
@@ -432,17 +460,18 @@ case "$generator" in
       # Coverage replay is mandatory in the strict profiles.
       export G2FUZZ_COVERAGE_REPLAY_REQUIRED="${G2FUZZ_COVERAGE_REPLAY_REQUIRED:-1}"
     fi
-    # zeta plan §8: forbid a precomputed G2FUZZ_COVERAGE_REPORT in production
-    # (a dry run never reads it). Only fixture tests under PYTEST_CURRENT_TEST
-    # may supply it.
-    if [[ "$profile" == "reproduction-zeta" && "$dry_run" != "1" && -n "${G2FUZZ_COVERAGE_REPORT:-}" ]]; then
-      die "g2fuzz/reproduction-zeta: G2FUZZ_COVERAGE_REPORT is forbidden in production; coverage must come from a real coverage replay"
+    # eta/zeta plan §8: forbid a precomputed G2FUZZ_COVERAGE_REPORT in
+    # production (a dry run never reads it). Only fixture tests under
+    # PYTEST_CURRENT_TEST may supply it.
+    if [[ "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]] && [[ "$dry_run" != "1" && -n "${G2FUZZ_COVERAGE_REPORT:-}" ]]; then
+      die "g2fuzz/$profile: G2FUZZ_COVERAGE_REPORT is forbidden in production; coverage must come from a real coverage replay"
     fi
-    # The strictest profiles (reproduction-delta, reproduction-epsilon, and
-    # reproduction-zeta) require the Docker socket to build the triple from the
-    # FuzzBench Docker environment (plan section 1.2). A dry run only validates
-    # the profile/protocol combination and never starts Docker.
-    if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" ]] && [[ "$dry_run" != "1" && ! -S /var/run/docker.sock ]]; then
+    # The strictest profiles (reproduction-eta, reproduction-zeta,
+    # reproduction-delta, reproduction-epsilon) require the Docker socket to
+    # build the triple from the FuzzBench Docker environment (plan section
+    # 1.2). A dry run only validates the profile/protocol combination and
+    # never starts Docker.
+    if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]] && [[ "$dry_run" != "1" && ! -S /var/run/docker.sock ]]; then
       die "g2fuzz/$profile: a Docker socket is required to build the .afl/.cmp/.cov triple from the FuzzBench Docker environment"
     fi
     export HGB_EXCLUDE_FROM_AGGREGATE=0
@@ -492,7 +521,7 @@ result = {
     "applicability": "applicable",
     "status": "dry_run_ok",
     "reason": "dry run validated profile/protocol without Docker or LLM calls",
-    "method_variant": "paper-faithful" if profile in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta") else profile,
+    "method_variant": "paper-faithful" if profile in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta") else profile,
     "excluded_from_aggregate": True,
 }
 Path(workspace, "metadata.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")

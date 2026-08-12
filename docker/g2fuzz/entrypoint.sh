@@ -261,13 +261,14 @@ if [[ "$mode" == "generate-target" ]]; then
   if [[ -z "${HGB_FUZZBENCH_BENCHMARK_DIR:-}" && -d "/opt/hgb/fuzzbench/benchmarks/$target_name" ]]; then
     export HGB_FUZZBENCH_BENCHMARK_DIR="/opt/hgb/fuzzbench/benchmarks/$target_name"
   fi
-  # reproduction-gamma/delta/epsilon/zeta preflight: verify G2Fuzz modified AFL++
-  # components. Zeta is the canonical strict paper-native profile; epsilon is
-  # the strict profile from the epsilon plan; delta is its backward-compatible
-  # alias; gamma is a backward-compatible alias. All require the modified
-  # afl-fuzz (with -c CmpLog and -k G2FUZZ), afl-clang-fast/afl-clang-fast++,
-  # and program_gen.py (plan section 1.2/4.1).
-  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" || "$HGB_BASELINE_PROFILE" == "reproduction-zeta" ]]; then
+  # reproduction-gamma/delta/epsilon/zeta/eta preflight: verify G2Fuzz modified
+  # AFL++ components. Eta is the canonical strictest paper-native profile (eta
+  # plan); zeta is the zeta strict profile; epsilon is the strict profile from
+  # the epsilon plan; delta is its backward-compatible alias; gamma is a
+  # backward-compatible alias. All require the modified afl-fuzz (with -c
+  # CmpLog and -k G2FUZZ), afl-clang-fast/afl-clang-fast++, and program_gen.py
+  # (plan section 1.2/4.1).
+  if [[ "$HGB_BASELINE_PROFILE" == "reproduction-gamma" || "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" || "$HGB_BASELINE_PROFILE" == "reproduction-zeta" || "$HGB_BASELINE_PROFILE" == "reproduction-eta" ]]; then
     missing=()
     [[ -f "$artifact/program_gen.py" ]] || missing+=("program_gen.py")
     [[ -x "$artifact/afl-fuzz" ]] || missing+=("afl-fuzz")
@@ -277,9 +278,9 @@ if [[ "$mode" == "generate-target" ]]; then
     fi
     [[ -x "$artifact/afl-clang-fast" ]] || missing+=("afl-clang-fast")
     [[ -x "$artifact/afl-clang-fast++" ]] || missing+=("afl-clang-fast++")
-    # Delta/epsilon/zeta additionally require program_to_format.json and
+    # Delta/epsilon/zeta/eta additionally require program_to_format.json and
     # model_setting.json (plan section 4.1).
-    if [[ "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" || "$HGB_BASELINE_PROFILE" == "reproduction-zeta" ]]; then
+    if [[ "$HGB_BASELINE_PROFILE" == "reproduction-delta" || "$HGB_BASELINE_PROFILE" == "reproduction-epsilon" || "$HGB_BASELINE_PROFILE" == "reproduction-zeta" || "$HGB_BASELINE_PROFILE" == "reproduction-eta" ]]; then
       [[ -f "$artifact/program_to_format.json" ]] || missing+=("program_to_format.json")
     fi
     if [[ ${#missing[@]} -gt 0 ]]; then

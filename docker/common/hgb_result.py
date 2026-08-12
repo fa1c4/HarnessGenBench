@@ -49,6 +49,13 @@ ALLOWED_STATUSES = {
 # considered evaluated.
 EVALUATION_STAGES = {"candidate_overlay", "copy_audit", "candidate_build", "sanitizer_smoke", "api_reachability", "campaign", "coverage"}
 
+# Eta is the canonical strictest profile (eta plan §6): coverage must come from
+# a separate coverage-instrumented build that replays the final campaign
+# corpus, with a copied coverage.json (no stdout fallback). copy_out_ok,
+# coverage_report_path, and inputs_replayed > 0 are mandatory for an evaluated
+# eta row.
+ETA_PROFILES = {"reproduction-eta"}
+
 
 def default_stages() -> dict[str, str]:
     return {name: "pending" for name in STAGE_NAMES}
@@ -162,6 +169,8 @@ def build_result(
     if profile == "reproduction-epsilon" and not method_variant:
         method_variant = "paper-faithful"
     if profile == "reproduction-zeta" and not method_variant:
+        method_variant = "paper-faithful"
+    if profile == "reproduction-eta" and not method_variant:
         method_variant = "paper-faithful"
     if status not in ALLOWED_STATUSES and status not in {"failed", "partial_completed", "missing_api_key"}:
         # Normalize legacy statuses into the beta contract.  A bare "failed"
@@ -288,6 +297,24 @@ def assert_evaluated_invariants(result: dict[str, Any]) -> list[str]:
         violations.append("evaluated row selected a near-duplicate reference candidate")
     elif sel_audit.get("exact_copy"):
         violations.append("evaluated row selected an exact-copy reference candidate")
+    # Eta-specific coverage invariants (eta plan §6): coverage must come from a
+    # separate coverage-instrumented build that replays the final campaign
+    # corpus. copy_out_ok, a coverage_report_path that exists on disk, and
+    # inputs_replayed > 0 are mandatory; stdout fallback alone is never accepted
+    # for an evaluated eta row.
+    if result.get("profile") in ETA_PROFILES:
+        sel_cov = result.get("selected_candidate", {}).get("coverage", {}) or cov
+        if not isinstance(sel_cov, dict):
+            sel_cov = cov
+        if not bool(sel_cov.get("copy_out_ok", False)):
+            violations.append("evaluated eta row has coverage.copy_out_ok != true")
+        cov_report = str(sel_cov.get("coverage_report_path", ""))
+        if not cov_report:
+            violations.append("evaluated eta row has no coverage.coverage_report_path")
+        elif not Path(cov_report).is_file():
+            violations.append(f"evaluated eta row coverage.coverage_report_path does not exist: {cov_report}")
+        if int(sel_cov.get("inputs_replayed", 0) or 0) <= 0:
+            violations.append("evaluated eta row has coverage.inputs_replayed <= 0")
     return violations
 
 

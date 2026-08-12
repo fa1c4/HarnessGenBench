@@ -39,11 +39,18 @@ NOT_APPLICABLE_STATUSES = {"not_applicable", "target_not_supported_by_elfuzz"}
 # successful evaluations for harness-generator rows.
 HARNESS_GENERATOR_STRICT_COMPLETED = {"evaluated"}
 
-# Strict reproduction profiles. ``reproduction-zeta`` is the canonical strict
-# profile (zeta plan); ``reproduction-epsilon`` is the strict profile from the
-# epsilon plan and ``reproduction-delta`` is its backward-compatible alias. All
-# three enforce the same paper-equivalent invariants.
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
+# Strict reproduction profiles. ``reproduction-eta`` is the canonical strict
+# profile (eta plan); ``reproduction-zeta`` is the strict profile from the
+# zeta plan and ``reproduction-epsilon``/``reproduction-delta`` are its
+# backward-compatible aliases. All enforce the same paper-equivalent
+# invariants; eta additionally requires a copied coverage report and nonzero
+# replayed inputs.
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+# Eta is the canonical strictest profile (eta plan §6): coverage must come from
+# a separate coverage-instrumented build that replays the final campaign
+# corpus, with a copied coverage.json (no stdout fallback), copy_out_ok,
+# coverage_report_path, and inputs_replayed > 0 mandatory.
+ETA_PROFILES = {"reproduction-eta"}
 # For input generators and non-strict harness runs, the broader set applies.
 COMPLETED_STATUSES = {"completed", "dry_run_ok", "evaluated"}
 # Statuses that must never be counted as successful.
@@ -199,16 +206,17 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
                 build = meta.get("build") or {}
                 if isinstance(build, dict) and not build.get("uses_fuzzbench_docker_environment"):
                     violations.append(f"evaluated {elfuzz_profile} elfuzz row did not build from the FuzzBench Docker environment")
-                # zeta plan §5/§8: evolution_iterations >= 2 and the reported
-                # target must match the actual SUT fuzz target.
+                # eta/zeta plan §5/§8: evolution_iterations >= 2 and the
+                # reported target must match the actual SUT fuzz target.
                 elfuzz_evo = int(elf.get("evolution_iterations", input_gen.get("evolution_iterations_completed", 0)) or 0)
-                if elfuzz_profile == "reproduction-zeta" and elfuzz_evo < 2:
+                _eta_or_zeta = elfuzz_profile in ETA_PROFILES or elfuzz_profile == "reproduction-zeta"
+                if _eta_or_zeta and elfuzz_evo < 2:
                     violations.append(f"evaluated {elfuzz_profile} elfuzz row has evolution_iterations < 2")
                 actual_sut = str(meta.get("actual_sut_fuzz_target", ""))
                 reported = str(meta.get("reported_target", meta.get("target", "")))
-                if elfuzz_profile == "reproduction-zeta" and actual_sut and reported and actual_sut != reported:
+                if _eta_or_zeta and actual_sut and reported and actual_sut != reported:
                     violations.append(f"evaluated {elfuzz_profile} elfuzz row actual_sut_fuzz_target != reported target")
-                if isinstance(build, dict) and elfuzz_profile == "reproduction-zeta" and not build.get("containerized_sut_runtime"):
+                if isinstance(build, dict) and _eta_or_zeta and not build.get("containerized_sut_runtime"):
                     violations.append(f"evaluated {elfuzz_profile} elfuzz row did not use containerized SUT runtime")
             return violations
         # G2Fuzz beta contract (plan section 11).
@@ -218,8 +226,8 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
         if not (target_pair.get("afl_binary") and target_pair.get("cmp_binary")):
             violations.append("evaluated input-generator row lacks .afl/.cmp build evidence")
         profile_s = str(meta.get("profile") or "")
-        # Gamma/delta/epsilon/zeta contract: also require .cov build evidence.
-        if profile_s in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"):
+        # Gamma/delta/epsilon/zeta/eta contract: also require .cov build evidence.
+        if profile_s in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"):
             if not target_pair.get("cov_binary"):
                 violations.append(f"evaluated {profile_s} input-generator row lacks .cov build evidence")
             cov_gamma = meta.get("coverage_gamma") or {}
@@ -301,6 +309,24 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
         sel_campaign = (sel or {}).get("campaign") or campaign
         if int(sel_campaign.get("final_corpus_file_count", 0) or 0) <= 0:
             violations.append(f"evaluated {profile_str} row has empty campaign final corpus")
+        # Eta-specific coverage invariants (eta plan §6): coverage must come
+        # from a separate coverage-instrumented build that replays the final
+        # campaign corpus. copy_out_ok, a coverage_report_path that exists on
+        # disk, and inputs_replayed > 0 are mandatory; stdout fallback alone is
+        # never accepted for an evaluated eta row.
+        if profile_str in ETA_PROFILES:
+            sel_cov = (sel or {}).get("coverage") or cov
+            if not isinstance(sel_cov, dict):
+                sel_cov = cov
+            if not bool(sel_cov.get("copy_out_ok", False)):
+                violations.append(f"evaluated {profile_str} row has coverage.copy_out_ok != true")
+            cov_report = str(sel_cov.get("coverage_report_path", ""))
+            if not cov_report:
+                violations.append(f"evaluated {profile_str} row has no coverage.coverage_report_path")
+            elif not Path(cov_report).is_file():
+                violations.append(f"evaluated {profile_str} row coverage.coverage_report_path does not exist: {cov_report}")
+            if int(sel_cov.get("inputs_replayed", 0) or 0) <= 0:
+                violations.append(f"evaluated {profile_str} row has coverage.inputs_replayed <= 0")
         # OSS-Fuzz-Gen-specific strict invariants (plan
         # oss-fuzz-gen_reproduction_delta.md section 7): a clean prompt audit,
         # a real (non-shim) introspector with nonzero functions, and a valid
@@ -327,6 +353,44 @@ def evaluated_row_violations(meta: dict[str, Any]) -> list[str]:
             if isinstance(coverage_diff, dict) and coverage_diff:
                 if coverage_diff.get("runtime_coverage_valid") is False:
                     violations.append(f"evaluated {profile_str} ofg row has coverage_diff.runtime_coverage_valid == false")
+        # PromeFuzz-specific strict invariants (plan promefuzz_reproduction_zeta.md
+        # section 1 / promefuzz_reproduction_eta.md section 4): exact FuzzBench
+        # compile DB provenance, nonempty driver_build_args, real embedding
+        # metadata, and loaded consumer knowledge evidence. These are enforced
+        # for zeta/eta (which introduced the method-evidence requirement);
+        # delta/epsilon enforce them at the entrypoint/profile level.
+        if gen_name == "promefuzz" and profile_str in {"reproduction-zeta", "reproduction-eta"}:
+            method = meta.get("method") or {}
+            if isinstance(method, dict):
+                compile_db = method.get("compile_db") or {}
+                if isinstance(compile_db, dict):
+                    strategy = str(compile_db.get("strategy", ""))
+                    if not strategy:
+                        violations.append(f"evaluated {profile_str} promefuzz row has no method.compile_db.strategy")
+                    elif strategy in {"synthetic", ""}:
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.compile_db.strategy={strategy!r} (synthetic)")
+                    if int(compile_db.get("count", 0) or 0) <= 0:
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.compile_db.count <= 0")
+                link_ctx = method.get("link_context") or {}
+                if isinstance(link_ctx, dict):
+                    if int(link_ctx.get("driver_build_args_count", 0) or 0) <= 0:
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.link_context.driver_build_args_count <= 0")
+                embedding = method.get("embedding") or {}
+                if isinstance(embedding, dict):
+                    provider = str(embedding.get("provider", ""))
+                    model = str(embedding.get("model", ""))
+                    if provider in {"mock", "local", "hash", ""}:
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.embedding.provider={provider!r} (not real)")
+                    if not model or model == "hgb-hash-embedding":
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.embedding.model={model!r} (not real)")
+                consumer_knowledge = method.get("consumer_knowledge") or {}
+                if isinstance(consumer_knowledge, dict):
+                    if not consumer_knowledge.get("enabled"):
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.consumer_knowledge.enabled != true")
+                    if not consumer_knowledge.get("artifacts_nonempty"):
+                        violations.append(f"evaluated {profile_str} promefuzz row has method.consumer_knowledge.artifacts_nonempty != true")
+            else:
+                violations.append(f"evaluated {profile_str} promefuzz row has no method evidence")
     return violations
 
 
@@ -381,14 +445,19 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     line_covered = line_cov.get("covered") if isinstance(line_cov, dict) else None
     execs_done = int(campaign.get("execs_done", 0) or 0)
     final_corpus_file_count = int(campaign.get("final_corpus_file_count", 0) or 0)
-    # Strict reproduction paper-equivalent gate (plan section 7 / E7 / zeta §6).
-    # reproduction-zeta is the canonical strict profile; reproduction-epsilon is
-    # the epsilon strict profile and reproduction-delta is its backward alias. A
-    # row is paper-equivalent only when it is evaluated, paper-faithful, not
-    # excluded, has real coverage (lines > 0), a real coverage report, real
-    # campaign executions (> 0), a nonempty final corpus, no exact or
-    # near-duplicate reference copy, and a candidate overlay that matches the
-    # candidate SHA256.
+    # Strict reproduction paper-equivalent gate (plan section 7 / E7 / zeta §6 /
+    # eta §6). reproduction-eta is the canonical strict profile; zeta is the
+    # zeta strict profile and reproduction-epsilon/delta are its backward
+    # aliases. A row is paper-equivalent only when it is evaluated,
+    # paper-faithful, not excluded, has real coverage (lines > 0), a real
+    # coverage report, real campaign executions (> 0), a nonempty final corpus,
+    # no exact or near-duplicate reference copy, and a candidate overlay that
+    # matches the candidate SHA256. Eta additionally requires the coverage
+    # report to be a copied file (copy_out_ok, coverage_report_path,
+    # inputs_replayed > 0) -- stdout fallback alone is not accepted.
+    copy_out_ok = bool(cov.get("copy_out_ok", True))
+    coverage_report_path = str(cov.get("coverage_report_path", ""))
+    inputs_replayed = int(cov.get("inputs_replayed", 0) or 0)
     _strict_paper_equivalent = (
         method_variant == "paper-faithful"
         and str(meta.get("status", "")) == "evaluated"
@@ -403,7 +472,14 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
     paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
     paper_equivalent_zeta = bool(profile == "reproduction-zeta" and _strict_paper_equivalent)
-    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta)
+    _eta_paper_equivalent = bool(
+        _strict_paper_equivalent
+        and copy_out_ok
+        and bool(coverage_report_path)
+        and inputs_replayed > 0
+    )
+    paper_equivalent_eta = bool(profile == "reproduction-eta" and _eta_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta or paper_equivalent_eta)
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
@@ -430,9 +506,13 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         "exact_copy": exact_copy,
         "matches_candidate": matches_candidate,
         "final_corpus_file_count": final_corpus_file_count,
+        "copy_out_ok": copy_out_ok,
+        "coverage_report_path": coverage_report_path,
+        "inputs_replayed": inputs_replayed,
         "paper_equivalent_delta": paper_equivalent_delta,
         "paper_equivalent_epsilon": paper_equivalent_epsilon,
         "paper_equivalent_zeta": paper_equivalent_zeta,
+        "paper_equivalent_eta": paper_equivalent_eta,
         "paper_equivalent_strict": paper_equivalent_strict,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
@@ -473,6 +553,11 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
     overlay_audit = sel_build.get("overlay_audit") or meta.get("overlay_audit") or {}
     if not isinstance(overlay_audit, dict):
         overlay_audit = {}
+    copy_audit = selected.get("copy_audit") or meta.get("copy_audit") or {}
+    if not isinstance(copy_audit, dict):
+        copy_audit = {}
+    exact_copy = bool(copy_audit.get("exact_copy", False))
+    near_duplicate_reference = bool(copy_audit.get("near_duplicate_reference", False))
     prompt_audit = meta.get("prompt_audit") or {}
     if not isinstance(prompt_audit, dict):
         prompt_audit = {}
@@ -486,6 +571,7 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
     method_variant = str(meta.get("method_variant", ""))
     line_covered = line_cov.get("covered")
     execs_done = int(campaign.get("execs_done", 0) or 0)
+    final_corpus_file_count = int(campaign.get("final_corpus_file_count", 0) or 0)
     matches_candidate = overlay_audit.get("matches_candidate")
     runtime_coverage_valid = coverage_diff.get("runtime_coverage_valid")
     cov_diff_status = str(coverage_diff.get("status", ""))
@@ -503,6 +589,8 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         and isinstance(line_covered, int) and line_covered > 0
         and execs_done > 0
         and matches_candidate is True
+        and not exact_copy
+        and not near_duplicate_reference
         and prompt_audit.get("exact_reference_harness_in_prompt") is False
         and prompt_audit.get("selected_harness_api_metadata_used") is False
         and introspector.get("used_local_shim") is False
@@ -512,7 +600,29 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
     paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
     paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
     paper_equivalent_zeta = bool(profile == "reproduction-zeta" and _strict_paper_equivalent)
-    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta)
+    # Eta plan §5/§6: eta is the canonical strictest profile. It inherits all
+    # zeta strict invariants and additionally requires the coverage to come
+    # from a separate coverage-instrumented build that replays the final
+    # campaign corpus (copy_out_ok, coverage_report_path, inputs_replayed > 0)
+    # and the native coverage control to produce an available line-coverage
+    # diff (coverage_diff.status == "available"). stdout fallback alone or a
+    # missing/unavailable coverage diff is never accepted for an eta row.
+    sel_cov = selected.get("coverage") or cov
+    if not isinstance(sel_cov, dict):
+        sel_cov = cov
+    eta_copy_out_ok = bool(sel_cov.get("copy_out_ok", False))
+    eta_coverage_report_path = str(sel_cov.get("coverage_report_path", ""))
+    eta_inputs_replayed = int(sel_cov.get("inputs_replayed", 0) or 0)
+    _eta_paper_equivalent = bool(
+        _strict_paper_equivalent
+        and final_corpus_file_count > 0
+        and eta_copy_out_ok
+        and bool(eta_coverage_report_path)
+        and eta_inputs_replayed > 0
+        and cov_diff_status == "available"
+    )
+    paper_equivalent_eta = bool(profile == "reproduction-eta" and _eta_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta or paper_equivalent_eta)
     return {
         "target": meta.get("target", ""),
         "status": str(meta.get("status", "")),
@@ -526,7 +636,7 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         "coverage": str(stages.get("coverage", "")),
         "line_coverage": line_covered,
         "execs_done": execs_done,
-        "final_corpus_file_count": int(campaign.get("final_corpus_file_count", 0) or 0),
+        "final_corpus_file_count": final_corpus_file_count,
         "matches_candidate": matches_candidate,
         "overlay_audit": overlay_audit,
         "prompt_audit": prompt_audit,
@@ -534,9 +644,157 @@ def extract_ofg_row(meta: dict[str, Any]) -> dict[str, Any]:
         "coverage_diff": coverage_diff,
         "runtime_coverage_valid": runtime_coverage_valid,
         "cov_diff_status": cov_diff_status,
+        "copy_out_ok": eta_copy_out_ok,
+        "coverage_report_path": eta_coverage_report_path,
+        "inputs_replayed": eta_inputs_replayed,
         "paper_equivalent_delta": paper_equivalent_delta,
         "paper_equivalent_epsilon": paper_equivalent_epsilon,
         "paper_equivalent_zeta": paper_equivalent_zeta,
+        "paper_equivalent_eta": paper_equivalent_eta,
+        "paper_equivalent_strict": paper_equivalent_strict,
+        "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
+    }
+
+
+def extract_promefuzz_row(meta: dict[str, Any]) -> dict[str, Any]:
+    """Extract the PromeFuzz reproduction-eta row fields from metadata.
+
+    Per plan promefuzz_reproduction_eta.md, a PromeFuzz row is paper-equivalent
+    only when every real stage has evidence: build success, candidate overlay
+    matching the candidate, nonzero campaign executions, real coverage with
+    covered lines > 0, exact FuzzBench compile DB provenance, nonempty
+    driver_build_args, real embedding metadata, loaded consumer knowledge, and
+    (for eta) a copied coverage report with inputs_replayed > 0 and an
+    available coverage diff.
+    """
+    stages = meta.get("stages") or {}
+    if not isinstance(stages, dict):
+        stages = {}
+    metrics = meta.get("metrics") or {}
+    if not isinstance(metrics, dict):
+        metrics = {}
+    cov = metrics.get("coverage") or meta.get("coverage") or {}
+    if not isinstance(cov, dict):
+        cov = {}
+    campaign = metrics.get("campaign") or meta.get("campaign") or {}
+    if not isinstance(campaign, dict):
+        campaign = {}
+    line_cov = cov.get("line_coverage") or {}
+    if not isinstance(line_cov, dict):
+        line_cov = {}
+    build = meta.get("build") or metrics.get("build") or {}
+    if not isinstance(build, dict):
+        build = {}
+    selected = meta.get("selected_candidate") or {}
+    if not isinstance(selected, dict):
+        selected = {}
+    sel_build = selected.get("build") or build or {}
+    overlay_audit = sel_build.get("overlay_audit") or meta.get("overlay_audit") or {}
+    if not isinstance(overlay_audit, dict):
+        overlay_audit = {}
+    copy_audit = selected.get("copy_audit") or meta.get("copy_audit") or {}
+    if not isinstance(copy_audit, dict):
+        copy_audit = {}
+    exact_copy = bool(copy_audit.get("exact_copy", False))
+    near_duplicate_reference = bool(copy_audit.get("near_duplicate_reference", False))
+    method = meta.get("method") or {}
+    if not isinstance(method, dict):
+        method = {}
+    profile = str(meta.get("profile", ""))
+    method_variant = str(meta.get("method_variant", ""))
+    line_covered = line_cov.get("covered")
+    execs_done = int(campaign.get("execs_done", 0) or 0)
+    final_corpus_file_count = int(campaign.get("final_corpus_file_count", 0) or 0)
+    matches_candidate = overlay_audit.get("matches_candidate")
+    # PromeFuzz method evidence (eta plan §4).
+    compile_db = method.get("compile_db") or {}
+    link_context = method.get("link_context") or {}
+    embedding = method.get("embedding") or {}
+    consumer_knowledge = method.get("consumer_knowledge") or {}
+    compile_db_ok = (
+        isinstance(compile_db, dict)
+        and str(compile_db.get("strategy", "")) not in {"", "synthetic"}
+        and int(compile_db.get("count", 0) or 0) > 0
+    )
+    link_args_ok = (
+        isinstance(link_context, dict)
+        and int(link_context.get("driver_build_args_count", 0) or 0) > 0
+    )
+    embedding_ok = (
+        isinstance(embedding, dict)
+        and str(embedding.get("provider", "")) not in {"mock", "local", "hash", ""}
+        and str(embedding.get("model", "")) not in {"", "hgb-hash-embedding"}
+    )
+    consumer_ok = (
+        isinstance(consumer_knowledge, dict)
+        and bool(consumer_knowledge.get("enabled"))
+        and bool(consumer_knowledge.get("artifacts_nonempty"))
+    )
+    # Eta coverage invariants (eta plan §6).
+    sel_cov = selected.get("coverage") or cov
+    if not isinstance(sel_cov, dict):
+        sel_cov = cov
+    copy_out_ok = bool(sel_cov.get("copy_out_ok", False))
+    coverage_report_path = str(sel_cov.get("coverage_report_path", ""))
+    inputs_replayed = int(sel_cov.get("inputs_replayed", 0) or 0)
+    coverage_diff = meta.get("coverage_diff") or metrics.get("coverage_diff") or {}
+    if not isinstance(coverage_diff, dict):
+        coverage_diff = {}
+    cov_diff_status = str(coverage_diff.get("status", ""))
+    _strict_paper_equivalent = bool(
+        method_variant == "paper-faithful"
+        and str(meta.get("status", "")) == "evaluated"
+        and not bool(meta.get("excluded_from_aggregate"))
+        and isinstance(line_covered, int) and line_covered > 0
+        and execs_done > 0
+        and final_corpus_file_count > 0
+        and matches_candidate is True
+        and not exact_copy
+        and not near_duplicate_reference
+        and compile_db_ok
+        and link_args_ok
+        and embedding_ok
+        and consumer_ok
+    )
+    paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
+    paper_equivalent_epsilon = bool(profile == "reproduction-epsilon" and _strict_paper_equivalent)
+    paper_equivalent_zeta = bool(profile == "reproduction-zeta" and _strict_paper_equivalent)
+    _eta_paper_equivalent = bool(
+        _strict_paper_equivalent
+        and copy_out_ok
+        and bool(coverage_report_path)
+        and inputs_replayed > 0
+        and cov_diff_status == "available"
+    )
+    paper_equivalent_eta = bool(profile == "reproduction-eta" and _eta_paper_equivalent)
+    paper_equivalent_strict = bool(paper_equivalent_delta or paper_equivalent_epsilon or paper_equivalent_zeta or paper_equivalent_eta)
+    return {
+        "target": meta.get("target", ""),
+        "status": str(meta.get("status", "")),
+        "applicability": str(meta.get("applicability", "")),
+        "profile": profile,
+        "method_variant": method_variant,
+        "candidate_build": str(stages.get("candidate_build", "")),
+        "sanitizer_smoke": str(stages.get("sanitizer_smoke", "")),
+        "campaign": str(stages.get("campaign", "")),
+        "coverage": str(stages.get("coverage", "")),
+        "line_coverage": line_covered,
+        "execs_done": execs_done,
+        "final_corpus_file_count": final_corpus_file_count,
+        "matches_candidate": matches_candidate,
+        "overlay_audit": overlay_audit,
+        "compile_db_ok": compile_db_ok,
+        "link_args_ok": link_args_ok,
+        "embedding_ok": embedding_ok,
+        "consumer_ok": consumer_ok,
+        "copy_out_ok": copy_out_ok,
+        "coverage_report_path": coverage_report_path,
+        "inputs_replayed": inputs_replayed,
+        "cov_diff_status": cov_diff_status,
+        "paper_equivalent_delta": paper_equivalent_delta,
+        "paper_equivalent_epsilon": paper_equivalent_epsilon,
+        "paper_equivalent_zeta": paper_equivalent_zeta,
+        "paper_equivalent_eta": paper_equivalent_eta,
         "paper_equivalent_strict": paper_equivalent_strict,
         "exclude_from_aggregate": bool(meta.get("excluded_from_aggregate")),
     }
@@ -705,7 +963,7 @@ def _apply_filters(records: list[dict[str, Any]], *, generator: str = "", target
     return filtered
 
 
-def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", generator: str = "", target_set: str = "", task_family: str = "", profile: str = "", method_profile: str = "", require_evaluated: bool = False) -> dict[str, Any]:
+def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", generator: str = "", target_set: str = "", task_family: str = "", profile: str = "", method_profile: str = "", require_evaluated: bool = False, require_input_generator_evaluated: bool = False, require_coverage_diff: bool = False, expect_invalid: int | None = None) -> dict[str, Any]:
     rows = read_rows(matrix_dir)
     records: list[dict[str, Any]] = []
     for row in rows:
@@ -735,6 +993,55 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
                     "generator": record["row"].get("generator", ""),
                     "target": record["row"].get("target", ""),
                     "status": status_s,
+                })
+    # --require-input-generator-evaluated: every applicable (non-excluded,
+    # non-not-applicable) input-generator row in the filtered set must be
+    # ``evaluated`` (eta plan §6). This is the input-generator acceptance gate:
+    # a build-only or failed applicable row fails the matrix loudly.
+    require_input_generator_evaluated_violations: list[dict[str, Any]] = []
+    if require_input_generator_evaluated:
+        for record in records:
+            meta = record["metadata"]
+            if bool(meta.get("excluded_from_aggregate")):
+                continue
+            status_s = str(meta.get("status") or record["row"].get("status") or "missing_metadata")
+            if status_s in NOT_APPLICABLE_STATUSES:
+                continue
+            family = str(meta.get("task_family") or meta.get("capability") or "harness_generator")
+            if family != "input_generator":
+                continue
+            if status_s not in HARNESS_GENERATOR_STRICT_COMPLETED:
+                require_input_generator_evaluated_violations.append({
+                    "generator": record["row"].get("generator", ""),
+                    "target": record["row"].get("target", ""),
+                    "status": status_s,
+                })
+    # --require-coverage-diff (eta plan §5): every evaluated harness-generator
+    # row in the filtered set must have an available runtime coverage diff
+    # (coverage_diff.status == "available"). A missing or unavailable coverage
+    # diff fails the matrix loudly instead of being silently counted as
+    # paper-equivalent. This is the OFG eta acceptance gate.
+    require_coverage_diff_violations: list[dict[str, Any]] = []
+    if require_coverage_diff:
+        for record in records:
+            meta = record["metadata"]
+            if bool(meta.get("excluded_from_aggregate")):
+                continue
+            status_s = str(meta.get("status") or record["row"].get("status") or "missing_metadata")
+            if status_s != "evaluated":
+                continue
+            family = str(meta.get("task_family") or meta.get("capability") or "harness_generator")
+            if family != "harness_generator":
+                continue
+            cov_diff = meta.get("coverage_diff") or (meta.get("metrics") or {}).get("coverage_diff") or {}
+            if not isinstance(cov_diff, dict):
+                cov_diff = {}
+            if str(cov_diff.get("status", "")) != "available":
+                require_coverage_diff_violations.append({
+                    "generator": record["row"].get("generator", ""),
+                    "target": record["row"].get("target", ""),
+                    "status": status_s,
+                    "cov_diff_status": str(cov_diff.get("status", "")),
                 })
     # Strict-mode validation: an evaluated harness-generator row must have a
     # real coverage report and nonzero campaign execs.  Violations are reported
@@ -836,6 +1143,9 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         # oss-fuzz-gen_reproduction_delta.md section 7).
         if gen == "oss-fuzz-gen":
             ofg_target_rows.append(extract_ofg_row(meta))
+        # Collect per-target PromeFuzz reproduction rows (eta plan §6).
+        if gen == "promefuzz":
+            ofg_target_rows.append(extract_promefuzz_row(meta))
         # Aggregate artifact counts by task family so harness and input
         # generators never share a single counter.
         harness_counts[gen] += int(meta.get("generated_harness_count") or meta.get("generated_driver_count") or 0)
@@ -947,6 +1257,16 @@ def collect(matrix_dir: Path, *, strict: bool = False, split_by: str = "", gener
         "top_remediations": remediation_counts.most_common(10),
         "storage": storage_report(matrix_dir, records),
         "evaluated_row_violations": evaluated_violations,
+        "require_evaluated_violations": require_evaluated_violations,
+        "require_input_generator_evaluated_violations": require_input_generator_evaluated_violations,
+        "require_coverage_diff_violations": require_coverage_diff_violations,
+        "expect_invalid_expected": expect_invalid,
+        "expect_invalid_actual": not_applicable_pairs,
+        "expect_invalid_violation": (
+            None if expect_invalid is None
+            else f"expected {expect_invalid} invalid rows, found {not_applicable_pairs}"
+            if not_applicable_pairs != expect_invalid else None
+        ),
         "ckgfuzzer_target_rows": ckgfuzzer_target_rows,
         "ckgfuzzer_paper_equivalent_delta": sum(1 for r in ckgfuzzer_target_rows if r.get("paper_equivalent_delta")),
         "ckgfuzzer_paper_equivalent_epsilon": sum(1 for r in ckgfuzzer_target_rows if r.get("paper_equivalent_epsilon")),
@@ -1096,12 +1416,20 @@ def main() -> int:
                         help="filter rows by method profile (e.g. paper-faithful or extension)")
     parser.add_argument("--require-evaluated", action="store_true",
                         help="require every applicable harness-generator row to be evaluated; exit nonzero otherwise")
+    parser.add_argument("--require-input-generator-evaluated", action="store_true",
+                        help="require every applicable input-generator row to be evaluated; exit nonzero otherwise")
+    parser.add_argument("--require-coverage-diff", dest="require_coverage_diff", action="store_true",
+                        help="require every evaluated harness-generator row to have an available coverage diff (eta plan §5); exit nonzero otherwise")
+    parser.add_argument("--expect-invalid", type=int, default=None,
+                        help="require exactly N invalid (not_applicable) rows in the filtered set; exit nonzero otherwise")
+    parser.add_argument("--fail-on-invariant-violations", action="store_true",
+                        help="fail the run when any evaluated row has invariant violations (eta/zeta strict gates); alias for --strict on the invariant check")
     args = parser.parse_args()
     matrix_dir = Path(args.matrix_dir).resolve()
     matrix_dir.mkdir(parents=True, exist_ok=True)
     summary = collect(
         matrix_dir,
-        strict=args.strict,
+        strict=args.strict or args.fail_on_invariant_violations,
         split_by=args.split_by,
         generator=args.generator,
         target_set=args.target_set,
@@ -1109,10 +1437,13 @@ def main() -> int:
         profile=args.profile,
         method_profile=args.method_profile,
         require_evaluated=args.require_evaluated,
+        require_input_generator_evaluated=args.require_input_generator_evaluated,
+        require_coverage_diff=args.require_coverage_diff,
+        expect_invalid=args.expect_invalid,
     )
     write_outputs(matrix_dir, summary)
-    if args.strict and summary.get("evaluated_row_violations"):
-        print(f"ERROR: {len(summary['evaluated_row_violations'])} evaluated row(s) lack coverage/execs:", file=sys.stderr)
+    if (args.strict or args.fail_on_invariant_violations) and summary.get("evaluated_row_violations"):
+        print(f"ERROR: {len(summary['evaluated_row_violations'])} evaluated row(s) have invariant violations:", file=sys.stderr)
         for v in summary["evaluated_row_violations"]:
             print(f"  {v['generator']}/{v['target']}: {'; '.join(v['violations'])}", file=sys.stderr)
         return 2
@@ -1120,6 +1451,19 @@ def main() -> int:
         print(f"ERROR: {len(summary['require_evaluated_violations'])} applicable harness-generator row(s) are not evaluated:", file=sys.stderr)
         for v in summary["require_evaluated_violations"]:
             print(f"  {v['generator']}/{v['target']}: status={v['status']}", file=sys.stderr)
+        return 2
+    if args.require_input_generator_evaluated and summary.get("require_input_generator_evaluated_violations"):
+        print(f"ERROR: {len(summary['require_input_generator_evaluated_violations'])} applicable input-generator row(s) are not evaluated:", file=sys.stderr)
+        for v in summary["require_input_generator_evaluated_violations"]:
+            print(f"  {v['generator']}/{v['target']}: status={v['status']}", file=sys.stderr)
+        return 2
+    if args.require_coverage_diff and summary.get("require_coverage_diff_violations"):
+        print(f"ERROR: {len(summary['require_coverage_diff_violations'])} evaluated harness-generator row(s) lack an available coverage diff:", file=sys.stderr)
+        for v in summary["require_coverage_diff_violations"]:
+            print(f"  {v['generator']}/{v['target']}: status={v['status']} cov_diff_status={v['cov_diff_status']}", file=sys.stderr)
+        return 2
+    if args.expect_invalid is not None and summary.get("expect_invalid_violation"):
+        print(f"ERROR: {summary['expect_invalid_violation']}", file=sys.stderr)
         return 2
     return 0
 

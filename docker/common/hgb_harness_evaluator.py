@@ -78,6 +78,13 @@ except Exception:  # pragma: no cover - only in stripped-down test environments
 
 SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx"}
 
+# Eta is the canonical strictest profile (eta plan §6): coverage must come from
+# a separate coverage-instrumented build that replays the final campaign
+# corpus, with a copied coverage.json (no stdout fallback). copy_out_ok,
+# coverage_report_path, and inputs_replayed > 0 are mandatory for an evaluated
+# eta row.
+ETA_PROFILES = {"reproduction-eta"}
+
 
 @dataclass
 class CandidateRecord:
@@ -303,8 +310,10 @@ def evaluate_candidate(
     coverage_image_tag: str = "",
     build_coverage_image: bool = False,
     build_timeout_seconds: int = 1800,
+    profile: str = "",
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
+    strict_eta = profile in ETA_PROFILES
 
     rec = CandidateRecord(
         candidate_id=candidate_id,
@@ -495,11 +504,59 @@ def evaluate_candidate(
         corpus_dir=coverage_corpus_dir,
         work_dir=candidate_work,
         runner=runner,
+        require_coverage_report=strict_eta,
     )
     raw_text = cov.get("raw_text", "")
     cov_summary: dict[str, Any] | None = None
     coverage_report_path = cov.get("coverage_report_path", "")
-    if raw_text.strip():
+    # Eta coverage invariants (eta plan §6): the coverage report must be a real
+    # coverage.json copied out of the container (copy_out_ok, a
+    # coverage_report_path that exists on disk, and inputs_replayed > 0). The
+    # stdout-only fallback is removed for strict eta; a missing copied report
+    # fails coverage immediately.
+    if strict_eta:
+        if not bool(cov.get("copy_out_ok", False)):
+            hgb_result.mark_stage(rec.stages, "coverage", "failed")
+            rec.error = "coverage.copy_out_ok != true; strict eta requires a copied coverage.json"
+            rec.coverage = {
+                "report_exists": bool(cov.get("report_exists", False)),
+                "line_coverage": {"covered": None},
+                "copy_out_ok": False,
+                "inputs_replayed": int(cov.get("inputs_replayed", 0) or 0),
+                "coverage_report_path": coverage_report_path,
+            }
+            return rec
+        if not coverage_report_path or not Path(coverage_report_path).is_file():
+            hgb_result.mark_stage(rec.stages, "coverage", "failed")
+            rec.error = "coverage.coverage_report_path is missing or does not exist; strict eta requires a copied coverage.json"
+            rec.coverage = {
+                "report_exists": False,
+                "line_coverage": {"covered": None},
+                "copy_out_ok": True,
+                "inputs_replayed": int(cov.get("inputs_replayed", 0) or 0),
+                "coverage_report_path": coverage_report_path,
+            }
+            return rec
+        if int(cov.get("inputs_replayed", 0) or 0) <= 0:
+            hgb_result.mark_stage(rec.stages, "coverage", "failed")
+            rec.error = "coverage.inputs_replayed <= 0; strict eta requires the final campaign corpus to be replayed"
+            rec.coverage = {
+                "report_exists": True,
+                "line_coverage": {"covered": None},
+                "copy_out_ok": True,
+                "inputs_replayed": 0,
+                "coverage_report_path": coverage_report_path,
+            }
+            return rec
+        # Parse the copied coverage.json directly (not stdout).
+        try:
+            cov_path = Path(coverage_report_path)
+            parser = coverage_parser or hgb_coverage.summarize_coverage_report
+            cov_summary = parser(cov_path)
+            hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary, cov_path.read_text(encoding="utf-8"))
+        except hgb_coverage.CoverageError as exc:
+            rec.error = f"coverage report invalid: {exc}"
+    elif raw_text.strip():
         try:
             cov_path = candidate_work / "coverage" / "coverage.json"
             cov_path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,7 +570,10 @@ def evaluate_candidate(
     # Attach the coverage-phase audit so invariants can require report_exists.
     if cov_summary is not None:
         cov_summary = dict(cov_summary)
-        cov_summary["report_exists"] = bool(cov.get("report_exists", False)) or bool(raw_text.strip())
+        if strict_eta:
+            cov_summary["report_exists"] = bool(cov.get("report_exists", False))
+        else:
+            cov_summary["report_exists"] = bool(cov.get("report_exists", False)) or bool(raw_text.strip())
         cov_summary["inputs_replayed"] = int(cov.get("inputs_replayed", 0) or 0)
         cov_summary["copy_in_ok"] = bool(cov.get("copy_in_ok", True))
         cov_summary["copy_out_ok"] = bool(cov.get("copy_out_ok", True))
@@ -559,6 +619,11 @@ def evaluate_candidate(
     native_summary: dict[str, Any] | None = None
     if run_native_control:
         try:
+            # Native control replays the same final campaign corpus as the
+            # candidate (not the original seed corpus) so the coverage diff
+            # compares candidate and reference harnesses on identical inputs
+            # (eta plan §2).
+            native_corpus_dir = coverage_corpus_dir if coverage_corpus_dir.is_dir() and any(coverage_corpus_dir.iterdir()) else corpus_dir
             native_summary = _run_native_coverage_control(
                 target_root=target_root,
                 evaluator_root=evaluator_root,
@@ -566,10 +631,11 @@ def evaluate_candidate(
                 native_harness=native_harness,
                 fuzz_target=fuzz_target,
                 image_tag=native_image_tag or (image_tag + "-native"),
-                corpus_dir=corpus_dir,
+                corpus_dir=native_corpus_dir,
                 work_dir=candidate_work,
                 runner=runner,
                 coverage_parser=coverage_parser,
+                require_coverage_report=strict_eta,
             )
         except Exception as exc:  # noqa: BLE001 - native control is best-effort
             rec.native_coverage = {"status": "unavailable", "error": str(exc)}
@@ -590,6 +656,7 @@ def _run_native_coverage_control(
     work_dir: Path,
     runner: Callable[..., Any],
     coverage_parser: Callable[[Path], dict[str, Any]] | None = None,
+    require_coverage_report: bool = False,
 ) -> dict[str, Any] | None:
     """Build the native (reference) image and replay coverage as a control.
 
@@ -649,7 +716,19 @@ def _run_native_coverage_control(
         corpus_dir=corpus_dir,
         work_dir=native_work,
         runner=runner,
+        require_coverage_report=require_coverage_report,
     )
+    # For strict eta, the native control coverage must also come from a copied
+    # coverage.json (no stdout fallback). For legacy profiles, parse stdout.
+    if require_coverage_report:
+        native_report = str(native_cov.get("coverage_report_path", ""))
+        if not native_report or not Path(native_report).is_file():
+            return None
+        try:
+            parser = coverage_parser or hgb_coverage.summarize_coverage_report
+            return parser(Path(native_report))
+        except hgb_coverage.CoverageError:
+            return None
     raw_text = native_cov.get("raw_text", "")
     if not raw_text.strip():
         return None
@@ -811,6 +890,7 @@ def evaluate(
             coverage_image_tag=coverage_image_tag,
             build_coverage_image=build_coverage_image,
             build_timeout_seconds=build_timeout_seconds,
+            profile=profile,
         )
         records.append(rec)
         # Flatten key audit/provenance fields onto the candidate dict so the

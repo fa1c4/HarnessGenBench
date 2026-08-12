@@ -26,11 +26,12 @@ die_profile() {
 }
 
 # Return 0 if the given profile is a strict reproduction profile
-# (reproduction-zeta, the canonical strict profile from the zeta plan, or its
-# backward-compatible aliases reproduction-epsilon and reproduction-delta).
+# (reproduction-eta, the canonical strict profile from the eta plan, or its
+# backward-compatible aliases reproduction-zeta, reproduction-epsilon, and
+# reproduction-delta).
 hgb_profile_is_strict_reproduction() {
   local p="${1:-}"
-  [[ "$p" == "reproduction-zeta" || "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" ]]
+  [[ "$p" == "reproduction-eta" || "$p" == "reproduction-zeta" || "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" ]]
 }
 
 # Universal set of host-runner profiles accepted across all generators. A
@@ -38,7 +39,7 @@ hgb_profile_is_strict_reproduction() {
 hgb_known_profile() {
   local p="${1:-}"
   case "$p" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke) return 0 ;;
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -603,9 +604,10 @@ run_hgb_target_container() {
   # selected_reference, or fuzzbench_selected_harness_apis.json.  The
   # evaluator-only half is mounted at /evaluator for the independent evaluator.
   # Old monolithic packages (no generator_input/) fall back to the package root
-  # UNLESS reproduction-delta is in effect, in which case a missing split is
-  # fail-closed: never mount the monolithic target root for a blind harness
-  # generator (it would leak reference_harnesses to the generator).
+  # UNLESS a strict reproduction profile (reproduction-eta/zeta/epsilon/delta)
+  # is in effect, in which case a missing split is fail-closed: never mount the
+  # monolithic target root for a blind harness generator (it would leak
+  # reference_harnesses to the generator).
   local target_mount_src="$target_package"
   local evaluator_mount_args=()
   local ckg_profile="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-}}"
@@ -615,10 +617,10 @@ run_hgb_target_container() {
       evaluator_mount_args+=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
     fi
   fi
-  # Strict reproduction (reproduction-epsilon and its alias reproduction-delta)
-  # fail-closed: a blind harness generator must never fall back to the
-  # monolithic package root. Require both halves and their manifests before
-  # container launch.
+  # Strict reproduction (reproduction-eta and its aliases reproduction-zeta,
+  # reproduction-epsilon, reproduction-delta) fail-closed: a blind harness
+  # generator must never fall back to the monolithic package root. Require both
+  # halves and their manifests before container launch.
   if hgb_generator_is_blind "$generator" && hgb_profile_is_strict_reproduction "$ckg_profile"; then
     if [[ ! -f "$target_package/generator_input/target_manifest.json" ]]; then
       die "$ckg_profile: missing $target_package/generator_input/target_manifest.json; target split did not produce the generator half (infra_failure)"

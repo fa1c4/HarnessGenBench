@@ -112,7 +112,7 @@ valid_hgb_generator "$generator" || die "unknown generator: $generator"
 # profile is allowed here; the generator default is applied by the host runner
 # or the container entrypoint.
 if [[ -n "$profile" ]] && ! hgb_known_profile "$profile"; then
-  die_profile "unknown profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, or compat-smoke)"
+  die_profile "unknown profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)"
 fi
 [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || die "--timeout must be an integer"
 [[ "$target_layout" == "compact" || "$target_layout" == "full" ]] || die "--layout must be compact or full"

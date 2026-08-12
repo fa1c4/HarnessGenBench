@@ -46,6 +46,43 @@ commit() { git -C "$artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
 hgb_profile="${HGB_BASELINE_PROFILE:-${HGB_PROFILE:-alpha}}"
 hgb_protocol="${HGB_BASELINE_PROTOCOL:-${HGB_PROTOCOL:-blind-project}}"
 
+# Strict reproduction defaults shared by reproduction-delta/epsilon/zeta/eta.
+# zeta/eta layer additional required env on top of these (see
+# _ofg_apply_zeta_eta_env).
+_ofg_apply_strict_reproduction_defaults() {
+  export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
+  export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
+  export OFG_ALLOW_PROJECT_YAML_FALLBACK="${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}"
+  export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}"
+  export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
+  export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
+  export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
+  export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+  export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
+  export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
+  export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
+  export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+  export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
+  export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
+  export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+}
+
+# zeta plan §1 / eta plan §1: zeta and eta are the strictest profiles. They
+# force real OSS-Fuzz project context, real Introspector, no reference
+# examples, no selected-harness API ranking, the upstream repair loop, real
+# coverage, and a sealed split package. Eta is the canonical strict profile
+# and inherits all of these required env values.
+_ofg_apply_zeta_eta_env() {
+  export OFG_USE_REAL_OSS_FUZZ="${OFG_USE_REAL_OSS_FUZZ:-1}"
+  export OFG_USE_REAL_INTROSPECTOR="${OFG_USE_REAL_INTROSPECTOR:-1}"
+  export OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM="${OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM:-0}"
+  export OFG_ALLOW_REFERENCE_EXAMPLES="${OFG_ALLOW_REFERENCE_EXAMPLES:-0}"
+  export OFG_ALLOW_SELECTED_HARNESS_API_RANKING="${OFG_ALLOW_SELECTED_HARNESS_API_RANKING:-0}"
+  export OFG_ENABLE_REPAIR_LOOP="${OFG_ENABLE_REPAIR_LOOP:-1}"
+  export OFG_ENABLE_COVERAGE="${OFG_ENABLE_COVERAGE:-1}"
+  export HGB_TARGET_REQUIRE_SPLIT=1
+}
+
 apply_profile_defaults() {
   case "$hgb_profile" in
     alpha)
@@ -99,47 +136,38 @@ apply_profile_defaults() {
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
       export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
       ;;
-    reproduction-delta|reproduction-epsilon|reproduction-zeta)
-      # Strict reproduction profiles. reproduction-zeta is the canonical
-      # strict profile (zeta plan); reproduction-epsilon is the strict profile
-      # from the epsilon plan; reproduction-delta is its backward-compatible
-      # alias (plan oss-fuzz-gen_reproduction_delta.md section 1). All are
-      # stricter than reproduction-gamma: OFG_INTROSPECTOR_MODE defaults to
-      # real, coverage gains are never skipped, GCS target download is
-      # forbidden, project-YAML fallback and bad-benchmark synthesis are
-      # forbidden unless an explicit compat variant is recorded and the row
-      # is excluded from the aggregate. No selected-harness API rank/report
-      # and no exact reference harness as example are produced (enforced by
-      # ofg_run_wrapper.py / ofg_api_rank.py).
-      export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-real}"
-      export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
-      export OFG_ALLOW_PROJECT_YAML_FALLBACK="${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}"
-      export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}"
-      export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
-      export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
-      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
-      export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
-      export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
-      export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
-      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
-      export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
-      export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
-      export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
+    reproduction-delta|reproduction-epsilon)
+      # Strict reproduction profiles. reproduction-epsilon is the strict
+      # profile from the epsilon plan and reproduction-delta is its
+      # backward-compatible alias (plan oss-fuzz-gen_reproduction_delta.md
+      # section 1). Both are stricter than reproduction-gamma:
+      # OFG_INTROSPECTOR_MODE defaults to real, coverage gains are never
+      # skipped, GCS target download is forbidden, project-YAML fallback and
+      # bad-benchmark synthesis are forbidden unless an explicit compat
+      # variant is recorded and the row is excluded from the aggregate. No
+      # selected-harness API rank/report and no exact reference harness as
+      # example are produced (enforced by ofg_run_wrapper.py /
+      # ofg_api_rank.py). zeta/eta are handled by their own cases below
+      # because they layer additional required env on top of these defaults.
+      _ofg_apply_strict_reproduction_defaults
       ;;
     reproduction-zeta)
       # zeta plan §1: zeta is the strictest profile. It inherits the strict
       # reproduction defaults and additionally forces real OSS-Fuzz project
       # context, real Introspector, no reference examples, no selected-harness
       # API ranking, repair loop, coverage, and a sealed split package.
-      export OFG_USE_REAL_OSS_FUZZ="${OFG_USE_REAL_OSS_FUZZ:-1}"
-      export OFG_USE_REAL_INTROSPECTOR="${OFG_USE_REAL_INTROSPECTOR:-1}"
-      export OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM="${OFG_ALLOW_LOCAL_INTROSPECTOR_SHIM:-0}"
-      export OFG_ALLOW_REFERENCE_EXAMPLES="${OFG_ALLOW_REFERENCE_EXAMPLES:-0}"
-      export OFG_ALLOW_SELECTED_HARNESS_API_RANKING="${OFG_ALLOW_SELECTED_HARNESS_API_RANKING:-0}"
-      export OFG_ENABLE_REPAIR_LOOP="${OFG_ENABLE_REPAIR_LOOP:-1}"
-      export OFG_ENABLE_COVERAGE="${OFG_ENABLE_COVERAGE:-1}"
-      export HGB_TARGET_REQUIRE_SPLIT=1
+      _ofg_apply_strict_reproduction_defaults
+      _ofg_apply_zeta_eta_env
+      ;;
+    reproduction-eta)
+      # eta plan §1: eta is the canonical strictest profile. It inherits all
+      # zeta required env (real OSS-Fuzz project context, real Introspector,
+      # no reference examples, no selected-harness API ranking, repair loop,
+      # coverage, sealed split package) and the strict reproduction defaults.
+      # The eta-specific coverage-instrumented build and native coverage
+      # control are requested by run_evaluator (eta plan §2/§5/§6).
+      _ofg_apply_strict_reproduction_defaults
+      _ofg_apply_zeta_eta_env
       ;;
     compat-smoke)
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-local}"
@@ -576,23 +604,44 @@ run_evaluator() {
   # Evaluator CLI failure must propagate (no `|| true`): section 9 forbids
   # swallowing evaluator failure.
   if [[ -n "$evaluator_root" ]]; then
-    "$python" /opt/hgb/bin/hgb_harness_evaluator.py \
-      --generator oss-fuzz-gen \
-      --target-root "${HGB_TARGET_PACKAGE:-/target}" \
-      --evaluator-root "$evaluator_root" \
-      --candidates "$workspace/generated_harnesses" \
-      --work-dir "$eval_dir" \
-      --project "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}" \
-      --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
-      --profile "$hgb_profile" \
-      --protocol "$hgb_protocol" \
-      --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}" \
-      --build-timeout-seconds "${OFG_EVAL_BUILD_TIMEOUT:-1800}" \
-      --intended-apis "$selected_functions" \
-      --strict \
-      --run-native-control \
+    # Build the evaluator args conditionally. Strict reproduction profiles
+    # (reproduction-delta/epsilon/zeta/eta) must build a separate
+    # coverage-instrumented image and replay the final campaign corpus
+    # (HGB8 blocker / eta plan §2/§6). zeta/eta additionally run the native
+    # coverage control to produce a line-coverage diff (eta plan §5).
+    local ofg_evaluator_args=(
+      --generator oss-fuzz-gen
+      --target-root "${HGB_TARGET_PACKAGE:-/target}"
+      --evaluator-root "$evaluator_root"
+      --candidates "$workspace/generated_harnesses"
+      --work-dir "$eval_dir"
+      --project "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+      --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+      --profile "$hgb_profile"
+      --protocol "$hgb_protocol"
+      --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}"
+      --build-timeout-seconds "${OFG_EVAL_BUILD_TIMEOUT:-1800}"
+      --intended-apis "$selected_functions"
+      --strict
+    )
+    case "$hgb_profile" in
+      reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
+        ofg_evaluator_args+=(--build-coverage-image)
+        ;;
+    esac
+    case "$hgb_profile" in
+      reproduction-zeta|reproduction-eta)
+        ofg_evaluator_args+=(--run-native-control)
+        ;;
+    esac
+    "$python" /opt/hgb/bin/hgb_harness_evaluator.py "${ofg_evaluator_args[@]}" \
       >"$workspace/logs/evaluator.log" 2>&1
-    return $?
+    local ofg_eval_rc=$?
+    if [[ "$ofg_eval_rc" -ne 0 ]]; then
+      printf 'ofg_evaluator_failed: shared harness evaluator exited %s for profile=%s\n' \
+        "$ofg_eval_rc" "$hgb_profile" >>"$workspace/logs/evaluator.log"
+    fi
+    return "$ofg_eval_rc"
   fi
   # Monolithic layout fallback (legacy/compat): ofg_evaluator without the split.
   "$python" /opt/hgb/bin/ofg_evaluator.py \
@@ -619,7 +668,7 @@ write_final_result() {
   local method_variant excluded
   if [[ "$hgb_profile" == "compat-smoke" ]]; then
     method_variant="compat-smoke"; excluded=true
-  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" || "$hgb_profile" == "reproduction-epsilon" || "$hgb_profile" == "reproduction-zeta" ]]; then
+  elif [[ "$hgb_profile" == "reproduction-gamma" || "$hgb_profile" == "reproduction-delta" || "$hgb_profile" == "reproduction-epsilon" || "$hgb_profile" == "reproduction-zeta" || "$hgb_profile" == "reproduction-eta" ]]; then
     method_variant="paper-faithful"; excluded=false
   else
     method_variant="$hgb_profile"; excluded=false

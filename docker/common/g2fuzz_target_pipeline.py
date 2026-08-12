@@ -74,6 +74,7 @@ GAMMA_PROFILE = "reproduction-gamma"
 DELTA_PROFILE = "reproduction-delta"
 EPSILON_PROFILE = "reproduction-epsilon"
 ZETA_PROFILE = "reproduction-zeta"
+ETA_PROFILE = "reproduction-eta"
 GAMMA_BUILD_MODE = "fuzzbench_docker_triple"
 # method_variant values reported in the delta result schema (plan section 7).
 PAPER_CORE_VARIANT = "paper-core"
@@ -83,27 +84,38 @@ EXTENSION_VARIANT = "extension"
 def is_gamma_profile(profile: str) -> bool:
     """Return True for the strict triple-build profiles.
 
-    ``reproduction-zeta`` is the canonical strict profile (plan
-    ``g2fuzz_reproduction_zeta.md``); ``reproduction-epsilon`` is the strict
-    profile from the epsilon plan (plan
-    ``ckgfuzzer_reproduction_epsilon.md`` shared foundation);
+    ``reproduction-eta`` is the canonical strictest profile (plan
+    ``g2fuzz_reproduction_eta.md``); ``reproduction-zeta`` is the strict
+    profile from the zeta plan (plan ``g2fuzz_reproduction_zeta.md``);
+    ``reproduction-epsilon`` is the strict profile from the epsilon plan
+    (plan ``ckgfuzzer_reproduction_epsilon.md`` shared foundation);
     ``reproduction-delta`` is its backward-compatible alias (plan
     ``g2fuzz_reproduction_delta.md``); ``reproduction-gamma`` is kept as a
-    backward-compatible alias.  All four share the exact FuzzBench Docker
+    backward-compatible alias.  All five share the exact FuzzBench Docker
     triple build, contract probe, and real coverage replay code path.
     """
 
-    return profile in (GAMMA_PROFILE, DELTA_PROFILE, EPSILON_PROFILE, ZETA_PROFILE)
+    return profile in (GAMMA_PROFILE, DELTA_PROFILE, EPSILON_PROFILE, ZETA_PROFILE, ETA_PROFILE)
 
 
 def is_delta_profile(profile: str) -> bool:
-    """Return True for the strictest triple-build profiles (delta + epsilon + zeta)."""
-    return profile in (DELTA_PROFILE, EPSILON_PROFILE, ZETA_PROFILE)
+    """Return True for the strictest triple-build profiles (delta + epsilon + zeta + eta)."""
+    return profile in (DELTA_PROFILE, EPSILON_PROFILE, ZETA_PROFILE, ETA_PROFILE)
 
 
 def is_zeta_profile(profile: str) -> bool:
-    """Return True for the zeta profile (the strictest)."""
-    return profile == ZETA_PROFILE
+    """Return True for the zeta and eta profiles (the strictest).
+
+    Eta is the canonical strictest profile (eta plan); zeta is the strict
+    profile from the zeta plan. Both reject a precomputed
+    ``G2FUZZ_COVERAGE_REPORT`` in production.
+    """
+    return profile in (ZETA_PROFILE, ETA_PROFILE)
+
+
+def is_eta_profile(profile: str) -> bool:
+    """Return True for the eta profile (the canonical strictest)."""
+    return profile == ETA_PROFILE
 
 
 def method_variant_for(adapter: dict[str, Any]) -> str:
@@ -2050,14 +2062,15 @@ class G2FuzzPipeline:
         raw_text = ""
         inputs_replayed = 0
         # 1. Explicit coverage report hook (test/CI or precomputed report).
-        # zeta plan §8: in production (no PYTEST_CURRENT_TEST) zeta must reject
-        # a precomputed G2FUZZ_COVERAGE_REPORT; only fixture tests may use it.
+        # eta/zeta plan §8: in production (no PYTEST_CURRENT_TEST) eta and zeta
+        # must reject a precomputed G2FUZZ_COVERAGE_REPORT; only fixture tests
+        # may use it.
         env_report = os.environ.get("G2FUZZ_COVERAGE_REPORT")
         if env_report and Path(env_report).is_file():
             if is_zeta_profile(self.profile) and not os.environ.get("PYTEST_CURRENT_TEST"):
                 raise PipelineError(
                     "failed",
-                    "G2Fuzz reproduction-zeta forbids G2FUZZ_COVERAGE_REPORT in production; "
+                    f"G2Fuzz {self.profile} forbids G2FUZZ_COVERAGE_REPORT in production; "
                     "coverage must come from a real coverage replay",
                     65,
                 )

@@ -126,6 +126,61 @@ def write_neutral_stub(destination: Path, language: str) -> Path:
     return destination
 
 
+def write_knowledge_usage(
+    knowledge_dir: Path,
+    *,
+    consumer_cases_status: str = "unavailable",
+    consumer_count: int = 0,
+    selected_api_count: int = 0,
+) -> dict[str, Any]:
+    """Record a ``knowledge_usage.json`` proving PromeFuzz loaded knowledge.
+
+    Eta plan §4: the knowledge_usage record proves counts of documents, API
+    usage patterns, call correlations, retrieved examples, and APIs used in
+    final prompts. It is written after the comprehend stage so the matrix
+    collector can verify consumer/API usage knowledge was both generated and
+    loaded.
+    """
+    knowledge_dir = Path(knowledge_dir)
+    record: dict[str, Any] = {
+        "knowledge_dir": str(knowledge_dir),
+        "consumer_cases_status": consumer_cases_status,
+        "consumer_count": int(consumer_count),
+        "document_count": 0,
+        "api_usage_pattern_count": 0,
+        "call_correlation_count": 0,
+        "retrieved_example_count": 0,
+        "selected_api_count": int(selected_api_count),
+        "knowledge_artifacts": [],
+    }
+    if knowledge_dir.is_dir():
+        artifacts: list[str] = []
+        for path in sorted(knowledge_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            name_l = path.name.lower()
+            artifacts.append(str(path))
+            if any(tok in name_l for tok in ("knowledge", "comprehend", "correlation", "retriev", "embed", "document")):
+                record["document_count"] += 1
+            if any(tok in name_l for tok in ("correlation", "call", "usage")):
+                record["call_correlation_count"] += 1
+            if any(tok in name_l for tok in ("retriev", "example", "case")):
+                record["retrieved_example_count"] += 1
+            if any(tok in name_l for tok in ("api", "pattern", "func")):
+                record["api_usage_pattern_count"] += 1
+        record["knowledge_artifacts"] = artifacts
+    record["loaded"] = (
+        record["document_count"] > 0
+        or record["api_usage_pattern_count"] > 0
+        or record["call_correlation_count"] > 0
+        or record["retrieved_example_count"] > 0
+    )
+    out_path = knowledge_dir.parent / "knowledge_usage.json" if knowledge_dir.name else knowledge_dir / "knowledge_usage.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return record
+
+
 def _is_fuzz_harness(path: Path) -> bool:
     name_l = path.name.lower()
     if FUZZ_NAME_RE.search(name_l):

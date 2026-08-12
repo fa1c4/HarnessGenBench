@@ -441,7 +441,7 @@ def test_hgb_generate_harness_accepts_reproduction_epsilon() -> None:
 
 def test_baseline_sh_accepts_reproduction_epsilon_for_promefuzz() -> None:
     baseline = _baseline_sh()
-    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|compat-smoke" in baseline
+    assert "alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke" in baseline
     assert "promefuzz/$profile: HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1 is forbidden" in baseline
 
 

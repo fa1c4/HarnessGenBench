@@ -609,6 +609,7 @@ def run_coverage(
     work_dir: Path,
     runner: Runner = _run,
     timeout_seconds: int = 600,
+    require_coverage_report: bool = False,
 ) -> dict:
     """Replay the final corpus under a coverage-instrumented binary.
 
@@ -618,6 +619,14 @@ def run_coverage(
     failed.  The export includes per-function detail (not ``-summary-only``)
     so the evaluator can match intended API symbols to covered functions for
     real API reachability evidence.
+
+    When ``require_coverage_report`` is true (strict eta), the coverage report
+    must be a real ``coverage.json`` copied out of the container; the
+    stdout-only ``report_exists`` fallback is removed.  The replay command
+    executes every copied corpus file in a per-file loop (one process per
+    input) and writes ``HGB_INPUTS_REPLAYED=<n>`` to stderr so the caller can
+    prove the corpus was actually replayed; the loop fails when zero files are
+    executed (eta plan §2/§6).
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     # Build copy_in list for corpus files to replay.
@@ -628,15 +637,35 @@ def run_coverage(
             copy_in.append((seed, f"/tmp/corpus/cov_{seed_index:04d}"))
             seed_index += 1
     cov_work = work_dir / "coverage"
-    cmd = [
-        "sh",
-        "-lc",
-        f'mkdir -p /tmp/cov /tmp/corpus && LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw '
-        f'{binary_path} -runs=0 /tmp/corpus && '
-        f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && '
-        f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
-        f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err; cat /tmp/cov/coverage.json',
-    ]
+    if require_coverage_report:
+        # Eta replay: execute every copied corpus file once in a per-file loop
+        # (one process per input, one profraw per input via the %p pattern), so
+        # the replay demonstrably executes all copied corpus files.  Fail when
+        # zero files are executed.  The coverage report is a copied
+        # coverage.json; stdout is not a fallback (eta plan §6).
+        replay_script = (
+            'set -e; mkdir -p /tmp/cov /tmp/corpus; '
+            'n=0; '
+            'for f in /tmp/corpus/*; do '
+            '[ -f "$f" ] || continue; '
+            f'LLVM_PROFILE_FILE=/tmp/cov/coverage-%p.profraw {binary_path} "$f" >/dev/null 2>&1 || true; '
+            'n=$((n+1)); '
+            'done; '
+            'printf "HGB_INPUTS_REPLAYED=%s\\n" "$n" >&2; '
+            'test "$n" -gt 0; '
+            f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/coverage-*.profraw && '
+            f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
+            f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err'
+        )
+    else:
+        replay_script = (
+            f'mkdir -p /tmp/cov /tmp/corpus && LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw '
+            f'{binary_path} -runs=0 /tmp/corpus && '
+            f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && '
+            f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
+            f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err; cat /tmp/cov/coverage.json'
+        )
+    cmd = ["sh", "-lc", replay_script]
     result = _container_run(
         image_tag=image_tag,
         work_dir=cov_work,
@@ -650,9 +679,22 @@ def run_coverage(
     copy_in_ok = bool(getattr(result, "copy_in_ok", True))
     copy_out_ok = bool(getattr(result, "copy_out_ok", True))
     cov_path = cov_work / "coverage.json"
+    # Parse the executed-file count from the HGB_INPUTS_REPLAYED marker the eta
+    # replay loop writes to stderr.  Fall back to the copy_in count for the
+    # legacy -runs=0 replay path.
+    inputs_replayed = len(copy_in)
+    marker_log = (result.stderr or "") + "\n" + (result.stdout or "")
+    m = re.search(r"HGB_INPUTS_REPLAYED=(\d+)", marker_log)
+    if m:
+        inputs_replayed = int(m.group(1))
     # A successful coverage phase requires a real coverage.json copied from
     # the container OR nonempty stdout plus a parseable report (zeta plan §2).
-    report_exists = cov_path.is_file() or bool((result.stdout or "").strip())
+    # For strict eta, the copied coverage.json is mandatory: the stdout-only
+    # report_exists fallback is removed (eta plan §6).
+    if require_coverage_report:
+        report_exists = cov_path.is_file()
+    else:
+        report_exists = cov_path.is_file() or bool((result.stdout or "").strip())
     return {
         "exit_code": result.exit_code,
         "raw_text": result.stdout,
@@ -661,7 +703,7 @@ def run_coverage(
         "copy_in_ok": copy_in_ok,
         "copy_out_ok": copy_out_ok,
         "report_exists": report_exists,
-        "inputs_replayed": len(copy_in),
+        "inputs_replayed": inputs_replayed,
     }
 
 

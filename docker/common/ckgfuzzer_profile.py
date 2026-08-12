@@ -17,20 +17,29 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
-# Strict reproduction profiles. ``reproduction-zeta`` is the canonical strict
-# profile introduced by the reproduction-zeta plan: it is paper-faithful and
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+# Strict reproduction profiles. ``reproduction-eta`` is the canonical strict
+# profile introduced by the reproduction-eta plan: it is paper-faithful and
 # rejects every local/deterministic fallback, every compatibility fallback,
-# and additionally forces a sealed split package and a real CodeQL graph.
-# ``reproduction-epsilon`` is the strict profile from the reproduction-epsilon
-# plan and ``reproduction-delta`` remains accepted as a backward-compatible
-# alias. ``reproduction-gamma`` is method-faithful but not strict (it does not
-# enforce the epsilon/zeta fail-closed invariants).
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta"}
-# Zeta is the strictest profile: it adds fail-closed split-package and
-# CodeQL-graph requirements on top of the epsilon strict invariants.
+# forces a sealed split package and a real CodeQL graph, and additionally
+# requires a separate coverage-instrumented build that replays the final
+# campaign corpus with a copied ``coverage.json`` (no stdout fallback).
+# ``reproduction-zeta`` is the strict profile from the reproduction-zeta plan
+# and ``reproduction-epsilon``/``reproduction-delta`` remain accepted as
+# backward-compatible aliases of the strict family. ``reproduction-gamma`` is
+# method-faithful but not strict (it does not enforce the eta/zeta fail-closed
+# invariants).
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+# Eta is the canonical strictest profile (eta plan): it adds fail-closed
+# split-package, CodeQL-graph, and copied-coverage-report requirements on top
+# of the zeta strict invariants. Zeta remains accepted with its existing
+# behavior; eta is the new canonical profile.
+ETA_PROFILES = {"reproduction-eta"}
+# Zeta is the strict profile from the zeta plan: it adds fail-closed
+# split-package and CodeQL-graph requirements on top of the epsilon strict
+# invariants.
 ZETA_PROFILES = {"reproduction-zeta"}
 
 # Flags that are forbidden in method-faithful profiles.
@@ -146,23 +155,24 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 "source-only CodeQL graph fallback is forbidden"
             )
 
-    # Zeta is stricter than epsilon: it additionally forbids the source graph
-    # fallback and mock embeddings by name, and requires a sealed split package
-    # (zeta plan §1). These are required env values, not merely forbidden ones.
-    if profile in ZETA_PROFILES:
+    # Eta is the canonical strictest profile (eta plan §1) and zeta is the
+    # strict profile from the zeta plan. Both additionally forbid the source
+    # graph fallback and mock embeddings by name, and require a sealed split
+    # package. These are required env values, not merely forbidden ones.
+    if profile in ZETA_PROFILES or profile in ETA_PROFILES:
         if normalize_env_bool(env.get("CKGFUZZER_SOURCE_GRAPH_FALLBACK")) == "1":
             violations.append(
-                "CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden in reproduction-zeta; "
+                f"CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden in {profile}; "
                 "the CodeQL/code-knowledge graph must be built from the sealed source snapshot"
             )
         if normalize_env_bool(env.get("CKGFUZZER_ALLOW_MOCK_EMBEDDING")) == "1":
             violations.append(
-                "CKGFUZZER_ALLOW_MOCK_EMBEDDING=1 is forbidden in reproduction-zeta; "
+                f"CKGFUZZER_ALLOW_MOCK_EMBEDDING=1 is forbidden in {profile}; "
                 "a real embedding service is required"
             )
         if normalize_env_bool(env.get("HGB_TARGET_REQUIRE_SPLIT")) != "1":
             violations.append(
-                "HGB_TARGET_REQUIRE_SPLIT=1 is required for reproduction-zeta; "
+                f"HGB_TARGET_REQUIRE_SPLIT=1 is required for {profile}; "
                 "the target package must be physically split into generator/evaluator halves"
             )
 
