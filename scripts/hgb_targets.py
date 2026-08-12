@@ -1704,7 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
             baseline_protocol = os.environ.get("HGB_BASELINE_PROTOCOL", "")
             if baseline_protocol == "blind-project" and (
                 os.environ.get("HGB_TARGET_REQUIRE_SPLIT", "0") == "1"
-                or baseline_profile in ("reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta")
+                or baseline_profile in ("reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "reproduction-theta")
             ):
                 require_split = True
         try:

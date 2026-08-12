@@ -402,6 +402,41 @@ for generator in "${generator_list[@]}"; do
     fi
     continue
   fi
+  # CKGFuzzer reproduction-theta model preflight (theta plan §3): run the
+  # USTC model resolution and live chat/embedding probes ONCE per matrix run,
+  # before preparing all 20 target packages. Cache the result so each
+  # per-target container reuses it via HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE.
+  # If the probe fails, stop early with a clear diagnostic instead of
+  # preparing all targets and failing 20 rows with an opaque status.
+  if [[ "$generator" == "ckgfuzzer" ]] && [[ "$profile" == "reproduction-theta" ]] && [[ "$dry_run" != "1" ]]; then
+    ckg_preflight_cache_dir="$matrix_dir/ckgfuzzer_model_preflight"
+    ckg_preflight_cache_file="$ckg_preflight_cache_dir/model_preflight.json"
+    mkdir -p "$ckg_preflight_cache_dir"
+    if [[ -f "$ckg_preflight_cache_file" ]] && [[ "${HGB_CKGFUZZER_MODEL_PREFLIGHT_SKIP:-0}" != "1" ]]; then
+      log "reusing cached CKGFuzzer model preflight: $ckg_preflight_cache_file"
+    else
+      log "running CKGFuzzer model preflight (theta plan §3) for provider=${HGB_LLM_PROVIDER:-auto}"
+      if ! python3 "$root/docker/common/ckgfuzzer_model_config.py" preflight \
+          --profile "$profile" --out "$ckg_preflight_cache_file" \
+          >"$ckg_preflight_cache_dir/preflight_stdout.log" 2>&1; then
+        ckg_preflight_status="model_preflight_failed"
+        if [[ -f "$ckg_preflight_cache_file" ]]; then
+          ckg_preflight_reason="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("reason_code","probe_failed"))' "$ckg_preflight_cache_file" 2>/dev/null || printf 'probe_failed')"
+        else
+          ckg_preflight_reason="probe_failed"
+        fi
+        log "CKGFuzzer model preflight failed: $ckg_preflight_reason (see $ckg_preflight_cache_dir/preflight_stdout.log)"
+        record_preflight_failure "$generator" 65 "$ckg_preflight_status" "${eligible_targets[@]}"
+        if [[ "$continue_on_error" != "1" ]]; then
+          python3 "$SCRIPT_DIR/hgb_collect_matrix.py" "$matrix_dir"
+          exit 65
+        fi
+        continue
+      fi
+      log "CKGFuzzer model preflight passed: $ckg_preflight_cache_file"
+    fi
+    export HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE="$ckg_preflight_cache_file"
+  fi
   prepare_shared_target_packages "${eligible_targets[@]}"
   active_count=0
   generator_failed=0

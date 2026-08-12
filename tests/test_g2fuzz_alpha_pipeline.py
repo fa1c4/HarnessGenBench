@@ -289,11 +289,16 @@ def test_build_command_pair_differs_only_by_instrumentation_and_output() -> None
 def test_host_target_dir_is_mounted_to_container_visible_path_and_optional_data_is_not_copied() -> None:
     common = (ROOT / "scripts/lib/common.sh").read_text(encoding="utf-8")
     dockerfile = (ROOT / "docker/g2fuzz/Dockerfile").read_text(encoding="utf-8")
+    entrypoint = (ROOT / "docker/g2fuzz/entrypoint.sh").read_text(encoding="utf-8")
     setup = (ROOT / "scripts/g2fuzz_setup.sh").read_text(encoding="utf-8")
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert "/g2fuzz-target-pair" in common
     assert "-e G2FUZZ_TARGET_DIR=/g2fuzz-target-pair" in common
+    assert '-v "$root/artifacts/g2fuzz:/opt/hgb/artifacts/g2fuzz:ro"' in common
+    assert "prepare_g2fuzz_runtime_artifact" in entrypoint
+    assert 'cp -a "$source_artifact"/. "$runtime_artifact"/' in entrypoint
+    assert 'export HGB_GENERATOR_ARTIFACT_DIR="$artifact"' in entrypoint
     assert "COPY artifacts/g2fuzz-data" not in dockerfile
     assert "ensure_artifacts_present \"$root\" \"g2fuzz\" \"g2fuzz-data\"" not in setup
     assert "smoke-g2fuzz:\n\tbash scripts/g2fuzz_smoke_afl.sh\n" in makefile

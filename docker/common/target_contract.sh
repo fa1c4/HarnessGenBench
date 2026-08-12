@@ -403,7 +403,7 @@ hgb_write_result_json() {
   local method_variant="$profile"
   case "$profile" in
     compat-smoke) excluded=true; method_variant="compat-smoke" ;;
-    reproduction-gamma) method_variant="paper-faithful" ;;
+    reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|reproduction-theta) method_variant="paper-faithful" ;;
   esac
   local stages_json
   stages_json="$(hgb_result_read_stages "$stage_file")"

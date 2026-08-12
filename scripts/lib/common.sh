@@ -27,11 +27,11 @@ die_profile() {
 
 # Return 0 if the given profile is a strict reproduction profile
 # (reproduction-eta, the canonical strict profile from the eta plan, or its
-# backward-compatible aliases reproduction-zeta, reproduction-epsilon, and
-# reproduction-delta).
+# backward-compatible aliases reproduction-zeta, reproduction-epsilon,
+# reproduction-delta, and reproduction-theta).
 hgb_profile_is_strict_reproduction() {
   local p="${1:-}"
-  [[ "$p" == "reproduction-eta" || "$p" == "reproduction-zeta" || "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" ]]
+  [[ "$p" == "reproduction-eta" || "$p" == "reproduction-zeta" || "$p" == "reproduction-epsilon" || "$p" == "reproduction-delta" || "$p" == "reproduction-theta" ]]
 }
 
 # Universal set of host-runner profiles accepted across all generators. A
@@ -39,7 +39,7 @@ hgb_profile_is_strict_reproduction() {
 hgb_known_profile() {
   local p="${1:-}"
   case "$p" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) return 0 ;;
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|reproduction-theta|compat-smoke) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -473,6 +473,12 @@ run_hgb_container() {
     -e CKGFUZZER_EMBEDDING_MODEL \
     -e CKGFUZZER_EMBEDDING_BASE_URL \
     -e CKGFUZZER_EMBEDDING_API_KEY \
+    -e CKGFUZZER_LLM_MODEL \
+    -e CKGFUZZER_API_KEY \
+    -e CKGFUZZER_BASE_URL \
+    -e HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE \
+    -e HGB_LLM_PROVIDER \
+    -e HGB_LLM_PROVIDER_RESOLVED \
     -e CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS \
     -e CKGFUZZER_LLM_MAX_RETRIES \
     -e CKGFUZZER_LOCAL_API_COMBINATION \
@@ -582,6 +588,10 @@ run_hgb_target_container() {
     extra_docker_args+=(-v "$workspace/docker_shared:$workspace/docker_shared" -e "HGB_CKG_DOCKER_SHARED=$workspace/docker_shared" -e "CKGFUZZER_MAX_CALL_GRAPH_APIS=${CKGFUZZER_MAX_CALL_GRAPH_APIS:-8}")
     extra_docker_args+=(-v "$ckg_codeql_cache_dir:/hgb-ckg-cache" -e HGB_CKG_CODEQL_CACHE_DIR=/hgb-ckg-cache -e "CKGFUZZER_CODEQL_CACHE=${CKGFUZZER_CODEQL_CACHE:-1}" -e "CKGFUZZER_CODEQL_CACHE_REFRESH=${CKGFUZZER_CODEQL_CACHE_REFRESH:-0}")
     extra_docker_args+=(-v "$(hgb_workspace_dir "$root"):/hgb-workspace:ro" -e HGB_CKG_PREVIOUS_WORKSPACE_ROOT=/hgb-workspace)
+    # Mount the theta model preflight cache so the container can reuse it.
+    if [[ -n "${HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE:-}" && -f "${HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE:-}" ]]; then
+      extra_docker_args+=(-v "${HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE}:/opt/hgb/model_preflight.json:ro" -e HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE=/opt/hgb/model_preflight.json)
+    fi
     if [[ -S /var/run/docker.sock ]]; then
       extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     fi
@@ -742,6 +752,12 @@ run_hgb_target_container() {
     -e CKGFUZZER_EMBEDDING_MODEL \
     -e CKGFUZZER_EMBEDDING_BASE_URL \
     -e CKGFUZZER_EMBEDDING_API_KEY \
+    -e CKGFUZZER_LLM_MODEL \
+    -e CKGFUZZER_API_KEY \
+    -e CKGFUZZER_BASE_URL \
+    -e HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE \
+    -e HGB_LLM_PROVIDER \
+    -e HGB_LLM_PROVIDER_RESOLVED \
     -e CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS \
     -e CKGFUZZER_LLM_MAX_RETRIES \
     -e CKGFUZZER_LOCAL_API_COMBINATION \

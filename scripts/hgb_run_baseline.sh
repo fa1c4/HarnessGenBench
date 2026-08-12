@@ -200,8 +200,8 @@ case "$generator" in
     ;;
   ckgfuzzer)
     case "$profile" in
-      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
-      *) die_profile "ckgfuzzer: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, or compat-smoke)" ;;
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|reproduction-theta|compat-smoke) ;;
+      *) die_profile "ckgfuzzer: invalid profile: $profile (expected alpha, paper-faithful, reproduction-gamma, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, reproduction-theta, or compat-smoke)" ;;
     esac
     case "$protocol" in
       blind-project|api-oracle) ;;
@@ -216,7 +216,7 @@ case "$generator" in
     # makes no LLM/embedding calls) only validates that the profile/protocol
     # combination is accepted.
     if [[ "$dry_run" != "1" ]]; then
-      if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
+      if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" || "$profile" == "reproduction-theta" ]]; then
         if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
           die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden; use compat-smoke for local summaries"
         fi
@@ -238,7 +238,7 @@ case "$generator" in
       # compatible aliases reproduction-zeta, reproduction-epsilon, and
       # reproduction-delta) forbid the source-only CodeQL graph fallback and
       # unrecorded compatibility query rewrites.
-      if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
+      if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" || "$profile" == "reproduction-theta" ]]; then
         if [[ "${CKGFUZZER_ALLOW_SOURCE_FALLBACK:-0}" == "1" ]]; then
           die "ckgfuzzer/$profile: CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden; source-only CodeQL graph fallback is not allowed"
         fi
@@ -249,11 +249,12 @@ case "$generator" in
           export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-1}"
         fi
       fi
-      # reproduction-eta is the canonical strictest profile (eta plan §1) and
-      # reproduction-zeta is the strict profile from the zeta plan: force the
-      # CodeQL graph to be built from the sealed source snapshot, forbid mock
-      # embeddings, and require the target package to be physically split.
-      if [[ "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" ]]; then
+      # reproduction-eta/reproduction-theta are the canonical strictest
+      # profiles (eta plan §1 / theta plan) and reproduction-zeta is the
+      # strict profile from the zeta plan: force the CodeQL graph to be built
+      # from the sealed source snapshot, forbid mock embeddings, and require
+      # the target package to be physically split.
+      if [[ "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" || "$profile" == "reproduction-theta" ]]; then
         if [[ "${CKGFUZZER_SOURCE_GRAPH_FALLBACK:-0}" == "1" ]]; then
           die "ckgfuzzer/$profile: CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden; the CodeQL graph must be built from the sealed source snapshot"
         fi
@@ -521,7 +522,7 @@ result = {
     "applicability": "applicable",
     "status": "dry_run_ok",
     "reason": "dry run validated profile/protocol without Docker or LLM calls",
-    "method_variant": "paper-faithful" if profile in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta") else profile,
+    "method_variant": "paper-faithful" if profile in ("reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "reproduction-theta") else profile,
     "excluded_from_aggregate": True,
 }
 Path(workspace, "metadata.json").write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")

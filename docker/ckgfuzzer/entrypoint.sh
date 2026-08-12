@@ -145,15 +145,90 @@ if [[ "$mode" == "generate-target" ]]; then
   ckg_profile="$HGB_PROFILE"
   ckg_protocol="$HGB_PROTOCOL"
   case "$ckg_profile" in
-    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|compat-smoke) ;;
+    alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|reproduction-theta|compat-smoke) ;;
     *) hgb_write_common_metadata failed "invalid CKGFuzzer profile: $ckg_profile" 64 harness_generator; exit 64 ;;
   esac
   case "$ckg_protocol" in
     blind-project|api-oracle) ;;
     *) hgb_write_common_metadata failed "invalid CKGFuzzer protocol: $ckg_protocol" 64 harness_generator; exit 64 ;;
   esac
+  # --- reproduction-theta USTC model resolution (theta plan §2/§5) ---
+  # Apply theta strict defaults BEFORE validating embedding/chat config so the
+  # USTC registry defaults populate CKGFUZZER_LLM_MODEL and
+  # CKGFUZZER_EMBEDDING_MODEL when the user omits them. The entrypoint order
+  # is: parse args/env -> resolve profile aliases -> apply theta strict
+  # defaults -> resolve USTC model names -> validate -> preflight -> build.
+  ckg_model_config_json="{}"
+  ckg_model_preflight_json="{}"
+  if [[ "$ckg_profile" == "reproduction-theta" ]]; then
+    if [[ -z "${CKGFUZZER_LLM_MODEL:-}" ]]; then
+      ckg_theta_chat_default="$("$python" - <<'PY_CKG_THETA_CHAT_DEFAULT'
+import sys
+sys.path.insert(0, "/opt/hgb/bin")
+try:
+    import ckgfuzzer_model_config as cmc
+    registry = cmc.load_model_registry()
+    provider = (cmc.os.environ.get("HGB_LLM_PROVIDER") or "").strip().lower()
+    print(registry.get(provider, {}).get("defaults", {}).get("ckgfuzzer_chat", ""))
+except Exception:
+    print("")
+PY_CKG_THETA_CHAT_DEFAULT
+)"
+      [[ -n "$ckg_theta_chat_default" ]] && export CKGFUZZER_LLM_MODEL="$ckg_theta_chat_default"
+    fi
+    if [[ -z "${CKGFUZZER_EMBEDDING_MODEL:-}" ]]; then
+      ckg_theta_emb_default="$("$python" - <<'PY_CKG_THETA_EMB_DEFAULT'
+import sys
+sys.path.insert(0, "/opt/hgb/bin")
+try:
+    import ckgfuzzer_model_config as cmc
+    registry = cmc.load_model_registry()
+    provider = (cmc.os.environ.get("HGB_LLM_PROVIDER") or "").strip().lower()
+    print(registry.get(provider, {}).get("defaults", {}).get("ckgfuzzer_embedding", ""))
+except Exception:
+    print("")
+PY_CKG_THETA_EMB_DEFAULT
+)"
+      [[ -n "$ckg_theta_emb_default" ]] && export CKGFUZZER_EMBEDDING_MODEL="$ckg_theta_emb_default"
+    fi
+    # Resolve and validate the model config against the registry.
+    if ! ckg_model_config_json="$("$python" /opt/hgb/bin/ckgfuzzer_model_config.py resolve --profile "$ckg_profile" 2>"$workspace/logs/model_resolution.log")"; then
+      ckg_resolution_errors="$(cat "$workspace/logs/model_resolution.log" 2>/dev/null || printf 'unknown')"
+      reason="ckgfuzzer_model_resolution_failed: $ckg_resolution_errors"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+    # Export resolved model names so the rest of the entrypoint uses them.
+    ckg_resolved_chat="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("chat_model",""))' <<<"$ckg_model_config_json" 2>/dev/null || printf '')"
+    ckg_resolved_emb="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("embedding_model",""))' <<<"$ckg_model_config_json" 2>/dev/null || printf '')"
+    [[ -n "$ckg_resolved_chat" ]] && export CKGFUZZER_LLM_MODEL="$ckg_resolved_chat"
+    [[ -n "$ckg_resolved_emb" ]] && export CKGFUZZER_EMBEDDING_MODEL="$ckg_resolved_emb"
+    # Live model preflight (theta plan §3). Runs once per target run; the
+    # matrix runner caches it and reuses it across targets.
+    ckg_preflight_cache="${HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE:-}"
+    if [[ -n "$ckg_preflight_cache" && -f "$ckg_preflight_cache" ]]; then
+      ckg_model_preflight_json="$(cat "$ckg_preflight_cache")"
+      ckg_preflight_status="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' <<<"$ckg_model_preflight_json" 2>/dev/null || printf '')"
+    else
+      "$python" /opt/hgb/bin/ckgfuzzer_model_config.py preflight --profile "$ckg_profile" --out "$workspace/logs/model_preflight.json" >"$workspace/logs/model_preflight_stdout.log" 2>&1 || true
+      if [[ -f "$workspace/logs/model_preflight.json" ]]; then
+        ckg_model_preflight_json="$(cat "$workspace/logs/model_preflight.json")"
+        ckg_preflight_status="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("status",""))' <<<"$ckg_model_preflight_json" 2>/dev/null || printf '')"
+      else
+        ckg_preflight_status="probe_failed"
+      fi
+    fi
+    if [[ "$ckg_preflight_status" != "ok" ]]; then
+      ckg_preflight_reason="$("$python" -c 'import json,sys; d=json.load(sys.stdin); print(d.get("reason_code","probe_failed"))' <<<"$ckg_model_preflight_json" 2>/dev/null || printf 'probe_failed')"
+      reason="ckgfuzzer_model_preflight_failed: $ckg_preflight_reason (see model_preflight.json)"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      hgb_write_common_summary infra_failure "$reason" harness_generator
+      exit 65
+    fi
+  fi
   # Method-faithful profiles forbid compat fallbacks even if legacy env is set.
-  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" ]]; then
+  if [[ "$ckg_profile" == "alpha" || "$ckg_profile" == "paper-faithful" || "$ckg_profile" == "reproduction-gamma" || "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" || "$ckg_profile" == "reproduction-theta" ]]; then
     if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
       hgb_write_common_metadata failed "CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden in $ckg_profile" 64 harness_generator; exit 64
     fi
@@ -171,7 +246,7 @@ if [[ "$mode" == "generate-target" ]]; then
     # compatible aliases reproduction-zeta, reproduction-epsilon, and
     # reproduction-delta) forbid source-only CodeQL graph fallback and
     # selected-harness API mode.
-    if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" ]]; then
+    if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" || "$ckg_profile" == "reproduction-theta" ]]; then
       if [[ "${CKGFUZZER_ALLOW_SOURCE_FALLBACK:-0}" == "1" ]]; then
         hgb_write_common_metadata failed "CKGFUZZER_ALLOW_SOURCE_FALLBACK=1 is forbidden in $ckg_profile; source-only CodeQL graph fallback is not allowed" 64 harness_generator; exit 64
       fi
@@ -180,12 +255,14 @@ if [[ "$mode" == "generate-target" ]]; then
           hgb_write_common_metadata failed "HGB_API_SELECTION_MODE=${HGB_API_SELECTION_MODE} is forbidden in $ckg_profile; reference-harness API filtering is evaluator-only" 64 harness_generator; exit 64 ;;
       esac
     fi
-    # reproduction-eta is the canonical strictest profile (eta plan §1) and
-    # reproduction-zeta is the strict profile from the zeta plan: force the
-    # CodeQL graph to be built from the sealed source snapshot, forbid mock
-    # embeddings, and require the target package to be physically split. No
-    # compatibility fallbacks are permitted.
-    if [[ "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" ]]; then
+    # reproduction-eta/reproduction-theta are the canonical strictest profiles
+    # (eta plan §1 / theta plan) and reproduction-zeta is the strict profile
+    # from the zeta plan: force the CodeQL graph to be built from the sealed
+    # source snapshot, forbid mock embeddings, and require the target package
+    # to be physically split. No compatibility fallbacks are permitted.
+    # reproduction-theta additionally requires USTC provider/model resolution
+    # and a live model preflight probe (theta plan §2/§3).
+    if [[ "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" || "$ckg_profile" == "reproduction-theta" ]]; then
       if [[ "${CKGFUZZER_SOURCE_GRAPH_FALLBACK:-0}" == "1" ]]; then
         hgb_write_common_metadata failed "CKGFUZZER_SOURCE_GRAPH_FALLBACK=1 is forbidden in $ckg_profile; the CodeQL graph must be built from the sealed source snapshot" 64 harness_generator; exit 64
       fi
@@ -2276,7 +2353,8 @@ PY_CKG_CAND_AUDIT
   "candidate": %s,
   "ckgfuzzer": %s,
   "method": {"ckgfuzzer": %s},
-  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_candidate_block" "$ckg_block" "$ckg_block" "$ckg_leakage_audit")
+  "model_config": %s,
+  "reference_leakage_audit": %s' "$api_selection_extra" "$(hgb_json_escape "$ckg_project")" "$(hgb_json_escape "$ckg_shared")" "$(hgb_json_escape "$ckg_profile")" "$(hgb_json_escape "$ckg_protocol")" "$ckg_method_faithful" "${api_count:-0}" "${generated_harness_count:-0}" "${verified_harness_count:-0}" "$verification_ran" "$(hgb_json_escape "$verification_code")" "$(hgb_json_escape "$candidate_verification_file")" "$(hgb_json_escape "${CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS:-900}")" "$(hgb_json_escape "${CKGFUZZER_LLM_MAX_RETRIES:-3}")" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$(hgb_json_escape "$repo_code")" "$(hgb_json_escape "$preproc_code")" "$(hgb_json_escape "$fuzzing_code")" "$(hgb_json_escape "$analysis_mode")" "$(hgb_json_escape "$analysis_fallback_reason")" "${source_fallback_recovered_body_count:-0}" "$(hgb_json_escape "$(ckg_codeql_version)")" "$ckg_codeql_graph_nodes_final" "$ckg_codeql_graph_edges_final" "$(hgb_json_escape "$ckg_codeql_cache_status")" "$(hgb_json_escape "$ckg_codeql_cache_key")" "$(hgb_json_escape "$ckg_codeql_cache_path")" "$(hgb_json_escape "$ckg_codeql_cache_reason")" "$ckg_candidate_block" "$ckg_block" "$ckg_block" "$ckg_model_config_json" "$ckg_leakage_audit")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
   hgb_write_common_summary "$status" "$reason" harness_generator
   exit "$code"

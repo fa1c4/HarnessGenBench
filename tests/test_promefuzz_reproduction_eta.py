@@ -383,6 +383,11 @@ def test_entrypoint_has_reproduction_eta_profile() -> None:
     assert "PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS" in entrypoint
     assert "PROMEFUZZ_REQUIRE_CONSUMER_CASES" in entrypoint
     assert "HGB_TARGET_REQUIRE_SPLIT=1" in entrypoint
+    validation_pos = entrypoint.index("promefuzz_profile.py validate")
+    defaults_pos = entrypoint.index("PROME_FUZZ_EMBEDDING_LLM_TYPE=\"${PROME_FUZZ_EMBEDDING_LLM_TYPE:-openai}")
+    split_pos = entrypoint.index("HGB_TARGET_REQUIRE_SPLIT=1")
+    assert defaults_pos < validation_pos
+    assert split_pos < validation_pos
 
 
 def test_entrypoint_eta_passes_build_coverage_image_and_native_control() -> None:

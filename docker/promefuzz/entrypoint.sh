@@ -494,16 +494,6 @@ if [[ "$mode" == "generate-target" ]]; then
   promefuzz_protocol="$HGB_PROTOCOL"
   mkdir -p "$workspace/logs" "$workspace/generated_harnesses" "$workspace/promefuzz_out" /run/hgb/promefuzz
   promefuzz_init_stages
-  # Validate profile/protocol invariants before any expensive work.
-  if ! "$python" /opt/hgb/bin/promefuzz_profile.py validate --profile "$promefuzz_profile" --protocol "$promefuzz_protocol" >/dev/null 2>"$workspace/logs/profile_validation.log"; then
-    violations="$(cat "$workspace/logs/profile_validation.log" 2>/dev/null || printf 'unknown')"
-    reason="promefuzz_profile_violation: $violations"
-    hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
-    promefuzz_set_stage target_prepared failed
-    promefuzz_write_final_result infra_failure "$reason" 65
-    hgb_write_common_summary failed "$reason" harness_generator
-    exit 65
-  fi
   case "$promefuzz_profile" in
     alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
       promefuzz_method_faithful=1
@@ -549,6 +539,16 @@ if [[ "$mode" == "generate-target" ]]; then
       promefuzz_allow_synthetic=1
       ;;
   esac
+  # Validate profile/protocol invariants before any expensive work.
+  if ! "$python" /opt/hgb/bin/promefuzz_profile.py validate --profile "$promefuzz_profile" --protocol "$promefuzz_protocol" >/dev/null 2>"$workspace/logs/profile_validation.log"; then
+    violations="$(cat "$workspace/logs/profile_validation.log" 2>/dev/null || printf 'unknown')"
+    reason="promefuzz_profile_violation: $violations"
+    hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+    promefuzz_set_stage target_prepared failed
+    promefuzz_write_final_result infra_failure "$reason" 65
+    hgb_write_common_summary failed "$reason" harness_generator
+    exit 65
+  fi
   # Official ALL-COVER budgets: practical multi-candidate budget for alpha,
   # upstream/paper-aligned values may override via env.
   export PROME_FUZZ_ALL_COVER_CANDIDATES="${PROME_FUZZ_ALL_COVER_CANDIDATES:-4}"

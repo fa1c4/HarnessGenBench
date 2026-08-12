@@ -208,6 +208,8 @@ def test_work_index_pins_oss_fuzz_immutably() -> None:
     assert "COPY artifacts/oss-fuzz /opt/hgb/oss-fuzz" in dockerfile
     assert "git clone --depth 1 --branch" not in dockerfile
     assert "OFG_OSS_FUZZ_COMMIT" in dockerfile
+    assert 'actual="$(git -C /opt/hgb/oss-fuzz rev-parse HEAD' in dockerfile
+    assert "$$actual" not in dockerfile
 
 
 def test_clone_artifacts_reuses_recorded_commit_by_default() -> None:

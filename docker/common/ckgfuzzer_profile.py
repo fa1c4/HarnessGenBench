@@ -17,9 +17,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "compat-smoke"}
+VALID_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "reproduction-theta", "compat-smoke"}
 VALID_PROTOCOLS = {"blind-project", "api-oracle"}
-METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "reproduction-theta"}
 # Strict reproduction profiles. ``reproduction-eta`` is the canonical strict
 # profile introduced by the reproduction-eta plan: it is paper-faithful and
 # rejects every local/deterministic fallback, every compatibility fallback,
@@ -31,16 +31,23 @@ METHOD_FAITHFUL_PROFILES = {"alpha", "paper-faithful", "reproduction-gamma", "re
 # backward-compatible aliases of the strict family. ``reproduction-gamma`` is
 # method-faithful but not strict (it does not enforce the eta/zeta fail-closed
 # invariants).
-STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
+STRICT_REPRODUCTION_PROFILES = {"reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta", "reproduction-theta"}
 # Eta is the canonical strictest profile (eta plan): it adds fail-closed
 # split-package, CodeQL-graph, and copied-coverage-report requirements on top
 # of the zeta strict invariants. Zeta remains accepted with its existing
 # behavior; eta is the new canonical profile.
-ETA_PROFILES = {"reproduction-eta"}
+# ``reproduction-theta`` is the USTC model fix profile (theta plan): it is a
+# strict alias of eta that additionally requires USTC provider/model
+# resolution and a live model preflight before target preparation.
+ETA_PROFILES = {"reproduction-eta", "reproduction-theta"}
 # Zeta is the strict profile from the zeta plan: it adds fail-closed
 # split-package and CodeQL-graph requirements on top of the epsilon strict
 # invariants.
 ZETA_PROFILES = {"reproduction-zeta"}
+# Theta is the USTC model fix strict profile (theta plan): it inherits all
+# eta strict invariants and additionally requires provider-aware model
+# resolution and a live model preflight probe.
+THETA_PROFILES = {"reproduction-theta"}
 
 # Flags that are forbidden in method-faithful profiles.
 FORBIDDEN_ALPHA_ENV = {

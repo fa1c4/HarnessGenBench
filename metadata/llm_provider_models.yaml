@@ -1,0 +1,68 @@
+# Repository-local LLM provider model registry.
+#
+# Lists the chat, embedding, and reranker models that each supported provider
+# exposes. Runtime code (ckgfuzzer_model_config.py) reads this file to
+# validate configured model names for strict reproduction profiles so a run
+# never silently falls back to a mock/hash/local embedding or an OpenAI-only
+# model name on a provider that does not serve it.
+#
+# To add a model for a provider, append it under the appropriate list. The
+# ``defaults`` section pins the canonical CKGFuzzer chat/embedding model for
+# each provider when the user omits the corresponding env var.
+
+ustc:
+  chat_models:
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+    - deepseek-v4-flash-ascend
+    - deepseek-v4-flash-ascend1
+    - glm-5.2
+    - glm-5.2-107b
+    - k3
+    - qwen3.6-chat
+    - qwen3.6-reasoner
+    - qwen-chat
+    - qwen-reasoner
+    - smart/default
+    - smart/reasoning
+  embedding_models:
+    - qwen3-embedding
+  reranker_models:
+    - qwen3-reranker
+  defaults:
+    ckgfuzzer_chat: deepseek-v4-pro
+    ckgfuzzer_embedding: qwen3-embedding
+
+deepseek:
+  chat_models:
+    - deepseek-v4-pro
+    - deepseek-v4-flash
+  embedding_models: []
+  reranker_models: []
+  defaults:
+    ckgfuzzer_chat: deepseek-v4-pro
+    ckgfuzzer_embedding: ""
+
+openai:
+  chat_models:
+    - gpt-4o-mini
+    - gpt-4o
+    - gpt-4.1-mini
+    - gpt-4.1
+  embedding_models:
+    - text-embedding-3-small
+    - text-embedding-3-large
+  reranker_models: []
+  defaults:
+    ckgfuzzer_chat: gpt-4o-mini
+    ckgfuzzer_embedding: text-embedding-3-small
+
+custom:
+  # A custom provider accepts any non-empty model name; validation only
+  # rejects the mock/hash/local sentinel values.
+  chat_models: []
+  embedding_models: []
+  reranker_models: []
+  defaults:
+    ckgfuzzer_chat: ""
+    ckgfuzzer_embedding: ""

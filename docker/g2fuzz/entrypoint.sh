@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-artifact=/opt/hgb/artifacts/g2fuzz
+source_artifact=/opt/hgb/artifacts/g2fuzz
+artifact="$source_artifact"
 data_artifact=/opt/hgb/artifacts/g2fuzz-data
 python=/opt/hgb/venv/bin/python
 if [[ ! -x "$python" ]]; then
@@ -25,6 +26,15 @@ count_files() { local d="$1"; shift || true; [[ -d "$d" ]] || { printf '0'; retu
 extract_json_string() { local key="$1" file="$2"; [[ -f "$file" ]] || return 0; sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1; }
 commit() { git -C "$artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
 data_commit() { git -C "$data_artifact" rev-parse HEAD 2>/dev/null || printf unknown; }
+prepare_g2fuzz_runtime_artifact() {
+  local runtime_root="${1:-/run/hgb/g2fuzz-runtime}"
+  local runtime_artifact="$runtime_root/artifact"
+  rm -rf "$runtime_artifact"
+  mkdir -p "$runtime_artifact"
+  cp -a "$source_artifact"/. "$runtime_artifact"/
+  artifact="$runtime_artifact"
+  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+}
 write_g2fuzz_preseeds() {
   local target="$1" formats="$2" seed_dir="$3"
   mkdir -p "$seed_dir"
@@ -242,7 +252,6 @@ if [[ "$mode" == "generate-target" ]]; then
   # shellcheck source=/opt/hgb/bin/target_contract.sh
   source /opt/hgb/bin/target_contract.sh
   export HGB_GENERATOR="${HGB_GENERATOR:-g2fuzz}"
-  export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
   export HGB_CAPABILITY=input_generator
   export HGB_TASK_FAMILY=input_generator
   export HGB_BASELINE_PROFILE="${HGB_BASELINE_PROFILE:-alpha}"
@@ -254,6 +263,8 @@ if [[ "$mode" == "generate-target" ]]; then
   export G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   mkdir -p "$workspace/logs" "$workspace/generated_inputs" "$workspace/config"
   hgb_require_target_package
+  runtime=/run/hgb/g2fuzz-runtime
+  prepare_g2fuzz_runtime_artifact "$runtime"
   patch_g2fuzz_program_gen
   target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
   # FuzzBench benchmark dir for auto-building the .afl/.cmp pair. Commonly set
@@ -320,6 +331,8 @@ PY_PREFLIGHT
 fi
 case "$mode" in
   generate-seeds|smoke)
+    runtime=/run/hgb/g2fuzz-runtime
+    prepare_g2fuzz_runtime_artifact "$runtime"
     mapfile -t selected < <(select_program)
     program="${selected[0]}"
     formats="${selected[1]}"
@@ -327,7 +340,6 @@ case "$mode" in
     output_dir="$workspace/${program}_output"
     write_g2fuzz_preseeds "$program" "$formats" "$output_dir/default/gen_seeds"
     patch_g2fuzz_program_gen
-    runtime=/run/hgb/g2fuzz-runtime
     mkdir -p "$runtime" "$workspace/config"
     cp "$artifact/program_to_format.json" "$runtime/program_to_format.json"
     cp "$artifact/program_to_format.json" "$workspace/config/program_to_format.json"

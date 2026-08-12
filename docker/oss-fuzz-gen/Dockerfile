@@ -28,9 +28,9 @@ RUN if [ "$OFG_INSTALL_OSS_FUZZ" = "1" ]; then \
       test -f /opt/hgb/oss-fuzz/infra/helper.py \
         || { echo "ERROR: pinned OSS-Fuzz checkout is missing infra/helper.py; run scripts/clone_artifacts.sh"; exit 1; }; \
       if [ "$OFG_OSS_FUZZ_COMMIT" != "unknown" ]; then \
-        actual="$$(git -C /opt/hgb/oss-fuzz rev-parse HEAD 2>/dev/null || echo unknown)"; \
-        if [ "$$actual" != "$OFG_OSS_FUZZ_COMMIT" ]; then \
-          echo "ERROR: pinned OSS-Fuzz commit mismatch: expected $OFG_OSS_FUZZ_COMMIT, got $$actual"; \
+        actual="$(git -C /opt/hgb/oss-fuzz rev-parse HEAD 2>/dev/null || echo unknown)"; \
+        if [ "$actual" != "$OFG_OSS_FUZZ_COMMIT" ]; then \
+          echo "ERROR: pinned OSS-Fuzz commit mismatch: expected $OFG_OSS_FUZZ_COMMIT, got $actual"; \
           exit 1; \
         fi; \
       fi; \
