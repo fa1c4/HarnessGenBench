@@ -118,6 +118,168 @@ def _write_log(path: Path, result: CommandResult) -> None:
     )
 
 
+def _normalize_candidate_for_native_path(candidate: Path, native_destination: str, work_dir: Path) -> Path:
+    """Return a staged candidate with native-path ABI compatibility.
+
+    CKGFuzzer often emits C++ wrappers even when the FuzzBench native harness
+    path is a C translation unit, and sometimes omits C linkage for libFuzzer
+    entrypoints in C++ files. The evaluator overlays by native path, so small
+    syntax/ABI normalizations avoid deterministic compiler or linker failures
+    while preserving the generated harness logic.
+    """
+
+    suffix = Path(native_destination).suffix.lower()
+    if not candidate.is_file():
+        return candidate
+    text = candidate.read_text(encoding="utf-8", errors="replace")
+    normalized = text
+    staged_suffix = candidate.suffix or suffix or ".cc"
+    if suffix == ".c":
+        normalized = normalized.replace('extern "C" ', "")
+        normalized = normalized.replace('extern "C"\n', "")
+        normalized = normalized.replace("nullptr", "NULL")
+        normalized = re.sub(r"(?m)^(\s*)void\s+log_set_max_level\s*\(", r"\1static void log_set_max_level(", normalized)
+        if "LLVMFuzzerTestOneInput" in normalized and "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);" not in normalized:
+            normalized = (
+                "#include <stdint.h>\n"
+                "#include <stddef.h>\n"
+                "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);\n"
+                + normalized
+            )
+        staged_suffix = ".c"
+    elif suffix in {".cc", ".cpp", ".cxx"} and "LLVMFuzzerTestOneInput" in normalized:
+        if 'extern "C" int LLVMFuzzerTestOneInput' not in normalized:
+            normalized = re.sub(
+                r"(?m)^(\s*)int\s+LLVMFuzzerTestOneInput\s*\(",
+                r'\1extern "C" int LLVMFuzzerTestOneInput(',
+                normalized,
+                count=1,
+            )
+    if normalized == text:
+        return candidate
+    staged_dir = work_dir / "hgb_normalized_candidate"
+    staged_dir.mkdir(parents=True, exist_ok=True)
+    staged = staged_dir / (candidate.stem + staged_suffix)
+    staged.write_text(normalized, encoding="utf-8")
+    return staged
+
+
+def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> None:
+    """Constrain build scripts that otherwise compile sibling fuzzers too.
+
+    Curl's historical ossfuzz.sh builds every curl-fuzzer target. Replacing the
+    selected source file can remove helper symbols required by sibling binaries,
+    so the evaluator should compile only the requested FuzzBench target.
+    """
+
+    curl_root = context_dir / "source_input" / "curl_fuzzer"
+    fuzz_targets = curl_root / "scripts" / "fuzz_targets"
+    if fuzz_targets.is_file() and fuzz_target.startswith("curl_fuzzer"):
+        text = fuzz_targets.read_text(encoding="utf-8", errors="replace")
+        rewritten = re.sub(r'export\s+FUZZ_TARGETS="[^"]*"', f'export FUZZ_TARGETS="{fuzz_target}"', text)
+        if rewritten != text:
+            fuzz_targets.write_text(rewritten, encoding="utf-8")
+    compile_fuzzer = curl_root / "scripts" / "compile_fuzzer.sh"
+    if compile_fuzzer.is_file() and fuzz_target.startswith("curl_fuzzer"):
+        text = compile_fuzzer.read_text(encoding="utf-8", errors="replace")
+        rewritten = text.replace("\nmake || exit 4\n", "\nmake ${FUZZ_TARGETS} || exit 4\n")
+        rewritten = rewritten.replace(
+            "\nmake check || exit 5\n",
+            "\ntrue # HGB sealed evaluator: skip broad curl make check for single-target builds.\n",
+        )
+        if rewritten != text:
+            compile_fuzzer.write_text(rewritten, encoding="utf-8")
+    ossfuzz = curl_root / "ossfuzz.sh"
+    if ossfuzz.is_file() and fuzz_target.startswith("curl_fuzzer"):
+        text = ossfuzz.read_text(encoding="utf-8", errors="replace")
+        rewritten = text
+        rewritten = re.sub(
+            r"(?m)^\$\{SCRIPTDIR\}/handle_x\.sh zlib .*\|\| exit 1$",
+            "true # HGB sealed evaluator: use curl without downloaded zlib source",
+            rewritten,
+        )
+        rewritten = re.sub(
+            r"(?s)# For the memory sanitizer build, turn off OpenSSL.*?fi\n",
+            "true # HGB sealed evaluator: avoid downloading OpenSSL; install_curl.sh will configure --without-ssl.\n",
+            rewritten,
+            count=1,
+        )
+        rewritten = re.sub(
+            r"(?m)^\$\{SCRIPTDIR\}/handle_x\.sh nghttp2 .*\|\| exit 1$",
+            "true # HGB sealed evaluator: use curl without downloaded nghttp2 source",
+            rewritten,
+        )
+        rewritten = rewritten.replace(
+            "make zip\n",
+            "for TARGET in $FUZZ_TARGETS; do make ${TARGET}_seed_corpus.zip || touch ${TARGET}_seed_corpus.zip; done\n",
+        )
+        if rewritten != text:
+            ossfuzz.write_text(rewritten, encoding="utf-8")
+
+    if fuzz_target == "ftfuzzer":
+        # libarchive 3.4.3 configure runs a sanitizer-built iconv conftest that
+        # can spin indefinitely under the sealed evaluator. Preseed the
+        # autotools cache with the same outcome the probe reaches on this base
+        # image so candidate/coverage builds remain deterministic.
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = "# HGB sealed evaluator: avoid sanitizer-built libarchive iconv conftest."
+            if marker in text:
+                continue
+            lines = text.splitlines()
+            injection = [
+                marker,
+                "export am_cv_func_iconv=yes",
+                "export am_cv_lib_iconv=no",
+                "export am_cv_func_iconv_works=yes",
+            ]
+            if lines and lines[0].startswith("#!"):
+                lines = [lines[0], *injection, *lines[1:]]
+            else:
+                lines = [*injection, *lines]
+            build_sh.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    makefile = curl_root / "Makefile.am"
+    if makefile.is_file() and fuzz_target.startswith("curl_fuzzer"):
+        text = makefile.read_text(encoding="utf-8", errors="replace")
+        rewritten = re.sub(
+            rf"(?m)^({re.escape(fuzz_target)}_SOURCES\s*=\s*)\$\(COMMON_SOURCES\)$",
+            rf"\1curl_fuzzer.cc",
+            text,
+        )
+        if rewritten != text:
+            makefile.write_text(rewritten, encoding="utf-8")
+
+
+def _sealed_compile_block() -> str:
+    """Return the final evaluator compile block appended to sealed Dockerfiles."""
+
+    return (
+        "# HGB sealed evaluator candidate build.\n"
+        "ARG FUZZING_ENGINE=libfuzzer\n"
+        "ARG SANITIZER=address\n"
+        "ARG ARCHITECTURE=x86_64\n"
+        "ARG FUZZING_LANGUAGE=c++\n"
+        "ARG HGB_FUZZING_ENGINE=libfuzzer\n"
+        "ARG HGB_SANITIZER=address\n"
+        "ARG HGB_ARCHITECTURE=x86_64\n"
+        "ARG HGB_FUZZING_LANGUAGE=c++\n"
+        "ARG HGB_BUILD_VARIANT=default\n"
+        "RUN printf '%s\\n' \"$HGB_SANITIZER:$HGB_FUZZING_ENGINE:$HGB_BUILD_VARIANT\" > /tmp/hgb_build_variant\n"
+        "ENV FUZZING_ENGINE=${HGB_FUZZING_ENGINE}\n"
+        "ENV SANITIZER=${HGB_SANITIZER}\n"
+        "ENV ARCHITECTURE=${HGB_ARCHITECTURE}\n"
+        "ENV FUZZING_LANGUAGE=${HGB_FUZZING_LANGUAGE}\n"
+        "RUN if [ \"$HGB_FUZZING_ENGINE\" = \"libfuzzer\" ]; then "
+        "export FUZZER_LIB=\"${FUZZER_LIB:--fsanitize=fuzzer}\"; "
+        "else export FUZZER_LIB=\"${FUZZER_LIB:-${LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a}}\"; fi; "
+        "FUZZING_ENGINE=\"$HGB_FUZZING_ENGINE\" SANITIZER=\"$HGB_SANITIZER\" "
+        "ARCHITECTURE=\"$HGB_ARCHITECTURE\" FUZZING_LANGUAGE=\"$HGB_FUZZING_LANGUAGE\" compile\n"
+    )
+
+
 def build_candidate_image(
     *,
     context_dir: Path,
@@ -153,6 +315,8 @@ def build_candidate_image(
     dest_in_context = context_dir / "source_input" / rel
     dest_in_context.parent.mkdir(parents=True, exist_ok=True)
     staged_candidate_host = Path(staged_candidate_host)
+    staged_candidate_host = _normalize_candidate_for_native_path(staged_candidate_host, native_destination, work_dir)
+    _patch_single_target_build_context(context_dir, fuzz_target)
     candidate_sha256 = ""
     if staged_candidate_host.is_file():
         import shutil
@@ -173,9 +337,37 @@ def build_candidate_image(
             overlay_copy = f"COPY hgb_candidate_overlay/{rel} /src/{rel}"
             if overlay_copy not in text:
                 text = text.rstrip() + "\n" + overlay_copy + "\n"
-                df.write_text(text, encoding="utf-8")
+            compile_marker = "# HGB sealed evaluator candidate build."
+            if compile_marker not in text:
+                text = text.rstrip() + "\n" + _sealed_compile_block()
+            else:
+                compile_tail = text[text.rfind(compile_marker):]
+                if (
+                    "RUN FUZZING_ENGINE=\"$HGB_FUZZING_ENGINE\" SANITIZER=\"$HGB_SANITIZER\"" not in compile_tail
+                    or "FUZZER_LIB" not in compile_tail
+                ):
+                    # Older sealed contexts only changed HGB_BUILD_VARIANT before
+                    # compile. Use unique HGB_* args plus inline env assignments so
+                    # the compile process sees SANITIZER=coverage even if legacy
+                    # Docker reuses earlier ENV layers from the ASan candidate build.
+                    text = text[:text.rfind(compile_marker)].rstrip() + "\n" + _sealed_compile_block()
+            df.write_text(text, encoding="utf-8")
 
-    build_command = ["docker", "build", "--file", str(dockerfile), "--tag", image_tag, str(context_dir)]
+    build_command = [
+        "docker", "build",
+        "--build-arg", f"FUZZING_ENGINE={engine}",
+        "--build-arg", f"SANITIZER={sanitizer}",
+        "--build-arg", "ARCHITECTURE=x86_64",
+        "--build-arg", "FUZZING_LANGUAGE=c++",
+        "--build-arg", f"HGB_FUZZING_ENGINE={engine}",
+        "--build-arg", f"HGB_SANITIZER={sanitizer}",
+        "--build-arg", "HGB_ARCHITECTURE=x86_64",
+        "--build-arg", "HGB_FUZZING_LANGUAGE=c++",
+        "--build-arg", f"HGB_BUILD_VARIANT={sanitizer}-{engine}",
+        "--file", str(dockerfile),
+        "--tag", image_tag,
+        str(context_dir),
+    ]
     build_result = _run_phase(runner, build_command, timeout_seconds, "build candidate image")
     _write_log(work_dir / "image_build.log", build_result)
 
@@ -243,23 +435,31 @@ def build_coverage_image(
     work_dir: Path,
     runner: Runner = _run,
     timeout_seconds: int = 1800,
-    sanitizer: str = "none",
+    sanitizer: str = "coverage",
 ) -> BuildResult:
     """Build a separate coverage-instrumented image for source-based coverage.
 
     The coverage image reuses the same sealed candidate overlay context but is
-    built with ``FUZZING_ENGINE=coverage`` so the FuzzBench compile script
+    built with ``SANITIZER=coverage`` so the FuzzBench compile script
     instruments with ``-fprofile-instr-generate -fcoverage-mapping``. An
     address/libFuzzer image must NOT be reused for coverage unless it was
-    explicitly built with source-based coverage instrumentation.
+    explicitly built with source-based coverage instrumentation.  A sanitizer
+    build-variant key is written immediately before ``RUN compile`` so Docker
+    can reuse package-install layers without reusing the wrong compiled binary.
     """
 
     work_dir.mkdir(parents=True, exist_ok=True)
     build_command = [
         "docker", "build",
-        "--build-arg", "FUZZING_ENGINE=coverage",
+        "--build-arg", "FUZZING_ENGINE=libfuzzer",
         "--build-arg", f"SANITIZER={sanitizer}",
         "--build-arg", "ARCHITECTURE=x86_64",
+        "--build-arg", "FUZZING_LANGUAGE=c++",
+        "--build-arg", "HGB_FUZZING_ENGINE=libfuzzer",
+        "--build-arg", f"HGB_SANITIZER={sanitizer}",
+        "--build-arg", "HGB_ARCHITECTURE=x86_64",
+        "--build-arg", "HGB_FUZZING_LANGUAGE=c++",
+        "--build-arg", f"HGB_BUILD_VARIANT={sanitizer}-libfuzzer",
         "--file", str(dockerfile),
         "--tag", image_tag,
         str(context_dir),
@@ -491,19 +691,31 @@ def run_campaign(
     artifact_dir = work_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     budget = max(1, int(campaign_seconds))
+    run_count = max(1, min(10000, budget * 256))
+    fuzzer_timeout = budget + 5
     # Build copy_in list for seed corpus files.
     copy_in: list[tuple[Path, str]] = []
     seed_index = 0
     for seed in sorted(corpus_dir.iterdir()) if corpus_dir.is_dir() else []:
         if seed.is_file():
-            copy_in.append((seed, f"/tmp/corpus/seed_{seed_index:04d}"))
+            # docker cp cannot create missing parent directories inside a
+            # stopped container. Stage seeds under /tmp, then move them into
+            # /tmp/corpus after the campaign command creates the directory.
+            copy_in.append((seed, f"/tmp/hgb_campaign_seed_{seed_index:04d}"))
             seed_index += 1
+    seed_stage = (
+        'mkdir -p /tmp/corpus /tmp/artifacts; '
+        'for f in /tmp/hgb_campaign_seed_*; do '
+        '[ -e "$f" ] || continue; cp "$f" "/tmp/corpus/$(basename "$f")"; '
+        'done; '
+    )
     cmd = [
         "sh",
         "-lc",
-        f'mkdir -p /tmp/corpus /tmp/artifacts && {binary_path} '
-        f'-max_total_time={budget} -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
+        f'{seed_stage}timeout -s INT -k 5s {fuzzer_timeout}s {binary_path} '
+        f'-runs={run_count} -max_total_time={budget} -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
         f'> /tmp/campaign.log 2>&1; '
+        f'fuzzer_rc=$?; echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
         f'echo "---STATS---"; '
         f'ls /tmp/corpus | wc -l; '
         f'ls /tmp/artifacts 2>/dev/null | wc -l; '
@@ -557,11 +769,12 @@ def run_campaign(
     if final_corpus_dir.is_dir():
         final_corpus_file_count = sum(1 for p in final_corpus_dir.rglob("*") if p.is_file())
     copy_out_ok = bool(getattr(result, "copy_out_ok", True))
+    fuzzer_timed_out = "HGB_FUZZER_EXIT_CODE=124" in log
     return {
         "execs_done": execs_done,
         "new_units": new_units,
         "crashes": crashes,
-        "timeouts": int(result.exit_code == 124),
+        "timeouts": int(result.exit_code == 124 or fuzzer_timed_out),
         "ooms": int("out-of-memory" in log.lower() or "SUMMARY: libFuzzer: out-of-memory" in log),
         "peak_rss_mb": _parse_peak_rss(log),
         "exit_code": result.exit_code,
@@ -634,8 +847,17 @@ def run_coverage(
     seed_index = 0
     for seed in sorted(corpus_dir.iterdir()) if corpus_dir.is_dir() else []:
         if seed.is_file():
-            copy_in.append((seed, f"/tmp/corpus/cov_{seed_index:04d}"))
+            # Stage under /tmp because docker cp cannot create /tmp/corpus in a
+            # stopped container. The replay script moves staged files after it
+            # creates the directory.
+            copy_in.append((seed, f"/tmp/hgb_coverage_seed_{seed_index:04d}"))
             seed_index += 1
+    coverage_seed_stage = (
+        'mkdir -p /tmp/corpus; '
+        'for f in /tmp/hgb_coverage_seed_*; do '
+        '[ -e "$f" ] || continue; cp "$f" "/tmp/corpus/cov_${f##*_}"; '
+        'done; '
+    )
     cov_work = work_dir / "coverage"
     if require_coverage_report:
         # Eta replay: execute every copied corpus file once in a per-file loop
@@ -644,7 +866,7 @@ def run_coverage(
         # zero files are executed.  The coverage report is a copied
         # coverage.json; stdout is not a fallback (eta plan §6).
         replay_script = (
-            'set -e; mkdir -p /tmp/cov /tmp/corpus; '
+            'set -e; mkdir -p /tmp/cov; ' + coverage_seed_stage +
             'n=0; '
             'for f in /tmp/corpus/*; do '
             '[ -f "$f" ] || continue; '
@@ -659,7 +881,7 @@ def run_coverage(
         )
     else:
         replay_script = (
-            f'mkdir -p /tmp/cov /tmp/corpus && LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw '
+            f'mkdir -p /tmp/cov; {coverage_seed_stage}LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw '
             f'{binary_path} -runs=0 /tmp/corpus && '
             f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && '
             f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '

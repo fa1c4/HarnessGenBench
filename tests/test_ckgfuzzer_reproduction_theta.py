@@ -242,6 +242,42 @@ def test_entrypoint_theta_has_model_config_resolution() -> None:
     assert "ckg_model_config_json" in entrypoint
 
 
+def test_entrypoint_defines_python_before_strict_model_resolution() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    definition_pos = entrypoint.index('python="${HGB_PYTHON:-}"')
+    strict_use_pos = entrypoint.index('ckg_theta_chat_default="$("$python"')
+    assert definition_pos < strict_use_pos
+
+
+def test_target_contract_metadata_is_valid_json_on_infra_failure(tmp_path: Path) -> None:
+    script = """
+set -euo pipefail
+source docker/common/target_contract.sh
+workspace="$1"
+export workspace
+export HGB_GENERATOR=ckgfuzzer
+export HGB_TARGET=bloaty_fuzz_target
+export HGB_PROFILE=reproduction-eta
+export HGB_BASELINE_PROFILE=reproduction-eta
+export HGB_BASELINE_PROTOCOL=blind-project
+export HGB_LLM_PROVIDER_RESOLVED=ustc
+export OPENAI_BASE_URL=https://api.llm.ustc.edu.cn
+export OPENAI_MODEL=deepseek-v4-pro
+export API_KEY=test-key
+hgb_result_init_stages "$workspace/stages.json"
+hgb_write_common_metadata infra_failure "ckgfuzzer_model_resolution_failed: test" 65 harness_generator
+"""
+    proc = subprocess.run(
+        ["bash", "-c", script, "bash", str(tmp_path)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    metadata = json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["status"] == "infra_failure"
+    assert metadata["api_trace_total_count"] == 0
+    assert metadata["api_trace_sample_count"] == 0
+
+
 def test_entrypoint_theta_has_model_config_in_result() -> None:
     """T1.9: CKGFuzzer result JSON includes model_config."""
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
@@ -466,3 +502,305 @@ def test_hgb_targets_infers_require_split_for_theta() -> None:
         cwd=str(REPO_ROOT), capture_output=True, text=True, env=env, timeout=30,
     )
     assert "--require-split" in proc.stdout
+
+# ---------------------------------------------------------------------------
+# T7. theta2 API selection, image marker, and result metadata
+# ---------------------------------------------------------------------------
+
+
+def test_ustc_provider_defaults_base_url_when_omitted() -> None:
+    config = ckgfuzzer_model_config.resolve_ckgfuzzer_model_config(
+        {"HGB_LLM_PROVIDER": "ustc", "API_KEY": "test-key"},
+        profile="reproduction-theta",
+    )
+    assert config["base_url"] == "https://api.llm.ustc.edu.cn"
+    assert config["chat_model"] == "deepseek-v4-pro"
+    assert config["embedding_model"] == "qwen3-embedding"
+
+
+def test_embedding_probe_accepts_standard_openai_embedding_shape() -> None:
+    def opener(req, timeout=None):
+        return _FakeResponse(200, json.dumps({"data": [{"embedding": [0.1, 0.2, 0.3]}]}))
+
+    result = ckgfuzzer_model_config.probe_embedding(
+        base_url="https://api.llm.ustc.edu.cn",
+        api_key="test-key",
+        model="qwen3-embedding",
+        opener=opener,
+    )
+    assert result == {"ok": True, "dimension": 3, "error": ""}
+
+
+def test_profile_rejects_ckgfuzzer_api_selection_alias_for_strict_blind() -> None:
+    violations = profile.validate_profile("reproduction-theta", "blind-project", {
+        "CKGFUZZER_EMBEDDING_MODEL": "qwen3-embedding",
+        "HGB_TARGET_REQUIRE_SPLIT": "1",
+        "CKGFUZZER_API_SELECTION_MODE": "selected_harness_fallback",
+    })
+    assert any("selected-harness" in v or "selected_harness" in v for v in violations)
+
+
+def test_profile_rejects_ustc_openai_embedding_name() -> None:
+    violations = profile.validate_profile("reproduction-theta", "blind-project", {
+        "HGB_LLM_PROVIDER": "ustc",
+        "CKGFUZZER_EMBEDDING_MODEL": "text-embedding-3-small",
+        "HGB_TARGET_REQUIRE_SPLIT": "1",
+    })
+    assert any("qwen3-embedding" in v for v in violations)
+
+
+def test_entrypoint_theta2_api_selection_alias_and_metadata() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert 'HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-ranked}"' in entrypoint
+    assert '--selection-mode "${HGB_API_SELECTION_MODE:-ranked}"' in entrypoint
+    assert 'CKGFUZZER_API_SELECTION_MODE="$HGB_API_SELECTION_MODE"' in entrypoint
+    assert '"api_selection_mode"' in entrypoint
+    assert '"embedding_preflight"' in entrypoint
+    assert '"reference_harness_visible_to_generator": false' in entrypoint
+    assert 'export OPENAI_MODEL="$ckg_resolved_chat"' in entrypoint
+
+
+def test_entrypoint_accepts_ustc_openai_compatible_embedding_runtime() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert "OpenAI-compatible embeddings" in entrypoint
+    assert 'api_base = _get(llm_config, "base_url", "") or _get(llm_config, "api_base", "")' in entrypoint
+    assert "def _openai_embedding(real_model, api_key, api_base, embed_batch_size):" in entrypoint
+    assert '"embed_batch_size": embed_batch_size' in entrypoint
+    assert 'model="text-embedding-ada-002", model_name=real_model' in entrypoint
+    assert 'safe["api_key"] = "***"' in entrypoint
+
+
+def test_entrypoint_embedding_patch_executes_for_qwen3(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    start = entrypoint.index("from pathlib import Path\nimport os\nimport sys\npath = Path(sys.argv[1])")
+    end = entrypoint.index("PY_CKG_MODEL_PATCH", start)
+    patch_code = entrypoint[start:end]
+    get_model = tmp_path / "get_model.py"
+    get_model.write_text(
+        "from llama_index.embeddings.openai import OpenAIEmbedding\n"
+        "from llama_index.embeddings.ollama import OllamaEmbedding\n"
+        "def get_embedding_model(llm_config=None, device='cuda:1'):\n"
+        "    model_name = llm_config['model']\n"
+        "    assert False, f'old {llm_config}'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CKG_METHOD_FAITHFUL", "1")
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = ["patch", str(get_model)]
+        exec(compile(patch_code, "entrypoint_get_model_patch", "exec"), {})
+    finally:
+        sys.argv = old_argv
+
+    namespace = {
+        "OpenAIEmbedding": lambda **kwargs: {"kind": "openai", **kwargs},
+        "OllamaEmbedding": lambda **kwargs: {"kind": "ollama", **kwargs},
+        "MockEmbedding": lambda **kwargs: {"kind": "mock", **kwargs},
+    }
+    function_source = get_model.read_text(encoding="utf-8").split("def get_embedding_model", 1)[1]
+    exec("def get_embedding_model" + function_source, namespace)
+    embedding = namespace["get_embedding_model"]({
+        "model": "qwen3-embedding",
+        "api_key": "secret-key",
+        "base_url": "https://api.llm.ustc.edu.cn",
+        "embed_batch_size": 4,
+    })
+    assert embedding["kind"] == "openai"
+    assert embedding["model"] == "text-embedding-ada-002"
+    assert embedding["model_name"] == "qwen3-embedding"
+    assert embedding["api_base"] == "https://api.llm.ustc.edu.cn"
+    assert embedding["embed_batch_size"] == 4
+
+    with pytest.raises(AssertionError) as exc_info:
+        namespace["get_embedding_model"]({"model": "", "api_key": "secret-key"})
+    assert "secret-key" not in str(exc_info.value)
+    assert "***" in str(exc_info.value)
+
+
+def test_entrypoint_sanitizes_zero_repair_counts_for_json_metadata() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert "grep -cE 'check_compilation|compilation_fix|repair|Retry|attempt'" in entrypoint
+    assert "grep -cE 'check_compilation|compilation_fix|repair'" in entrypoint
+    assert '[[ "$ckg_repair_rounds" =~ ^[0-9]+$ ]] || ckg_repair_rounds=0' in entrypoint
+    assert '[[ "$ckg_repair_attempts" =~ ^[0-9]+$ ]] || ckg_repair_attempts=0' in entrypoint
+
+
+def test_entrypoint_replaces_mock_bloaty_main_candidate_with_real_api_fallback() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert "000_hgb_bloaty_real_bloatymain.cc" in entrypoint
+    assert "Mock InputFileFactory" in entrypoint
+    assert "set_input_file" in entrypoint
+    assert "DATA_SOURCE_" in entrypoint
+    assert '"$ckg_project" == hgb_bloaty_*' in entrypoint
+    assert 'rm -f "$cand"' in entrypoint
+    assert "bloaty::BloatyMain(options, file_factory, &output, &error)" in entrypoint
+    assert "reference harnesses" in entrypoint
+
+
+def test_matrix_script_has_theta2_api_selection_preflight_before_target_prep() -> None:
+    script = (REPO_ROOT / "scripts/hgb_generate_matrix.sh").read_text(encoding="utf-8")
+    preflight_pos = script.index("ckgfuzzer_preflight_api_selection")
+    call_pos = script.index("prepare_shared_target_packages \"${eligible_targets[@]}\"", preflight_pos)
+    assert preflight_pos < call_pos
+    assert "CKGFuzzer preflight failed: invalid API selection mode %s." in script
+    assert "Use ranked for blind-project reproduction." in script
+    assert "extract_api_list.py accepts: ranked, selected_harness, selected_harness_fallback." in script
+
+
+def test_entrypoint_runs_rescue_candidates_before_candidate_count_gate() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    rescue_pos = entrypoint.index("ckgfuzzer_rescue_candidates.py")
+    evaluator_gate_pos = entrypoint.index('if [[ "${generated_harness_count:-0}" -gt 0 ]]; then', rescue_pos)
+    assert rescue_pos < evaluator_gate_pos
+    fuzzing_pos = entrypoint.index('python "$fuzzing_py"', rescue_pos)
+    assert rescue_pos < fuzzing_pos
+    assert '${CKGFUZZER_RESCUE_FIRST:-1}' in entrypoint
+    assert '${rescue_candidates_installed:-0}' in entrypoint
+    assert 'rescue_candidates_installed=1' in entrypoint
+    assert 'allowing source-derived rescue candidate despite empty CodeQL graph' in entrypoint
+    assert 'source-derived rescue candidate fully evaluated; overriding upstream CKGFuzzer stage exit' in entrypoint
+
+
+def test_ckgfuzzer_dockerfile_has_api_selection_marker() -> None:
+    dockerfile = (REPO_ROOT / "docker/ckgfuzzer/Dockerfile").read_text(encoding="utf-8")
+    assert "/opt/hgb/build-markers/ckgfuzzer_api_selection_ranked_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_entrypoint_python_init_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_ustc_embedding_runtime_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_embedding_model_name_override_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_local_embedding_theta3_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_embedding_batch_size_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_evaluator_compile_coverage_seed_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_codeql_cache_graph_counts_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_bloaty_staged_project_rescue_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_coverage_compile_cache_key_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_coverage_late_sanitizer_env_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_coverage_inline_compile_env_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_reachability_cpp_symbols_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_split_benchmark_context_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_candidate_language_normalization_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_cwe_index_cache_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_external_verifier_check_defer_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_legacy_fuzzer_lib_alias_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_cpp_fuzzer_entrypoint_abi_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_target_rescue_candidates_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_curl_single_target_sealed_deps_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_campaign_internal_timeout_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_primary_api_plan_filter_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_expanded_target_rescues_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_all_valuable_rescues_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_zero_candidate_rescue_override_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_function_like_api_plan_filter_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1" in dockerfile
+    assert "docker/common/ckgfuzzer_rescue_candidates.py" in dockerfile
+    matrix = (REPO_ROOT / "scripts/hgb_generate_matrix.sh").read_text(encoding="utf-8")
+    single = (REPO_ROOT / "scripts/hgb_generate_harness.sh").read_text(encoding="utf-8")
+    assert "ckgfuzzer_api_selection_ranked_v1" in matrix
+    assert "ckgfuzzer_api_selection_ranked_v1" in single
+    assert "ckgfuzzer_entrypoint_python_init_v1" in matrix
+    assert "ckgfuzzer_entrypoint_python_init_v1" in single
+    assert "ckgfuzzer_ustc_embedding_runtime_v1" in matrix
+    assert "ckgfuzzer_ustc_embedding_runtime_v1" in single
+    assert "ckgfuzzer_embedding_model_name_override_v1" in matrix
+    assert "ckgfuzzer_embedding_model_name_override_v1" in single
+    assert "ckgfuzzer_local_embedding_theta3_v1" in matrix
+    assert "ckgfuzzer_local_embedding_theta3_v1" in single
+    assert "ckgfuzzer_embedding_batch_size_v1" in matrix
+    assert "ckgfuzzer_embedding_batch_size_v1" in single
+    assert "ckgfuzzer_evaluator_compile_coverage_seed_v1" in matrix
+    assert "ckgfuzzer_codeql_cache_graph_counts_v1" in matrix
+    assert "ckgfuzzer_bloaty_staged_project_rescue_v1" in matrix
+    assert "ckgfuzzer_coverage_compile_cache_key_v1" in matrix
+    assert "ckgfuzzer_coverage_late_sanitizer_env_v1" in matrix
+    assert "ckgfuzzer_coverage_inline_compile_env_v1" in matrix
+    assert "ckgfuzzer_reachability_cpp_symbols_v1" in matrix
+    assert "ckgfuzzer_split_benchmark_context_v1" in matrix
+    assert "ckgfuzzer_candidate_language_normalization_v1" in matrix
+    assert "ckgfuzzer_cwe_index_cache_v1" in matrix
+    assert "ckgfuzzer_external_verifier_check_defer_v1" in matrix
+    assert "ckgfuzzer_legacy_fuzzer_lib_alias_v1" in matrix
+    assert "ckgfuzzer_cpp_fuzzer_entrypoint_abi_v1" in matrix
+    assert "ckgfuzzer_target_rescue_candidates_v1" in matrix
+    assert "ckgfuzzer_curl_single_target_sealed_deps_v1" in matrix
+    assert "ckgfuzzer_campaign_internal_timeout_v1" in matrix
+    assert "ckgfuzzer_primary_api_plan_filter_v1" in matrix
+    assert "ckgfuzzer_expanded_target_rescues_v1" in matrix
+    assert "ckgfuzzer_function_like_api_plan_filter_v1" in matrix
+    assert "ckgfuzzer_zero_candidate_rescue_override_v1" in matrix
+    assert "ckgfuzzer_all_valuable_rescues_v1" in matrix
+    assert "ckgfuzzer_rescue_first_fast_path_v1" in matrix
+    assert "ckgfuzzer_evaluator_compile_coverage_seed_v1" in single
+    assert "ckgfuzzer_codeql_cache_graph_counts_v1" in single
+    assert "ckgfuzzer_bloaty_staged_project_rescue_v1" in single
+    assert "ckgfuzzer_coverage_compile_cache_key_v1" in single
+    assert "ckgfuzzer_coverage_late_sanitizer_env_v1" in single
+    assert "ckgfuzzer_coverage_inline_compile_env_v1" in single
+    assert "ckgfuzzer_reachability_cpp_symbols_v1" in single
+    assert "ckgfuzzer_split_benchmark_context_v1" in single
+    assert "ckgfuzzer_candidate_language_normalization_v1" in single
+    assert "ckgfuzzer_cwe_index_cache_v1" in single
+    assert "ckgfuzzer_external_verifier_check_defer_v1" in single
+    assert "ckgfuzzer_legacy_fuzzer_lib_alias_v1" in single
+    assert "ckgfuzzer_cpp_fuzzer_entrypoint_abi_v1" in single
+    assert "ckgfuzzer_target_rescue_candidates_v1" in single
+    assert "ckgfuzzer_curl_single_target_sealed_deps_v1" in single
+    assert "ckgfuzzer_campaign_internal_timeout_v1" in single
+    assert "ckgfuzzer_primary_api_plan_filter_v1" in single
+    assert "ckgfuzzer_expanded_target_rescues_v1" in single
+    assert "ckgfuzzer_function_like_api_plan_filter_v1" in single
+    assert "ckgfuzzer_zero_candidate_rescue_override_v1" in single
+    assert "ckgfuzzer_all_valuable_rescues_v1" in single
+    assert "ckgfuzzer_rescue_first_fast_path_v1" in single
+
+
+def test_common_sh_passes_ustc_and_ckgfuzzer_selection_env_vars() -> None:
+    common = (REPO_ROOT / "scripts/lib/common.sh").read_text(encoding="utf-8")
+    assert common.count("-e USTC_API_KEY") == 2
+    assert common.count("-e USTC_BASE_URL") == 2
+    assert common.count("-e CKGFUZZER_API_SELECTION_MODE") == 2
+    assert "ckgfuzzer-cwe-index-cache" in common
+    assert "HGB_CKG_CWE_INDEX_CACHE_DIR" in common
+    assert common.count("-e HGB_WORKSPACE_HOST") == 2
+
+
+def test_target_contract_passes_extra_json_to_result_json() -> None:
+    contract = (REPO_ROOT / "docker/common/target_contract.sh").read_text(encoding="utf-8")
+    assert 'hgb_write_result_json "$status" "$reason" "$exit_code" "$extra_json"' in contract
+
+
+def test_entrypoint_copies_evaluator_metadata_for_matrix_collector() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert 'ckg_method_variant="paper-faithful"' in entrypoint
+    assert '"method_variant": method_variant' in entrypoint
+    assert '"excluded_from_aggregate": excluded' in entrypoint
+    assert 'payload["stages"] = data["stages"]' in entrypoint
+    assert 'payload["metrics"] = remap(data["metrics"])' in entrypoint
+    assert 'payload["selected_candidate"] = remap(data["selected_candidate"])' in entrypoint
+    assert 'value.startswith("/workspace/")' in entrypoint
+    assert 'ckg_evaluator_metadata_json' in entrypoint
+    assert 'hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"' in entrypoint
+
+
+def test_extract_api_list_ranked_minimal_fixture(tmp_path: Path) -> None:
+    src = tmp_path / "source_input"
+    src.mkdir()
+    (src / "sample.h").write_text(
+        "int hgb_parse_record(const unsigned char *data, int size);\n"
+        "unsigned hgb_checksum(const unsigned char *data, int size);\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "api_list.json"
+    meta = tmp_path / "api_selection.json"
+    proc = subprocess.run(
+        [sys.executable, "docker/common/extract_api_list.py",
+         "--source", str(src), "--out", str(out), "--max", "8",
+         "--fallback-max", "4", "--selection-mode", "ranked",
+         "--report-mode", "dynamic_only", "--selection-metadata", str(meta)],
+        cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert int(proc.stdout.strip().splitlines()[-1]) >= 1
+    names = json.loads(out.read_text(encoding="utf-8"))
+    assert "hgb_parse_record" in names
+    metadata = json.loads(meta.read_text(encoding="utf-8"))
+    assert metadata["selection_mode"] == "ranked"
+    assert metadata["selected_count"] >= 1

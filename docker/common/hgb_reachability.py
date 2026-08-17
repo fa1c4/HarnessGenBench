@@ -86,6 +86,54 @@ def _normalize_api_list(items: Iterable[Any]) -> list[str]:
     return out
 
 
+def _strip_signature(name: str) -> str:
+    return name.split("(", 1)[0].strip()
+
+
+def _symbol_names(symbol: str) -> set[str]:
+    """Return comparable API names from a raw/qualified/mangled symbol."""
+
+    raw = _strip_signature(symbol.strip())
+    if not raw:
+        return set()
+    names = {raw}
+    # Demangled C++ and qualified C names.
+    for sep in ("::", "."):
+        if sep in raw:
+            last = raw.rsplit(sep, 1)[-1]
+            if last:
+                names.add(last)
+    # Some OSS-Fuzz builds rename public project symbols with a stable prefix
+    # during sanitizer/link isolation, while coverage still reports the renamed
+    # symbol. Preserve the original and add the public API spelling.
+    for prefix in ("OSS_FUZZ_",):
+        if raw.startswith(prefix) and len(raw) > len(prefix):
+            names.add(raw[len(prefix):])
+    # Itanium C++ ABI mangling stores identifiers as length-prefixed
+    # components, e.g. _ZN6bloaty10BloatyMainERK... -> bloaty, BloatyMain.
+    mangled = raw
+    if mangled.startswith("_Z"):
+        i = 2
+        if i < len(mangled) and mangled[i] == "N":
+            i += 1
+        while i < len(mangled):
+            if mangled[i] == "E":
+                break
+            match = re.match(r"(\d+)", mangled[i:])
+            if not match:
+                i += 1
+                continue
+            length = int(match.group(1))
+            i += len(match.group(1))
+            if length <= 0 or i + length > len(mangled):
+                break
+            component = mangled[i:i + length]
+            if component:
+                names.add(component)
+            i += length
+    return names
+
+
 def reached_apis_from_trace(trace: dict[str, Any] | str | Path, intended: list[str]) -> list[str]:
     """Return the subset of intended APIs that appear in a dynamic trace.
 
@@ -123,8 +171,19 @@ def reached_apis_from_trace(trace: dict[str, Any] | str | Path, intended: list[s
             value = trace.get(key)
             if isinstance(value, list):
                 executed.update(_normalize_api_list(value))
-    intended_set = {name.split("(")[0].strip() for name in intended if name}
-    return sorted(intended_set & executed)
+    intended_names: dict[str, set[str]] = {}
+    for name in intended:
+        clean = _strip_signature(name) if name else ""
+        if clean:
+            intended_names[clean] = _symbol_names(clean)
+    executed_names: set[str] = set()
+    for symbol in executed:
+        executed_names.update(_symbol_names(symbol))
+    return sorted(
+        intended_name
+        for intended_name, aliases in intended_names.items()
+        if aliases & executed_names
+    )
 
 
 def check_reachability(intended: list[str], trace: dict[str, Any] | str | Path) -> dict[str, Any]:

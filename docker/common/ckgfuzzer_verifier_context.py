@@ -242,6 +242,14 @@ def _rewrite_dockerfile(dockerfile: Path) -> tuple[str, int]:
             output.extend(
                 [
                     "# HGB sealed verifier source snapshot.",
+                    "ARG FUZZING_ENGINE=libfuzzer",
+                    "ARG SANITIZER=address",
+                    "ARG ARCHITECTURE=x86_64",
+                    "ARG FUZZING_LANGUAGE=c++",
+                    "ENV FUZZING_ENGINE=${FUZZING_ENGINE}",
+                    "ENV SANITIZER=${SANITIZER}",
+                    "ENV ARCHITECTURE=${ARCHITECTURE}",
+                    "ENV FUZZING_LANGUAGE=${FUZZING_LANGUAGE}",
                     "ENV HGB_SEALED_VERIFIER=1",
                     "COPY source_input/ /src/",
                     "COPY hgb_reference_harnesses/ /src/",
@@ -249,7 +257,7 @@ def _rewrite_dockerfile(dockerfile: Path) -> tuple[str, int]:
                     # bootstraps that can no longer resolve their dependencies
                     # reliably. Supply the stable distro tools and patch only
                     # those exact bootstraps in the copied build script below.
-                    "RUN apt-get update && apt-get install -y meson ninja-build python3-jinja2 python3-jsonschema",
+                    "RUN apt-get -o Acquire::Retries=5 update && apt-get -o Acquire::Retries=5 install -y --fix-missing meson ninja-build python3-pip python3-jinja2 python3-jsonschema m4",
                 ]
             )
             inserted_snapshot = True
@@ -311,23 +319,60 @@ def _patch_legacy_build_tool_bootstrap(context: Path) -> int:
     original = build_script.read_text(encoding="utf-8", errors="replace")
     harfbuzz_legacy = "python3.8 -m pip install ninja meson==0.56.0"
     harfbuzz_replacement = (
-        "# HGB sealed verifier: use distro Meson/Ninja; Python 3.8's bundled "
-        "pip cannot install modern Ninja.\n"
-        "command -v meson >/dev/null && command -v ninja >/dev/null"
+        "# HGB sealed verifier: install a Meson/Ninja pair new enough for the "
+        "captured HarfBuzz source without relying on Python 3.8's stale pip.\n"
+        "python3 -m pip install --no-cache-dir 'meson==0.56.0' 'ninja==1.10.2.4'\n"
+        "hash -r"
     )
     mbedtls_legacy = "pip3 install -r $SRC/mbedtls/scripts/basic.requirements.txt"
+    openssl_fuzzer_guard = 'if [ "$FUZZER" = "centipede" ]'
+    openssl_fuzzer_replacement = ': "${FUZZER:=${FUZZING_ENGINE:-libfuzzer}}"\nif [ "$FUZZER" = "centipede" ]'
     mbedtls_replacement = (
         "# HGB sealed verifier: generated Mbed TLS wrappers only require the "
         "Ubuntu jsonschema package; avoid an unpinned pip/Rust bootstrap.\n"
         "export PYTHONPATH=/usr/lib/python3/dist-packages${PYTHONPATH:+:$PYTHONPATH}\n"
         "python3.8 -c 'import jsonschema'"
     )
+    freetype_archive = "tar xf libarchive-3.4.3.tar.xz"
+    freetype_replacement = (
+        "# HGB sealed verifier: the source snapshot already contains the "
+        "extracted libarchive tree, while the downloaded tarball is removed.\n"
+        "[ -d libarchive-3.4.3 ] || tar xf libarchive-3.4.3.tar.xz"
+    )
     patched = original.replace(harfbuzz_legacy, harfbuzz_replacement)
     patched = patched.replace(mbedtls_legacy, mbedtls_replacement)
+    patched = patched.replace(openssl_fuzzer_guard, openssl_fuzzer_replacement)
+    patched = patched.replace(freetype_archive, freetype_replacement)
+    fuzzer_lib_fallback = (
+        "# HGB sealed verifier: older OSS-Fuzz scripts link $FUZZER_LIB; "
+        "prefer the current libFuzzer driver flag when that engine is active.\n"
+        'if [ "${FUZZING_ENGINE:-libfuzzer}" = "libfuzzer" ]; then\n'
+        '  : "${FUZZER_LIB:=${LIB_FUZZING_ENGINE:--fsanitize=fuzzer}}"\n'
+        'else\n'
+        '  : "${FUZZER_LIB:=${LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a}}"\n'
+        'fi\n'
+        "export FUZZER_LIB"
+    )
+    fuzzer_lib_needs_alias = (
+        "FUZZER_LIB" in original
+        and "HGB sealed verifier: older OSS-Fuzz scripts link $FUZZER_LIB" not in original
+        and not re.search(r"(?m)^\s*(?:export\s+)?FUZZER_LIB=", original)
+    )
+    if fuzzer_lib_needs_alias:
+        patched_lines = patched.splitlines()
+        insert_at = 1 if patched_lines and patched_lines[0].startswith("#!") else 0
+        patched_lines[insert_at:insert_at] = fuzzer_lib_fallback.splitlines()
+        patched = "\n".join(patched_lines) + ("\n" if patched.endswith("\n") or original.endswith("\n") else "")
     if patched == original:
         return 0
     build_script.write_text(patched, encoding="utf-8")
-    return int(harfbuzz_legacy in original) + int(mbedtls_legacy in original)
+    return (
+        int(harfbuzz_legacy in original)
+        + int(mbedtls_legacy in original)
+        + int(openssl_fuzzer_guard in original)
+        + int(freetype_archive in original)
+        + int(fuzzer_lib_needs_alias)
+    )
 
 
 def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str, Any]:

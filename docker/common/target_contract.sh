@@ -180,7 +180,7 @@ hgb_write_common_metadata() {
     printf '  "api_trace_dir": "%s",\n' "$(hgb_json_escape "$trace_path")"
     printf '  "api_trace_file": "%s",\n' "$(hgb_json_escape "$trace_file")"
     printf '  "api_trace_sample_rate": "%s",\n' "$(hgb_json_escape "$trace_rate")"
-    printf '  "api_trace_total_count": %s' "${trace_total:-0}"
+    printf '  "api_trace_total_count": %s,\n' "${trace_total:-0}"
     printf '  "api_trace_sample_count": %s' "${trace_sample:-0}"
     if [[ -n "$extra_json" ]]; then
       printf ',\n%s\n' "$extra_json"
@@ -191,7 +191,7 @@ hgb_write_common_metadata() {
   } >"$workspace/metadata.json"
   # Derive result.json (schema v2) from the same data so statuses never diverge.
   if [[ "$capability" == "harness_generator" ]]; then
-    hgb_write_result_json "$status" "$reason" "$exit_code" ""
+    hgb_write_result_json "$status" "$reason" "$exit_code" "$extra_json"
   fi
 }
 

@@ -163,6 +163,59 @@ class FakeRunner:
         return FakeResult(cmd, 0, "", "")
 
 
+def test_builder_preseeds_freetype_libarchive_iconv_configure(tmp_path: Path) -> None:
+    context = tmp_path / "context"
+    (context / "fuzzbench_benchmark").mkdir(parents=True)
+    for build_sh in (context / "build.sh", context / "fuzzbench_benchmark" / "build.sh"): 
+        build_sh.write_text("#!/bin/bash -ex\n./configure --disable-shared\n", encoding="utf-8")
+
+    hgb_fuzzbench_builder._patch_single_target_build_context(context, "ftfuzzer")
+
+    for build_sh in (context / "build.sh", context / "fuzzbench_benchmark" / "build.sh"): 
+        patched = build_sh.read_text(encoding="utf-8")
+        assert patched.startswith("#!/bin/bash -ex\n# HGB sealed evaluator: avoid sanitizer-built libarchive iconv conftest.")
+        assert "export am_cv_func_iconv=yes" in patched
+        assert "export am_cv_lib_iconv=no" in patched
+        assert "export am_cv_func_iconv_works=yes" in patched
+
+def test_evaluator_filters_comment_only_api_mentions(tmp_path: Path) -> None:
+    target_root = tmp_path / "target"
+    primary = target_root / "source_input" / "project"
+    primary.mkdir(parents=True)
+    (primary / "api.c").write_text(
+        '/* CreateFont() appears only in docs. */\n'
+        'const char *s = "line() is only a string";\n'
+        'int real_api(void) { return 0; }\n'
+        'void caller(void) { (void) real_api(); }\n',
+        encoding="utf-8",
+    )
+    (target_root / "source_repos.json").write_text(json.dumps([
+        {"package_path": "source_input/project", "is_primary_project": True},
+    ]), encoding="utf-8")
+
+    assert evaluator._filter_intended_apis_by_primary_source(
+        ["CreateFont", "line", "real_api"], target_root
+    ) == ["real_api"]
+
+
+def test_evaluator_filters_intended_apis_to_primary_source(tmp_path: Path) -> None:
+    target_root = tmp_path / "target"
+    primary = target_root / "source_input" / "mbedtls"
+    secondary = target_root / "source_input" / "boringssl"
+    primary.mkdir(parents=True)
+    secondary.mkdir(parents=True)
+    (primary / "ssl.h").write_text("int mbedtls_ssl_setup(void);\n", encoding="utf-8")
+    (secondary / "rand.h").write_text("void CRYPTO_sysrand(unsigned char *, size_t);\n", encoding="utf-8")
+    (target_root / "source_repos.json").write_text(json.dumps([
+        {"package_path": "source_input/mbedtls", "is_primary_project": True},
+        {"package_path": "source_input/boringssl", "is_primary_project": False},
+    ]), encoding="utf-8")
+
+    assert evaluator._filter_intended_apis_by_primary_source(
+        ["mbedtls_ssl_setup", "CRYPTO_sysrand"], target_root
+    ) == ["mbedtls_ssl_setup"]
+
+
 def _setup_evaluator_paths(tmp_path: Path):
     gen_root = tmp_path / "generator_input"
     evl_root = tmp_path / "evaluator_only"
@@ -260,9 +313,29 @@ def test_create_sealed_build_context_assembles_both_halves(tmp_path: Path) -> No
     assert (sealed_dir / "source_input" / "project" / "sample.c").is_file()
     assert (sealed_dir / "source_repos.json").is_file()
     assert (sealed_dir / "fuzzbench_benchmark" / "Dockerfile").is_file()
+    assert (sealed_dir / "build.sh").is_file()
+    assert sealed["benchmark_context_file_count"] >= 1
     assert (sealed_dir / "native_harness_path.json").is_file()
     assert (sealed_dir / "reference_harnesses").is_dir()
     assert sealed["mode"] == "split_sealed_source_snapshot"
+
+
+def test_split_context_mirrors_benchmark_root_auxiliary_files(tmp_path: Path) -> None:
+    gen_root, evl_root, _candidates_dir, work_dir = _setup_evaluator_paths(tmp_path)
+    (evl_root / "benchmark_copy" / "target.cc").write_text("// aux\n", encoding="utf-8")
+    (evl_root / "benchmark_copy" / ".dockerignore").write_text("/build.sh\n", encoding="utf-8")
+    (evl_root / "benchmark_copy" / "seeds").mkdir()
+    (evl_root / "benchmark_copy" / "seeds" / "seed").write_bytes(b"seed")
+
+    ctx = hgb_split_context.SplitTargetContext.load(gen_root, evl_root)
+    sealed = hgb_split_context.create_sealed_build_context(ctx, work_dir / "sealed")
+    sealed_dir = Path(sealed["context_dir"])
+
+    assert (sealed_dir / "target.cc").is_file()
+    assert (sealed_dir / ".dockerignore").read_text(encoding="utf-8") == "/build.sh\n"
+    assert (sealed_dir / "seeds" / "seed").is_file()
+    assert (sealed_dir / "fuzzbench_benchmark" / "target.cc").is_file()
+    assert sealed["benchmark_context_file_count"] >= 4
 
 
 def test_evaluator_uses_split_context_for_split_package(tmp_path: Path) -> None:
@@ -293,6 +366,80 @@ def test_verify_overlay_path_rejects_traversal(tmp_path: Path) -> None:
     (sealed_dir / "source_input").mkdir(parents=True)
     with pytest.raises(SplitContextError):
         hgb_split_context.verify_overlay_path("/src/../../etc/passwd", sealed_dir)
+
+
+
+def test_builder_normalizes_cpp_syntax_for_c_native_harness(tmp_path: Path) -> None:
+    builder = _load_module("hgb_fuzzbench_builder_gamma_direct", "docker/common/hgb_fuzzbench_builder.py")
+    cand = tmp_path / "candidate.cc"
+    cand.write_text(
+        '#include <stdint.h>\n#include <stddef.h>\nextern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return nullptr == NULL; }\n',
+        encoding="utf-8",
+    )
+
+    staged = builder._normalize_candidate_for_native_path(cand, "/src/project/fuzz_target.c", tmp_path / "work")
+    text = staged.read_text(encoding="utf-8")
+
+    assert staged.suffix == ".c"
+    assert 'extern "C"' not in text
+    assert "nullptr" not in text
+    assert "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);" in text
+
+
+def test_builder_adds_c_linkage_for_cpp_libfuzzer_entrypoint(tmp_path: Path) -> None:
+    builder = _load_module("hgb_fuzzbench_builder_gamma_cpp_linkage", "docker/common/hgb_fuzzbench_builder.py")
+    cand = tmp_path / "candidate.cc"
+    cand.write_text(
+        '#include <stdint.h>\n#include <stddef.h>\nint LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return 0; }\n',
+        encoding="utf-8",
+    )
+
+    staged = builder._normalize_candidate_for_native_path(cand, "/src/project/fuzz_target.cc", tmp_path / "work")
+    text = staged.read_text(encoding="utf-8")
+
+    assert staged.suffix == ".cc"
+    assert 'extern "C" int LLVMFuzzerTestOneInput' in text
+
+
+def test_builder_restricts_curl_fuzzer_target_list(tmp_path: Path) -> None:
+    builder = _load_module("hgb_fuzzbench_builder_gamma_curl", "docker/common/hgb_fuzzbench_builder.py")
+    curl_root = tmp_path / "source_input" / "curl_fuzzer"
+    scripts = curl_root / "scripts"
+    scripts.mkdir(parents=True)
+    fuzz_targets = scripts / "fuzz_targets"
+    fuzz_targets.write_text('export FUZZ_TARGETS="curl_fuzzer_http curl_fuzzer_ws"\n', encoding="utf-8")
+    (scripts / "compile_fuzzer.sh").write_text("#!/bin/bash\nmake || exit 4\nmake check || exit 5\n", encoding="utf-8")
+    (curl_root / "ossfuzz.sh").write_text(
+        "${SCRIPTDIR}/handle_x.sh zlib ${ZLIBDIR} ${INSTALLDIR} || exit 1\n"
+        "# For the memory sanitizer build, turn off OpenSSL as it causes bugs we can't\n"
+        "if [[ ${SANITIZER} != \"memory\" ]]\nthen\n"
+        "    ${SCRIPTDIR}/handle_x.sh openssl ${OPENSSLDIR} ${INSTALLDIR} || exit 1\n"
+        "fi\n"
+        "${SCRIPTDIR}/handle_x.sh nghttp2 ${NGHTTPDIR} ${INSTALLDIR} || exit 1\n"
+        "make zip\n",
+        encoding="utf-8",
+    )
+    (curl_root / "Makefile.am").write_text(
+        "COMMON_SOURCES = curl_fuzzer.cc curl_fuzzer_tlv.cc curl_fuzzer_callback.cc\n"
+        "curl_fuzzer_http_SOURCES = $(COMMON_SOURCES)\n"
+        "curl_fuzzer_ws_SOURCES = $(COMMON_SOURCES)\n",
+        encoding="utf-8",
+    )
+
+    builder._patch_single_target_build_context(tmp_path, "curl_fuzzer_http")
+
+    assert fuzz_targets.read_text(encoding="utf-8") == 'export FUZZ_TARGETS="curl_fuzzer_http"\n'
+    compile_text = (scripts / "compile_fuzzer.sh").read_text(encoding="utf-8")
+    assert "make ${FUZZ_TARGETS} || exit 4" in compile_text
+    assert "skip broad curl make check" in compile_text
+    ossfuzz_text = (curl_root / "ossfuzz.sh").read_text(encoding="utf-8")
+    assert "downloaded zlib" in ossfuzz_text
+    assert "avoid downloading OpenSSL" in ossfuzz_text
+    assert "downloaded nghttp2" in ossfuzz_text
+    assert "make ${TARGET}_seed_corpus.zip" in ossfuzz_text
+    makefile_text = (curl_root / "Makefile.am").read_text(encoding="utf-8")
+    assert "curl_fuzzer_http_SOURCES = curl_fuzzer.cc" in makefile_text
+    assert "curl_fuzzer_ws_SOURCES = $(COMMON_SOURCES)" in makefile_text
 
 
 # ---------------------------------------------------------------------------
@@ -433,6 +580,25 @@ def test_smoke_runner_fails_if_no_sample_executed(tmp_path: Path) -> None:
     source = (REPO_ROOT / "docker/common/hgb_fuzzbench_builder.py").read_text(encoding="utf-8")
     assert "any_executed" in source
     assert "copy_in" in source
+
+
+def test_campaign_runner_adds_bounded_runs_to_time_budget(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    result = hgb_fuzzbench_builder.run_campaign(
+        image_tag="hgb-test",
+        binary_path="/out/fuzz_target",
+        corpus_dir=tmp_path / "seed_corpus",
+        work_dir=tmp_path / "campaign",
+        campaign_seconds=2,
+        runner=runner,
+    )
+
+    create_commands = [" ".join(c) for c in runner.commands if c[:2] == ["docker", "create"]]
+    assert any("timeout -s INT -k 5s 7s" in c for c in create_commands)
+    assert any("-runs=512" in c and "-max_total_time=2" in c for c in create_commands)
+    assert any("HGB_FUZZER_EXIT_CODE=$fuzzer_rc" in c for c in create_commands)
+    assert result["execs_done"] == 500
+    assert result["timeouts"] == 0
 
 
 # ---------------------------------------------------------------------------

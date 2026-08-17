@@ -130,6 +130,12 @@ def test_entrypoint_blind_mode_does_not_use_selected_harness_report() -> None:
     # In blind-project, the api-report and report-mode should be cleared.
     assert 'HGB_SELECTED_API_REPORT=""' in entrypoint
     assert 'HGB_API_REPORT_MODE=""' in entrypoint
+    assert 'HGB_API_SELECTION_MODE="${HGB_API_SELECTION_MODE:-ranked}"' in entrypoint
+    assert '--selection-mode "${HGB_API_SELECTION_MODE:-ranked}"' in entrypoint
+    assert ':-public_headers' not in entrypoint
+    assert '""|public_headers)' in entrypoint
+    assert 'HGB_API_SELECTION_MODE=ranked' in entrypoint
+    assert 'CKGFUZZER_API_SELECTION_MODE="$HGB_API_SELECTION_MODE"' in entrypoint
     # The extract args should not pass reference-dir in blind-project.
     assert '"$ckg_protocol" != "blind-project"' in entrypoint
 

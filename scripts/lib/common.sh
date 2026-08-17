@@ -141,9 +141,28 @@ latest_workspace_run() {
 
 load_hgb_config() {
   local root config legacy_env
+  local _hgb_name
+  local -A _hgb_preserved_env=()
+  local _hgb_preserve_names=(
+    CKGFUZZER_EMBEDDING_BACKEND
+    CKGFUZZER_EMBEDDING_MODEL
+    CKGFUZZER_EMBEDDING_BASE_URL
+    CKGFUZZER_EMBEDDING_API_KEY
+    CKGFUZZER_EMBEDDING_MODEL_SOURCE
+    CKGFUZZER_EMBEDDING_DIMENSION
+    CKGFUZZER_EMBEDDING_BATCH_SIZE
+    HGB_API_SELECTION_MODE
+    CKGFUZZER_API_SELECTION_MODE
+  )
   root="$(repo_root)"
   config="$root/configs/set_api_key.sh"
   legacy_env="$root/.env"
+
+  for _hgb_name in "${_hgb_preserve_names[@]}"; do
+    if [[ -v $_hgb_name ]]; then
+      _hgb_preserved_env[$_hgb_name]="${!_hgb_name}"
+    fi
+  done
 
   if [[ -f "$config" ]]; then
     # shellcheck disable=SC1090
@@ -158,6 +177,12 @@ load_hgb_config() {
       set +a
     fi
   fi
+
+  for _hgb_name in "${_hgb_preserve_names[@]}"; do
+    if [[ -v _hgb_preserved_env[$_hgb_name] ]]; then
+      export "$_hgb_name=${_hgb_preserved_env[$_hgb_name]}"
+    fi
+  done
 
   hgb_resolve_llm_provider
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900}"
@@ -393,14 +418,41 @@ hgb_build_image() {
   printf '%s\n' "$image"
 }
 
+
+hgb_docker_url_needs_host_gateway() {
+  local url="${1:-}"
+  [[ "$url" == *host.docker.internal* ]]
+}
+
+hgb_add_host_gateway_for_url() {
+  local -n _hgb_docker_args_ref="$1"
+  local url="${2:-}"
+  local existing
+  if ! hgb_docker_url_needs_host_gateway "$url"; then
+    return 0
+  fi
+  for existing in "${_hgb_docker_args_ref[@]:-}"; do
+    if [[ "$existing" == "--add-host=host.docker.internal:host-gateway" || "$existing" == "host.docker.internal:host-gateway" ]]; then
+      return 0
+    fi
+  done
+  _hgb_docker_args_ref+=(--add-host=host.docker.internal:host-gateway)
+}
+
 run_hgb_container() {
   local image="$1"
   local workspace="$2"
   local mode="$3"
+  local extra_docker_args=()
   shift 3
   ensure_dir "$workspace"
+  hgb_add_host_gateway_for_url extra_docker_args "${CKGFUZZER_EMBEDDING_BASE_URL:-}"
   docker run --rm --init \
+    "${extra_docker_args[@]}" \
     -e API_KEY \
+    -e USTC_API_KEY \
+    -e USTC_BASE_URL \
+    -e USTC_API_BASE \
     -e BASE_URL \
     -e MODEL \
     -e OPENAI_API_KEY \
@@ -419,6 +471,7 @@ run_hgb_container() {
     -e HGB_SELECTED_API_MAX \
     -e HGB_SELECTED_API_FALLBACK_MAX \
     -e HGB_API_SELECTION_MODE \
+    -e CKGFUZZER_API_SELECTION_MODE \
     -e HGB_SELECTED_API_REPORT \
     -e HGB_API_REPORT_MODE \
     -e HGB_ALLOW_REFERENCE_USAGE \
@@ -470,9 +523,13 @@ run_hgb_container() {
     -e ELFUZZ_LOCAL_MODEL_CACHE_READY \
     -e ELFUZZ_COVERAGE_REPLAY \
     -e ELFUZZ_SANITIZER \
+    -e CKGFUZZER_EMBEDDING_BACKEND \
     -e CKGFUZZER_EMBEDDING_MODEL \
     -e CKGFUZZER_EMBEDDING_BASE_URL \
     -e CKGFUZZER_EMBEDDING_API_KEY \
+    -e CKGFUZZER_EMBEDDING_MODEL_SOURCE \
+    -e CKGFUZZER_EMBEDDING_DIMENSION \
+    -e CKGFUZZER_EMBEDDING_BATCH_SIZE \
     -e CKGFUZZER_LLM_MODEL \
     -e CKGFUZZER_API_KEY \
     -e CKGFUZZER_BASE_URL \
@@ -535,6 +592,7 @@ run_hgb_container() {
     -e PROME_FUZZ_SKIP_BAD_DOCS \
     -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
+    -e HGB_WORKSPACE_HOST="$workspace" \
     -e HGB_HOST_UID="$(id -u)" \
     -e HGB_HOST_GID="$(id -g)" \
     -v "$workspace:/workspace" \
@@ -550,12 +608,13 @@ run_hgb_target_container() {
   local target_package="$5"
   local project="$6"
   local fuzz_target="$7"
-  local root artifact_name generator_commit shared_llm_lock_dir ckg_codeql_cache_dir
+  local root artifact_name generator_commit shared_llm_lock_dir ckg_codeql_cache_dir ckg_cwe_index_cache_dir
   local extra_docker_args=()
   shift 7
   root="$(repo_root)"
   shared_llm_lock_dir="$(hgb_workspace_dir "$root")/llm-locks"
   ensure_dir "$shared_llm_lock_dir"
+  hgb_add_host_gateway_for_url extra_docker_args "${CKGFUZZER_EMBEDDING_BASE_URL:-}"
   extra_docker_args+=(-v "$shared_llm_lock_dir:/hgb-llm-locks" -e HGB_LLM_LOCK_DIR=/hgb-llm-locks)
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
@@ -584,9 +643,12 @@ run_hgb_target_container() {
   if [[ "$generator" == "ckgfuzzer" ]]; then
     ensure_dir "$workspace/docker_shared"
     ckg_codeql_cache_dir="$(hgb_workspace_dir "$root")/ckgfuzzer-codeql-cache"
+    ckg_cwe_index_cache_dir="$(hgb_workspace_dir "$root")/ckgfuzzer-cwe-index-cache"
     ensure_dir "$ckg_codeql_cache_dir"
+    ensure_dir "$ckg_cwe_index_cache_dir"
     extra_docker_args+=(-v "$workspace/docker_shared:$workspace/docker_shared" -e "HGB_CKG_DOCKER_SHARED=$workspace/docker_shared" -e "CKGFUZZER_MAX_CALL_GRAPH_APIS=${CKGFUZZER_MAX_CALL_GRAPH_APIS:-8}")
     extra_docker_args+=(-v "$ckg_codeql_cache_dir:/hgb-ckg-cache" -e HGB_CKG_CODEQL_CACHE_DIR=/hgb-ckg-cache -e "CKGFUZZER_CODEQL_CACHE=${CKGFUZZER_CODEQL_CACHE:-1}" -e "CKGFUZZER_CODEQL_CACHE_REFRESH=${CKGFUZZER_CODEQL_CACHE_REFRESH:-0}")
+    extra_docker_args+=(-v "$ckg_cwe_index_cache_dir:/hgb-ckg-cwe-index-cache" -e HGB_CKG_CWE_INDEX_CACHE_DIR=/hgb-ckg-cwe-index-cache)
     extra_docker_args+=(-v "$(hgb_workspace_dir "$root"):/hgb-workspace:ro" -e HGB_CKG_PREVIOUS_WORKSPACE_ROOT=/hgb-workspace)
     # Mount the theta model preflight cache so the container can reuse it.
     if [[ -n "${HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE:-}" && -f "${HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE:-}" ]]; then
@@ -668,6 +730,9 @@ run_hgb_target_container() {
     --entrypoint /opt/hgb/entrypoint.sh \
     -e HGB_DOCKER_IMAGE_DIGEST="$hgb_docker_image_digest" \
     -e API_KEY \
+    -e USTC_API_KEY \
+    -e USTC_BASE_URL \
+    -e USTC_API_BASE \
     -e BASE_URL \
     -e MODEL \
     -e OPENAI_API_KEY \
@@ -686,6 +751,7 @@ run_hgb_target_container() {
     -e HGB_SELECTED_API_MAX \
     -e HGB_SELECTED_API_FALLBACK_MAX \
     -e HGB_API_SELECTION_MODE \
+    -e CKGFUZZER_API_SELECTION_MODE \
     -e HGB_SELECTED_API_REPORT \
     -e HGB_API_REPORT_MODE \
     -e OFG_OSS_FUZZ_DIR \
@@ -749,9 +815,13 @@ run_hgb_target_container() {
     -e ELFUZZ_PRODUCED_INPUTS_DIR \
     -e ELFUZZ_CAMPAIGN_OUTPUT_DIR \
     -e ELFUZZ_MODEL \
+    -e CKGFUZZER_EMBEDDING_BACKEND \
     -e CKGFUZZER_EMBEDDING_MODEL \
     -e CKGFUZZER_EMBEDDING_BASE_URL \
     -e CKGFUZZER_EMBEDDING_API_KEY \
+    -e CKGFUZZER_EMBEDDING_MODEL_SOURCE \
+    -e CKGFUZZER_EMBEDDING_DIMENSION \
+    -e CKGFUZZER_EMBEDDING_BATCH_SIZE \
     -e CKGFUZZER_LLM_MODEL \
     -e CKGFUZZER_API_KEY \
     -e CKGFUZZER_BASE_URL \
@@ -833,6 +903,7 @@ run_hgb_target_container() {
     -e PROME_FUZZ_SKIP_BAD_DOCS \
     -e PROME_FUZZ_MAX_DOC_BYTES \
     -e HGB_RUN_ID="$(basename "$workspace")" \
+    -e HGB_WORKSPACE_HOST="$workspace" \
     -e HGB_GENERATOR="$generator" \
     -e HGB_GENERATOR_COMMIT="$generator_commit" \
     -e HGB_TARGET="$target" \

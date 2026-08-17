@@ -136,6 +136,17 @@ def validate_cache_tree(
             f"cache CSV exceeds configured limit {max_csv_bytes}: {details}"
         )
 
+    combined_graph = root / "api_combine/combined_call_graph.csv"
+    try:
+        import csv
+
+        with combined_graph.open(encoding="utf-8", errors="replace") as f:
+            has_graph_row = any(row and row[0] not in ("caller", "") for row in csv.reader(f))
+    except Exception as exc:
+        raise CacheValidationError("cache combined call graph could not be read") from exc
+    if not has_graph_row:
+        raise CacheValidationError("cache combined call graph contains no selected API rows")
+
     api_code = json.loads((root / "src/src_api_code.json").read_text(encoding="utf-8"))
     if not isinstance(api_code, dict) or not api_code:
         raise CacheValidationError("cache contains no resolved selected API source")

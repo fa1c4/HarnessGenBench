@@ -366,6 +366,45 @@ def test_ckgfuzzer_runtime_patch_scopes_string_checks_away_from_boolean_docker_s
     assert "if not result:" in patched[start:build]
     assert ".startswith" not in patched[start:build]
     assert "result.startswith(('ERROR:', 'INFRA_ERROR:'))" in patched[build:]
+    assert "HGB_EXTERNAL_VERIFIER_DEFERRED" in patched
+    assert "project_name + '_check'" in patched
+    py_compile.compile(str(upstream), doraise=True)
+
+
+def test_ckgfuzzer_runtime_patch_defers_upstream_run_under_external_verifier(tmp_path: Path) -> None:
+    upstream = tmp_path / "run_fuzzer.py"
+    upstream.write_text(
+        "\n".join(
+            [
+                "import os",
+                "class Logger:",
+                "    def info(self, *args): pass",
+                "    def error(self, *args): pass",
+                "logger = Logger()",
+                "class Runner:",
+                "    def build_and_fuzz_one_file(self, fuzz_driver_file):",
+                "        self.failed_builds = []",
+                "        build_fuzzer_result = 'HGB_EXTERNAL_VERIFIER_DEFERRED'",
+                "        if \"ERROR\" in build_fuzzer_result or \"error\" in build_fuzzer_result.lower():",
+                "            self.failed_builds.append(fuzz_driver_file)",
+                "            return",
+                "        else:",
+                "            logger.info(f\"Successfully built fuzzer {fuzz_driver_file}\")",
+                "            run_fuzzer_result = 'HGB_COMMAND_OK'",
+                "            if \"ERROR\" in run_fuzzer_result:",
+                "                logger.info(\"Crash detected. Analyzing...\")",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    ckg_runtime_patch.patch_run_fuzzer(upstream)
+    patched = upstream.read_text(encoding="utf-8")
+
+    assert "self.successful_builds = []" in patched
+    assert "HGB_CKG_EXTERNAL_VERIFIER" in patched
+    assert "Deferring upstream run/coverage" in patched
     py_compile.compile(str(upstream), doraise=True)
 
 
@@ -376,6 +415,10 @@ def test_ckgfuzzer_call_graph_query_uses_distinct_variable_and_column_names() ->
     assert "start as caller" in query
     assert "end as callee" in query
     assert "from Function caller" not in query
+    assert "predicate selectedEvidence(Function caller, Function callee)" in query
+    assert "selectedFunction(caller) and directCall(caller, callee)" in query
+    assert "selectedFunction(callee) and directCall(caller, callee)" in query
+    assert "selectedFunction(caller) and caller = callee" in query
 
 
 def test_ckgfuzzer_api_recovery_handles_knr_c_and_cpp_templates() -> None:

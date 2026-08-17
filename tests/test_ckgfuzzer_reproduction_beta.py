@@ -425,3 +425,32 @@ def test_reachability_extracts_intended_apis_from_plan() -> None:
     assert reach["reached"] is True
     reach_none = hgb_reachability.check_reachability(intended, {"executed_functions": ["unrelated"]})
     assert reach_none["reached"] is False
+
+
+def test_reachability_matches_itanium_mangled_cpp_component() -> None:
+    intended = ["BloatyMain"]
+    trace = {
+        "executed_functions": [
+            "_ZN6bloaty10BloatyMainERKNS_7OptionsERKNS_16InputFileFactoryEPNS_12RollupOutputEPNSt3__112basic_stringIcNS8_11char_traitsIcEENS8_9allocatorIcEEEE"
+        ]
+    }
+    reach = hgb_reachability.check_reachability(intended, trace)
+    assert reach["reached"] is True
+    assert reach["reached_apis"] == ["BloatyMain"]
+
+
+def test_reachability_matches_demangled_cpp_basename() -> None:
+    reach = hgb_reachability.check_reachability(
+        ["BloatyMain"],
+        {"executed_functions": ["bloaty::BloatyMain(bloaty::Options const&)"]},
+    )
+    assert reach["reached"] is True
+
+
+def test_reachability_matches_oss_fuzz_prefixed_c_symbol() -> None:
+    reach = hgb_reachability.check_reachability(
+        ["png_set_sig_bytes"],
+        {"covered_functions": ["OSS_FUZZ_png_set_sig_bytes"]},
+    )
+    assert reach["reached"] is True
+    assert reach["reached_apis"] == ["png_set_sig_bytes"]

@@ -111,7 +111,7 @@ class EtaFakeRunner:
             sub = cmd[1] if len(cmd) > 1 else ""
             if sub == "build":
                 argv = " ".join(cmd[2:])
-                if "FUZZING_ENGINE=coverage" in argv:
+                if "SANITIZER=coverage" in argv:
                     return FakeResult(cmd, self.coverage_build_exit, "cov build", "")
                 return FakeResult(cmd, self.build_exit, "build ok", "")
             if sub == "image" and len(cmd) > 3 and cmd[2] == "inspect":
@@ -273,6 +273,7 @@ def test_reproduction_eta_forbids_all_local_mock_fallbacks() -> None:
         {"CKGFUZZER_ALLOW_MOCK_EMBEDDING": "1", "HGB_TARGET_REQUIRE_SPLIT": "1"},
         {"HGB_API_SELECTION_MODE": "selected_harness"},
         {"HGB_API_SELECTION_MODE": "selected_harness_fallback"},
+        {"CKGFUZZER_API_SELECTION_MODE": "selected_harness_fallback"},
     ):
         env = {"CKGFUZZER_EMBEDDING_MODEL": "openai-text-embedding-3-small", "HGB_TARGET_REQUIRE_SPLIT": "1"}
         env.update(bad_env)
@@ -362,6 +363,18 @@ def test_codeql_graph_evidence_missing_prevents_evaluator_invocation() -> None:
     assert "api_plan.json" in entrypoint
 
 
+def test_codeql_cache_hit_recounts_graph_before_eta_evidence_guard() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    restore_pos = entrypoint.index("ckg_codeql_cache_try_restore")
+    recount_pos = entrypoint.index("PY_CKG_COMBINED_GRAPH_COUNTS_POST_CACHE")
+    evidence_guard_pos = entrypoint.index("requires nonzero CodeQL graph query results")
+    assert restore_pos < recount_pos < evidence_guard_pos
+    recount_block = entrypoint[recount_pos - 900:recount_pos + 1800]
+    assert "api_combine/combined_call_graph.csv" in recount_block
+    assert 'ckg_codeql_cache_restored" == "1' in recount_block
+    assert "knowledge_graph completed" in recount_block
+
+
 def test_compile_repair_loop_command_does_not_skip_check_compilation() -> None:
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
     assert 'ckg_compilation_args+=(--skip_check_compilation)' in entrypoint
@@ -442,6 +455,26 @@ def test_assert_evaluated_invariants_rejects_eta_coverage_gaps(tmp_path: Path) -
     bad = json.loads(json.dumps(base))
     bad["selected_candidate"]["coverage"]["inputs_replayed"] = 0
     assert any("inputs_replayed" in v for v in hgb_result.assert_evaluated_invariants(bad))
+
+
+def test_coverage_image_build_uses_sanitizer_cache_key(tmp_path: Path) -> None:
+    runner = EtaFakeRunner()
+    hgb_fuzzbench_builder.build_coverage_image(
+        context_dir=tmp_path,
+        dockerfile=tmp_path / "Dockerfile",
+        image_tag="hgb-test-coverage",
+        fuzz_target="fuzz_target",
+        work_dir=tmp_path / "coverage_build",
+        runner=runner,
+    )
+    build_cmd = next(
+        cmd for cmd in runner.commands
+        if cmd[:2] == ["docker", "build"] and "SANITIZER=coverage" in " ".join(cmd)
+    )
+    assert "--no-cache" not in build_cmd
+    assert "HGB_BUILD_VARIANT=coverage-libfuzzer" in build_cmd
+    assert "HGB_SANITIZER=coverage" in build_cmd
+    assert "HGB_FUZZING_ENGINE=libfuzzer" in build_cmd
 
 
 def test_coverage_build_failure_cannot_fall_back_to_non_coverage_image(tmp_path: Path) -> None:

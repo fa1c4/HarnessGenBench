@@ -1,0 +1,8 @@
+{
+  "backend": "tei-cpu",
+  "downloaded_at_utc": "1970-01-01T00:00:00Z",
+  "local_dir": "models/Qwen3-Embedding-0.6B",
+  "openai_model_name": "text-embeddings-inference",
+  "repo_id": "Qwen/Qwen3-Embedding-0.6B",
+  "revision": ""
+}

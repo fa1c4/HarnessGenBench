@@ -280,9 +280,92 @@ def test_split_package_evaluator_can_create_sealed_context(tmp_path: Path) -> No
     assert (sealed_dir / "source_input" / "jsoncpp" / "json_reader.cpp").is_file()
     assert (sealed_dir / "source_repos.json").is_file()
     assert (sealed_dir / "fuzzbench_benchmark" / "Dockerfile").is_file()
+    assert (sealed_dir / "fuzzbench_benchmark" / "build.sh").is_file()
+    assert (sealed_dir / "build.sh").is_file()
     assert (sealed_dir / "native_harness_path.json").is_file()
     assert (sealed_dir / "reference_harnesses").is_dir()
+    dockerfile_text = (sealed_dir / "Dockerfile").read_text(encoding="utf-8")
+    assert "ARG FUZZING_ENGINE=libfuzzer" in dockerfile_text
+    assert "ENV SANITIZER=${SANITIZER}" in dockerfile_text
+    assert "ENV FUZZING_LANGUAGE=${FUZZING_LANGUAGE}" in dockerfile_text
     assert sealed["mode"] == "split_sealed_source_snapshot"
+
+
+def test_build_candidate_image_compiles_after_final_overlay(tmp_path: Path) -> None:
+    context_dir = tmp_path / "ctx"
+    source_file = context_dir / "source_input" / "jsoncpp" / "jsoncpp_fuzzer.cc"
+    source_file.parent.mkdir(parents=True)
+    source_file.write_text("int old_harness;\n", encoding="utf-8")
+    dockerfile = context_dir / "Dockerfile"
+    dockerfile.write_text(
+        "FROM scratch\n"
+        "ARG FUZZING_ENGINE=libfuzzer\n"
+        "ARG SANITIZER=address\n"
+        "ENV FUZZING_ENGINE=${FUZZING_ENGINE}\n"
+        "ENV SANITIZER=${SANITIZER}\n"
+        "ENV FUZZING_LANGUAGE=${FUZZING_LANGUAGE}\n",
+        encoding="utf-8",
+    )
+    candidate = tmp_path / "candidate.cc"
+    candidate.write_text("int LLVMFuzzerTestOneInput(){return 0;}\n", encoding="utf-8")
+    candidate_sha = hgb_fuzzbench_builder._sha256_file(candidate)
+    commands: list[list[str]] = []
+
+    def runner(command, timeout_seconds):
+        argv = list(command)
+        commands.append(argv)
+        if argv[:2] == ["docker", "build"]:
+            assert "--build-arg" in argv
+            assert "FUZZING_ENGINE=libfuzzer" in argv
+            assert "SANITIZER=address" in argv
+            assert "FUZZING_LANGUAGE=c++" in argv
+            assert "HGB_BUILD_VARIANT=address-libfuzzer" in argv
+            return hgb_fuzzbench_builder.CommandResult(argv, 0, "", "")
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return hgb_fuzzbench_builder.CommandResult(argv, 0, "sha256:test\n", "")
+        shell = argv[-1]
+        if "test -x /out/jsoncpp_fuzzer" in shell:
+            return hgb_fuzzbench_builder.CommandResult(argv, 0, "abc123  /out/jsoncpp_fuzzer\n", "")
+        if "sha256sum /src/jsoncpp/jsoncpp_fuzzer.cc" in shell:
+            overlay_file = context_dir / "hgb_candidate_overlay" / "jsoncpp" / "jsoncpp_fuzzer.cc"
+            overlay_sha = hgb_fuzzbench_builder._sha256_file(overlay_file)
+            return hgb_fuzzbench_builder.CommandResult(
+                argv, 0, f"{overlay_sha}  /src/jsoncpp/jsoncpp_fuzzer.cc\n", ""
+            )
+        raise AssertionError(f"unexpected command: {argv}")
+
+    result = hgb_fuzzbench_builder.build_candidate_image(
+        context_dir=context_dir,
+        dockerfile=dockerfile,
+        image_tag="hgb-test-image",
+        fuzz_target="jsoncpp_fuzzer",
+        staged_candidate_host=candidate,
+        native_destination="/src/jsoncpp/jsoncpp_fuzzer.cc",
+        work_dir=tmp_path / "work",
+        runner=runner,
+    )
+
+    dockerfile_text = dockerfile.read_text(encoding="utf-8")
+    overlay = "COPY hgb_candidate_overlay/jsoncpp/jsoncpp_fuzzer.cc /src/jsoncpp/jsoncpp_fuzzer.cc"
+    marker = "# HGB sealed evaluator candidate build."
+    assert dockerfile_text.index(overlay) < dockerfile_text.index(marker)
+    compile_tail = dockerfile_text[dockerfile_text.index(marker):]
+    assert "ARG FUZZING_ENGINE=libfuzzer" in compile_tail
+    assert "ARG SANITIZER=address" in compile_tail
+    assert "ARG HGB_FUZZING_ENGINE=libfuzzer" in compile_tail
+    assert "ARG HGB_SANITIZER=address" in compile_tail
+    assert "ARG HGB_BUILD_VARIANT=default" in compile_tail
+    expected_variant_line = """RUN printf '%s\\n' "$HGB_SANITIZER:$HGB_FUZZING_ENGINE:$HGB_BUILD_VARIANT" > /tmp/hgb_build_variant"""
+    assert expected_variant_line in compile_tail
+    assert "ENV FUZZING_ENGINE=${HGB_FUZZING_ENGINE}" in compile_tail
+    assert "ENV SANITIZER=${HGB_SANITIZER}" in compile_tail
+    assert 'export FUZZER_LIB="${FUZZER_LIB:--fsanitize=fuzzer}"' in compile_tail
+    assert 'LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a' in compile_tail
+    expected_compile_prefix = 'FUZZING_ENGINE="$HGB_FUZZING_ENGINE" SANITIZER="$HGB_SANITIZER"'
+    assert expected_compile_prefix in compile_tail
+    assert dockerfile_text.rstrip().endswith('FUZZING_LANGUAGE="$HGB_FUZZING_LANGUAGE" compile')
+    assert result.binary_verified is True
+    assert result.overlay_audit["matches_candidate"] is True
 
 
 def test_split_context_load_names_missing_evaluator_file(tmp_path: Path) -> None:
@@ -492,6 +575,40 @@ def test_evaluator_cli_accepts_exact_ofg_flags(tmp_path: Path, monkeypatch) -> N
     assert captured["result_dir"] == result_dir
 
 
+def test_evaluator_cli_candidates_dir_does_not_default_to_dot_candidate(tmp_path: Path, monkeypatch) -> None:
+    pkg, generator_input, evaluator_only = _make_split_package(tmp_path)
+    candidates_dir = tmp_path / "candidates"
+    _write_candidate(candidates_dir)
+    result_dir = tmp_path / "result"
+
+    captured: dict[str, object] = {}
+
+    def fake_evaluate(**kwargs):
+        captured.update(kwargs)
+        return hgb_result.build_result(
+            generator=kwargs["generator"], profile=kwargs["profile"],
+            protocol=kwargs["protocol"], target=kwargs["fuzz_target"],
+            status=hgb_result.STATUS_QUALITY_FAILURE,
+            stages=hgb_result.default_stages(), candidate_count=1,
+        )
+
+    monkeypatch.setattr(hgb_harness_evaluator, "evaluate", fake_evaluate)
+    argv = [
+        "hgb_harness_evaluator.py",
+        "--generator", "ckgfuzzer",
+        "--target-root", str(generator_input),
+        "--evaluator-root", str(evaluator_only),
+        "--candidates", str(candidates_dir),
+        "--result-dir", str(result_dir),
+        "--profile", "reproduction-eta",
+        "--protocol", "blind-project",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    rc = hgb_harness_evaluator.main()
+    assert rc == 0
+    assert captured["candidates_dir"] == candidates_dir
+
+
 def test_evaluator_cli_derives_fuzz_target_from_manifest(tmp_path: Path, monkeypatch) -> None:
     pkg, generator_input, evaluator_only = _make_split_package(tmp_path)
     candidate = _write_candidate(tmp_path / "candidates")
@@ -563,6 +680,39 @@ def test_candidate_overlay_copies_into_native_path(tmp_path: Path) -> None:
     assert "jsoncpp_parse" in sealed_harness.read_text(encoding="utf-8")
     assert result["candidate_count"] == 1
     assert result["protocol"] == "blind-project"
+
+
+def test_evaluator_materializes_empty_campaign_seed_when_target_has_none(tmp_path: Path) -> None:
+    pkg, generator_input, evaluator_only = _make_split_package(tmp_path)
+    candidates_dir = tmp_path / "candidates"
+    _write_candidate(candidates_dir)
+    work_dir = tmp_path / "evaluation"
+    runner = FakeRunner()
+    hgb_harness_evaluator.evaluate(
+        generator="oss-fuzz-gen",
+        target_root=generator_input,
+        evaluator_root=evaluator_only,
+        candidates_dir=candidates_dir,
+        work_dir=work_dir,
+        project="jsoncpp",
+        fuzz_target="jsoncpp_fuzzer",
+        profile="reproduction-gamma",
+        protocol="blind-project",
+        campaign_seconds=10,
+        strict=True,
+        runner=runner,
+        context_provider=_fake_context_provider,
+        intended_apis=["jsoncpp_parse"],
+        seeds=None,
+    )
+    assert (work_dir / "campaign_seeds" / "hgb_empty_seed").is_file()
+    campaign_seed_copies = [
+        cmd for cmd in runner.commands
+        if cmd[:2] == ["docker", "cp"]
+        and "hgb_empty_seed" in cmd[2]
+        and cmd[3].endswith(":/tmp/hgb_campaign_seed_0000")
+    ]
+    assert campaign_seed_copies
 
 
 def test_evaluator_result_dir_writes_additional_result_json(tmp_path: Path) -> None:

@@ -27,22 +27,35 @@ from typing import Any
 
 # Sentinel model names that are never valid in a strict profile.
 INVALID_MODEL_SENTINELS = {"", "mock", "hash", "local", "fake", "none", "dummy", "hgb-hash-embedding"}
+DEFAULT_PROVIDER_BASE_URLS = {
+    "ustc": "https://api.llm.ustc.edu.cn",
+    "deepseek": "https://api.deepseek.com",
+    "openai": "https://api.openai.com/v1",
+}
 
 # Environment variable aliases for API key/base URL resolution. The first
-# non-empty value wins. CKGFuzzer-specific vars take priority, then provider-
-# specific vars, then generic OpenAI-compatible vars.
-API_KEY_ALIASES = (
+# non-empty value wins. Chat and embedding endpoints may be different: for
+# theta3 local TEI runs the chat LLM stays on USTC while embeddings use a
+# host-local OpenAI-compatible endpoint.
+CHAT_API_KEY_ALIASES = (
     "CKGFUZZER_API_KEY",
-    "CKGFUZZER_EMBEDDING_API_KEY",
     "USTC_API_KEY",
     "HGB_OPENAI_API_KEY",
     "HGB_LLM_API_KEY",
     "OPENAI_API_KEY",
     "API_KEY",
 )
-BASE_URL_ALIASES = (
+EMBEDDING_API_KEY_ALIASES = (
+    "CKGFUZZER_EMBEDDING_API_KEY",
+    "CKGFUZZER_API_KEY",
+    "USTC_API_KEY",
+    "HGB_OPENAI_API_KEY",
+    "HGB_LLM_API_KEY",
+    "OPENAI_API_KEY",
+    "API_KEY",
+)
+CHAT_BASE_URL_ALIASES = (
     "CKGFUZZER_BASE_URL",
-    "CKGFUZZER_EMBEDDING_BASE_URL",
     "USTC_BASE_URL",
     "USTC_API_BASE",
     "HGB_OPENAI_BASE_URL",
@@ -51,6 +64,21 @@ BASE_URL_ALIASES = (
     "OPENAI_API_BASE",
     "BASE_URL",
 )
+EMBEDDING_BASE_URL_ALIASES = (
+    "CKGFUZZER_EMBEDDING_BASE_URL",
+    "CKGFUZZER_BASE_URL",
+    "USTC_BASE_URL",
+    "USTC_API_BASE",
+    "HGB_OPENAI_BASE_URL",
+    "HGB_LLM_BASE_URL",
+    "OPENAI_BASE_URL",
+    "OPENAI_API_BASE",
+    "BASE_URL",
+)
+
+# Backward-compatible aliases used by older tests/importers.
+API_KEY_ALIASES = CHAT_API_KEY_ALIASES
+BASE_URL_ALIASES = CHAT_BASE_URL_ALIASES
 
 
 class ModelConfigError(Exception):
@@ -145,8 +173,42 @@ def _resolve_env(env: dict[str, str], aliases: tuple[str, ...]) -> str:
     return ""
 
 
+def _api_key_is_present(value: str) -> bool:
+    return bool(value.strip())
+
+
+def _auth_api_key(value: str) -> str:
+    value = value.strip()
+    return "" if value == "-" else value
+
+
 def _is_invalid_model(model: str) -> bool:
     return model.lower() in INVALID_MODEL_SENTINELS
+
+
+def _detect_provider(base_url: str) -> str:
+    if "api.llm.ustc.edu.cn" in base_url:
+        return "ustc"
+    if "api.deepseek.com" in base_url:
+        return "deepseek"
+    if "api.openai.com" in base_url:
+        return "openai"
+    return "custom"
+
+
+def _base_url_kind(base_url: str) -> str:
+    base = base_url.lower()
+    if not base:
+        return "unset"
+    if "host.docker.internal" in base or "127.0.0.1" in base or "localhost" in base:
+        return "host_local"
+    return "remote"
+
+
+def _embedding_endpoint_is_separate(chat_base_url: str, embedding_base_url: str, env: dict[str, str]) -> bool:
+    explicit_embedding_url = bool((env.get("CKGFUZZER_EMBEDDING_BASE_URL") or "").strip())
+    explicit_backend = bool((env.get("CKGFUZZER_EMBEDDING_BACKEND") or "").strip())
+    return explicit_backend or (explicit_embedding_url and embedding_base_url.rstrip("/") != chat_base_url.rstrip("/"))
 
 
 def resolve_ckgfuzzer_model_config(
@@ -167,11 +229,28 @@ def resolve_ckgfuzzer_model_config(
     env = env if env is not None else dict(os.environ)
     registry = registry if registry is not None else load_model_registry()
 
-    provider = (env.get("HGB_LLM_PROVIDER") or env.get("HGB_LLM_PROVIDER_RESOLVED") or "").strip().lower()
+    provider = (env.get("HGB_LLM_PROVIDER_RESOLVED") or env.get("HGB_LLM_PROVIDER") or "").strip().lower()
     chat_model = (env.get("CKGFUZZER_LLM_MODEL") or "").strip()
     embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip()
-    base_url = _resolve_env(env, BASE_URL_ALIASES)
-    api_key = _resolve_env(env, API_KEY_ALIASES)
+    chat_base_url = _resolve_env(env, CHAT_BASE_URL_ALIASES)
+    embedding_base_url = _resolve_env(env, EMBEDDING_BASE_URL_ALIASES)
+    if provider in {"", "auto"}:
+        provider = _detect_provider(chat_base_url)
+    chat_api_key = _resolve_env(env, CHAT_API_KEY_ALIASES)
+    embedding_api_key = _resolve_env(env, EMBEDDING_API_KEY_ALIASES)
+    if not chat_base_url and provider in DEFAULT_PROVIDER_BASE_URLS:
+        chat_base_url = DEFAULT_PROVIDER_BASE_URLS[provider]
+    if not embedding_base_url:
+        embedding_base_url = chat_base_url
+    embedding_backend = (env.get("CKGFUZZER_EMBEDDING_BACKEND") or "").strip()
+    if not embedding_backend and _base_url_kind(embedding_base_url) == "host_local":
+        embedding_backend = "openai_compatible_local_tei_cpu"
+    elif not embedding_backend and embedding_base_url:
+        embedding_backend = "openai_compatible"
+    embedding_model_source = (env.get("CKGFUZZER_EMBEDDING_MODEL_SOURCE") or "").strip()
+    if not embedding_model_source and _base_url_kind(embedding_base_url) == "host_local":
+        embedding_model_source = "Qwen/Qwen3-Embedding-0.6B"
+    embedding_separate = _embedding_endpoint_is_separate(chat_base_url, embedding_base_url, env)
 
     is_strict = profile in {"reproduction-theta", "reproduction-eta", "reproduction-zeta", "reproduction-epsilon", "reproduction-delta"}
 
@@ -193,6 +272,12 @@ def resolve_ckgfuzzer_model_config(
         default_emb = defaults.get("ckgfuzzer_embedding", "") if isinstance(defaults, dict) else ""
         if default_emb:
             embedding_model = default_emb
+    if (
+        not (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip()
+        and embedding_separate
+        and _base_url_kind(embedding_base_url) == "host_local"
+    ):
+        embedding_model = "text-embeddings-inference"
 
     # Strict profiles reject sentinel/mock/empty models.
     if is_strict:
@@ -223,7 +308,7 @@ def resolve_ckgfuzzer_model_config(
                 f"CKGFuzzer strict preflight failed: {chat_model} is not registered for provider {provider}. "
                 f"Available chat models: {available}."
             )
-        if embedding_model and embedding_models and embedding_model not in embedding_models:
+        if not embedding_separate and embedding_model and embedding_models and embedding_model not in embedding_models:
             available = ", ".join(embedding_models)
             errors.append(
                 f"CKGFuzzer strict preflight failed: {embedding_model} is not registered for provider {provider}. "
@@ -234,8 +319,15 @@ def resolve_ckgfuzzer_model_config(
         "provider": provider,
         "chat_model": chat_model,
         "embedding_model": embedding_model,
-        "base_url": base_url,
-        "api_key_present": bool(api_key),
+        "base_url": chat_base_url,
+        "chat_base_url": chat_base_url,
+        "embedding_base_url": embedding_base_url,
+        "embedding_backend": embedding_backend,
+        "embedding_model_source": embedding_model_source,
+        "embedding_base_url_kind": _base_url_kind(embedding_base_url),
+        "api_key_present": _api_key_is_present(chat_api_key),
+        "chat_api_key_present": _api_key_is_present(chat_api_key),
+        "embedding_api_key_present": _api_key_is_present(embedding_api_key),
         "chat_probe_passed": False,
         "embedding_probe_passed": False,
         "embedding_dimension": 0,
@@ -292,37 +384,41 @@ def probe_embedding(
     url = _build_embeddings_url(base_url)
     payload = json.dumps({"model": model, "input": "hgb"}).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    auth_key = _auth_api_key(api_key)
+    if auth_key:
+        headers["Authorization"] = f"Bearer {auth_key}"
     req = urllib.request.Request(url, data=payload, headers=headers)
     urlopen = opener or urllib.request.urlopen
     try:
         with urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "replace")
             if resp.status != 200:
-                return {"ok": False, "dimension": 0, "error": f"HTTP {resp.status}: {_redact(body, [api_key])[:200]}"}
+                return {"ok": False, "dimension": 0, "error": f"HTTP {resp.status}: {_redact(body, [auth_key])[:200]}"}
             data = json.loads(body)
             emb = data.get("data") or data.get("embedding") or data.get("embeddings")
-            dimension = 0
+            vector: Any = None
             if isinstance(emb, list) and emb:
-                if isinstance(emb[0], list):
-                    dimension = len(emb[0])
-                elif isinstance(emb[0], (int, float)):
-                    dimension = len(emb)
+                first = emb[0]
+                if isinstance(first, dict):
+                    vector = first.get("embedding")
+                elif isinstance(first, list):
+                    vector = first
+                elif isinstance(first, (int, float)):
+                    vector = emb
             elif isinstance(emb, list):
-                dimension = len(emb)
-            if dimension <= 0:
+                vector = emb
+            if not isinstance(vector, list) or not vector or not all(isinstance(v, (int, float)) for v in vector):
                 return {"ok": False, "dimension": 0, "error": "embedding output is not a numeric non-empty vector"}
-            return {"ok": True, "dimension": dimension, "error": ""}
+            return {"ok": True, "dimension": len(vector), "error": ""}
     except urllib.error.HTTPError as exc:
         body = ""
         try:
             body = exc.read().decode("utf-8", "replace")
         except Exception:
             pass
-        return {"ok": False, "dimension": 0, "error": f"HTTP {exc.code} {exc.reason}: {_redact(body, [api_key])[:200]}"}
+        return {"ok": False, "dimension": 0, "error": f"HTTP {exc.code} {exc.reason}: {_redact(body, [auth_key])[:200]}"}
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        return {"ok": False, "dimension": 0, "error": f"{type(exc).__name__}: {_redact(str(exc), [api_key])[:200]}"}
+        return {"ok": False, "dimension": 0, "error": f"{type(exc).__name__}: {_redact(str(exc), [auth_key])[:200]}"}
     except (json.JSONDecodeError, KeyError) as exc:
         return {"ok": False, "dimension": 0, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -351,15 +447,16 @@ def probe_chat(
         "temperature": 0,
     }).encode("utf-8")
     headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    auth_key = _auth_api_key(api_key)
+    if auth_key:
+        headers["Authorization"] = f"Bearer {auth_key}"
     req = urllib.request.Request(url, data=payload, headers=headers)
     urlopen = opener or urllib.request.urlopen
     try:
         with urlopen(req, timeout=timeout) as resp:
             body = resp.read().decode("utf-8", "replace")
             if resp.status != 200:
-                return {"ok": False, "error": f"HTTP {resp.status}: {_redact(body, [api_key])[:200]}"}
+                return {"ok": False, "error": f"HTTP {resp.status}: {_redact(body, [auth_key])[:200]}"}
             return {"ok": True, "error": ""}
     except urllib.error.HTTPError as exc:
         body = ""
@@ -367,9 +464,9 @@ def probe_chat(
             body = exc.read().decode("utf-8", "replace")
         except Exception:
             pass
-        return {"ok": False, "error": f"HTTP {exc.code} {exc.reason}: {_redact(body, [api_key])[:200]}"}
+        return {"ok": False, "error": f"HTTP {exc.code} {exc.reason}: {_redact(body, [auth_key])[:200]}"}
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {_redact(str(exc), [api_key])[:200]}"}
+        return {"ok": False, "error": f"{type(exc).__name__}: {_redact(str(exc), [auth_key])[:200]}"}
 
 
 def run_model_preflight(
@@ -411,21 +508,30 @@ def run_model_preflight(
         "chat_model": config["chat_model"],
         "embedding_model": config["embedding_model"],
         "base_url": config["base_url"],
+        "chat_base_url": config["chat_base_url"],
+        "embedding_base_url": config["embedding_base_url"],
+        "embedding_backend": config["embedding_backend"],
+        "embedding_model_source": config["embedding_model_source"],
+        "embedding_base_url_kind": config["embedding_base_url_kind"],
         "api_key_present": config["api_key_present"],
+        "chat_api_key_present": config["chat_api_key_present"],
+        "embedding_api_key_present": config["embedding_api_key_present"],
     }
 
-    api_key = _resolve_env(env, API_KEY_ALIASES)
-    base_url = config["base_url"]
+    chat_api_key = _resolve_env(env, CHAT_API_KEY_ALIASES)
+    embedding_api_key = _resolve_env(env, EMBEDDING_API_KEY_ALIASES)
+    chat_base_url = config["chat_base_url"]
+    embedding_base_url = config["embedding_base_url"]
 
-    if not config["api_key_present"]:
+    if not config["chat_api_key_present"]:
         result["status"] = "probe_failed"
         result["reason_code"] = "missing_api_key"
-        result["model_config"]["errors"] = ["API key is not configured for the selected provider"]
+        result["model_config"]["errors"] = ["Chat API key is not configured for the selected provider"]
         return result
 
     # Chat probe.
     chat_result = probe_chat(
-        base_url=base_url, api_key=api_key, model=config["chat_model"],
+        base_url=chat_base_url, api_key=chat_api_key, model=config["chat_model"],
         timeout=timeout, opener=chat_opener,
     )
     result["chat_probe"] = {"ok": chat_result["ok"], "error": chat_result.get("error", "")}
@@ -437,7 +543,7 @@ def run_model_preflight(
 
     # Embedding probe.
     emb_result = probe_embedding(
-        base_url=base_url, api_key=api_key, model=config["embedding_model"],
+        base_url=embedding_base_url, api_key=embedding_api_key, model=config["embedding_model"],
         timeout=timeout, opener=embedding_opener,
     )
     result["embedding_probe"] = {

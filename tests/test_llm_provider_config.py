@@ -133,5 +133,14 @@ def test_ckgfuzzer_timeout_retry_defaults_reach_the_client_and_containers() -> N
     assert "HGB_LLM_REQUEST_TIMEOUT_SECONDS:-900" in common
     assert common.count("-e CKGFUZZER_LLM_MAX_RETRIES") == 2
     assert "CKGFUZZER_LLM_MAX_RETRIES:-3" in target_launcher
+    assert r'HGB_API_SELECTION_MODE="\${HGB_API_SELECTION_MODE:-ranked}"' in target_launcher
+    assert r'--selection-mode "\${HGB_API_SELECTION_MODE:-ranked}"' in target_launcher
+    assert r'HGB_API_SELECTION_MODE="\${HGB_API_SELECTION_MODE:-ranked}"' in matrix_launcher
+    assert r'--selection-mode "\${HGB_API_SELECTION_MODE:-ranked}"' in matrix_launcher
+    assert "ckgfuzzer_api_selection_ranked_v1" in target_launcher
+    assert "ckgfuzzer_api_selection_ranked_v1" in matrix_launcher
+    assert "USTC_API_KEY" in common
+    assert "USTC_BASE_URL" in common
+    assert "CKGFUZZER_API_SELECTION_MODE" in common
     assert "rebuilding stale CKGFuzzer image" in target_launcher
     assert "rebuilding stale CKGFuzzer image" in matrix_launcher

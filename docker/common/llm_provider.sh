@@ -39,8 +39,8 @@ hgb_resolve_llm_provider() {
       ;;
   esac
 
-  api_key="${HGB_LLM_API_KEY:-${OPENAI_API_KEY:-${API_KEY:-}}}"
-  base_url="${HGB_LLM_BASE_URL:-${OPENAI_BASE_URL:-${BASE_URL:-}}}"
+  api_key="${HGB_LLM_API_KEY:-${USTC_API_KEY:-${OPENAI_API_KEY:-${API_KEY:-}}}}"
+  base_url="${HGB_LLM_BASE_URL:-${USTC_BASE_URL:-${USTC_API_BASE:-${OPENAI_BASE_URL:-${BASE_URL:-}}}}}"
   model="${HGB_LLM_MODEL:-${OPENAI_MODEL:-${MODEL:-}}}"
 
   if [[ "$requested" == 'auto' ]]; then

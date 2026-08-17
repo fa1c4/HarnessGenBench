@@ -217,6 +217,22 @@ case "$generator" in
     # combination is accepted.
     if [[ "$dry_run" != "1" ]]; then
       if [[ "$profile" == "alpha" || "$profile" == "paper-faithful" || "$profile" == "reproduction-gamma" || "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" || "$profile" == "reproduction-theta" ]]; then
+        if [[ -z "${HGB_API_SELECTION_MODE:-}" && -n "${CKGFUZZER_API_SELECTION_MODE:-}" ]]; then
+          export HGB_API_SELECTION_MODE="$CKGFUZZER_API_SELECTION_MODE"
+        fi
+        if [[ "${HGB_API_SELECTION_MODE:-}" == "public_headers" ]]; then
+          export HGB_API_SELECTION_MODE=ranked
+          export CKGFUZZER_API_SELECTION_MODE=ranked
+        fi
+        if [[ "$profile" == "reproduction-delta" || "$profile" == "reproduction-epsilon" || "$profile" == "reproduction-zeta" || "$profile" == "reproduction-eta" || "$profile" == "reproduction-theta" ]]; then
+          if [[ -z "${CKGFUZZER_LLM_MODEL:-}" || -z "${CKGFUZZER_EMBEDDING_MODEL:-}" ]]; then
+            ckg_resolved_models="$(python3 "$SCRIPT_DIR/../docker/common/ckgfuzzer_model_config.py" resolve --profile "$profile" 2>/dev/null || true)"
+            ckg_resolved_chat="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("chat_model", ""))' <<<"$ckg_resolved_models" 2>/dev/null || true)"
+            ckg_resolved_emb="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("embedding_model", ""))' <<<"$ckg_resolved_models" 2>/dev/null || true)"
+            [[ -n "$ckg_resolved_chat" && -z "${CKGFUZZER_LLM_MODEL:-}" ]] && export CKGFUZZER_LLM_MODEL="$ckg_resolved_chat"
+            [[ -n "$ckg_resolved_emb" && -z "${CKGFUZZER_EMBEDDING_MODEL:-}" ]] && export CKGFUZZER_EMBEDDING_MODEL="$ckg_resolved_emb"
+          fi
+        fi
         if [[ "${CKGFUZZER_LOCAL_API_SUMMARY:-0}" == "1" ]]; then
           die "ckgfuzzer/$profile: CKGFUZZER_LOCAL_API_SUMMARY=1 is forbidden; use compat-smoke for local summaries"
         fi
@@ -227,8 +243,18 @@ case "$generator" in
           die "ckgfuzzer/$profile: --skip_check_compilation is forbidden; use compat-smoke to skip compilation checking"
         fi
         emb="${CKGFUZZER_EMBEDDING_MODEL:-}"
-        if [[ -z "$emb" || "$emb" == "mock" || "$emb" == "local" || "$emb" == "hgb-hash-embedding" ]]; then
-          die "ckgfuzzer/$profile: CKGFUZZER_EMBEDDING_MODEL must be a real embedding service (e.g. openai-text-embedding-3-small), not mock/local/hgb-hash-embedding/empty"
+        emb_l="${emb,,}"
+        if [[ -z "$emb" || "$emb_l" == "mock" || "$emb_l" == "hash" || "$emb_l" == "local" || "$emb_l" == "dummy" || "$emb_l" == "none" || "$emb_l" == "fake" || "$emb_l" == "hgb-hash-embedding" ]]; then
+          die "ckgfuzzer/$profile: CKGFUZZER_EMBEDDING_MODEL must be a real embedding service, not mock/hash/local/dummy/none/hgb-hash-embedding/empty"
+        fi
+        emb_backend_l="${CKGFUZZER_EMBEDDING_BACKEND:-}"
+        emb_backend_l="${emb_backend_l,,}"
+        case "$emb_backend_l" in
+          mock|hash|local|dummy|none|fake|random|constant|source-only)
+            die "ckgfuzzer/$profile: CKGFUZZER_EMBEDDING_BACKEND=$emb_backend_l is forbidden; a real embedding service is required" ;;
+        esac
+        if [[ "${HGB_LLM_PROVIDER_RESOLVED:-${HGB_LLM_PROVIDER:-}}" == "ustc" && "$emb" == "text-embedding-3-small" ]]; then
+          die "ckgfuzzer/$profile: CKGFUZZER_EMBEDDING_MODEL=text-embedding-3-small is not registered for provider ustc; use qwen3-embedding"
         fi
         case "${HGB_API_SELECTION_MODE:-}" in
           selected_harness|selected_harness_fallback) die "ckgfuzzer/$profile: HGB_API_SELECTION_MODE=$HGB_API_SELECTION_MODE is forbidden; reference-harness API filtering is evaluator-only" ;;

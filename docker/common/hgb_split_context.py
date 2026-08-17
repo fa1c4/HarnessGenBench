@@ -154,6 +154,34 @@ def _copytree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
 
 
+def _mirror_benchmark_context_files(benchmark: Path, sealed: Path) -> int:
+    """Expose benchmark-copy root files at the Docker build-context root.
+
+    FuzzBench Dockerfiles frequently use root-relative ``COPY``/``ADD`` inputs
+    such as ``seeds/``, ``target.cc`` or ``cms_transform_fuzzer.cc``. The split
+    evaluator keeps a full ``fuzzbench_benchmark/`` audit copy, but Docker only
+    sees paths rooted at ``sealed/``. Mirror the evaluator-only benchmark
+    context there after synthetic wrappers have been removed.
+    """
+
+    mirrored = 0
+    for child in sorted(benchmark.iterdir()):
+        if child.name == "Dockerfile":
+            continue
+        destination = sealed / child.name
+        if destination.exists() or destination.is_symlink():
+            if destination.is_dir() and not destination.is_symlink():
+                shutil.rmtree(destination)
+            else:
+                destination.unlink()
+        if child.is_dir() and not child.is_symlink():
+            shutil.copytree(child, destination, symlinks=True)
+        else:
+            shutil.copy2(child, destination, follow_symlinks=False)
+        mirrored += 1
+    return mirrored
+
+
 def create_sealed_build_context(
     context: SplitTargetContext,
     work_dir: Path,
@@ -206,6 +234,11 @@ def create_sealed_build_context(
 
     build_tool_fallbacks = _patch_legacy_build_tool_bootstrap(benchmark_dst)
 
+    # Keep the evaluator-only benchmark copy under fuzzbench_benchmark for
+    # auditability, and expose its build-context inputs at sealed/ so the
+    # rewritten Dockerfile's root-relative COPY/ADD instructions still work.
+    benchmark_context_file_count = _mirror_benchmark_context_files(benchmark_dst, sealed)
+
     # Rewrite the benchmark Dockerfile to use the sealed source snapshot.
     dockerfile_src = benchmark_dst / "Dockerfile"
     rewritten, removed = _rewrite_dockerfile(dockerfile_src)
@@ -245,6 +278,7 @@ def create_sealed_build_context(
         "generator_root": str(context.generator_root),
         "evaluator_root": str(context.evaluator_root),
         "reference_restore_audit": restore_audit,
+        "benchmark_context_file_count": benchmark_context_file_count,
     }
 
 

@@ -318,7 +318,7 @@ class ZetaFakeRunner:
             sub = cmd[1] if len(cmd) > 1 else ""
             if sub == "build":
                 argv = " ".join(cmd[2:])
-                if "FUZZING_ENGINE=coverage" in argv:
+                if "SANITIZER=coverage" in argv:
                     return FakeResult(cmd, self.coverage_build_exit, "cov build", "")
                 return FakeResult(cmd, self.build_exit, "build ok", "")
             if sub == "image" and len(cmd) > 3 and cmd[2] == "inspect":

@@ -143,6 +143,50 @@ def patch_preproc(path: Path) -> bool:
                         break
             if written >= max_edges:
                 break
+        if written == 0:
+            src_api_code_path = os.path.join(src_api_file_path, "src", "src_api_code.json")
+            try:
+                with open(src_api_code_path, "r", encoding="utf-8") as f:
+                    src_api_code = json.load(f)
+            except Exception:
+                src_api_code = {}
+            verified_apis = set(src_api_code)
+            if not verified_apis:
+                src_api_json_path = os.path.join(src_api_file_path, "codebase/api/src_api.json")
+                try:
+                    with open(src_api_json_path, "r", encoding="utf-8") as f:
+                        src_api_data = json.load(f)
+                except Exception:
+                    src_api_data = {}
+                for src_value in src_api_data.get("src", {}).values():
+                    for api in src_value.get("fn_def_list", []):
+                        api_name = api.get("fn_meta", {}).get("identifier", "")
+                        if api_name in api_list:
+                            verified_apis.add(api_name)
+                    for api in src_value.get("fn_decl_list", []):
+                        api_name = api.get("fn_meta", {}).get("identifier", "")
+                        if api_name in api_list:
+                            verified_apis.add(api_name)
+            if fieldnames is None:
+                fieldnames = default_header
+                writer = csv.DictWriter(output, fieldnames=fieldnames)
+                writer.writeheader()
+            for api_name in sorted(api_list):
+                if api_name not in verified_apis:
+                    continue
+                row = {key: "" for key in fieldnames}
+                row.update({
+                    "caller": api_name,
+                    "callee": api_name,
+                    "caller_signature": api_name,
+                    "callee_signature": api_name,
+                    "caller_src": "hgb_source_recovered",
+                    "callee_src": "hgb_source_recovered",
+                })
+                writer.writerow({key: row.get(key, "") for key in fieldnames})
+                written += 1
+                if written >= max_edges:
+                    break
         if fieldnames is None:
             csv.writer(output).writerow(default_header)
     print(f"Wrote {written} unique selected call-graph edges to {output_path}")
@@ -319,6 +363,9 @@ def patch_check_gen_fuzzer(path: Path) -> bool:
     return f"INFRA_ERROR: nested docker exec timed out after {timeout_seconds}s\\n{output}"
   output = completed.stdout.decode('utf-8', errors='replace')
   if completed.returncode != 0:
+    if os.environ.get('HGB_CKG_EXTERNAL_VERIFIER') == '1' and 'No such container:' in output and project_name + '_check' in output:
+      logger.info('Deferring missing upstream check container to HarnessGenBench external verifier.')
+      return "HGB_EXTERNAL_VERIFIER_DEFERRED"
     return f"ERROR: nested docker exec exited {completed.returncode}\\n{output}"
   return output or "HGB_COMMAND_OK"
 '''
@@ -370,7 +417,7 @@ def patch_check_gen_fuzzer(path: Path) -> bool:
 def patch_run_fuzzer(path: Path) -> bool:
     source = path.read_text(encoding="utf-8")
     source = source.replace("        self.failed_builds = []", "        self.failed_builds = []\n        self.successful_builds = []", 1)
-    source = source.replace("            logger.info(f\"Successfully built fuzzer {fuzz_driver_file}\")", "            logger.info(f\"Successfully built fuzzer {fuzz_driver_file}\")\n            self.successful_builds.append(fuzz_driver_file)")
+    source = source.replace("            logger.info(f\"Successfully built fuzzer {fuzz_driver_file}\")", "            logger.info(f\"Successfully built fuzzer {fuzz_driver_file}\")\n            self.successful_builds.append(fuzz_driver_file)\n            if os.environ.get(\"HGB_CKG_EXTERNAL_VERIFIER\") == \"1\":\n                logger.info(\"Deferring upstream run/coverage to HarnessGenBench external verifier.\")\n                return")
     old = '''            if "ERROR" in run_fuzzer_result:
                 logger.info("Crash detected. Analyzing...")'''
     new = '''            if run_fuzzer_result.startswith("INFRA_ERROR:"):
@@ -419,14 +466,21 @@ predicate directCall(Function caller, Function callee) {
   )
 }
 
-predicate selectedRoot(Function function) {
+predicate selectedFunction(Function function) {
   function.hasName("ENTRY_FNC")
+}
+
+predicate selectedEvidence(Function caller, Function callee) {
+  (selectedFunction(caller) and directCall(caller, callee))
+  or
+  (selectedFunction(callee) and directCall(caller, callee))
+  or
+  (selectedFunction(caller) and caller = callee)
 }
 
 from Function start, Function end, Location start_loc, Location end_loc
 where
-  selectedRoot(start) and
-  directCall(start, end) and
+  selectedEvidence(start, end) and
   start_loc = start.getLocation() and
   end_loc = end.getLocation()
 select

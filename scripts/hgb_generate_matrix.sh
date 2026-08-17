@@ -228,8 +228,8 @@ preflight_generator() {
   elif [[ "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && grep -Fq "_chat_completion_kwargs" /opt/hgb/artifacts/oss-fuzz-gen/llm_toolkit/models.py && grep -Fq "_copy_hgb_target_source" /opt/hgb/artifacts/oss-fuzz-gen/data_prep/project_src.py && grep -Fq "OFG_LOCAL_INTROSPECTOR_SHIM" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "ofg_benchmark_trim_failed" /opt/hgb/entrypoint.sh && grep -Fq "OFG_OSS_FUZZ_VENV" /opt/hgb/entrypoint.sh' >/dev/null 2>&1; then
     log "rebuilding stale OSS-Fuzz-Gen image without /opt/hgb/oss-fuzz or current OSS-Fuzz-Gen fixes: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
-  elif [[ "$generator" == "ckgfuzzer" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
-    log "rebuilding stale CKGFuzzer image without current LLM timeout/retry wiring: $image"
+  elif [[ "$generator" == "ckgfuzzer" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh && grep -Fq 'HGB_API_SELECTION_MODE="\${HGB_API_SELECTION_MODE:-ranked}"' /opt/hgb/entrypoint.sh && grep -Fq -- '--selection-mode "\${HGB_API_SELECTION_MODE:-ranked}"' /opt/hgb/entrypoint.sh && grep -Fq 'embed_batch_size: \${CKGFUZZER_EMBEDDING_BATCH_SIZE:-100}' /opt/hgb/entrypoint.sh && test -f /opt/hgb/build-markers/ckgfuzzer_api_selection_ranked_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_entrypoint_python_init_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_ustc_embedding_runtime_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_embedding_model_name_override_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_local_embedding_theta3_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_embedding_batch_size_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_evaluator_compile_coverage_seed_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_codeql_cache_graph_counts_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_bloaty_staged_project_rescue_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_compile_cache_key_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_late_sanitizer_env_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_inline_compile_env_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_reachability_cpp_symbols_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_split_benchmark_context_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_candidate_language_normalization_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_cwe_index_cache_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_external_verifier_check_defer_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_legacy_fuzzer_lib_alias_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_cpp_fuzzer_entrypoint_abi_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_target_rescue_candidates_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_curl_single_target_sealed_deps_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_campaign_internal_timeout_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_primary_api_plan_filter_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_expanded_target_rescues_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_all_valuable_rescues_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_zero_candidate_rescue_override_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_function_like_api_plan_filter_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1" >/dev/null 2>&1; then
+    log "rebuilding stale CKGFuzzer image without current LLM timeout/retry, API selection, entrypoint Python, USTC embedding, embedding model-name, or local embedding, embedding batch-size, or evaluator compile/coverage seed, CodeQL cache graph-count, staged Bloaty rescue, coverage compile-cache-key, late sanitizer ENV, inline compile-env, C++ reachability-symbol, split benchmark-context, candidate language-normalization, or CWE index-cache, external verifier check-defer, legacy FUZZER_LIB alias, C++ fuzzer-entrypoint ABI, or target rescue-candidate, curl single-target sealed-dependency, campaign internal-timeout, primary API-plan filter, expanded target-rescue, all valuable rescue, zero-candidate rescue override, function-like API-plan filter, or rescue-first fast-path wiring: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
   elif [[ "$generator" == "promefuzz" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "test -f /opt/hgb/bin/promefuzz_target_build.sh && test -f /opt/hgb/bin/promefuzz_profile.py && test -f /opt/hgb/bin/promefuzz_build_context.py && test -f /opt/hgb/bin/hgb_harness_evaluator.py && command -v wget >/dev/null && command -v autoreconf >/dev/null && command -v nasm >/dev/null && command -v tclsh >/dev/null && test -x /usr/local/bin/python3.8 && test -f /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.ubsan_standalone-x86_64.a && dpkg-query -W -f='\${db:Status-Status}' zlib1g-dev 2>/dev/null | grep -qx installed && grep -Fq 'fuzzbench_target_build_available' /opt/hgb/entrypoint.sh && grep -Fq 'promefuzz_build_context.py' /opt/hgb/entrypoint.sh && grep -Fq 'promefuzz_profile.py validate' /opt/hgb/entrypoint.sh && grep -Fq 'hgb_harness_evaluator.py' /opt/hgb/entrypoint.sh && grep -Fq 'consumer_case_paths' /opt/hgb/entrypoint.sh && grep -Fq 'verify_and_record_link_set' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
     log "rebuilding stale PromeFuzz image without current target-build validation: $image"
@@ -298,6 +298,182 @@ record_preflight_failure() {
   done
 }
 
+
+
+ckgfuzzer_profile_is_strict_reproduction() {
+  case "${1:-${profile:-${HGB_BASELINE_PROFILE:-alpha}}}" in
+    reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta|reproduction-theta) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ckgfuzzer_preflight_api_selection() {
+  local generator="$1"
+  local active_profile active_protocol mode
+  [[ "$generator" == "ckgfuzzer" ]] || return 0
+  active_profile="${profile:-${HGB_BASELINE_PROFILE:-alpha}}"
+  active_protocol="${protocol:-${HGB_BASELINE_PROTOCOL:-blind-project}}"
+  mode="${HGB_API_SELECTION_MODE:-${CKGFUZZER_API_SELECTION_MODE:-}}"
+  if [[ "$active_protocol" == "blind-project" ]] && ckgfuzzer_profile_is_strict_reproduction "$active_profile"; then
+    if [[ -z "$mode" ]]; then
+      mode="ranked"
+    fi
+    if [[ "$mode" != "ranked" ]]; then
+      printf 'CKGFuzzer preflight failed: invalid API selection mode %s.\n' "$mode" >&2
+      printf 'Use ranked for blind-project reproduction.\n' >&2
+      printf 'extract_api_list.py accepts: ranked, selected_harness, selected_harness_fallback.\n' >&2
+      return 64
+    fi
+  elif [[ -z "$mode" && "$active_protocol" == "blind-project" ]]; then
+    mode="ranked"
+  fi
+  if [[ -n "$mode" ]]; then
+    export HGB_API_SELECTION_MODE="$mode"
+    export CKGFUZZER_API_SELECTION_MODE="$mode"
+    printf 'CKGFuzzer API selection mode: %s\n' "$mode"
+  fi
+}
+
+
+ckgfuzzer_embedding_base_url_kind() {
+  local url="${1:-}"
+  case "${url,,}" in
+    *host.docker.internal*|*127.0.0.1*|*localhost*) printf 'host_local\n' ;;
+    "") printf 'unset\n' ;;
+    *) printf 'remote\n' ;;
+  esac
+}
+
+ckgfuzzer_host_probe_base_url() {
+  local url="${1:-}"
+  printf '%s\n' "${url/host.docker.internal/127.0.0.1}"
+}
+
+ckgfuzzer_preflight_local_embedding() {
+  local generator="$1"
+  local active_profile active_protocol embedding_base_url embedding_model embedding_api_key embedding_backend embedding_model_source embedding_kind
+  local probe_base_url probe_output probe_dimension config_json provider chat_model chat_base_url chat_key_present
+  local ckg_preflight_cache_dir ckg_preflight_cache_file
+  [[ "$generator" == "ckgfuzzer" ]] || return 0
+  active_profile="${profile:-${HGB_BASELINE_PROFILE:-alpha}}"
+  active_protocol="${protocol:-${HGB_BASELINE_PROTOCOL:-blind-project}}"
+  if [[ "$dry_run" == "1" ]] || ! ckgfuzzer_profile_is_strict_reproduction "$active_profile"; then
+    return 0
+  fi
+  embedding_base_url="${CKGFUZZER_EMBEDDING_BASE_URL:-}"
+  if [[ -z "$embedding_base_url" ]]; then
+    return 0
+  fi
+
+  embedding_kind="$(ckgfuzzer_embedding_base_url_kind "$embedding_base_url")"
+  if [[ -z "${CKGFUZZER_EMBEDDING_BACKEND:-}" ]]; then
+    if [[ "$embedding_kind" == "host_local" ]]; then
+      export CKGFUZZER_EMBEDDING_BACKEND="openai_compatible_local_tei_cpu"
+    else
+      export CKGFUZZER_EMBEDDING_BACKEND="openai_compatible"
+    fi
+  fi
+  export CKGFUZZER_EMBEDDING_MODEL="${CKGFUZZER_EMBEDDING_MODEL:-text-embeddings-inference}"
+  export CKGFUZZER_EMBEDDING_API_KEY="${CKGFUZZER_EMBEDDING_API_KEY:--}"
+  if [[ "$embedding_kind" == "host_local" ]]; then
+    export CKGFUZZER_EMBEDDING_MODEL_SOURCE="${CKGFUZZER_EMBEDDING_MODEL_SOURCE:-Qwen/Qwen3-Embedding-0.6B}"
+    export CKGFUZZER_EMBEDDING_BATCH_SIZE="${CKGFUZZER_EMBEDDING_BATCH_SIZE:-4}"
+  else
+    export CKGFUZZER_EMBEDDING_MODEL_SOURCE="${CKGFUZZER_EMBEDDING_MODEL_SOURCE:-}"
+  fi
+
+  embedding_model="$CKGFUZZER_EMBEDDING_MODEL"
+  embedding_api_key="$CKGFUZZER_EMBEDDING_API_KEY"
+  embedding_backend="$CKGFUZZER_EMBEDDING_BACKEND"
+  embedding_model_source="$CKGFUZZER_EMBEDDING_MODEL_SOURCE"
+
+  if ! config_json="$(python3 "$root/docker/common/ckgfuzzer_model_config.py" resolve --profile "$active_profile" 2>&1)"; then
+    printf 'CKGFuzzer local embedding preflight failed: model resolution failed.\n' >&2
+    printf '%s\n' "$config_json" >&2
+    return 65
+  fi
+  provider="$(printf '%s' "$config_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("provider", ""))' 2>/dev/null || true)"
+  chat_model="$(printf '%s' "$config_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("chat_model", ""))' 2>/dev/null || true)"
+  chat_base_url="$(printf '%s' "$config_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("chat_base_url", d.get("base_url", "")))' 2>/dev/null || true)"
+  chat_key_present="$(printf '%s' "$config_json" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("true" if d.get("chat_api_key_present", d.get("api_key_present", False)) else "false")' 2>/dev/null || printf false)"
+  if [[ -z "$chat_model" || -z "$chat_base_url" || "$chat_key_present" != "true" ]]; then
+    printf 'CKGFuzzer local embedding preflight failed: chat LLM config is incomplete (provider=%s model=%s base_url_present=%s api_key_present=%s).\n' \
+      "$provider" "$chat_model" "$([[ -n "$chat_base_url" ]] && printf true || printf false)" "$chat_key_present" >&2
+    return 65
+  fi
+
+  printf 'CKGFuzzer embedding backend: %s\n' "$embedding_backend"
+  printf 'CKGFuzzer embedding base_url: %s\n' "$embedding_base_url"
+  printf 'CKGFuzzer embedding model: %s\n' "$embedding_model"
+  printf 'CKGFuzzer reference harness visible to generator: false\n'
+
+  probe_base_url="$(ckgfuzzer_host_probe_base_url "$embedding_base_url")"
+  if ! probe_output="$(python3 "$root/scripts/probe_openai_embedding.py" \
+      --base-url "$probe_base_url" \
+      --model "$embedding_model" \
+      --api-key "$embedding_api_key" 2>&1)"; then
+    printf '%s\n' "$probe_output" >&2
+    return 65
+  fi
+  if [[ "$probe_output" =~ dimension=([0-9]+) ]]; then
+    probe_dimension="${BASH_REMATCH[1]}"
+  else
+    printf 'CKGFuzzer local embedding preflight failed: probe output did not include dimension: %s\n' "$probe_output" >&2
+    return 65
+  fi
+  printf 'CKGFuzzer embedding preflight: ok dimension=%s\n' "$probe_dimension"
+  export CKGFUZZER_EMBEDDING_DIMENSION="$probe_dimension"
+
+  ckg_preflight_cache_dir="$matrix_dir/ckgfuzzer_model_preflight"
+  ckg_preflight_cache_file="$ckg_preflight_cache_dir/model_preflight.json"
+  mkdir -p "$ckg_preflight_cache_dir"
+  CKG_LOCAL_MODEL_CONFIG_JSON="$config_json" \
+  CKG_LOCAL_PREFLIGHT_OUT="$ckg_preflight_cache_file" \
+  CKG_LOCAL_PROFILE="$active_profile" \
+  CKG_LOCAL_EMBEDDING_DIMENSION="$probe_dimension" \
+  CKG_LOCAL_EMBEDDING_BACKEND="$embedding_backend" \
+  CKG_LOCAL_EMBEDDING_MODEL="$embedding_model" \
+  CKG_LOCAL_EMBEDDING_MODEL_SOURCE="$embedding_model_source" \
+  CKG_LOCAL_EMBEDDING_BASE_URL_KIND="$embedding_kind" \
+  python3 - <<'PY_CKG_LOCAL_PREFLIGHT'
+import json
+import os
+import time
+from pathlib import Path
+
+config = json.loads(os.environ["CKG_LOCAL_MODEL_CONFIG_JSON"])
+model_config = {
+    "provider": config.get("provider", ""),
+    "chat_model": config.get("chat_model", ""),
+    "embedding_model": os.environ.get("CKG_LOCAL_EMBEDDING_MODEL", config.get("embedding_model", "")),
+    "base_url": config.get("base_url", ""),
+    "chat_base_url": config.get("chat_base_url", config.get("base_url", "")),
+    "embedding_base_url": config.get("embedding_base_url", ""),
+    "embedding_backend": os.environ.get("CKG_LOCAL_EMBEDDING_BACKEND", config.get("embedding_backend", "")),
+    "embedding_model_source": os.environ.get("CKG_LOCAL_EMBEDDING_MODEL_SOURCE", config.get("embedding_model_source", "")),
+    "embedding_base_url_kind": os.environ.get("CKG_LOCAL_EMBEDDING_BASE_URL_KIND", config.get("embedding_base_url_kind", "")),
+    "api_key_present": bool(config.get("api_key_present", False)),
+    "chat_api_key_present": bool(config.get("chat_api_key_present", config.get("api_key_present", False))),
+    "embedding_api_key_present": bool(config.get("embedding_api_key_present", False)),
+    "chat_probe_passed": False,
+    "embedding_probe_passed": True,
+    "embedding_dimension": int(os.environ["CKG_LOCAL_EMBEDDING_DIMENSION"]),
+}
+payload = {
+    "status": "ok",
+    "reason_code": "",
+    "profile": os.environ.get("CKG_LOCAL_PROFILE", ""),
+    "timestamp": time.time(),
+    "model_config": model_config,
+    "chat_probe": {"ok": False, "skipped": "host preflight validates chat config only"},
+    "embedding_probe": {"ok": True, "dimension": model_config["embedding_dimension"], "error": ""},
+}
+out = Path(os.environ["CKG_LOCAL_PREFLIGHT_OUT"])
+out.parent.mkdir(parents=True, exist_ok=True)
+out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_CKG_LOCAL_PREFLIGHT
+  export HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE="$ckg_preflight_cache_file"
+}
 
 run_pair() {
   local generator="$1"
@@ -402,6 +578,46 @@ for generator in "${generator_list[@]}"; do
     fi
     continue
   fi
+  ckg_api_selection_preflight_log="$matrix_dir/ckgfuzzer_api_selection_preflight.log"
+  if ckgfuzzer_preflight_api_selection "$generator" >"$ckg_api_selection_preflight_log" 2>&1; then
+    :
+  else
+    preflight_code=$?
+    cat "$ckg_api_selection_preflight_log" >&2
+    HGB_LAST_IMAGE_BUILD_LOG="$ckg_api_selection_preflight_log"
+    log "CKGFuzzer API selection preflight failed for $generator (exit $preflight_code)"
+    record_preflight_failure "$generator" "$preflight_code" "ckgfuzzer_preflight_invalid_api_selection" "${eligible_targets[@]}"
+    if [[ "$continue_on_error" != "1" ]]; then
+      python3 "$SCRIPT_DIR/hgb_collect_matrix.py" "$matrix_dir"
+      exit "$preflight_code"
+    fi
+    continue
+  fi
+  if [[ -s "$ckg_api_selection_preflight_log" ]]; then
+    while IFS= read -r ckg_api_selection_line; do
+      [[ -n "$ckg_api_selection_line" ]] && log "$ckg_api_selection_line"
+    done <"$ckg_api_selection_preflight_log"
+  fi
+  ckg_local_embedding_preflight_log="$matrix_dir/ckgfuzzer_local_embedding_preflight.log"
+  if ckgfuzzer_preflight_local_embedding "$generator" >"$ckg_local_embedding_preflight_log" 2>&1; then
+    :
+  else
+    preflight_code=$?
+    cat "$ckg_local_embedding_preflight_log" >&2
+    HGB_LAST_IMAGE_BUILD_LOG="$ckg_local_embedding_preflight_log"
+    log "CKGFuzzer local embedding preflight failed for $generator (exit $preflight_code)"
+    record_preflight_failure "$generator" "$preflight_code" "ckgfuzzer_preflight_embedding_failed" "${eligible_targets[@]}"
+    if [[ "$continue_on_error" != "1" ]]; then
+      python3 "$SCRIPT_DIR/hgb_collect_matrix.py" "$matrix_dir"
+      exit "$preflight_code"
+    fi
+    continue
+  fi
+  if [[ -s "$ckg_local_embedding_preflight_log" ]]; then
+    while IFS= read -r ckg_local_embedding_line; do
+      [[ -n "$ckg_local_embedding_line" ]] && log "$ckg_local_embedding_line"
+    done <"$ckg_local_embedding_preflight_log"
+  fi
   # CKGFuzzer reproduction-theta model preflight (theta plan §3): run the
   # USTC model resolution and live chat/embedding probes ONCE per matrix run,
   # before preparing all 20 target packages. Cache the result so each
@@ -435,6 +651,14 @@ for generator in "${generator_list[@]}"; do
       fi
       log "CKGFuzzer model preflight passed: $ckg_preflight_cache_file"
     fi
+    ckg_preflight_provider="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); c=d.get("model_config",{}); print(c.get("provider", ""))' "$ckg_preflight_cache_file" 2>/dev/null || true)"
+    ckg_preflight_chat="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); c=d.get("model_config",{}); print(c.get("chat_model", ""))' "$ckg_preflight_cache_file" 2>/dev/null || true)"
+    ckg_preflight_embedding="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); c=d.get("model_config",{}); print(c.get("embedding_model", ""))' "$ckg_preflight_cache_file" 2>/dev/null || true)"
+    ckg_preflight_dimension="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); p=d.get("embedding_probe",{}); print(p.get("dimension", 0))' "$ckg_preflight_cache_file" 2>/dev/null || printf '0')"
+    [[ -n "$ckg_preflight_provider" ]] && log "CKGFuzzer LLM provider: $ckg_preflight_provider"
+    [[ -n "$ckg_preflight_chat" ]] && log "CKGFuzzer chat model: $ckg_preflight_chat"
+    [[ -n "$ckg_preflight_embedding" ]] && log "CKGFuzzer embedding model: $ckg_preflight_embedding"
+    log "CKGFuzzer embedding preflight: ok dimension=$ckg_preflight_dimension"
     export HGB_CKGFUZZER_MODEL_PREFLIGHT_CACHE="$ckg_preflight_cache_file"
   fi
   prepare_shared_target_packages "${eligible_targets[@]}"

@@ -91,7 +91,7 @@ baselines:
       row.
   - name: ckgfuzzer
     task_family: harness_generator
-    profiles: [alpha, paper-faithful, compat-smoke]
+    profiles: [alpha, paper-faithful, reproduction-delta, reproduction-epsilon, reproduction-zeta, reproduction-eta, reproduction-theta, compat-smoke]
     default_profile: alpha
     default_protocol: blind-project
     strict_success_status: evaluated

@@ -55,6 +55,8 @@ FORBIDDEN_ALPHA_ENV = {
     "CKGFUZZER_LOCAL_API_COMBINATION": "1",
 }
 FORBIDDEN_ALPHA_FLAGS = ["--skip_check_compilation"]
+INVALID_EMBEDDING_SENTINELS = {"", "mock", "hash", "local", "dummy", "none", "fake", "hgb-hash-embedding"}
+INVALID_EMBEDDING_BACKEND_SENTINELS = {"mock", "hash", "local", "dummy", "none", "fake", "random", "constant", "source-only"}
 
 # Stage names in canonical order.
 STAGE_NAMES = [
@@ -113,12 +115,18 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 f"CKGFUZZER_SKIP_CHECK_COMPILATION=1 is forbidden in {profile}; "
                 f"the compile-check/repair loop must run"
             )
-        # A mock/local embedding model is forbidden in alpha/paper.
+        # A mock/local embedding model or backend is forbidden in alpha/paper.
         embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip().lower()
-        if embedding_model in {"mock", "local", "hgb-hash-embedding", ""}:
+        if embedding_model in INVALID_EMBEDDING_SENTINELS:
             violations.append(
                 f"CKGFUZZER_EMBEDDING_MODEL={embedding_model!r} is forbidden in {profile}; "
                 f"a real embedding service is required (openai-* or ollama-* prefix)"
+            )
+        embedding_backend = (env.get("CKGFUZZER_EMBEDDING_BACKEND") or "").strip().lower()
+        if embedding_backend in INVALID_EMBEDDING_BACKEND_SENTINELS:
+            violations.append(
+                f"CKGFUZZER_EMBEDDING_BACKEND={embedding_backend!r} is forbidden in {profile}; "
+                "a real embedding service is required"
             )
         # source_fallback_only must not be permitted in alpha.
         if normalize_env_bool(env.get("CKGFUZZER_ALLOW_SOURCE_FALLBACK")) == "1":
@@ -128,7 +136,7 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
             )
         # selected-harness API mode is evaluator-only; a blind generator must
         # never read the reference-derived API list.
-        api_mode = (env.get("HGB_API_SELECTION_MODE") or "").strip()
+        api_mode = (env.get("HGB_API_SELECTION_MODE") or env.get("CKGFUZZER_API_SELECTION_MODE") or "").strip()
         if api_mode in {"selected_harness", "selected_harness_fallback"}:
             violations.append(
                 f"HGB_API_SELECTION_MODE={api_mode} is forbidden in {profile}; "
@@ -151,10 +159,22 @@ def validate_profile(profile: str, protocol: str, env: dict[str, str] | None = N
                 "the compile-check/repair loop must run"
             )
         embedding_model = (env.get("CKGFUZZER_EMBEDDING_MODEL") or "").strip().lower()
-        if embedding_model in {"mock", "local", "hgb-hash-embedding", ""}:
+        if embedding_model in INVALID_EMBEDDING_SENTINELS:
             violations.append(
                 f"CKGFUZZER_EMBEDDING_MODEL={embedding_model!r} is forbidden in {profile}; "
                 f"{profile} requires a real embedding service"
+            )
+        embedding_backend = (env.get("CKGFUZZER_EMBEDDING_BACKEND") or "").strip().lower()
+        if embedding_backend in INVALID_EMBEDDING_BACKEND_SENTINELS:
+            violations.append(
+                f"CKGFUZZER_EMBEDDING_BACKEND={embedding_backend!r} is forbidden in {profile}; "
+                f"{profile} requires a real embedding service"
+            )
+        provider = (env.get("HGB_LLM_PROVIDER") or env.get("HGB_LLM_PROVIDER_RESOLVED") or "").strip().lower()
+        if provider == "ustc" and embedding_model == "text-embedding-3-small":
+            violations.append(
+                "CKGFUZZER_EMBEDDING_MODEL='text-embedding-3-small' is forbidden for provider ustc; "
+                "use qwen3-embedding"
             )
         if normalize_env_bool(env.get("CKGFUZZER_ALLOW_SOURCE_FALLBACK")) == "1":
             violations.append(

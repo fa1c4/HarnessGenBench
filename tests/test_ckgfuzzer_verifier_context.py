@@ -50,7 +50,8 @@ def test_sealed_context_uses_snapshot_and_removes_git_clone(tmp_path: Path) -> N
     assert result["removed_acquisition_commands"] == 1
     assert "COPY source_input/ /src/" in dockerfile
     assert "COPY hgb_reference_harnesses/ /src/" in dockerfile
-    assert "apt-get install -y meson ninja-build python3-jinja2 python3-jsonschema" in dockerfile
+    assert "apt-get -o Acquire::Retries=5 update" in dockerfile
+    assert "apt-get -o Acquire::Retries=5 install -y --fix-missing meson ninja-build python3-pip python3-jinja2 python3-jsonschema m4" in dockerfile
     assert "git clone" not in dockerfile
     assert "cd project && ./configure" in dockerfile
 
@@ -142,8 +143,57 @@ def test_sealed_context_replaces_legacy_harfbuzz_pip_bootstrap(tmp_path: Path) -
     build = Path(result["context_dir"]) / "build.sh"
 
     assert result["build_tool_fallbacks"] == 1
-    assert "python3.8 -m pip install" not in build.read_text(encoding="utf-8")
-    assert "command -v meson" in build.read_text(encoding="utf-8")
+    text = build.read_text(encoding="utf-8")
+    assert "python3.8 -m pip install" not in text
+    assert "meson==0.56.0" in text
+    assert "ninja==1.10.2.4" in text
+
+
+def test_sealed_context_skips_missing_freetype_libarchive_tar_when_snapshot_has_tree(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    (target / "source_input" / "libarchive-3.4.3").mkdir()
+    (target / "fuzzbench_benchmark" / "build.sh").write_text(
+        "#!/bin/sh\ntar xf libarchive-3.4.3.tar.xz\n",
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+    build = Path(result["context_dir"]) / "build.sh"
+
+    assert result["build_tool_fallbacks"] == 1
+    text = build.read_text(encoding="utf-8")
+    assert "[ -d libarchive-3.4.3 ] || tar xf libarchive-3.4.3.tar.xz" in text
+
+
+def test_sealed_context_defaults_openssl_fuzzer_env_var(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    (target / "fuzzbench_benchmark" / "build.sh").write_text(
+        '#!/bin/sh\nif [ "$FUZZER" = "centipede" ]\nthen\n  echo centipede\nfi\n',
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+    text = (Path(result["context_dir"]) / "build.sh").read_text(encoding="utf-8")
+
+    assert result["build_tool_fallbacks"] == 1
+    assert ': "${FUZZER:=${FUZZING_ENGINE:-libfuzzer}}"' in text
+
+
+def test_sealed_context_defaults_legacy_fuzzer_lib_env_var(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    (target / "fuzzbench_benchmark" / "build.sh").write_text(
+        '#!/bin/bash -eu\n$CXX $CXXFLAGS $SRC/fuzzer.cc $FUZZER_LIB -o $OUT/fuzzer\n',
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+    text = (Path(result["context_dir"]) / "build.sh").read_text(encoding="utf-8")
+
+    assert result["build_tool_fallbacks"] == 1
+    assert 'older OSS-Fuzz scripts link $FUZZER_LIB' in text
+    assert 'LIB_FUZZING_ENGINE:--fsanitize=fuzzer' in text
+    assert 'LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a' in text
+    assert text.splitlines()[1].startswith('# HGB sealed verifier')
 
 
 def test_sealed_context_replaces_legacy_mbedtls_pip_bootstrap(tmp_path: Path) -> None:

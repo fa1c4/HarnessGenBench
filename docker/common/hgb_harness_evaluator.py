@@ -34,6 +34,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -84,6 +85,80 @@ SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx"}
 # coverage_report_path, and inputs_replayed > 0 are mandatory for an evaluated
 # eta row.
 ETA_PROFILES = {"reproduction-eta"}
+SOURCE_TEXT_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inc"}
+_C_LIKE_COMMENT_RE = re.compile(r"//.*?$|/\*.*?\*/", re.DOTALL | re.MULTILINE)
+_C_LIKE_STRING_RE = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', re.DOTALL)
+
+
+def _primary_source_roots(target_root: Path) -> list[Path]:
+    """Return generator-visible primary-project source roots.
+
+    Some FuzzBench packages include dependency trees beside the target project
+    (for example Mbed TLS packages can contain BoringSSL/OpenSSL checkouts).
+    CKGFuzzer API plans must not require symbols that only appear in those
+    secondary dependency roots.
+    """
+
+    repos_path = target_root / "source_repos.json"
+    if not repos_path.is_file():
+        return []
+    try:
+        records = json.loads(repos_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(records, list):
+        return []
+    roots: list[Path] = []
+    for record in records:
+        if not isinstance(record, dict) or not record.get("is_primary_project"):
+            continue
+        rel = str(record.get("package_path") or "").strip()
+        if not rel:
+            dest = str(record.get("dest") or record.get("docker_dest") or "").strip().strip("/")
+            rel = f"source_input/{dest}" if dest else ""
+        if not rel:
+            continue
+        root = (target_root / rel).resolve()
+        try:
+            root.relative_to(target_root.resolve())
+        except ValueError:
+            continue
+        if root.exists():
+            roots.append(root)
+    return roots
+
+
+def _source_without_comments_or_strings(text: str) -> str:
+    text = _C_LIKE_COMMENT_RE.sub(" ", text)
+    return _C_LIKE_STRING_RE.sub(" ", text)
+
+
+def _symbol_visible_in_roots(symbol: str, roots: list[Path]) -> bool:
+    clean_symbol = symbol.strip()
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", clean_symbol):
+        return False
+    call_like = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(clean_symbol)}\s*\(")
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in SOURCE_TEXT_SUFFIXES:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            if call_like.search(_source_without_comments_or_strings(source)):
+                return True
+    return False
+
+
+def _filter_intended_apis_by_primary_source(intended_apis: list[str], target_root: Path) -> list[str]:
+    if not intended_apis:
+        return []
+    roots = _primary_source_roots(target_root)
+    if not roots:
+        return intended_apis
+    filtered = [api for api in intended_apis if _symbol_visible_in_roots(api.split("::")[-1], roots)]
+    return filtered
 
 
 @dataclass
@@ -849,10 +924,21 @@ def evaluate(
                 plan_apis = []
         else:
             plan_apis = []
+    plan_apis = _filter_intended_apis_by_primary_source(plan_apis, target_root)
 
     if seeds is None:
         seeds_dir = target_root / "seeds"
-        seeds = sorted(seeds_dir.iterdir()) if seeds_dir.is_dir() else []
+        seeds = sorted(p for p in seeds_dir.iterdir() if p.is_file()) if seeds_dir.is_dir() else []
+    else:
+        seeds = [Path(p) for p in seeds if Path(p).is_file()]
+    if not seeds:
+        # Materialize libFuzzer's implicit empty seed as an explicit campaign
+        # input so strict profiles have a real final corpus artifact to replay.
+        seed_dir = work_dir / "campaign_seeds"
+        seed_dir.mkdir(parents=True, exist_ok=True)
+        empty_seed = seed_dir / "hgb_empty_seed"
+        empty_seed.write_bytes(b"")
+        seeds = [empty_seed]
 
     records: list[CandidateRecord] = []
     candidate_dicts: list[dict[str, Any]] = []
@@ -1019,9 +1105,9 @@ def main() -> int:
     # --candidates is a directory of candidates; --candidate is a single file.
     # Exactly one of the two must be supplied so the shared CLI works for both
     # the multi-candidate (OFG) and single-candidate (plan section 4) flows.
-    parser.add_argument("--candidates", default="", type=Path,
+    parser.add_argument("--candidates", default=None, type=Path,
                         help="directory of candidate source files")
-    parser.add_argument("--candidate", default="", type=Path,
+    parser.add_argument("--candidate", default=None, type=Path,
                         help="single candidate source file (staged into a temp candidates dir)")
     parser.add_argument("--work-dir", default="", type=Path,
                         help="evaluation work directory (defaults to --result-dir/work)")

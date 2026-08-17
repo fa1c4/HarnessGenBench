@@ -1,0 +1,5 @@
+*
+!.gitignore
+!.gitkeep
+!README.md
+!embedding_manifest.example.json
