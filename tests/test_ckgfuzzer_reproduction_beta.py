@@ -454,3 +454,12 @@ def test_reachability_matches_oss_fuzz_prefixed_c_symbol() -> None:
     )
     assert reach["reached"] is True
     assert reach["reached_apis"] == ["png_set_sig_bytes"]
+
+
+def test_reachability_matches_source_file_qualified_c_symbol() -> None:
+    reach = hgb_reachability.check_reachability(
+        ["php_scanner_globals_ctor"],
+        {"covered_functions": ["zend.c:php_scanner_globals_ctor"]},
+    )
+    assert reach["reached"] is True
+    assert reach["reached_apis"] == ["php_scanner_globals_ctor"]

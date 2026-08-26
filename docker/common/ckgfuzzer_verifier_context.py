@@ -20,6 +20,7 @@ from typing import Any
 
 _SYNTHETIC_BUILD_SCRIPT_MARKER = "FuzzBench benchmark did not include a top-level build.sh"
 _ARCHIVE_URL_RE = re.compile(r"https?://[^\s'\"]+(?:\.tar(?:\.[A-Za-z0-9]+)?|\.tgz|\.zip)(?:\?[^\s'\"]*)?")
+SEALED_ENV_DEFAULTS: dict[str, str] = {"MERGE_WITH_OSS_FUZZ_CORPORA": "0"}
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,7 @@ class VerificationContext:
     excluded_synthetic_build_script: bool
     captured_unpinned_source_count: int
     build_tool_fallbacks: int
+    sealed_env_defaults: dict[str, str]
 
 
 class VerificationContextError(RuntimeError):
@@ -251,6 +253,7 @@ def _rewrite_dockerfile(dockerfile: Path) -> tuple[str, int]:
                     "ENV ARCHITECTURE=${ARCHITECTURE}",
                     "ENV FUZZING_LANGUAGE=${FUZZING_LANGUAGE}",
                     "ENV HGB_SEALED_VERIFIER=1",
+                    "ENV MERGE_WITH_OSS_FUZZ_CORPORA=0",
                     "COPY source_input/ /src/",
                     "COPY hgb_reference_harnesses/ /src/",
                     # HarfBuzz and Mbed TLS use historical Python 3.8/pip
@@ -417,5 +420,6 @@ def prepare_verification_context(target_root: Path, work_dir: Path) -> dict[str,
         excluded_synthetic_build_script=excluded_synthetic_build,
         captured_unpinned_source_count=captured_unpinned_source_count,
         build_tool_fallbacks=build_tool_fallbacks,
+        sealed_env_defaults=dict(SEALED_ENV_DEFAULTS),
     )
     return asdict(result)

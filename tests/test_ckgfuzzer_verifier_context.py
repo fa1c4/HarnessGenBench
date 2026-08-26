@@ -132,6 +132,20 @@ def test_rewrite_removes_source_only_branch_clone_loop(tmp_path: Path) -> None:
     assert "git clone" not in rewritten
 
 
+def test_sealed_context_defaults_systemd_optional_corpus_env(tmp_path: Path) -> None:
+    target = _target(tmp_path)
+    (target / "fuzzbench_benchmark" / "build.sh").write_text(
+        '#!/bin/bash -eu\necho "$MERGE_WITH_OSS_FUZZ_CORPORA"\n',
+        encoding="utf-8",
+    )
+
+    result = context.prepare_verification_context(target, tmp_path / "work")
+    dockerfile = Path(result["dockerfile"]).read_text(encoding="utf-8")
+
+    assert result["sealed_env_defaults"] == {"MERGE_WITH_OSS_FUZZ_CORPORA": "0"}
+    assert "ENV MERGE_WITH_OSS_FUZZ_CORPORA=0" in dockerfile
+
+
 def test_sealed_context_replaces_legacy_harfbuzz_pip_bootstrap(tmp_path: Path) -> None:
     target = _target(tmp_path)
     (target / "fuzzbench_benchmark" / "build.sh").write_text(

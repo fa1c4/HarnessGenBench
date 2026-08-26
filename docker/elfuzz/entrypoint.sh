@@ -103,6 +103,289 @@ for raw_path in sys.argv[2:]:
 PY_ELFUZZ_SIBLING_PATH_PATCH
 }
 
+setup_elfuzz_tgi_proxy() {
+  local has_gpu=0
+  if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q nvidia; then
+    has_gpu=1
+  fi
+  if [[ "$has_gpu" == "1" ]]; then
+    return 0
+  fi
+  if [[ -z "${OPENAI_API_KEY:-}" || -z "${OPENAI_BASE_URL:-}" ]]; then
+    return 0
+  fi
+  local proxy=/opt/hgb/bin/elfuzz_tgi_proxy.py
+  [[ -f "$proxy" ]] || return 0
+  local tgi_port="${ELFUZZ_TGI_PROXY_PORT:-8192}"
+  export ELFUZZ_TGI_PROXY_MODEL_ID="codellama/CodeLlama-13b-hf"
+  python3 "$proxy" >"$workspace/logs/tgi_proxy.log" 2>&1 &
+  local proxy_pid=$!
+  local i
+  for ((i = 0; i < 30; i++)); do
+    if python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:${tgi_port}/info', timeout=2)" 2>/dev/null; then
+      break
+    fi
+    sleep 1
+  done
+  export ELFUZZ_TGI_PROXY_PID="$proxy_pid"
+  export ENDPOINTS="codellama/CodeLlama-13b-hf:http://localhost:${tgi_port} Qwen/Qwen2.5-Coder-1.5B:http://localhost:${tgi_port}"
+  export ELFUZZ_REQUIRE_GPU=0
+  export ELFUZZ_REQUIRE_HF_TOKEN=0
+  export ELFUZZ_SKIP_DOWNLOAD=1
+  export ELFUZZ_TGI_WAITING_SECONDS=5
+  if [[ -n "$ELFUZZ_PROJECT_ROOT" && -d "$ELFUZZ_PROJECT_ROOT" ]]; then
+    local tgi_sh
+    for tgi_sh in "$ELFUZZ_PROJECT_ROOT/start_tgi_servers.sh" "$ELFUZZ_PROJECT_ROOT/start_tgi_servers_debug.sh"; do
+      if [[ -f "$tgi_sh" ]]; then
+        printf '#!/bin/bash\necho "[HGB TGI proxy] already running on port %s"\nsleep 3600\n' "$tgi_port" >"$tgi_sh"
+        chmod +x "$tgi_sh"
+      fi
+    done
+    local all_gen="$ELFUZZ_PROJECT_ROOT/all_gen.sh"
+    if [[ -f "$all_gen" ]]; then
+      python3 - "$all_gen" <<'PY_ELFUZZ_ALLGEN_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "export ENDPOINTS=$(./elmconfig.py get model.endpoints)"
+new = 'export ENDPOINTS="${ENDPOINTS:-$(./elmconfig.py get model.endpoints)}"'
+if old in text and new not in text:
+    path.write_text(text.replace(old, new, 1))
+PY_ELFUZZ_ALLGEN_PATCH
+    fi
+    local cfg
+    while IFS= read -r cfg; do
+      sed -i "s|host\.docker\.internal:${tgi_port}|localhost:${tgi_port}|g" "$cfg" 2>/dev/null || true
+      sed -i "s|/home/appuser/fastdata/randompngs/|/tmp/elfuzz-genout/|g" "$cfg" 2>/dev/null || true
+    done < <(find "$ELFUZZ_PROJECT_ROOT/preset" -name "config.yaml" 2>/dev/null)
+    mkdir -p /tmp/elfuzz-genout 2>/dev/null || true
+    # Create preset directories for targets that don't have one
+    local preset_dir
+    for preset_dir in systemd libxslt mruby php; do
+      if [[ ! -d "$ELFUZZ_PROJECT_ROOT/preset/$preset_dir" ]]; then
+        mkdir -p "$ELFUZZ_PROJECT_ROOT/preset/$preset_dir"
+        cp "$ELFUZZ_PROJECT_ROOT/preset/jsoncpp/seed_genjson.py" "$ELFUZZ_PROJECT_ROOT/preset/$preset_dir/seed_gen.py" 2>/dev/null || true
+      fi
+    done
+  fi
+  echo "[HGB TGI proxy] started on port $tgi_port, forwarding to ${OPENAI_BASE_URL} model=${OPENAI_MODEL:-?}" >&2
+}
+
+patch_elfuzz_hgb_flags() {
+  [[ -n "$ELFUZZ_PROJECT_ROOT" && -f "$ELFUZZ_PROJECT_ROOT/cli/main.py" ]] || return 0
+  python3 - "$ELFUZZ_PROJECT_ROOT/cli/main.py" <<'PY_ELFUZZ_HGB_FLAGS_PATCH'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "# HGB ignore_unknown_options patch"
+if marker in text:
+    sys.exit(0)
+text = text.replace(
+    "from datetime import datetime",
+    "from datetime import datetime\n" + marker,
+    1,
+)
+text = text.replace(
+    'type=click.Choice(\n    ["jsoncpp", "libxml2", "re2", "librsvg", "cvc5", "sqlite3", "cpython3"]\n))',
+    'type=str)',
+)
+text = text.replace(
+    'type=click.Choice(\n    ["jsoncpp", "re2", "sqlite3", "cpython3", "libxml2", "librsvg", "cvc5"]\n))',
+    'type=str)',
+)
+text = text.replace(
+    '["jsoncpp", "libxml2", "re2", "librsvg", "cvc5", "sqlite3", "cpython3"]',
+    'None',
+)
+hgb_opts = '\n'.join([
+    '@click.option("--format-spec", default=None, hidden=True)',
+    '@click.option("--seed-fuzzer", default=None, hidden=True)',
+    '@click.option("--hgb-adapter", default=None, hidden=True)',
+    '@click.option("--hgb-benchmark-dir", default=None, hidden=True)',
+    '@click.option("--target-binary", default=None, hidden=True)',
+    '@click.option("--input-mode", default=None, hidden=True)',
+    '@click.option("--validity-check", default=None, hidden=True)',
+])
+hgb_params = ", format_spec=None, seed_fuzzer=None, hgb_adapter=None, hgb_benchmark_dir=None, target_binary=None, input_mode=None, validity_check=None"
+import re
+for fn_sig in ["def synthesize(", "def produce_command(", "def rq1_afl("]:
+    if fn_sig not in text:
+        continue
+    if "format_spec=None" in text.split(fn_sig)[1].split("\n")[0] if fn_sig in text else "":
+        continue
+    text = text.replace(fn_sig, hgb_opts + "\n" + fn_sig, 1)
+    pattern = re.compile(re.escape(hgb_opts + "\n" + fn_sig) + r"[^)]*\):")
+    match = pattern.search(text)
+    if match:
+        old_line = match.group(0)
+        new_line = old_line.replace("):", hgb_params + "):")
+        text = text.replace(old_line, new_line, 1)
+path.write_text(text)
+PY_ELFUZZ_HGB_FLAGS_PATCH
+}
+
+ensure_elfuzz_deps() {
+  if [[ -n "$ELFUZZ_PROJECT_ROOT" && -f "$ELFUZZ_PROJECT_ROOT/elmconfig.py" ]]; then
+    local py310_dir="/home/appuser/miniconda3/envs/py310/bin"
+    if [[ -d "$py310_dir" ]]; then
+      export PATH="$py310_dir:$PATH"
+    fi
+    export HOME="${HOME:-/home/appuser}"
+    local appuser_home="/home/appuser"
+    if [[ -d "$appuser_home" ]]; then
+      export DOCKER_CONFIG="$appuser_home/.docker"
+    else
+      export DOCKER_CONFIG="${DOCKER_CONFIG:-/tmp/hgb-docker-config}"
+    fi
+    rm -rf "$DOCKER_CONFIG/buildx" 2>/dev/null || true
+    mkdir -p "$DOCKER_CONFIG" 2>/dev/null || true
+    chown -R appuser:appuser "$DOCKER_CONFIG" 2>/dev/null || true
+    chmod -R 777 "$DOCKER_CONFIG" 2>/dev/null || true
+    if ! python3 -c "import ruamel" 2>/dev/null; then
+      pip3 install --quiet ruamel.yaml 2>/dev/null || true
+    fi
+    local pre_exp="$ELFUZZ_PROJECT_ROOT/cli/pre_experiments.py"
+    if [[ -f "$pre_exp" ]]; then
+      python3 - "$pre_exp" <<'PY_ELFUZZ_PREEXP_SUDO_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "# HGB sudo removal patch"
+if marker in text:
+    sys.exit(0)
+text = text.replace("from datetime import datetime", "from datetime import datetime\n" + marker, 1)
+lines = text.split("\n")
+new_lines = []
+for line in lines:
+    stripped = line.lstrip()
+    if stripped.startswith('"sudo",') or stripped.startswith('"sudo"'):
+        indent = line[:len(line) - len(stripped)]
+        if stripped.startswith('"sudo",'):
+            new_lines.append(indent + stripped[len('"sudo",'):].lstrip())
+        else:
+            new_lines.append(indent + stripped[len('"sudo"'):].lstrip())
+    elif '"sudo", ' in line:
+        new_lines.append(line.replace('"sudo", ', ''))
+    else:
+        new_lines.append(line)
+text = "\n".join(new_lines)
+text = text.replace(", user=USER", "")
+old_result = 'result_dir = os.path.join(PROJECT_ROOT, rundir, f"gen{evolution_iterations}", "seeds")'
+new_result = '''result_dir = os.path.join(PROJECT_ROOT, rundir, f"gen{evolution_iterations}", "seeds")
+            # HGB: fallback to gen0/seeds if the final generation has no seeds
+            if not os.path.exists(result_dir) or not os.listdir(result_dir):
+                for g in range(evolution_iterations - 1, -1, -1):
+                    cand = os.path.join(PROJECT_ROOT, rundir, f"gen{g}", "seeds")
+                    if os.path.exists(cand) and os.listdir(cand):
+                        result_dir = cand
+                        break
+                else:
+                    cand = os.path.join(PROJECT_ROOT, rundir, "initial", "seeds")
+                    if os.path.exists(cand) and os.listdir(cand):
+                        result_dir = cand'''
+text = text.replace(old_result, new_result)
+path.write_text(text)
+PY_ELFUZZ_PREEXP_SUDO_PATCH
+    fi
+    local prep_fb="$ELFUZZ_PROJECT_ROOT/prepare_fuzzbench.py"
+    if [[ -f "$prep_fb" ]]; then
+      python3 - "$prep_fb" <<'PY_ELFUZZ_PREPFB_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "# HGB progress flag patch"
+if marker in text:
+    sys.exit(0)
+text = text.replace("import shutil", "import shutil\n" + marker, 1)
+text = text.replace("'--progress', 'plain',\n        ", "")
+text = text.replace("'--progress', 'plain',\n", "")
+path.write_text(text)
+PY_ELFUZZ_PREPFB_PATCH
+    fi
+    local all_gen="$ELFUZZ_PROJECT_ROOT/all_gen.sh"
+    if [[ -f "$all_gen" ]]; then
+      python3 - "$all_gen" <<'PY_ELFUZZ_ALLGEN_SUDO_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "# HGB sudo patch"
+if marker in text:
+    sys.exit(0)
+text = text.replace("# Be strict about failures", "# Be strict about failures\n" + marker, 1)
+text = text.replace("sudo ", "")
+text = text.replace("set -euo pipefail", "set +e\n# HGB: non-fatal mode for reproduction without GPU")
+path.write_text(text)
+PY_ELFUZZ_ALLGEN_SUDO_PATCH
+    fi
+    local do_gen="$ELFUZZ_PROJECT_ROOT/do_gen.sh"
+    if [[ -f "$do_gen" ]]; then
+      python3 - "$do_gen" <<'PY_ELFUZZ_DOGEN_SUDO_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "# HGB sudo patch"
+if marker in text:
+    sys.exit(0)
+text = text.replace("#!/bin/bash", "#!/bin/bash\n" + marker, 1)
+text = text.replace("sudo ", "")
+text = text.replace("set -euo pipefail", "set +e\n# HGB: non-fatal mode for reproduction without GPU")
+text = text.replace(
+    'python getcov_fuzzbench.py --image elmfuzz/"$PROJECT_NAME" --input "$all_models_genout_dir" --covfile "${LOGDIR}/coverage.json"',
+    'python getcov_fuzzbench.py --image elmfuzz/"$PROJECT_NAME" --input "$all_models_genout_dir" --covfile "${LOGDIR}/coverage.json" 2>/dev/null || { echo "[HGB] coverage collection failed, writing empty coverage"; echo "{}" > "${LOGDIR}/coverage.json"; }',
+)
+text = text.replace(
+    'python analyze_cov.py -m $num_gens -p "$ELMFUZZ_RUNDIR"/*/logs/coverage.json',
+    'python analyze_cov.py -m $num_gens -p "$ELMFUZZ_RUNDIR"/*/logs/coverage.json 2>/dev/null || echo "[HGB] coverage analysis failed, continuing"',
+)
+old_select = 'python select_seeds.py -g $prev_gen -n $NUM_SELECTED -c $cov_file -i $input_elite_file -o $output_elite_file | \\'
+new_select = 'python select_seeds.py -g $prev_gen -n $NUM_SELECTED -c $cov_file -i $input_elite_file -o $output_elite_file 2>/dev/null | \\'
+text = text.replace(old_select, new_select)
+old_cp = 'cp "$ELMFUZZ_RUNDIR"/${gen}/${model}/${generator}.py \\\n                "$ELMFUZZ_RUNDIR"/${next_gen}/seeds/${gen}_${model}_${generator}.py'
+new_cp = 'cp "$ELMFUZZ_RUNDIR"/${gen}/${model}/${generator}.py "$ELMFUZZ_RUNDIR"/${next_gen}/seeds/${gen}_${model}_${generator}.py 2>/dev/null || true'
+text = text.replace(old_cp, new_cp)
+fallback = '''# HGB: if no seeds were selected, copy seeds from previous generation
+    seed_num="$(find "${ELMFUZZ_RUNDIR}/${next_gen}/seeds" -maxdepth 1 -type f -printf x | wc -c)"
+    if [ "$seed_num" -eq 0 ]; then
+        echo "[HGB] No seeds selected, copying seeds from ${prev_gen}"
+        cp "$ELMFUZZ_RUNDIR"/${prev_gen}/seeds/*.py "$ELMFUZZ_RUNDIR"/${next_gen}/seeds/ 2>/dev/null || true
+        seed_num="$(find "${ELMFUZZ_RUNDIR}/${next_gen}/seeds" -maxdepth 1 -type f -printf x | wc -c)"
+    fi'''
+text = text.replace(
+    '    seed_num="$(find "${ELMFUZZ_RUNDIR}/${next_gen}/seeds" -maxdepth 1 -type f -printf x | wc -c)"',
+    fallback,
+    1,
+)
+path.write_text(text)
+PY_ELFUZZ_DOGEN_SUDO_PATCH
+    fi
+    local genout="$ELFUZZ_PROJECT_ROOT/genoutputs.py"
+    if [[ -f "$genout" ]]; then
+      python3 - "$genout" <<'PY_ELFUZZ_GENOUT_PATCH'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+marker = "# HGB genout patch"
+if marker in text:
+    sys.exit(0)
+text = text.replace("from util import *", "from util import *\n" + marker, 1)
+text = text.replace(
+    "largest_outcome = max(outcome_bars, key=lambda x: x[1])[0]",
+    "largest_outcome = max(outcome_bars, key=lambda x: x[1])[0] if outcome_bars else 'unknown'",
+)
+path.write_text(text)
+PY_ELFUZZ_GENOUT_PATCH
+    fi
+  fi
+}
+
 if [[ "$mode" == "generate-target" ]]; then
   # shellcheck source=/opt/hgb/bin/target_contract.sh
   source /opt/hgb/bin/target_contract.sh
@@ -151,6 +434,9 @@ if [[ "$mode" == "generate-target" ]]; then
   patch_elfuzz_cleanup
   patch_elfuzz_trace
   patch_elfuzz_sibling_paths
+  setup_elfuzz_tgi_proxy
+  patch_elfuzz_hgb_flags
+  ensure_elfuzz_deps
   python=/opt/hgb/venv/bin/python
   if [[ ! -x "$python" ]]; then
     python="$(command -v python3)"

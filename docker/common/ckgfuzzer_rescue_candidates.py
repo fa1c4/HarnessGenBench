@@ -225,16 +225,38 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
 PHP_PARSER_COMPILE_RESCUE = """#include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 
-#include \"php.h\"
-#include \"Zend/zend_compile.h\"
+#include "php.h"
+#include "Zend/zend_compile.h"
+#include "fuzzer-sapi.h"
+
+#ifndef HGB_ZEND_COMPILE_POSITION
+# ifdef ZEND_COMPILE_POSITION_AFTER_OPEN_TAG
+#  define HGB_ZEND_COMPILE_POSITION ZEND_COMPILE_POSITION_AFTER_OPEN_TAG
+# elif defined(ZEND_COMPILE_POSITION_AT_OPEN_TAG)
+#  define HGB_ZEND_COMPILE_POSITION ZEND_COMPILE_POSITION_AT_OPEN_TAG
+# else
+#  define HGB_ZEND_COMPILE_POSITION ZEND_COMPILE_POSITION_AT_SHEBANG
+# endif
+#endif
+
+int LLVMFuzzerInitialize(int *argc, char ***argv);
+int LLVMFuzzerInitialize(int *argc, char ***argv) {
+  (void)argc;
+  (void)argv;
+  putenv("USE_TRACKED_ALLOC=1");
+  fuzzer_init_php(NULL);
+  return 0;
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (data == NULL && size != 0) return 0;
   if (size > 1024 * 1024) return 0;
   zend_string *code = zend_string_init((const char *)data, size, 0);
   if (code == NULL) return 0;
-  zend_op_array *op_array = zend_compile_string(code, \"hgb_fuzz_input\");
+  zend_op_array *op_array = zend_compile_string(code, "hgb_fuzz_input", HGB_ZEND_COMPILE_POSITION);
   if (op_array != NULL) {
     destroy_op_array(op_array);
     efree_size(op_array, sizeof(zend_op_array));
@@ -243,7 +265,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   return 0;
 }
 """
-
 
 
 CURL_MULTI_RESCUE = """#include <stdint.h>
@@ -453,8 +474,22 @@ OPENSSL_X509_RESCUE = """#include <stdint.h>
 #include <openssl/crypto.h>
 #include <openssl/x509.h>
 
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
+int FuzzerInitialize(int *argc, char ***argv);
+int FuzzerTestOneInput(const uint8_t *data, size_t size);
+void FuzzerCleanup(void);
+
+int FuzzerInitialize(int *argc, char ***argv) {
+  (void)argc;
+  (void)argv;
+#if defined(OPENSSL_INIT_LOAD_CRYPTO_STRINGS)
+  OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+#endif
+  ERR_clear_error();
+  return 1;
+}
+
+int FuzzerTestOneInput(const uint8_t *data, size_t size) {
+  if (data == NULL && size != 0) return 0;
   ERR_clear_error();
   BIO *bio = BIO_new(BIO_s_mem());
   const unsigned char *cursor = data;
@@ -468,6 +503,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   if (bio != NULL) BIO_free(bio);
   ERR_clear_error();
   return 0;
+}
+
+void FuzzerCleanup(void) {
+  ERR_clear_error();
 }
 """
 
@@ -613,17 +652,50 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 """
 
 
-SYSTEMD_LOG_LEVEL_RESCUE = """#include <stdint.h>
+SYSTEMD_LINK_PARSER_RESCUE = """#include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
 #include <syslog.h>
+#include <unistd.h>
 
+#include "link-config.h"
 #include "log.h"
+
+static void hgb_write_all(int fd, const void *data, size_t size) {
+  const uint8_t *p = (const uint8_t *)data;
+  while (size > 0) {
+    ssize_t n = write(fd, p, size);
+    if (n <= 0) return;
+    p += (size_t)n;
+    size -= (size_t)n;
+  }
+}
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-  (void)data;
-  (void)size;
+  if (data == NULL && size != 0) return 0;
   log_set_max_level(LOG_CRIT);
+  LinkConfigContext *ctx = NULL;
+  if (link_config_ctx_new(&ctx) < 0 || ctx == NULL) return 0;
+
+  char path[] = "/tmp/hgb-link-parser-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd >= 0) {
+    static const char prefix[] =
+        "[Match]\\n"
+        "OriginalName=*\\n"
+        "[Link]\\n";
+    hgb_write_all(fd, prefix, sizeof(prefix) - 1);
+    hgb_write_all(fd, data, size > 4096 ? 4096 : size);
+    static const char suffix[] = "\\n";
+    hgb_write_all(fd, suffix, sizeof(suffix) - 1);
+    close(fd);
+    (void)link_load_one(ctx, path);
+    unlink(path);
+  }
+
+  link_config_ctx_free(ctx);
   return 0;
 }
 """
@@ -664,10 +736,10 @@ RESCUE_SPECS: dict[tuple[str, str], dict[str, str]] = {
         "reason": "replace zero-candidate OpenH264 runs with a direct WelsCreateDecoder/WelsDestroyDecoder harness",
     },
     ("systemd", "fuzz-link-parser"): {
-        "filename": "000_hgb_systemd_log_level_rescue.c",
-        "source": SYSTEMD_LOG_LEVEL_RESCUE,
+        "filename": "000_hgb_systemd_link_parser_rescue.c",
+        "source": SYSTEMD_LINK_PARSER_RESCUE,
         "mode": "replace",
-        "reason": "replace generated systemd link-parser candidates with a strict-C log_set_max_level harness",
+        "reason": "replace generated systemd link-parser candidates with a bounded link_config_ctx_new/link_load_one parser harness",
     },
     ("zlib", "zlib_uncompress_fuzzer"): {
         "filename": "000_hgb_zlib_uncompress_rescue.cc",

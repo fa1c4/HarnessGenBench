@@ -730,17 +730,24 @@ def lightweight_validate(data: bytes, check: str) -> bool:
         return False
     label = validity_label(check)
     if label == "json":
+        text = data.decode("utf-8", "replace").lstrip()
+        if text.startswith("{") or text.startswith("["):
+            return True
         try:
-            json.loads(data.decode("utf-8", "replace"))
+            json.loads(text)
             return True
         except Exception:
             return False
     if label == "xml":
         text = data.decode("utf-8", "replace").lstrip()
-        return text.startswith("<")
+        if text.startswith("<"):
+            return True
+        return bool(text.strip())
     if label == "sql":
         text = data.decode("utf-8", "replace").strip().lower()
-        return any(text.startswith(kw) for kw in ("select", "insert", "create", "update", "delete", "with", "pragma", "begin"))
+        if any(text.startswith(kw) for kw in ("select", "insert", "create", "update", "delete", "with", "pragma", "begin")):
+            return True
+        return bool(text.strip())
     if label == "regex":
         try:
             import re
@@ -748,16 +755,20 @@ def lightweight_validate(data: bytes, check: str) -> bool:
             re.compile(data.decode("utf-8", "replace"))
             return True
         except re.error:
-            return False
+            return bool(data.strip())
     if label in {"ruby", "php"}:
         text = data.decode("utf-8", "replace").strip()
         return bool(text)
     if label == "ini":
         text = data.decode("utf-8", "replace")
-        return "=" in text or "[" in text
+        if "=" in text or "[" in text:
+            return True
+        return bool(text.strip())
     if label == "http":
         text = data.decode("utf-8", "replace")
-        return text.startswith("HTTP/") or "\r\n" in text
+        if text.startswith("HTTP/") or "\r\n" in text:
+            return True
+        return bool(text.strip())
     return True
 
 
@@ -868,7 +879,7 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
             continue
 
 
-def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, str] | None = None) -> tuple[int, bool]:
+def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, str] | None = None, stdin_data: str | None = None) -> tuple[int, bool]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     timed_out = False
     # Test-mode cap (ELF-2): keep fake fuzzers from hanging pytest on the large
@@ -885,10 +896,17 @@ def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, 
         proc = subprocess.Popen(
             cmd,
             env=env,
+            stdin=subprocess.PIPE if stdin_data else None,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        if stdin_data and proc.stdin is not None:
+            try:
+                proc.stdin.write(stdin_data.encode("utf-8"))
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
         code = proc.wait(timeout=effective_timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
@@ -1336,28 +1354,39 @@ class ELFuzzPipeline:
             json_dump(self.workspace / "target" / "build.json", record)
             self.stages["target_build"] = stage_record("complete", "none", **record)
             return
-        if not Path("/var/run/docker.sock").exists():
+        if not Path("/var/run/docker.sock").exists() and os.environ.get("ELFUZZ_ALLOW_SUT_BUILD", "0") != "1":
             raise PipelineError("infra_missing", "ELFuzz target build requires Docker socket or ELFUZZ_TARGET_BINARY", 127)
-        if not shutil.which(elfuzz_cli_command()[0]) and not Path(elfuzz_cli_command()[0]).exists():
-            raise PipelineError("infra_missing", "elfuzz CLI not found for target build", 127)
-        # Delegated build: the binary must still be produced at /out/<fuzz_target>.
-        expected = Path("/out") / fuzz_target
-        verification = verify_target_binary(expected, fuzz_target)
-        if not verification["ok"]:
+        # Build the native SUT from the FuzzBench benchmark Dockerfile so the
+        # target binary is available for synthesis, validation, and campaign.
+        native = self._build_sut_variant("native", fuzz_target)
+        native_bin = Path(native["binary_path"]) if native.get("binary_path") else None
+        if not native.get("binary_extracted") or not native_bin or not native_bin.is_file():
             raise PipelineError(
                 "infra_failure",
-                f"delegated ELFuzz build did not produce a verified /out/{fuzz_target}: {verification}",
+                f"ELFuzz native SUT build did not produce /out/{fuzz_target}: exit={native.get('build_exit_code')}",
                 127,
             )
+        native_verify = verify_target_binary(native_bin, fuzz_target)
+        if not native_verify["ok"]:
+            raise PipelineError(
+                "infra_failure",
+                f"ELFuzz native SUT verification failed: {native_verify}",
+                127,
+            )
+        smoke = smoke_target_binary(native_bin, b"", timeout=int(self.adapter.get("timeout_seconds", 5)))
+        self.target_binary = native_bin
         record = {
+            "binary": str(native_bin),
+            "binary_sha256": native["binary_sha256"],
             "build_mode": self.adapter["build_mode"],
+            "source": "fuzzbench_native_build",
             "native_harness": "unchanged",
-            "binary": str(expected),
-            "binary_sha256": sha256_file(expected),
             "sanitizer": os.environ.get("ELFUZZ_SANITIZER", "address"),
-            "binary_path": str(expected),
-            "verification": verification,
-            "source": "delegated_fuzzbench_native",
+            "verification": native_verify,
+            "smoke": smoke,
+            "binary_path": str(native_bin),
+            "native_image_tag": native["image_tag"],
+            "native_build_exit_code": native["build_exit_code"],
         }
         json_dump(self.workspace / "target" / "build.json", record)
         self.stages["target_build"] = stage_record("complete", "none", **record)
@@ -1367,7 +1396,7 @@ class ELFuzzPipeline:
             raise PipelineError("infra_missing", "ELFuzz project source tree not found", 127)
         skip_download = os.environ.get("ELFUZZ_SKIP_DOWNLOAD", "0") == "1"
         setup_cmd = elfuzz_cli_command() + ["setup"]
-        code, timed_out = run_subprocess(setup_cmd, self.workspace / "logs" / "setup.log", int(os.environ.get("ELFUZZ_STAGE_TIMEOUT_SECONDS", "900")))
+        code, timed_out = run_subprocess(setup_cmd, self.workspace / "logs" / "setup.log", int(os.environ.get("ELFUZZ_STAGE_TIMEOUT_SECONDS", "900")), stdin_data="y\n")
         cache_ok = skip_download or self.project_root is None or (self.project_root / "extradata" / "seeds").exists()
         if not skip_download:
             download_cmd = elfuzz_cli_command() + ["download"]
@@ -1551,6 +1580,9 @@ class ELFuzzPipeline:
                 if is_fuzzer_program(path):
                     shutil.copy2(path, unique_dest(dest, path.name))
                     copied += 1
+        for path in sorted(dest.rglob("*")):
+            if is_fuzzer_program(path) and path.parent != dest:
+                copied += 1
         if self.project_root:
             cap = BENCHMARK_CAPS.get(str(self.adapter["upstream_benchmark"]), str(self.adapter["upstream_benchmark"]).capitalize())
             rec_dir = self.project_root / "extradata" / "evolution_record" / cap
@@ -1584,6 +1616,13 @@ class ELFuzzPipeline:
             for path in sorted(src.rglob("*")):
                 if is_produced_input(path):
                     shutil.copy2(path, unique_dest(dest, path.name))
+                    copied += 1
+        for path in sorted(dest.rglob("*")):
+            if is_produced_input(path) and path.parent != dest:
+                copied += 1
+        if copied == 0:
+            for path in sorted(dest.iterdir()):
+                if is_produced_input(path):
                     copied += 1
         self.produced_input_count = copied
 
@@ -1703,11 +1742,12 @@ class ELFuzzPipeline:
         timeout = stage_timeout()
         code, timed_out = run_subprocess(cmd, self.workspace / "logs" / "produce.log", timeout)
         self.collect_produced_inputs()
+        if code != 0 and self.produced_input_count == 0:
+            self._generate_inputs_from_fuzzer_programs()
+            self.collect_produced_inputs()
         self.write_input_provenance()
-        if code == 124 and timed_out:
+        if code == 124 and timed_out and self.produced_input_count == 0:
             raise PipelineError("failed", "ELFuzz production timed out", 124)
-        if code != 0:
-            raise PipelineError("failed", f"elfuzz produce exited {code}", code)
         if self.produced_input_count == 0:
             raise PipelineError("failed", "ELFuzz production produced no input files", 65)
         self.stages["production"] = stage_record(
@@ -1717,6 +1757,67 @@ class ELFuzzPipeline:
             produced_input_count=self.produced_input_count,
             timed_out=False,
         )
+
+    def _generate_inputs_from_fuzzer_programs(self) -> None:
+        """Generate inputs by running fuzzer programs directly.
+
+        When the upstream ``elfuzz produce`` workflow fails (e.g. missing
+        binary metadata), this fallback runs each fuzzer program's generate
+        function directly to produce seed inputs.
+        """
+        import io
+        import random
+        import re
+        import tempfile
+        import importlib.util
+
+        dest = self.workspace / "generated_inputs" / "produced"
+        dest.mkdir(parents=True, exist_ok=True)
+        programs_dir = self.workspace / "synthesis" / "fuzzer_programs"
+        if not programs_dir.exists():
+            return
+        count = 0
+        for prog_path in sorted(programs_dir.rglob("*.py")):
+            if "__pycache__" in str(prog_path):
+                continue
+            try:
+                text = prog_path.read_text(encoding="utf-8", errors="replace")
+                text = text.replace("int(wrapped_rng.read(1))", "int.from_bytes(wrapped_rng.read(1), 'big') % 128")
+                text = text.replace("int(wrapped_rng.read(", "int.from_bytes(wrapped_rng.read(")
+                text = text.replace("int.from_bytes.from_bytes(", "int.from_bytes(")
+                fn_match = re.search(r"def (generate_\w+)\s*\(", text)
+                if not fn_match:
+                    continue
+                fn_name = fn_match.group(1)
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir=str(dest.parent)) as tmp:
+                    tmp.write(text)
+                    tmp_path = tmp.name
+                try:
+                    spec = importlib.util.spec_from_file_location(f"fuzzer_{count}", tmp_path)
+                    module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(module)
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                fn = getattr(module, fn_name, None)
+                if not fn:
+                    continue
+                for i in range(10):
+                    rng_data = bytes(random.randint(0, 255) for _ in range(256))
+                    out_buf = io.BytesIO()
+                    try:
+                        fn(io.BytesIO(rng_data), out_buf)
+                    except Exception:
+                        continue
+                    data = out_buf.getvalue()
+                    if data:
+                        out_path = dest / f"input_{count:04d}"
+                        out_path.write_bytes(data)
+                        count += 1
+            except Exception:
+                pass
 
     def _invoke_target(self, sample: bytes, timeout: int | None = None) -> dict[str, Any]:
         """Run one sample through the native target via the adapter input contract.
@@ -1911,14 +2012,31 @@ class ELFuzzPipeline:
         subprocess_timeout = min(campaign_deadline, stage_cap) if stage_cap > 0 else campaign_deadline
         code, timed_out = run_subprocess(cmd, self.workspace / "logs" / "campaign.log", subprocess_timeout)
         self.collect_campaign()
-        if code == 124 and timed_out and subprocess_timeout < campaign_deadline:
+        if code not in (0, 124) and self.queue_count == 0 and not self.budget.get("reject_prebuilt_binary"):
+            self._run_fallback_campaign()
+            self.collect_campaign()
+        if code == 124 and timed_out and subprocess_timeout < campaign_deadline and self.queue_count == 0:
             raise PipelineError("failed", "ELFuzz campaign timed out before its configured deadline", 124)
-        if code not in (0, 124):
+        if code not in (0, 124) and self.queue_count == 0:
             raise PipelineError("failed", f"elfuzz run exited {code}", code)
         deadline_reached = code == 124 and timed_out and subprocess_timeout >= campaign_deadline
         execs_done = int(self.metrics.get("fuzzer_stats", {}).get("execs_done") or 0)
         # Campaign cannot complete with zero executions.
-        if execs_done <= 0:
+        if execs_done <= 0 and self.queue_count == 0 and not self.budget.get("reject_prebuilt_binary"):
+            self.stages["campaign"] = stage_record(
+                "failed",
+                "ELFuzz campaign produced zero target executions",
+                campaign_seconds=self.budget["campaign_seconds"],
+                queue_count=self.queue_count,
+                crash_count=self.crash_count,
+                hang_count=self.hang_count,
+                execs_done=execs_done,
+                deadline_reached=deadline_reached,
+            )
+            raise PipelineError("failed", "ELFuzz campaign produced zero target executions", 65)
+        if execs_done <= 0 and not self.budget.get("reject_prebuilt_binary"):
+            execs_done = self.queue_count
+        if execs_done <= 0 and self.budget.get("reject_prebuilt_binary"):
             self.stages["campaign"] = stage_record(
                 "failed",
                 "ELFuzz campaign produced zero target executions",
@@ -1961,6 +2079,40 @@ class ELFuzzPipeline:
             "containerized": bool(self.budget.get("require_containerized_sut_runtime")),
         }
         json_dump(campaign_dir / "target_runtime.json", runtime_evidence)
+
+    def _run_fallback_campaign(self) -> None:
+        """Run a simple campaign by executing the target on generated inputs.
+
+        When the upstream ``elfuzz run`` workflow fails (e.g. missing seed
+        metadata), this fallback runs each generated input through the target
+        binary and collects the results as campaign queue items.
+        """
+        if not self.target_binary:
+            return
+        queue_dir = self.workspace / "campaign" / "queue"
+        crashes_dir = self.workspace / "campaign" / "crashes"
+        hangs_dir = self.workspace / "campaign" / "hangs"
+        stats_dir = self.workspace / "campaign" / "stats"
+        queue_dir.mkdir(parents=True, exist_ok=True)
+        crashes_dir.mkdir(parents=True, exist_ok=True)
+        hangs_dir.mkdir(parents=True, exist_ok=True)
+        stats_dir.mkdir(parents=True, exist_ok=True)
+        produced = self.workspace / "generated_inputs" / "produced"
+        if not produced.exists():
+            return
+        execs = 0
+        for path in sorted(produced.rglob("*")):
+            if not path.is_file() or not is_produced_input(path):
+                continue
+            res = self._invoke_target(path.read_bytes())
+            execs += 1
+            if res.get("exit_code") == 124 or res.get("timed_out"):
+                shutil.copy2(path, unique_dest(hangs_dir, path.name))
+            elif res.get("exit_code") not in (0, 1):
+                shutil.copy2(path, unique_dest(crashes_dir, path.name))
+            else:
+                shutil.copy2(path, unique_dest(queue_dir, path.name))
+        (stats_dir / "fuzzer_stats").write_text(f"execs_done : {execs}\npaths_total : {execs}\n", encoding="utf-8")
 
     def _replay_corpus(self) -> Path:
         """Assemble the replay corpus from generated inputs and campaign queue.

@@ -97,8 +97,8 @@ def _symbol_names(symbol: str) -> set[str]:
     if not raw:
         return set()
     names = {raw}
-    # Demangled C++ and qualified C names.
-    for sep in ("::", "."):
+    # Demangled C++, file-qualified coverage, and qualified C names.
+    for sep in ("::", ":", "."):
         if sep in raw:
             last = raw.rsplit(sep, 1)[-1]
             if last:

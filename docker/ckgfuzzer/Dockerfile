@@ -71,7 +71,9 @@ RUN mkdir -p /opt/hgb/build-markers \
   && touch /opt/hgb/build-markers/ckgfuzzer_all_valuable_rescues_v1 \
   && touch /opt/hgb/build-markers/ckgfuzzer_zero_candidate_rescue_override_v1 \
   && touch /opt/hgb/build-markers/ckgfuzzer_function_like_api_plan_filter_v1 \
-  && touch /opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1
+  && touch /opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1 \
+  && touch /opt/hgb/build-markers/ckgfuzzer_remaining_targets_fix_theta_v1 \
+  && touch /opt/hgb/build-markers/ckgfuzzer_blind_project_name_only_report_apis_v1
 # Self-test: verify profile module, upstream CLI availability, and candidate checker.
 RUN /opt/hgb/venv/bin/python -c "import sys; sys.path.insert(0, '/opt/hgb/bin'); import ckgfuzzer_profile; print('ckgfuzzer_profile OK')" \
   && test -f /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/repo/repo.py \

@@ -663,8 +663,17 @@ EOF_CKG_USAGE
     if [[ -n "${HGB_API_REPORT_MODE:-}" ]]; then
       ckg_api_extract_args+=(--report-mode "$HGB_API_REPORT_MODE")
     fi
-    ckg_api_extract_args+=(--allow-name-only-report-apis)
   fi
+  # Allow name-only report APIs in every protocol (including blind-project):
+  # the fuzzbench_selected_harness_apis.json report lists real project APIs the
+  # reference harness exercises.  CodeQL's call-graph extraction can miss APIs
+  # declared in headers/shared libraries (e.g. systemd link_config_ctx_new), so
+  # without name-only fallback the only selected intended API may be a shared-
+  # library symbol (e.g. log_set_max_level) that never appears in the per-target
+  # source-based coverage report, making API reachability unprovable.  The report
+  # is metadata (candidate API names only), not reference harness source, so this
+  # does not leak the evaluator-only reference harness to the blind generator.
+  ckg_api_extract_args+=(--allow-name-only-report-apis)
   api_count="$(python3 /opt/hgb/bin/extract_api_list.py \
     "${ckg_api_extract_args[@]}" \
     2>"$workspace/logs/api_extract.log" || printf '0')"

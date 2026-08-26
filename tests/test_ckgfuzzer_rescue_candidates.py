@@ -62,7 +62,8 @@ def test_all_rescue_specs_install_source_candidates(tmp_path: Path) -> None:
         assert result["removed_candidates"] == 1
         assert rescue_path.is_file()
         assert not old.exists()
-        assert "LLVMFuzzerTestOneInput" in rescue_path.read_text(encoding="utf-8")
+        source = rescue_path.read_text(encoding="utf-8")
+        assert "LLVMFuzzerTestOneInput" in source or "FuzzerTestOneInput" in source
 
 
 def test_additional_rescue_targets_replace_bad_generated_candidates(tmp_path: Path) -> None:
@@ -75,7 +76,7 @@ def test_additional_rescue_targets_replace_bad_generated_candidates(tmp_path: Pa
         ("freetype2", "ftfuzzer", "000_hgb_freetype2_face_rescue.cc", ["FT_New_Memory_Face", "FT_Load_Glyph"]),
         ("harfbuzz", "hb-shape-fuzzer", "000_hgb_harfbuzz_shape_rescue.cc", ["hb_shape", "hb_buffer_flags_t", "size >= sizeof(codepoints)"]),
         ("openh264", "decoder_fuzzer", "000_hgb_openh264_decoder_rescue.cc", ["WelsCreateDecoder", "WelsDestroyDecoder"]),
-        ("systemd", "fuzz-link-parser", "000_hgb_systemd_log_level_rescue.c", ["log_set_max_level", "LLVMFuzzerTestOneInput"]),
+        ("systemd", "fuzz-link-parser", "000_hgb_systemd_link_parser_rescue.c", ["link_config_ctx_new", "link_load_one", "log_set_max_level"]),
         ("zlib", "zlib_uncompress_fuzzer", "000_hgb_zlib_uncompress_rescue.cc", ["uncompress", "LLVMFuzzerTestOneInput"]),
         ("libpcap", "fuzz_both", "000_hgb_libpcap_offline_rescue.c", ["fuzz_openFile", "pcap_open_offline"]),
     ]
@@ -102,6 +103,52 @@ def test_additional_rescue_targets_replace_bad_generated_candidates(tmp_path: Pa
         assert "LLVMFuzzerTestOneInput" in text
         for needle in needles:
             assert needle in text
+
+
+def test_openssl_x509_rescue_exports_openssl_fuzzer_abi_without_duplicate_libfuzzer_entrypoint() -> None:
+    source = rescue.RESCUE_SPECS[("openssl", "x509")]["source"]
+
+    for symbol in (
+        "int FuzzerInitialize(int *argc, char ***argv)",
+        "int FuzzerTestOneInput(const uint8_t *data, size_t size)",
+        "void FuzzerCleanup(void)",
+    ):
+        assert symbol in source
+
+    assert "int LLVMFuzzerTestOneInput" not in source
+    assert "return FuzzerTestOneInput(data, size);" not in source
+    for api in ("d2i_X509", "X509_print", "X509_free", "BIO_new", "BIO_free", "ERR_clear_error"):
+        assert api in source
+
+
+def test_php_parser_rescue_uses_target_revision_three_arg_zend_compile() -> None:
+    source = rescue.RESCUE_SPECS[("php", "php-fuzz-parser")]["source"]
+
+    assert "HGB_ZEND_COMPILE_POSITION" in source
+    assert "ZEND_COMPILE_POSITION_AT_OPEN_TAG" in source
+    assert 'zend_compile_string(code, "hgb_fuzz_input", HGB_ZEND_COMPILE_POSITION)' in source
+    assert 'zend_compile_string(code, "hgb_fuzz_input");' not in source
+    assert "LLVMFuzzerInitialize" in source
+    assert "fuzzer_init_php(NULL)" in source
+    for api in ("zend_string_init", "destroy_op_array", "zend_string_release"):
+        assert api in source
+
+
+def test_systemd_rescue_uses_real_link_parser_api() -> None:
+    spec = rescue.RESCUE_SPECS[("systemd", "fuzz-link-parser")]
+    source = spec["source"]
+
+    assert spec["filename"] == "000_hgb_systemd_link_parser_rescue.c"
+    assert "log_set_max_level" in source
+    assert "link_config_ctx_new" in source
+    assert "link_load_one" in source
+    assert "link_config_ctx_free" in source
+    assert "mkstemp" in source
+    assert "[Match]\\n" in source
+    assert "OriginalName=*\\n" in source
+    assert "[Link]\\n" in source
+    assert "weak fallback" not in spec["reason"]
+    assert "link_load_one" in spec["reason"]
 
 
 def test_non_rescue_target_leaves_candidates_unchanged(tmp_path: Path) -> None:

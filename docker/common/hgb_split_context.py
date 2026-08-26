@@ -38,6 +38,7 @@ from typing import Any
 # context stays consistent with the monolithic verifier path.
 from ckgfuzzer_verifier_context import (  # noqa: E402
     VerificationContextError,
+    SEALED_ENV_DEFAULTS,
     _assert_reproducible_sources,
     _copy_reference_harnesses,
     _patch_legacy_build_tool_bootstrap,
@@ -275,6 +276,7 @@ def create_sealed_build_context(
         "excluded_synthetic_build_script": excluded_synthetic_build,
         "captured_unpinned_source_count": captured_unpinned,
         "build_tool_fallbacks": build_tool_fallbacks,
+        "sealed_env_defaults": dict(SEALED_ENV_DEFAULTS),
         "generator_root": str(context.generator_root),
         "evaluator_root": str(context.evaluator_root),
         "reference_restore_audit": restore_audit,

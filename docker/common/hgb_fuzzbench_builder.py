@@ -27,6 +27,7 @@ Runner = Callable[[Sequence[str], int], "CommandResult"]
 # if this marker appears in the captured logs AND the required ``docker cp``
 # input copy succeeded (zeta plan §2).
 HGB_TARGET_START_MARKER = "HGB_TARGET_START"
+SEALED_ENV_DEFAULTS: dict[str, str] = {"MERGE_WITH_OSS_FUZZ_CORPORA": "0"}
 
 
 @dataclass
@@ -81,7 +82,7 @@ def deterministic_image_tag(
     cand = safe_token(candidate_id or "cand")[:24]
     gen = safe_token(generator or "ckgfuzzer")[:24]
     digest = hashlib.sha256(f"{generator}|{run_id}|{target}|{candidate_id}".encode()).hexdigest()[:8]
-    return f"hgb-{gen}-{run}-{tgt}-{cand}-{digest}"
+    return f"hgb-{gen}-{run}-{tgt}-{cand}-{digest}".lower()
 
 
 @dataclass
@@ -97,6 +98,7 @@ class BuildResult:
     engine: str
     binary_verified: bool = False
     overlay_audit: dict = None
+    sealed_env_defaults: dict = None
 
 
 def _run_phase(runner: Runner, command: Sequence[str], timeout_seconds: int, phase: str) -> CommandResult:
@@ -252,6 +254,85 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
         if rewritten != text:
             makefile.write_text(rewritten, encoding="utf-8")
 
+    # Fix "zip error: Nothing to do!" for targets with empty seed corpus dirs
+    for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+        if not build_sh.is_file():
+            continue
+        text = build_sh.read_text(encoding="utf-8", errors="replace")
+        if "zip -j" in text and "_seed_corpus.zip" in text:
+            text = re.sub(
+                r"(zip -j (\$OUT/\S+_seed_corpus\.zip) (\S+/\*/\S*))",
+                r"mkdir -p \3 && touch \3/.empty && \1 \3/.empty 2>/dev/null || true",
+                text,
+            )
+            build_sh.write_text(text, encoding="utf-8")
+        if "zip -rq" in text and "_seed_corpus" in text:
+            text = text.replace(
+                "zip -rq $OUT/mruby_fuzzer_seed_corpus $SRC/mruby_seeds",
+                "mkdir -p $SRC/mruby_seeds && touch $SRC/mruby_seeds/.empty && zip -rq $OUT/mruby_fuzzer_seed_corpus $SRC/mruby_seeds 2>/dev/null || true",
+            )
+            build_sh.write_text(text, encoding="utf-8")
+
+    # Fix PHP unrecognized --enable-opcache option and libtool --with-pic
+    if fuzz_target.startswith("php-fuzz"):
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            text = text.replace("--enable-opcache", "")
+            text = text.replace("--enable-option-checking=fatal", "--enable-option-checking=no")
+            text = text.replace("--with-pic", "")
+            build_sh.write_text(text, encoding="utf-8")
+
+    # Fix curl: checkout specific commit and install autotools
+    if fuzz_target.startswith("curl_fuzzer"):
+        dockerfile = context_dir / "Dockerfile"
+        if dockerfile.is_file():
+            text = dockerfile.read_text(encoding="utf-8", errors="replace")
+            if "git clone --depth 1 https://github.com/curl/curl.git" in text:
+                text = text.replace(
+                    "RUN git clone --depth 1 https://github.com/curl/curl.git /src/curl",
+                    "RUN git clone https://github.com/curl/curl.git /src/curl && cd /src/curl && git checkout a20f74a16ae1e89be170eeaa6059b37e513392a4",
+                )
+            if "autoconf" not in text:
+                text = text.replace(
+                    "RUN $SRC/curl_fuzzer/scripts/ossfuzzdeps.sh",
+                    "RUN apt-get update && apt-get install -y autoconf automake libtool pkg-config\nRUN $SRC/curl_fuzzer/scripts/ossfuzzdeps.sh",
+                )
+            dockerfile.write_text(text, encoding="utf-8")
+        # Fix SSL download failures by skipping external dependency downloads
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            text = text.replace("./ossfuzz.sh", "./ossfuzz.sh || (echo '[HGB] ossfuzz.sh failed, trying minimal build'; FUZZ_TARGETS=" + fuzz_target + " make -C /src/curl_fuzzer " + fuzz_target + " || true)")
+            build_sh.write_text(text, encoding="utf-8")
+
+    # Fix re2: use older version that doesn't need abseil
+    if fuzz_target == "fuzzer" and (context_dir / "re2").is_dir():
+        dockerfile = context_dir / "Dockerfile"
+        if dockerfile.is_file():
+            text = dockerfile.read_text(encoding="utf-8", errors="replace")
+            if "abseil" not in text:
+                text = text.replace(
+                    "RUN git clone https://github.com/google/re2.git",
+                    "RUN git clone --depth 1 --branch 20230301 https://github.com/google/re2.git",
+                )
+                dockerfile.write_text(text, encoding="utf-8")
+
+    # Fix mruby: run rake with proper environment to generate presym headers
+    if fuzz_target == "mruby_fuzzer" and (context_dir / "mruby").is_dir():
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            if "rake -m || true" in text:
+                text = text.replace(
+                    "rake -m || true",
+                    "rake -m 2>/dev/null || (ruby ./minirake 2>/dev/null || true)",
+                )
+            build_sh.write_text(text, encoding="utf-8")
+
 
 def _sealed_compile_block() -> str:
     """Return the final evaluator compile block appended to sealed Dockerfiles."""
@@ -272,9 +353,11 @@ def _sealed_compile_block() -> str:
         "ENV SANITIZER=${HGB_SANITIZER}\n"
         "ENV ARCHITECTURE=${HGB_ARCHITECTURE}\n"
         "ENV FUZZING_LANGUAGE=${HGB_FUZZING_LANGUAGE}\n"
+        "ENV MERGE_WITH_OSS_FUZZ_CORPORA=0\n"
         "RUN if [ \"$HGB_FUZZING_ENGINE\" = \"libfuzzer\" ]; then "
         "export FUZZER_LIB=\"${FUZZER_LIB:--fsanitize=fuzzer}\"; "
         "else export FUZZER_LIB=\"${FUZZER_LIB:-${LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a}}\"; fi; "
+        "MERGE_WITH_OSS_FUZZ_CORPORA=\"${MERGE_WITH_OSS_FUZZ_CORPORA:-0}\" "
         "FUZZING_ENGINE=\"$HGB_FUZZING_ENGINE\" SANITIZER=\"$HGB_SANITIZER\" "
         "ARCHITECTURE=\"$HGB_ARCHITECTURE\" FUZZING_LANGUAGE=\"$HGB_FUZZING_LANGUAGE\" compile\n"
     )
@@ -423,6 +506,7 @@ def build_candidate_image(
         engine=engine,
         binary_verified=binary_verified,
         overlay_audit=overlay_audit,
+        sealed_env_defaults=dict(SEALED_ENV_DEFAULTS),
     )
 
 
@@ -496,6 +580,7 @@ def build_coverage_image(
         engine="coverage",
         binary_verified=binary_verified,
         overlay_audit=None,
+        sealed_env_defaults=dict(SEALED_ENV_DEFAULTS),
     )
 
 
@@ -1272,6 +1357,43 @@ def _elfuzz_build_args(*, engine: str, sanitizer: str) -> list[str]:
     ]
 
 
+def _elfuzz_compile_block(*, engine: str, sanitizer: str) -> str:
+    """Return the compile block appended to ELFuzz SUT Dockerfiles.
+
+    FuzzBench benchmark Dockerfiles set up the source tree and copy
+    ``build.sh`` but do NOT run ``compile`` during ``docker build``.  The
+    ``compile`` script (provided by the base-builder image) reads
+    ``FUZZING_ENGINE``/``SANITIZER``/etc. and invokes ``build.sh`` to produce
+    ``/out/<fuzz_target>``.  Without this block the built image has no binary
+    and ``docker cp /out/<fuzz_target>`` fails.
+    """
+
+    return (
+        "# HGB ELFuzz SUT build.\n"
+        "ARG FUZZING_ENGINE=libfuzzer\n"
+        "ARG SANITIZER=address\n"
+        "ARG ARCHITECTURE=x86_64\n"
+        "ARG FUZZING_LANGUAGE=c++\n"
+        "ARG HGB_FUZZING_ENGINE=libfuzzer\n"
+        "ARG HGB_SANITIZER=address\n"
+        "ARG HGB_ARCHITECTURE=x86_64\n"
+        "ARG HGB_FUZZING_LANGUAGE=c++\n"
+        "ARG HGB_BUILD_VARIANT=default\n"
+        "RUN printf '%s\\n' \"$HGB_SANITIZER:$HGB_FUZZING_ENGINE:$HGB_BUILD_VARIANT\" > /tmp/hgb_build_variant\n"
+        "ENV FUZZING_ENGINE=${HGB_FUZZING_ENGINE}\n"
+        "ENV SANITIZER=${HGB_SANITIZER}\n"
+        "ENV ARCHITECTURE=${HGB_ARCHITECTURE}\n"
+        "ENV FUZZING_LANGUAGE=${HGB_FUZZING_LANGUAGE}\n"
+        "ENV MERGE_WITH_OSS_FUZZ_CORPORA=0\n"
+        "RUN if [ \"$HGB_FUZZING_ENGINE\" = \"libfuzzer\" ]; then "
+        "export FUZZER_LIB=\"${FUZZER_LIB:--fsanitize=fuzzer}\"; "
+        "else export FUZZER_LIB=\"${FUZZER_LIB:-${LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a}}\"; fi; "
+        "MERGE_WITH_OSS_FUZZ_CORPORA=\"${MERGE_WITH_OSS_FUZZ_CORPORA:-0}\" "
+        "FUZZING_ENGINE=\"$HGB_FUZZING_ENGINE\" SANITIZER=\"$HGB_SANITIZER\" "
+        "ARCHITECTURE=\"$HGB_ARCHITECTURE\" FUZZING_LANGUAGE=\"$HGB_FUZZING_LANGUAGE\" compile\n"
+    )
+
+
 def build_elfuzz_sut(
     *,
     benchmark_dir: Path,
@@ -1296,13 +1418,28 @@ def build_elfuzz_sut(
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     (work_dir / "out").mkdir(parents=True, exist_ok=True)
-    dockerfile = Path(benchmark_dir) / "Dockerfile"
+    # The benchmark dir may be mounted read-only (e.g. /target/fuzzbench_benchmark
+    # in the ELFuzz container).  Copy it to a writable context so we can append
+    # the ``RUN compile`` block that FuzzBench Dockerfiles omit.
+    import shutil
+
+    context_dir = work_dir / "context"
+    if context_dir.exists():
+        shutil.rmtree(context_dir)
+    shutil.copytree(benchmark_dir, context_dir)
+    _patch_single_target_build_context(context_dir, fuzz_target)
+    dockerfile = context_dir / "Dockerfile"
+    if dockerfile.is_file():
+        df_text = dockerfile.read_text(encoding="utf-8", errors="replace")
+        marker = "# HGB ELFuzz SUT build."
+        if marker not in df_text:
+            dockerfile.write_text(df_text.rstrip() + "\n" + _elfuzz_compile_block(engine=engine, sanitizer=sanitizer), encoding="utf-8")
     build_command = [
         "docker", "build",
         *_elfuzz_build_args(engine=engine, sanitizer=sanitizer),
         "--file", str(dockerfile),
         "--tag", image_tag,
-        str(benchmark_dir),
+        str(context_dir),
     ]
     build_result = _run_phase(runner, build_command, timeout_seconds, f"build elfuzz {engine} sut")
     _write_log(work_dir / "build.log", build_result)

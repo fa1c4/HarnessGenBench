@@ -465,6 +465,7 @@ def evaluate_candidate(
         "engine": build.engine,
         "log": build.log,
         "overlay_audit": build.overlay_audit or {},
+        "sealed_env_defaults": build.sealed_env_defaults or sealed_context.get("sealed_env_defaults", {}),
     }
     if build.build_exit_code != 0:
         hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
@@ -1082,6 +1083,7 @@ def evaluate(
         artifacts={
             "candidate_reports_dir": str(candidates_json_dir),
             "sealed_context_dir": str(work_dir / "sealed_context"),
+            "sealed_env_defaults": sealed_context.get("sealed_env_defaults", {}),
         },
         selected_candidate=selected or {},
     )

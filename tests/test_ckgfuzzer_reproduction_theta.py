@@ -560,6 +560,22 @@ def test_entrypoint_theta2_api_selection_alias_and_metadata() -> None:
     assert 'export OPENAI_MODEL="$ckg_resolved_chat"' in entrypoint
 
 
+def test_entrypoint_passes_allow_name_only_report_apis_in_blind_project() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    # The --allow-name-only-report-apis flag must be added outside the
+    # blind-project guard so report APIs missing from the CodeQL graph (e.g.
+    # systemd link_config_ctx_new) still become intended APIs for reachability.
+    guard_start = entrypoint.index('if [[ "$ckg_protocol" != "blind-project" ]]; then')
+    guard_end = entrypoint.index("fi", guard_start)
+    guard_block = entrypoint[guard_start:guard_end]
+    assert "--reference-dir" in guard_block
+    # The name-only flag must NOT be inside the blind-project guard.
+    assert "--allow-name-only-report-apis" not in guard_block
+    # It must appear after the guard so it applies to every protocol.
+    after_guard = entrypoint[guard_end:]
+    assert "--allow-name-only-report-apis" in after_guard
+
+
 def test_entrypoint_accepts_ustc_openai_compatible_embedding_runtime() -> None:
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
     assert "OpenAI-compatible embeddings" in entrypoint
@@ -661,6 +677,15 @@ def test_entrypoint_runs_rescue_candidates_before_candidate_count_gate() -> None
     assert 'source-derived rescue candidate fully evaluated; overriding upstream CKGFuzzer stage exit' in entrypoint
 
 
+def test_sealed_compile_block_defaults_systemd_optional_corpus_env() -> None:
+    builder = _load_module("hgb_fuzzbench_builder_theta", "docker/common/hgb_fuzzbench_builder.py")
+    block = builder._sealed_compile_block()
+
+    assert builder.SEALED_ENV_DEFAULTS == {"MERGE_WITH_OSS_FUZZ_CORPORA": "0"}
+    assert "ENV MERGE_WITH_OSS_FUZZ_CORPORA=0" in block
+    assert 'MERGE_WITH_OSS_FUZZ_CORPORA="${MERGE_WITH_OSS_FUZZ_CORPORA:-0}"' in block
+
+
 def test_ckgfuzzer_dockerfile_has_api_selection_marker() -> None:
     dockerfile = (REPO_ROOT / "docker/ckgfuzzer/Dockerfile").read_text(encoding="utf-8")
     assert "/opt/hgb/build-markers/ckgfuzzer_api_selection_ranked_v1" in dockerfile
@@ -691,6 +716,8 @@ def test_ckgfuzzer_dockerfile_has_api_selection_marker() -> None:
     assert "/opt/hgb/build-markers/ckgfuzzer_zero_candidate_rescue_override_v1" in dockerfile
     assert "/opt/hgb/build-markers/ckgfuzzer_function_like_api_plan_filter_v1" in dockerfile
     assert "/opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_remaining_targets_fix_theta_v1" in dockerfile
+    assert "/opt/hgb/build-markers/ckgfuzzer_blind_project_name_only_report_apis_v1" in dockerfile
     assert "docker/common/ckgfuzzer_rescue_candidates.py" in dockerfile
     matrix = (REPO_ROOT / "scripts/hgb_generate_matrix.sh").read_text(encoding="utf-8")
     single = (REPO_ROOT / "scripts/hgb_generate_harness.sh").read_text(encoding="utf-8")
@@ -728,6 +755,8 @@ def test_ckgfuzzer_dockerfile_has_api_selection_marker() -> None:
     assert "ckgfuzzer_zero_candidate_rescue_override_v1" in matrix
     assert "ckgfuzzer_all_valuable_rescues_v1" in matrix
     assert "ckgfuzzer_rescue_first_fast_path_v1" in matrix
+    assert "ckgfuzzer_remaining_targets_fix_theta_v1" in matrix
+    assert "ckgfuzzer_blind_project_name_only_report_apis_v1" in matrix
     assert "ckgfuzzer_evaluator_compile_coverage_seed_v1" in single
     assert "ckgfuzzer_codeql_cache_graph_counts_v1" in single
     assert "ckgfuzzer_bloaty_staged_project_rescue_v1" in single
@@ -750,6 +779,8 @@ def test_ckgfuzzer_dockerfile_has_api_selection_marker() -> None:
     assert "ckgfuzzer_zero_candidate_rescue_override_v1" in single
     assert "ckgfuzzer_all_valuable_rescues_v1" in single
     assert "ckgfuzzer_rescue_first_fast_path_v1" in single
+    assert "ckgfuzzer_remaining_targets_fix_theta_v1" in single
+    assert "ckgfuzzer_blind_project_name_only_report_apis_v1" in single
 
 
 def test_common_sh_passes_ustc_and_ckgfuzzer_selection_env_vars() -> None:
