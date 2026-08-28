@@ -21,9 +21,41 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 import urllib.request
 import urllib.error
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+
+def _post_upstream(url: str, key: str, oa_req: dict) -> tuple[dict, int]:
+    """POST to the upstream OpenAI-compatible API with one quick retry on
+    rate limits and transient server errors (429/5xx).
+
+    ELFuzz treats every failed /generate as a dead variant, so a bursty
+    upstream rate limiter silently destroys whole generations.  However the
+    upstream quota here is far below ELFuzz's request rate (50 generations x
+    200 variants), so aggressive backoff turns instant 429 failures into
+    minutes-long waits and blows the synthesis deadline.  A single fast retry
+    recovers transient hiccups while sustained rate limiting still fails
+    quickly, which keeps the evolutionary loop inside its time budget."""
+    max_attempts = int(os.environ.get("ELFUZZ_TGI_PROXY_RETRY_ATTEMPTS", "2"))
+    base_delay = float(os.environ.get("ELFUZZ_TGI_PROXY_RETRY_BASE_SECONDS", "0.5"))
+    cap_delay = float(os.environ.get("ELFUZZ_TGI_PROXY_RETRY_MAX_SECONDS", "1"))
+    retry_codes = {429, 500, 502, 503, 504}
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(url, data=json.dumps(oa_req).encode("utf-8"), method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", f"Bearer {key}")
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                return json.loads(resp.read()), int(resp.getcode())
+        except urllib.error.HTTPError as exc:
+            if exc.code in retry_codes and attempt < max_attempts - 1:
+                delay = min(cap_delay, base_delay * (2 ** attempt))
+                time.sleep(delay)
+                continue
+            raise
+    raise RuntimeError("unreachable")
 
 
 class TGIProxyHandler(BaseHTTPRequestHandler):
@@ -87,12 +119,8 @@ class TGIProxyHandler(BaseHTTPRequestHandler):
         if "stop" in params:
             oa_req["stop"] = params["stop"]
         url = f"{base}/v1/chat/completions"
-        req = urllib.request.Request(url, data=json.dumps(oa_req).encode("utf-8"), method="POST")
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Authorization", f"Bearer {key}")
         try:
-            with urllib.request.urlopen(req, timeout=300) as resp:
-                oa_resp = json.loads(resp.read())
+            oa_resp, _ = _post_upstream(url, key, oa_req)
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", "replace")[:2000]
             self._json(exc.code, {"error": err_body})

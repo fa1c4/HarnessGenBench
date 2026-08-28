@@ -162,7 +162,7 @@ PY_ELFUZZ_ALLGEN_PATCH
     mkdir -p /tmp/elfuzz-genout 2>/dev/null || true
     # Create preset directories for targets that don't have one
     local preset_dir
-    for preset_dir in systemd libxslt mruby php; do
+    for preset_dir in systemd libxslt mruby php curl; do
       if [[ ! -d "$ELFUZZ_PROJECT_ROOT/preset/$preset_dir" ]]; then
         mkdir -p "$ELFUZZ_PROJECT_ROOT/preset/$preset_dir"
         cp "$ELFUZZ_PROJECT_ROOT/preset/jsoncpp/seed_genjson.py" "$ELFUZZ_PROJECT_ROOT/preset/$preset_dir/seed_gen.py" 2>/dev/null || true

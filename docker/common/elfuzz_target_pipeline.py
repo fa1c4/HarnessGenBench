@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import stat
@@ -1662,7 +1663,89 @@ class ELFuzzPipeline:
         except Exception:
             pass
 
+    def prepare_elfuzz_preset(self) -> None:
+        """Ensure the ELFuzz preset dir has a working config.yaml and seed program.
+
+        Upstream ELFuzz ships preset configs only for its built-in benchmarks
+        (jsoncpp/libxml2/re2/sqlite3/...). Extension targets (systemd, curl,
+        libxslt, mruby, php) have no preset config, so ``elfuzz synth`` falls
+        back to broken defaults: no model, 10 generations, 1 variant per seed,
+        and the run dies with ``TypeError: 'NoneType' object is not
+        subscriptable`` in genvariants_parallel. Generate a config derived
+        from the jsoncpp template and install the adapter seed template as the
+        initial seed program.
+        """
+        if not self.project_root:
+            return
+        benchmark = str(self.adapter["upstream_benchmark"])
+        preset_dir = self.project_root / "preset" / benchmark
+        preset_dir.mkdir(parents=True, exist_ok=True)
+        cfg = preset_dir / "config.yaml"
+        if cfg.is_file():
+            # Upstream preset (jsoncpp/libxml2/re2/sqlite3/...): leave it as-is.
+            return
+        (preset_dir / "initial" / "seeds").mkdir(parents=True, exist_ok=True)
+        # Install the adapter seed template as the initial seed program. It
+        # must define generate_input(rng, output) for the genoutputs driver.
+        seed_src = None
+        repo = repo_root_from(self.metadata_root)
+        for candidate in (
+            repo / self.adapter["seed_template"],
+            Path("/opt/hgb") / self.adapter["seed_template"],
+        ):
+            if candidate.is_file():
+                seed_src = candidate
+                break
+        if seed_src is not None:
+            seed_text = seed_src.read_text(encoding="utf-8", errors="replace")
+            if "def generate_input(" not in seed_text:
+                seed_text += (
+                    "\n\ndef generate_input(rng, output):\n"
+                    "    output.write(produce())\n"
+                )
+            (preset_dir / "seed_gen.py").write_text(seed_text, encoding="utf-8")
+            # Mutators treat lines before start_line as immutable; protect the
+            # header (imports/def) so cuts only touch the function body.
+            start_line = 1
+            for index, line in enumerate(seed_text.splitlines()):
+                if line.startswith("def generate_input("):
+                    start_line = index + 2
+                    break
+        else:
+            start_line = 1
+        template_cfg = self.project_root / "preset" / "jsoncpp" / "config.yaml"
+        if not template_cfg.is_file():
+            return
+        text = template_cfg.read_text(encoding="utf-8", errors="replace")
+        manifest = self.target_manifest()
+        fuzz_target = manifest.get("fuzz_target", self.target)
+        cov_bin = str(self.coverage_binary or self.target_binary or f"/out/{fuzz_target}")
+        text = re.sub(r"(?m)^project_name: .*$", f"project_name: {benchmark}", text, count=1)
+        # The FuzzBench benchmark dir key is the full target name (e.g.
+        # systemd_fuzz-link-parser), not the bare fuzz_target binary name.
+        text = re.sub(r"(?m)^fuzzbench_project: .*$", f"fuzzbench_project: {self.target}", text, count=1)
+        text = re.sub(r"(?m)^  covbin: .*$", f"  covbin: {cov_bin}", text, count=1)
+        text = re.sub(
+            r"(?m)^  - /home/appuser/elmfuzz/preset/jsoncpp/seed_genjson\.py$",
+            f"  - /home/appuser/elmfuzz/preset/{benchmark}/seed_gen.py",
+            text,
+            count=1,
+        )
+        text = re.sub(r"(?m)^      function_name: generate_json$", "      function_name: generate_input", text, count=1)
+        text = re.sub(r"(?m)^      output_suffix: \.gif$", "      output_suffix: .dat", text, count=1)
+        text = re.sub(r"(?m)^    start_line: 56$", f"    start_line: {start_line}", text, count=1)
+        # Moderate variant-generation parallelism: the remote API is rate
+        # limited, and 64-way parallel generation just piles up 429s.
+        text = re.sub(r"(?m)^    jobs: 64$", "    jobs: 16", text)
+        text = text.replace("host.docker.internal:8192", "localhost:8192")
+        text = text.replace(
+            "genoutput_dir: '/home/appuser/fastdata/randompngs/{ELMFUZZ_RUN_NAME}/{GEN}/{MODEL}'",
+            "genoutput_dir: '/tmp/elfuzz-genout/{ELMFUZZ_RUN_NAME}/{GEN}/{MODEL}'",
+        )
+        cfg.write_text(text, encoding="utf-8")
+
     def synthesis(self) -> None:
+        self.prepare_elfuzz_preset()
         cmd = self.synth_command()
         (self.workspace / "synthesis" / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
         timeout = stage_timeout()

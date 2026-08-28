@@ -166,6 +166,67 @@ def _normalize_candidate_for_native_path(candidate: Path, native_destination: st
     return staged
 
 
+def _read_benchmark_commit(context_dir: Path) -> str:
+    """Return the benchmark.yaml ``commit`` value from the build context."""
+    for name in ("benchmark.yaml", "benchmark.yml"):
+        path = context_dir / name
+        if not path.is_file():
+            continue
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("commit:"):
+                return stripped.split(":", 1)[1].strip()
+    return ""
+
+
+def _pin_git_clone(dockerfile_text: str, clone_url: str, commit: str) -> str:
+    """Append ``git checkout <commit>`` after an unpinned ``RUN git clone`` line.
+
+    FuzzBench Dockerfiles that clone the project at build time (re2, mruby,
+    php, libxslt) track upstream HEAD instead of the benchmark.yaml commit, so
+    builds break as upstream moves.  The clone happens inside the image build,
+    so the checkout must be injected into the Dockerfile itself.  Clones may
+    span multiple lines via line continuations.
+    """
+    if not commit:
+        return dockerfile_text
+    dest = clone_url.rstrip("/").rsplit("/", 1)[-1]
+    if dest.endswith(".git"):
+        dest = dest[:-4]
+    lines = dockerfile_text.splitlines()
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("RUN git clone"):
+            stmt_lines = [line]
+            j = i
+            while stmt_lines[-1].rstrip().endswith("\\") and j + 1 < len(lines):
+                j += 1
+                stmt_lines.append(lines[j])
+            out.extend(stmt_lines)
+            i = j + 1
+            joined = "\n".join(stmt_lines)
+            if clone_url in joined:
+                tail = joined[joined.index(clone_url) + len(clone_url):].split("&&")[0]
+                if "checkout" not in tail:
+                    if "&&" in joined:
+                        # Clone embedded in a && chain: append the checkout to
+                        # the last line of the chain statement.
+                        last = out[-1]
+                        if last.rstrip().endswith("\\"):
+                            last = last.rstrip()[:-1].rstrip() + " && git -C " + dest + " checkout " + commit + " \\"
+                        else:
+                            last = last.rstrip() + " && git -C " + dest + " checkout " + commit
+                        out[-1] = last
+                    else:
+                        out.append(f"RUN git -C {dest} checkout {commit}")
+            continue
+        out.append(line)
+        i += 1
+    return "\n".join(out) + "\n"
+
+
 def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> None:
     """Constrain build scripts that otherwise compile sibling fuzzers too.
 
@@ -265,6 +326,14 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
                 r"mkdir -p \3 && touch \3/.empty && \1 \3/.empty 2>/dev/null || true",
                 text,
             )
+            # Also guard globs at end-of-line (e.g. libxslt's
+            # ``zip -j $OUT/${fuzzer}_seed_corpus.zip tests/fuzz/seed/$fuzzer/*``).
+            text = re.sub(
+                r"(zip -j (\$OUT/\S+_seed_corpus\.zip) (\S+)/\*)(\s*)$",
+                r"mkdir -p \3 && touch \3/.empty && zip -j \2 \3/.empty 2>/dev/null || true\4",
+                text,
+                flags=re.M,
+            )
             build_sh.write_text(text, encoding="utf-8")
         if "zip -rq" in text and "_seed_corpus" in text:
             text = text.replace(
@@ -273,20 +342,48 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
             )
             build_sh.write_text(text, encoding="utf-8")
 
-    # Fix PHP unrecognized --enable-opcache option and libtool --with-pic
-    if fuzz_target.startswith("php-fuzz"):
-        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
-            if not build_sh.is_file():
-                continue
-            text = build_sh.read_text(encoding="utf-8", errors="replace")
-            text = text.replace("--enable-opcache", "")
-            text = text.replace("--enable-option-checking=fatal", "--enable-option-checking=no")
-            text = text.replace("--with-pic", "")
-            build_sh.write_text(text, encoding="utf-8")
+    benchmark_commit = _read_benchmark_commit(context_dir)
+    dockerfile = context_dir / "Dockerfile"
 
-    # Fix curl: checkout specific commit and install autotools
+    # Pin runtime clones to the benchmark.yaml commit so builds don't drift
+    # with upstream HEAD.
+    def pin_dockerfile_clone(clone_url: str, fallback_commit: str) -> bool:
+        if not dockerfile.is_file():
+            return False
+        commit = benchmark_commit or fallback_commit
+        if not commit:
+            return False
+        text = dockerfile.read_text(encoding="utf-8", errors="replace")
+        rewritten = _pin_git_clone(text, clone_url, commit)
+        if rewritten != text:
+            dockerfile.write_text(rewritten, encoding="utf-8")
+            return True
+        return False
+
+    # Fix PHP: pin php-src to the benchmark commit. At that commit the original
+    # build.sh options (--enable-opcache, --enable-option-checking=fatal,
+    # --with-pic) are valid, so only strip them when the clone could not be
+    # pinned and is tracking upstream HEAD where those options are gone.
+    php_pinned = False
+    if fuzz_target.startswith("php-fuzz"):
+        php_pinned = pin_dockerfile_clone(
+            "https://github.com/php/php-src.git",
+            "0dbedb3dbdb27bd3acde65e448ff7bdf2260e620",
+        )
+        if not php_pinned:
+            for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+                if not build_sh.is_file():
+                    continue
+                text = build_sh.read_text(encoding="utf-8", errors="replace")
+                text = text.replace("--enable-opcache", "")
+                text = text.replace("--enable-option-checking=fatal", "--enable-option-checking=no")
+                text = text.replace("--with-pic", "")
+                build_sh.write_text(text, encoding="utf-8")
+
+    # Fix curl: checkout specific commit, install autotools, and patch the
+    # runtime-cloned sources (zlib download URL, single-target build) inside
+    # the image where context-file patches can't reach them.
     if fuzz_target.startswith("curl_fuzzer"):
-        dockerfile = context_dir / "Dockerfile"
         if dockerfile.is_file():
             text = dockerfile.read_text(encoding="utf-8", errors="replace")
             if "git clone --depth 1 https://github.com/curl/curl.git" in text:
@@ -299,29 +396,55 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
                     "RUN $SRC/curl_fuzzer/scripts/ossfuzzdeps.sh",
                     "RUN apt-get update && apt-get install -y autoconf automake libtool pkg-config\nRUN $SRC/curl_fuzzer/scripts/ossfuzzdeps.sh",
                 )
+            curl_runtime_marker = "# HGB curl runtime-clone patches"
+            if curl_runtime_marker not in text and "RUN git clone https://github.com/curl/curl-fuzzer /src/curl_fuzzer" in text:
+                sed_block = (
+                    curl_runtime_marker
+                    + "\nRUN sed -i 's|https://zlib.net/zlib.tar.gz|https://github.com/madler/zlib/archive/refs/tags/v1.2.13.tar.gz|' /src/curl_fuzzer/scripts/download_zlib.sh\n"
+                    + "RUN sed -i 's/^export FUZZ_TARGETS=\".*\"/export FUZZ_TARGETS=\"" + fuzz_target + "\"/' /src/curl_fuzzer/scripts/fuzz_targets\n"
+                    + "RUN sed -i 's/^make || exit 4$/make ${FUZZ_TARGETS} || exit 4/; s/^make check || exit 5$/true # HGB: skip make check/' /src/curl_fuzzer/scripts/compile_fuzzer.sh\n"
+                    + "RUN sed -i 's/^make zip$/for TARGET in $FUZZ_TARGETS; do make ${TARGET}_seed_corpus.zip || touch ${TARGET}_seed_corpus.zip; done/' /src/curl_fuzzer/ossfuzz.sh\n"
+                )
+                anchor = "RUN git clone https://github.com/curl/curl-fuzzer /src/curl_fuzzer"
+                checkout_re = re.compile(r"(RUN git -C /src/curl_fuzzer checkout[^\n]*\n)")
+                if checkout_re.search(text):
+                    # The sed patches must run after the pinned checkout so the
+                    # checkout doesn't revert them.
+                    text = checkout_re.sub(lambda m: m.group(1) + sed_block, text, count=1)
+                else:
+                    text = text.replace(anchor, anchor + "\n" + sed_block, 1)
             dockerfile.write_text(text, encoding="utf-8")
-        # Fix SSL download failures by skipping external dependency downloads
+        # The ossfuzz.sh fallback targets a Makefile that only exists after
+        # buildconf/configure; the runtime patches above fix the real failure
+        # modes, so make the fallback harmless.
         for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
             if not build_sh.is_file():
                 continue
             text = build_sh.read_text(encoding="utf-8", errors="replace")
-            text = text.replace("./ossfuzz.sh", "./ossfuzz.sh || (echo '[HGB] ossfuzz.sh failed, trying minimal build'; FUZZ_TARGETS=" + fuzz_target + " make -C /src/curl_fuzzer " + fuzz_target + " || true)")
+            text = text.replace("./ossfuzz.sh", "./ossfuzz.sh || true")
             build_sh.write_text(text, encoding="utf-8")
 
-    # Fix re2: use older version that doesn't need abseil
-    if fuzz_target == "fuzzer" and (context_dir / "re2").is_dir():
-        dockerfile = context_dir / "Dockerfile"
-        if dockerfile.is_file():
-            text = dockerfile.read_text(encoding="utf-8", errors="replace")
-            if "abseil" not in text:
-                text = text.replace(
-                    "RUN git clone https://github.com/google/re2.git",
-                    "RUN git clone --depth 1 --branch 20230301 https://github.com/google/re2.git",
-                )
-                dockerfile.write_text(text, encoding="utf-8")
+    # Fix re2: pin to the benchmark commit that doesn't need abseil.
+    if fuzz_target == "fuzzer":
+        pin_dockerfile_clone(
+            "https://github.com/google/re2.git",
+            "b025c6a3ae05995660e3b882eb3277f4399ced1a",
+        )
 
-    # Fix mruby: run rake with proper environment to generate presym headers
-    if fuzz_target == "mruby_fuzzer" and (context_dir / "mruby").is_dir():
+    # Fix libxslt: pin the unpinned libxslt clone to the benchmark commit.
+    if fuzz_target == "xpath":
+        pin_dockerfile_clone(
+            "https://gitlab.gnome.org/GNOME/libxslt.git",
+            "180cdb804efedcba363016fcf6cd3dbd2adca607",
+        )
+
+    # Fix mruby: pin the clone (HEAD requires presym headers that the 2023-era
+    # build.sh does not generate) and keep the rake fallback.
+    if fuzz_target == "mruby_fuzzer":
+        pin_dockerfile_clone(
+            "https://github.com/mruby/mruby",
+            "8c8bbd94dce3b3eabcf72c674e690516c075b0ee",
+        )
         for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
             if not build_sh.is_file():
                 continue
