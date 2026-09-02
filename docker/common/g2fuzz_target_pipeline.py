@@ -70,6 +70,17 @@ PAPER_METHOD_PROFILE = "paper-faithful"
 EXTENSION_METHOD_PROFILE = "extension"
 TASK_FAMILY = "input_generator"
 BUILD_MODE = "fuzzbench_native_afl_cmps"
+# Marker written by hgb_targets.ensure_package_build_script when the FuzzBench
+# benchmark dir has no top-level build.sh (the real recipe lives in the
+# project source and is copied into $SRC by the benchmark Dockerfile).
+SYNTHETIC_BUILD_SH_MARKER = "did not include a top-level build.sh"
+# Base compiler flags for the native .afl/.cmp build. SANITIZER=address is
+# mirrored here so build scripts that never read $SANITIZER still link the
+# ASan runtime (the G2Fuzz image ships libclang-rt-18-dev for this).
+NATIVE_BUILD_CFLAGS = "-O1 -fno-omit-frame-pointer -fsanitize=address -pthread -Wno-register -Wno-documentation -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"
+# afl-cc maps -fsanitize=fuzzer onto the bundled libAFLDriver.a, so FuzzBench
+# build.sh scripts that use $LIB_FUZZING_ENGINE/$FUZZER_LIB get the AFL driver.
+NATIVE_AFL_DRIVER_FLAG = "-fsanitize=fuzzer"
 GAMMA_PROFILE = "reproduction-gamma"
 DELTA_PROFILE = "reproduction-delta"
 EPSILON_PROFILE = "reproduction-epsilon"
@@ -487,11 +498,15 @@ def build_command_pair(
         "CC": str(cc),
         "CXX": str(cxx),
         "FUZZING_ENGINE": "afl",
+        "FUZZER": "afl",
         "SANITIZER": "address",
         "ARCHITECTURE": "x86_64",
         "SRC": str(src),
         "WORK": str(out_root / "target" / "build_work"),
-        "LIB_FUZZING_ENGINE": "",
+        "LIB_FUZZING_ENGINE": NATIVE_AFL_DRIVER_FLAG,
+        "FUZZER_LIB": NATIVE_AFL_DRIVER_FLAG,
+        "CFLAGS": f"{NATIVE_BUILD_CFLAGS} -L{src}",
+        "CXXFLAGS": f"{NATIVE_BUILD_CFLAGS} -L{src}",
     }
     afl_env = dict(common_env)
     afl_env["AFL_LLVM_CMPLOG"] = "0"
@@ -657,10 +672,15 @@ def is_generated_input_candidate(path: Path) -> bool:
     generator execution (e.g. under ``gen_seeds``) are admitted.
     """
 
-    ignored_suffixes = {".py", ".log", ".json", ".jsonl", ".txt", ".toml", ".md", ".yaml", ".yml", ".sh", ".cfg", ".ini", ".conf"}
+    # Real generator-produced inputs may use any data extension (JSON seeds
+    # for the JSON target, .txt seeds for text-format targets, etc.). Only
+    # exclude generator artifacts: Python sources, logs, and JSON-lines
+    # traces. Config-like JSON files are still excluded via ignored_stems.
+    ignored_suffixes = {".py", ".log", ".jsonl"}
     ignored_stems = {
         "manifest",
         "metadata",
+        "meta",
         "config",
         "model_setting",
         "program_to_format",
@@ -972,41 +992,403 @@ class G2FuzzPipeline:
             )
         return cc, cxx
 
-    def resolve_build_sh(self) -> Path:
+    def _is_synthetic_build_sh(self, path: Path) -> bool:
+        if not path.is_file():
+            return False
+        try:
+            return SYNTHETIC_BUILD_SH_MARKER in path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+
+    def install_fuzzing_engine_library(self, src: Path, engine: str = "afl") -> None:
+        """Make -lFuzzingEngine resolvable to the right driver.
+
+        afl-cc maps ``-fsanitize=fuzzer`` onto the bundled libAFLDriver.a, but
+        several build recipes hardcode ``-lFuzzingEngine`` (libpng) or use
+        meson's ``dependency('FuzzingEngine')`` (systemd), which searches the
+        standard library directories. Install the driver as libFuzzingEngine.a
+        in /usr/local/lib (the container runs as root) so both styles link.
+        For coverage builds use the real libFuzzer driver instead, since the
+        replay executes the binary libFuzzer-style.
+        """
+        if engine == "coverage":
+            driver = next(
+                (
+                    p
+                    for p in (
+                        Path("/usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.fuzzer-x86_64.a"),
+                        Path("/usr/lib/clang/18/lib/linux/libclang_rt.fuzzer-x86_64.a"),
+                    )
+                    if p.is_file()
+                ),
+                None,
+            )
+        else:
+            driver = self.artifact_dir / "libAFLDriver.a"
+        if driver is None or not driver.is_file():
+            return
+        for lib_dir in (Path("/usr/local/lib"), Path("/usr/lib"), src):
+            target = lib_dir / "libFuzzingEngine.a"
+            if target.is_file() and target.samefile(driver):
+                continue
+            try:
+                lib_dir.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(driver, target)
+            except OSError:
+                pass
+
+    def _derive_build_sh_from_dockerfile(self, dest: Path, dockerfile: Path) -> bool:
+        """Materialize $SRC/build.sh the way the benchmark Dockerfile does.
+
+        Many FuzzBench benchmarks keep their recipe inside the project source
+        and ``cp`` it into $SRC during the image build (libpng, systemd). This
+        replays ``cp ... $SRC`` and follow-up ``sed -i ... $SRC/build.sh``
+        commands against the prepared source root.
+        """
+        if not dockerfile.is_file():
+            return False
+        src_input = self.target_package / "source_input"
+        text = dockerfile.read_text(encoding="utf-8", errors="replace")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith(("RUN", "run")):
+                continue
+            stripped = stripped[3:].strip()
+            if "cp " in stripped and ("$SRC" in stripped or "/src" in stripped):
+                parts = [p for p in stripped.split() if p not in ("cp", "&&", ";")]
+                candidate_sources = [p for p in parts if p.endswith((".sh", "build.sh", ".bash"))]
+                target = next((p for p in parts if p in ("$SRC", "$SRC/", "/src", "/src/", "$SRC/build.sh", "/src/build.sh")), None)
+                if target is None:
+                    continue
+                for source in candidate_sources:
+                    source = source.replace("$SRC/", "").replace("/src/", "")
+                    source_path = src_input / source if source else None
+                    if source_path and source_path.is_file():
+                        shutil.copy2(source_path, dest / "build.sh")
+                        for sed_line in text.splitlines():
+                            sed_stripped = sed_line.strip()
+                            if "sed -i" in sed_stripped and "$SRC/build.sh" in sed_stripped:
+                                import re as _re
+                                match = _re.search(r"sed -i (['\"])(.+?)\1", sed_stripped)
+                                if match:
+                                    subprocess.run(
+                                        ["sed", "-i", "-e", match.group(2), str(dest / "build.sh")],
+                                        check=False,
+                                    )
+                        (dest / "build.sh").chmod(0o755)
+                        return True
+        return False
+
+    def _find_project_build_script(self) -> Path | None:
+        src_input = self.target_package / "source_input"
+        if not src_input.is_dir():
+            return None
+        candidates: list[Path] = []
+        for pattern in ("**/oss-fuzz/build.sh", "**/contrib/oss-fuzz/build.sh", "**/tools/oss-fuzz.sh", "**/fuzz/build.sh"):
+            candidates.extend(p for p in src_input.glob(pattern) if p.is_file())
+        candidates.sort(key=lambda p: (p.as_posix().count("/"), p.as_posix()))
+        return candidates[0] if candidates else None
+
+    def _recreate_archives(self, dest: Path) -> None:
+        build_sh = dest / "build.sh"
+        if not build_sh.is_file():
+            return
+        text = build_sh.read_text(encoding="utf-8", errors="replace")
+        import re as _re
+        for name in sorted(set(_re.findall(r"[A-Za-z0-9][A-Za-z0-9._+-]*\.(?:tar\.xz|tar\.gz|tgz|zip)", text))):
+            archive = dest / name
+            if archive.exists():
+                continue
+            if name.endswith(".tar.xz"):
+                stem = name[: -len(".tar.xz")]
+            elif name.endswith(".tar.gz"):
+                stem = name[: -len(".tar.gz")]
+            elif name.endswith(".tgz"):
+                stem = name[: -len(".tgz")]
+            else:
+                stem = name[: -len(".zip")]
+            source_dir = dest / stem
+            if not source_dir.is_dir():
+                continue
+            if name.endswith(".zip"):
+                subprocess.run(["zip", "-qr", str(archive), stem], cwd=str(dest), check=False)
+            elif name.endswith(".tar.xz"):
+                subprocess.run(["tar", "-C", str(dest), "-cJf", str(archive), stem], check=False)
+            else:
+                subprocess.run(["tar", "-C", str(dest), "-czf", str(archive), stem], check=False)
+
+    def _patch_native_build_script(self, dest: Path) -> None:
+        build_sh = dest / "build.sh"
+        if not build_sh.is_file():
+            return
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
+        # Reuse the shared FuzzBench build-context patches (curl single-target
+        # build + dependency URL fixes, ftfuzzer iconv conftest, php options,
+        # mruby/zip corpus guards, ...). The helper expects a context dir with
+        # source_input/<project> and build.sh at the root; the prepared $SRC
+        # layout matches except for the source_input/ prefix, so point it there
+        # via a temporary symlink.
+        try:
+            from hgb_fuzzbench_builder import _patch_single_target_build_context
+
+            link = dest / "source_input"
+            if not link.exists():
+                link.symlink_to(dest, target_is_directory=True)
+            try:
+                _patch_single_target_build_context(dest, fuzz_target)
+            finally:
+                if link.is_symlink():
+                    link.unlink()
+        except Exception:
+            pass
+        text = build_sh.read_text(encoding="utf-8", errors="replace")
+        if fuzz_target.startswith("curl_fuzzer"):
+            # The shared patch makes ossfuzz.sh best-effort and rewrites
+            # Makefile.am SOURCES for sealed Docker evaluator candidate builds;
+            # the native build must surface ossfuzz.sh failures and keep the
+            # original COMMON_SOURCES (curl_fuzzer.cc + tlv/callback helpers).
+            text = text.replace("./ossfuzz.sh || true", "./ossfuzz.sh")
+            makefile = dest / "curl_fuzzer" / "Makefile.am"
+            if makefile.is_file():
+                make_text = makefile.read_text(encoding="utf-8", errors="replace")
+                make_text = make_text.replace(
+                    f"{fuzz_target}_SOURCES = curl_fuzzer.cc",
+                    f"{fuzz_target}_SOURCES = $(COMMON_SOURCES)",
+                )
+                makefile.write_text(make_text, encoding="utf-8")
+        if fuzz_target == "hb-shape-fuzzer":
+            # The benchmark Dockerfile expects Ubuntu 20.04 python3.8; the
+            # G2Fuzz image ships python3 (3.12) with ninja + meson 0.56
+            # preinstalled, so the runtime pip install is a fast no-op that
+            # must not fail the build when PyPI is unreachable.
+            text = text.replace(
+                "python3.8 -m pip install ninja meson==0.56.0",
+                "python3 -m pip install ninja meson==0.56.0 || true",
+            )
+        if fuzz_target.startswith("php-fuzz"):
+            # php's configure hardcodes FUZZING_CC="$CXX -stdlib=libc++".
+            # The coverage build links the libstdc++-ABI libFuzzer driver, so
+            # strip -stdlib=libc++ from the generated Makefile after configure
+            # to keep the C++ ABI consistent (the AFL build tolerates it
+            # because the AFL driver is C-only).
+            text = text.replace(
+                "make -j$(nproc)",
+                "sed -i 's/-stdlib=libc++//g' Makefile\nmake -j$(nproc)",
+            )
+        build_sh.write_text(text, encoding="utf-8")
+        if self.target == "mbedtls_fuzz_dtlsclient":
+            # mbedtls forces -Werror and -Wdocumentation; clang 18 turns the
+            # empty-\retval documentation notes in psa/crypto.h into errors
+            # that older FuzzBench clang versions never reported.
+            root_cmake = dest / "mbedtls" / "CMakeLists.txt"
+            lib_cmake = dest / "mbedtls" / "library" / "CMakeLists.txt"
+            for path, replacements in (
+                (root_cmake, ((' -Werror")', '")'),)),
+                (lib_cmake, (("-Wdocumentation", "-Wno-documentation"),)),
+            ):
+                if path.is_file():
+                    cmake_text = path.read_text(encoding="utf-8", errors="replace")
+                    for old, new in replacements:
+                        cmake_text = cmake_text.replace(old, new)
+                    path.write_text(cmake_text, encoding="utf-8")
+
+    def prepare_source_root(self, variant: str = "afl") -> Path:
+        """Prepare a writable $SRC emulating the FuzzBench builder environment.
+
+        The FuzzBench builder image has $SRC holding the benchmark files
+        (build.sh, fuzz-target sources, seeds) plus every project checkout
+        produced by the Dockerfile RUN commands. Direct build.sh execution
+        against the read-only /target package breaks whenever the Dockerfile
+        copies the recipe into $SRC, extracts archives, or relies on a
+        writable tree. This stage reproduces that layout under
+        workspace/target/src_<variant>; each build variant gets a fresh copy
+        because FuzzBench build scripts assume a clean tree (some fail on
+        ``mkdir build`` when the afl variant already created it).
+        """
+        dest = self.workspace / "target" / f"src_{variant}"
+        marker = dest / ".hgb_prepared"
+        if marker.is_file():
+            return dest
+        if dest.exists():
+            shutil.rmtree(dest)
+        dest.mkdir(parents=True)
+        src_input = self.target_package / "source_input"
+        if src_input.is_dir():
+            # rsync preserves symlinks without following them; shutil.copytree
+            # follows symlinked directories while scanning and can loop forever
+            # on trees like systemd's recursive testdata links.
+            proc = subprocess.run(
+                ["rsync", "-a", "--delete", str(src_input) + "/", str(dest) + "/"],
+                check=False,
+            )
+            if proc.returncode != 0 or not any(dest.iterdir()):
+                shutil.copytree(src_input, dest, dirs_exist_ok=True)
+        # The beta-plan physical split moves the fuzz-target sources (the
+        # "reference harnesses") out of source_input into reference_harnesses/.
+        # G2Fuzz is a paper-native input generator that must build the original
+        # FuzzBench target unchanged, so restore them at their native paths:
+        # reference_harnesses/<project>/ mirrors the project tree relative to
+        # source_input/<project>/ and selected/source_input/ holds the selected
+        # target at its native source_input path.
+        ref_root = self.target_package / "reference_harnesses"
+        if ref_root.is_dir():
+            for item in ref_root.iterdir():
+                if item.name == "selected":
+                    sel = item / "source_input"
+                    if sel.is_dir():
+                        shutil.copytree(sel, dest, dirs_exist_ok=True)
+                elif item.is_dir():
+                    shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+        bench = self.target_package / "fuzzbench_benchmark"
+        if bench.is_dir():
+            for item in bench.iterdir():
+                if item.name == "build.sh" and self._is_synthetic_build_sh(item):
+                    continue
+                if item.is_dir():
+                    shutil.copytree(item, dest / item.name, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(item, dest / item.name)
+        dockerfile = bench / "Dockerfile"
+        if not (dest / "build.sh").is_file():
+            derived = self._derive_build_sh_from_dockerfile(dest, dockerfile)
+            if not derived:
+                project_build = self._find_project_build_script()
+                if project_build is not None:
+                    shutil.copy2(project_build, dest / "build.sh")
+                    (dest / "build.sh").chmod(0o755)
+        if not (dest / "build.sh").is_file():
+            raise PipelineError("infra_missing", "G2Fuzz target build.sh not found for auto-build", 127)
+        (dest / "build.sh").chmod(0o755)
+        self._recreate_archives(dest)
+        self._patch_native_build_script(dest)
+        self._prepare_target_seed_artifacts(dest)
+        # Some build scripts use the literal /src FuzzBench path (curl).
+        # Repoint a /src symlink at this variant's prepared root (the
+        # container runs as root).
+        src_link = Path("/src")
+        try:
+            if src_link.is_symlink() or not src_link.exists():
+                if src_link.is_symlink():
+                    src_link.unlink()
+                src_link.symlink_to(dest, target_is_directory=True)
+        except OSError:
+            pass
+        driver = self.artifact_dir / "libAFLDriver.a"
+        if driver.is_file():
+            shutil.copy2(driver, dest / "libFuzzingEngine.a")
+        marker.write_text("ok\n", encoding="utf-8")
+        return dest
+
+    def _prepare_target_seed_artifacts(self, dest: Path) -> None:
+        """Replay Dockerfile RUN steps that build seed corpora/aux files.
+
+        Several FuzzBench Dockerfiles produce files the build.sh expects at
+        build time (seed corpus zips, /opt/seeds). These steps don't exist in
+        the prepared source tree, so replay them here.
+        """
+        fuzz_target = self.target_manifest().get("fuzz_target", self.target)
+        bench = self.target_package / "fuzzbench_benchmark"
+        if fuzz_target == "libjpeg_turbo_fuzzer":
+            corpora = dest / "seed-corpora"
+            if corpora.is_dir():
+                subprocess.run(
+                    ["zip", "-rq", str(dest / "decompress_fuzzer_seed_corpus.zip"), ".", "-i", "afl-testcases/jpeg*", "bugs/decompress*"],
+                    cwd=str(corpora), check=False,
+                )
+                subprocess.run(
+                    ["zip", "-rq", str(dest / "compress_fuzzer_seed_corpus.zip"), ".", "-i", "afl-testcases/bmp", "afl-testcases/gif*", "bugs/compress*"],
+                    cwd=str(corpora), check=False,
+                )
+        if fuzz_target == "ossfuzz" and self.target == "sqlite3_ossfuzz":
+            sqlite_dir = dest / "sqlite3"
+            if sqlite_dir.is_dir():
+                subprocess.run(
+                    ["bash", "-c", "find sqlite3 -name '*.test' -type f -print | xargs -r zip -q ossfuzz_seed_corpus.zip"],
+                    cwd=str(dest), check=False,
+                )
+        seeds = bench / "seeds"
+        if seeds.is_dir():
+            opt_seeds = Path("/opt/seeds")
+            if not opt_seeds.exists():
+                try:
+                    shutil.copytree(seeds, opt_seeds, dirs_exist_ok=True)
+                except OSError:
+                    pass
+
+    def resolve_build_workdir(self, src: Path) -> Path:
+        """Return the build.sh working directory per the benchmark Dockerfile.
+
+        FuzzBench runs build.sh with CWD = the Dockerfile's final WORKDIR
+        (e.g. ``WORKDIR libpng``); the prepared $SRC must mirror that.
+        """
+        dockerfile = self.target_package / "fuzzbench_benchmark" / "Dockerfile"
+        if dockerfile.is_file():
+            for line in dockerfile.read_text(encoding="utf-8", errors="replace").splitlines():
+                stripped = line.strip()
+                if stripped.startswith("WORKDIR"):
+                    rel = stripped[len("WORKDIR"):].strip()
+                    for prefix in ("$SRC/", "/src/"):
+                        if rel.startswith(prefix):
+                            rel = rel[len(prefix):]
+                            break
+                    if rel in ("", "$SRC", "/src"):
+                        return src
+                    candidate = (src / rel)
+                    if candidate.is_dir():
+                        return candidate
+        return src
+
+    def resolve_build_sh(self, src: Path | None = None) -> Path:
+        prepared = (src or self.prepare_source_root()) / "build.sh"
+        if prepared.is_file():
+            return prepared
         bench_dir_env = os.environ.get("HGB_FUZZBENCH_BENCHMARK_DIR")
         if bench_dir_env:
             candidate = Path(bench_dir_env) / "build.sh"
-            if candidate.is_file():
+            if candidate.is_file() and not self._is_synthetic_build_sh(candidate):
                 return candidate
         manifest = self.target_manifest()
         bench_dir = manifest.get("benchmark_dir", "")
         if bench_dir:
             candidate = Path(bench_dir) / "build.sh"
-            if candidate.is_file():
+            if candidate.is_file() and not self._is_synthetic_build_sh(candidate):
                 return candidate
         pkg_build = self.target_package / "fuzzbench_benchmark" / "build.sh"
-        if pkg_build.is_file():
+        if pkg_build.is_file() and not self._is_synthetic_build_sh(pkg_build):
             return pkg_build
         raise PipelineError("infra_missing", "G2Fuzz target build.sh not found for auto-build", 127)
 
-    def resolve_source_dir(self) -> Path:
-        for candidate in (
-            self.target_package / "source_input",
-            self.target_package / "fuzzbench_benchmark" / "source_input",
-            self.target_package / "fuzzbench_benchmark",
-        ):
-            if candidate.is_dir():
-                return candidate
-        return self.target_package / "source_input"
+    def resolve_source_dir(self, variant: str = "afl") -> Path:
+        return self.prepare_source_root(variant)
+
+    def _build_sh_command(self, build_sh: Path) -> list[str]:
+        """Return the build.sh argv, preserving its shebang flags.
+
+        FuzzBench executes build.sh directly, so ``#!/bin/bash -ex`` flags
+        (errexit/xtrace) take effect.  Invoking it via ``bash build.sh`` drops
+        them, letting failed compile/link steps pass silently and produce
+        exit-0 builds without the fuzz target.
+        """
+        if build_sh.is_file() and executable(build_sh):
+            try:
+                with build_sh.open("rb") as handle:
+                    first = handle.readline(256)
+                if first.startswith(b"#!"):
+                    return [str(build_sh)]
+            except OSError:
+                pass
+        return ["bash", str(build_sh)]
 
     def auto_build_pair(self) -> tuple[dict[str, Any], dict[str, Any]]:
         cc, cxx = self.resolve_toolchain()
-        build_sh = self.resolve_build_sh()
         fuzz_target = self.target_manifest().get("fuzz_target", self.target)
-        src = self.resolve_source_dir()
+        self.install_fuzzing_engine_library(self.workspace / "target" / "src_afl")
         commands = build_command_pair(self.adapter, self.artifact_dir, self.target_package, self.workspace)
         results: dict[str, Any] = {}
         for label, variant in (("afl", commands["afl"]), ("cmp", commands["cmp"])):
+            src = self.resolve_source_dir(label)
+            build_sh = self.resolve_build_sh(src)
+            build_cwd = self.resolve_build_workdir(src)
             out_dir = self.workspace / "target" / f"build_{label}"
             work_dir = self.workspace / "target" / f"work_{label}"
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -1016,14 +1398,21 @@ class G2FuzzPipeline:
             env["OUT"] = str(out_dir)
             env["SRC"] = str(src)
             env["WORK"] = str(work_dir)
+            env["CFLAGS"] = f"{NATIVE_BUILD_CFLAGS} -L{src}"
+            env["CXXFLAGS"] = f"{NATIVE_BUILD_CFLAGS} -L{src}"
+            env["LIB_FUZZING_ENGINE"] = NATIVE_AFL_DRIVER_FLAG
+            env["FUZZER_LIB"] = NATIVE_AFL_DRIVER_FLAG
+            env["FUZZER"] = "afl"
+            library_path = env.get("LIBRARY_PATH", "")
+            env["LIBRARY_PATH"] = f"{src}:/usr/local/lib" + (f":{library_path}" if library_path else "")
             log_path = self.workspace / "logs" / f"build_{label}.log"
-            cmd = ["bash", str(build_sh)]
+            cmd = self._build_sh_command(build_sh)
             try:
                 with log_path.open("wb") as log:
                     proc = subprocess.run(
                         cmd,
                         env=env,
-                        cwd=str(src) if src.is_dir() else None,
+                        cwd=str(build_cwd) if build_cwd.is_dir() else str(src),
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         timeout=int(os.environ.get("G2FUZZ_BUILD_TIMEOUT_SECONDS", "3600") or "3600"),
@@ -1054,6 +1443,12 @@ class G2FuzzPipeline:
             shutil.copy2(produced, dest)
             if not executable(dest):
                 raise PipelineError("infra_failure", f"G2Fuzz {label} built binary is not executable: {dest}", 127)
+            # FuzzBench ships the whole $OUT layout at runtime; some binaries
+            # carry RUNPATH=$ORIGIN/src/shared (systemd). Keep that layout
+            # next to the copied binary.
+            shared_out = out_dir / "src" / "shared"
+            if shared_out.is_dir():
+                shutil.copytree(shared_out, self.workspace / "target" / "src" / "shared", dirs_exist_ok=True)
         return results, commands
 
     def write_invocation(self) -> None:
@@ -1142,12 +1537,83 @@ class G2FuzzPipeline:
         self.input_contract = contract
         return contract
 
+    def _smoke_seed_bytes(self) -> bytes:
+        """Prefer a real corpus file for the pair smoke.
+
+        The crude bootstrap seed (the format name as bytes) crashes some
+        targets on garbage input (e.g. libxslt xpath SEGVs on ``XPath\n``),
+        while FuzzBench smokes builds against real corpus entries. Fall back
+        through the built seed-corpus zips, the package seed dirs, and finally
+        the bootstrap bytes.
+        """
+        import zipfile as _zipfile
+        for archive in sorted(self.workspace.glob("target/build_afl/*_seed_corpus.zip")):
+            try:
+                with _zipfile.ZipFile(archive) as zf:
+                    names = sorted(n for n in zf.namelist() if not n.endswith("/"))
+                    for name in names:
+                        data = zf.read(name)
+                        if data:
+                            return data
+            except Exception:  # noqa: BLE001
+                pass
+        for seeds_dir in (self.target_package / "seeds", self.target_package / "fuzzbench_benchmark" / "seeds"):
+            if seeds_dir.is_dir():
+                for path in sorted(p for p in seeds_dir.rglob("*") if p.is_file() and p.stat().st_size < 1_048_576):
+                    try:
+                        data = path.read_bytes()
+                    except OSError:
+                        continue
+                    if data:
+                        return data
+        # Fall back to real corpus-like files in the materialized sources
+        # (tests/corpus/seed trees) so targets that crash on garbage inputs
+        # (e.g. libxslt xpath SEGVs on raw format-name bytes) smoke against a
+        # plausible input.
+        src_input = self.target_package / "source_input"
+        if src_input.is_dir():
+            candidates = sorted(
+                p
+                for p in src_input.rglob("*")
+                if p.is_file()
+                and p.stat().st_size < 1_048_576
+                and any(part in ("tests", "test", "corpus", "corpora", "seed", "seeds", "testdata") for part in p.parts)
+            )
+            for suffix in (".xml", ".html", ".txt", ".json", ""):
+                for path in candidates:
+                    if suffix and not path.name.endswith(suffix):
+                        continue
+                    try:
+                        data = path.read_bytes()
+                    except OSError:
+                        continue
+                    if data:
+                        return data
+        return bootstrap_bytes(self.formats[0] if self.formats else "custom")
+
+    def _install_harness_context_files(self) -> None:
+        """Install context files some harnesses load relative to the binary.
+
+        libxslt's xpath fuzzer reads a fixed ``xpath.xml`` document from the
+        binary's directory (the fuzzed input is the XPath expression itself);
+        without it the harness crashes on any probe input.
+        """
+        if self.target == "libxslt_xpath":
+            candidates = (
+                self.target_package / "source_input" / "libxslt" / "tests" / "fuzz" / "xpath.xml",
+                self.target_package / "generator_input" / "source_input" / "libxslt" / "tests" / "fuzz" / "xpath.xml",
+            )
+            for candidate in candidates:
+                if candidate.is_file():
+                    shutil.copy2(candidate, self.workspace / "target" / "xpath.xml")
+                    break
+
     def smoke_pair(self) -> dict[str, Any]:
         smoke_dir = self.workspace / "seeds" / "bootstrap"
         smoke_dir.mkdir(parents=True, exist_ok=True)
         smoke_input = smoke_dir / f"{self.program_id}_bootstrap_seed"
         if not smoke_input.exists():
-            smoke_input.write_bytes(bootstrap_bytes(self.formats[0] if self.formats else "custom"))
+            smoke_input.write_bytes(self._smoke_seed_bytes())
         empty_input = smoke_dir / f"{self.program_id}_empty_seed"
         if not empty_input.exists():
             empty_input.write_bytes(b"")
@@ -1197,6 +1663,7 @@ class G2FuzzPipeline:
             build_results, commands = self.auto_build_pair()
             self.build_source = "auto_built"
             source_dir = self.workspace / "target"
+        self._install_harness_context_files()
         self.write_invocation()
         contract = self.validate_input_contract()
         smoke = self.smoke_pair()
@@ -1932,7 +2399,7 @@ class G2FuzzPipeline:
             "-c",
             str(self.target_cmp),
             "-m",
-            os.environ.get("G2FUZZ_MEMORY_MB", "1024"),
+            os.environ.get("G2FUZZ_MEMORY_MB", "none"),
             "-k",
             str(self.artifact_dir),
             "--",
@@ -2014,16 +2481,18 @@ class G2FuzzPipeline:
         if not clang or not clangxx:
             return None
         try:
-            build_sh = self.resolve_build_sh()
+            src = self.resolve_source_dir("cov")
+            build_sh = self.resolve_build_sh(src)
         except PipelineError:
             return None
         fuzz_target = self.target_manifest().get("fuzz_target", self.target)
-        src = self.resolve_source_dir()
+        build_cwd = self.resolve_build_workdir(src)
+        self.install_fuzzing_engine_library(src, engine="coverage")
         out_dir = self.workspace / "target" / "build_cov"
         work_dir = self.workspace / "target" / "work_cov"
         out_dir.mkdir(parents=True, exist_ok=True)
         work_dir.mkdir(parents=True, exist_ok=True)
-        cov_flags = "-fprofile-instr-generate -fcoverage-mapping"
+        cov_flags = "-fprofile-instr-generate -fcoverage-mapping -pthread -Wno-register -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION"
         env = os.environ.copy()
         env.update(
             {
@@ -2035,15 +2504,17 @@ class G2FuzzPipeline:
                 "SRC": str(src),
                 "OUT": str(out_dir),
                 "WORK": str(work_dir),
-                "CFLAGS": cov_flags,
-                "CXXFLAGS": cov_flags,
-                "LIB_FUZZING_ENGINE": "",
+                "CFLAGS": f"{cov_flags} -L{src}",
+                "CXXFLAGS": f"{cov_flags} -L{src}",
+                "LIB_FUZZING_ENGINE": "-fsanitize=fuzzer",
+                "FUZZER_LIB": "-fsanitize=fuzzer",
+                "FUZZER": "libfuzzer",
             }
         )
         log_path = self.workspace / "logs" / "build_cov.log"
         try:
             with log_path.open("wb") as log:
-                proc = subprocess.run(["bash", str(build_sh)], env=env, stdout=log, stderr=subprocess.STDOUT, timeout=int(os.environ.get("G2FUZZ_BUILD_TIMEOUT_SECONDS", "3600") or "3600"), check=False)
+                proc = subprocess.run(self._build_sh_command(build_sh), env=env, cwd=str(build_cwd), stdout=log, stderr=subprocess.STDOUT, timeout=int(os.environ.get("G2FUZZ_BUILD_TIMEOUT_SECONDS", "3600") or "3600"), check=False)
             if proc.returncode != 0:
                 return None
         except Exception:
@@ -2052,6 +2523,9 @@ class G2FuzzPipeline:
         if not produced.is_file() or not executable(produced):
             return None
         shutil.copy2(produced, self.target_cov)
+        shared_out = out_dir / "src" / "shared"
+        if shared_out.is_dir():
+            shutil.copytree(shared_out, self.workspace / "target" / "src" / "shared", dirs_exist_ok=True)
         return self.target_cov
 
     def collect_coverage(self) -> None:

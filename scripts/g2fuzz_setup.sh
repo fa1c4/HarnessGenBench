@@ -11,5 +11,6 @@ main() {
   ensure_artifacts_present "$root" "g2fuzz"
   image="$(hgb_build_image "g2fuzz" "g2fuzz" "$root")"
   log "G2FUZZ Docker image ready: $image"
+  bash "$SCRIPT_DIR/g2fuzz_build_toolchain.sh"
 }
 main "$@"

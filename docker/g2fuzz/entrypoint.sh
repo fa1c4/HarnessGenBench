@@ -77,6 +77,28 @@ text = text.replace(
     'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, 1)',
     'feature_analysis(model, file_format, tmp_path, seeds_path, generators, output_path, int(os.environ.get("G2FUZZ_TRY_NUM", "3") or "3"))',
 )
+# Format descriptions containing '/' (e.g. "systemd .link/INI text",
+# "DTLS client record/message sequence") must not become path separators in
+# the generated seed/generator file names.
+text = text.replace(
+    'mv_files(tmp_path, seeds_path, file_format + "-" + str(generator_cnt))',
+    'mv_files(tmp_path, seeds_path, file_format.replace("/", "_") + "-" + str(generator_cnt))',
+)
+text = text.replace(
+    'cur_generator_path = os.path.join(generators, file_format.replace("/", "_") + "-" + str(generator_cnt) + ".py")',
+    'cur_generator_path = os.path.join(generators, file_format.replace("/", "_") + "-" + str(generator_cnt) + ".py")',
+)
+func_path = path.parent / "py_utils" / "func.py"
+if func_path.exists():
+    func_text = func_path.read_text()
+    # LLM-generated generators occasionally leave broken symlinks or delete
+    # their own outputs between os.listdir and getsize/move; skip them
+    # instead of aborting the whole run.
+    func_text = func_text.replace(
+        "        # 检查文件大小，如果大于10MB，则删除该文件\n        if os.path.getsize(source_path) > size_limit:\n            os.remove(source_path)\n            print(f\"---- Deleted large file {source_path} (greater than 10MB)\")\n            continue  # 跳过该文件，避免继续移动\n",
+        "        # 检查文件大小，如果大于10MB，则删除该文件\n        try:\n            file_size = os.path.getsize(source_path)\n        except OSError:\n            print(f\"---- Skipped unreadable file {source_path}\")\n            continue\n        if file_size > size_limit:\n            os.remove(source_path)\n            print(f\"---- Deleted large file {source_path} (greater than 10MB)\")\n            continue  # 跳过该文件，避免继续移动\n",
+    )
+    func_path.write_text(func_text)
 llm_path = path.parent / "py_utils" / "llm_utils.py"
 if llm_path.exists():
     llm_text = llm_path.read_text()
@@ -86,9 +108,15 @@ if llm_path.exists():
         f"OpenAI(api_key=OPENAI_KEY, timeout={timeout_expr})",
     )
     if "hgb_llm_trace" not in llm_text:
-        llm_text = f"""from openai import OpenAI
+        llm_text = f"""from openai import OpenAI, APIConnectionError, APITimeoutError, InternalServerError
 import os
 import sys
+import time as _hgb_time
+
+try:
+    import fcntl as _hgb_fcntl
+except Exception:  # noqa: BLE001
+    _hgb_fcntl = None
 
 sys.path.insert(0, \"/opt/hgb/bin\")
 try:
@@ -102,6 +130,17 @@ with open('openai_key.txt', 'r') as file:
 
 OPENAI_KEY = key
 
+_HGB_MAX_RETRIES = int(os.environ.get(\"G2FUZZ_LLM_MAX_RETRIES\", \"24\"))
+_HGB_RATE_SLEEP = float(os.environ.get(\"G2FUZZ_LLM_RATE_SLEEP_SECONDS\", \"10\"))
+# Global per-key rate limiting across all G2Fuzz workers: every request must
+# be spaced by HGB_LLM_MIN_INTERVAL_SECONDS (default 5s => 12 req/min, under
+# the typical 20 req/min key limit). A shared flock + timestamp file keeps the
+# per-process Python processes coordinated.
+_HGB_MIN_INTERVAL = float(os.environ.get(\"HGB_LLM_MIN_INTERVAL_SECONDS\", \"5\"))
+_HGB_LOCK_DIR = os.environ.get(\"HGB_LLM_LOCK_DIR\", \"\")
+_HGB_LOCK_PATH = os.path.join(_HGB_LOCK_DIR, \"g2fuzz_llm_rate.lock\") if _HGB_LOCK_DIR else \"\"
+_HGB_STAMP_PATH = os.path.join(_HGB_LOCK_DIR, \"g2fuzz_llm_rate.stamp\") if _HGB_LOCK_DIR else \"\"
+
 
 def _client():
     timeout = float(os.environ.get(\"G2FUZZ_LLM_REQUEST_TIMEOUT_SECONDS\", os.environ.get(\"HGB_LLM_REQUEST_TIMEOUT_SECONDS\", \"1200\")))
@@ -109,21 +148,99 @@ def _client():
     return OpenAI(api_key=OPENAI_KEY, base_url=base_url, timeout=timeout)
 
 
-def _create(model, messages, temperature):
-    client = _client()
-    request = {{\"model\": model, \"messages\": messages, \"temperature\": temperature}}
+def _rate_gate():
+    if not _HGB_LOCK_DIR or _hgb_fcntl is None:
+        return (None, None)
+    try:
+        os.makedirs(_HGB_LOCK_DIR, exist_ok=True)
+        handle = open(_HGB_LOCK_PATH, \"a+\")
+        _hgb_fcntl.flock(handle, _hgb_fcntl.LOCK_EX)
+        last = 0.0
+        try:
+            last = float(open(_HGB_STAMP_PATH).read().strip())
+        except Exception:  # noqa: BLE001
+            last = 0.0
+        wait = _HGB_MIN_INTERVAL - (_hgb_time.time() - last)
+        if wait > 0:
+            _hgb_time.sleep(wait)
+        open(_HGB_STAMP_PATH, \"w\").write(str(_hgb_time.time()))
+        return (handle, _HGB_LOCK_PATH)
+    except Exception:  # noqa: BLE001
+        return (None, None)
+
+
+def _rate_ungate(state):
+    if state and state[0] is not None and _hgb_fcntl is not None:
+        try:
+            _hgb_fcntl.flock(state[0], _hgb_fcntl.LOCK_UN)
+            state[0].close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _call_once(client, request):
     if hgb_llm_trace is not None:
-        response = hgb_llm_trace.trace_call(
+        return hgb_llm_trace.trace_call(
             lambda: client.chat.completions.create(**request),
             stage=\"g2fuzz\",
             provider=\"openai-compatible\",
             operation=\"chat.completions.create\",
-            model=model,
+            model=request[\"model\"],
             request=request,
         )
-    else:
-        response = client.chat.completions.create(**request)
-    return response.choices[0].message.content
+    return client.chat.completions.create(**request)
+
+
+def _is_transient(exc):
+    status = getattr(getattr(exc, \"response\", None), \"status_code\", None)
+    if status in (429, 500, 502, 503, 504):
+        return True
+    if isinstance(exc, (APIConnectionError, APITimeoutError, InternalServerError)):
+        return True
+    text = str(exc)
+    return any(token in text for token in (\"429\", \"500\", \"502\", \"503\", \"504\")) or \"connection\" in text.lower()
+
+
+def _create(model, messages, temperature):
+    client = _client()
+    request = {{\"model\": model, \"messages\": messages, \"temperature\": temperature}}
+    last_exc = None
+    for attempt in range(_HGB_MAX_RETRIES + 1):
+        transient = False
+        gate = _rate_gate()
+        try:
+            try:
+                response = _call_once(client, request)
+                content = response.choices[0].message.content
+                if content:
+                    return content
+                # Providers occasionally return an empty completion, which
+                # crashes the upstream feature analysis (.split() on None).
+                last_exc = RuntimeError(\"empty LLM response content\")
+                transient = True
+            except Exception as exc:  # noqa: BLE001 - retry only transient failures.
+                last_exc = exc
+                transient = _is_transient(exc)
+        finally:
+            _rate_ungate(gate)
+        if not transient:
+            raise last_exc
+        retry_after = None
+        try:
+            header = last_exc.response.headers.get(\"Retry-After\")
+            if header:
+                retry_after = float(header)
+        except Exception:  # noqa: BLE001
+            retry_after = None
+        if retry_after:
+            delay = retry_after
+        elif isinstance(last_exc, APIConnectionError) or \"connection\" in str(last_exc).lower():
+            delay = min(60.0, 5.0 * (2 ** min(attempt, 3)))
+        else:
+            delay = _HGB_RATE_SLEEP * (2 ** min(attempt, 3))
+        print(f\"HGB_LLM_RETRY: transient provider failure ({{type(last_exc).__name__}}); retrying in {{delay:.1f}}s (attempt {{attempt + 1}}/{{_HGB_MAX_RETRIES}})\", file=sys.stderr)
+        _hgb_time.sleep(delay)
+    raise last_exc
 
 
 def llm(model, prompt, temperature):

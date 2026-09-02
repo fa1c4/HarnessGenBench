@@ -1173,7 +1173,10 @@ def g2fuzz_target_pair_build_commands(
         "ARCHITECTURE": "x86_64",
         "SRC": str(src),
         "WORK": str(out_root / "target" / "build_work"),
-        "LIB_FUZZING_ENGINE": "",
+        "LIB_FUZZING_ENGINE": "-fsanitize=fuzzer",
+        "FUZZER_LIB": "-fsanitize=fuzzer",
+        "CFLAGS": f"-O1 -fno-omit-frame-pointer -fsanitize=address -pthread -Wno-register -Wno-documentation -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -L{src}",
+        "CXXFLAGS": f"-O1 -fno-omit-frame-pointer -fsanitize=address -pthread -Wno-register -Wno-documentation -DFUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION -L{src}",
     }
     afl_env = dict(common_env)
     afl_env["AFL_LLVM_CMPLOG"] = "0"
