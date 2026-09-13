@@ -300,6 +300,69 @@ def _patch_project_target_downloads() -> None:
     print("OFG_SKIP_GCS_TARGET_DOWNLOAD: target answer download blocked", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Model compat: accept arbitrary OpenAI-compatible model names (e.g. a USTC
+# endpoint's deepseek model) and honor OPENAI_BASE_URL, which upstream ignores.
+# ---------------------------------------------------------------------------
+
+
+def _install_model_compat() -> None:
+    import openai as openai_lib
+    from llm_toolkit import models as llm_models  # pylint: disable=import-outside-toplevel
+
+    if getattr(llm_models.LLM, "_hgb_model_compat", False):
+        return
+
+    # Unknown model names fall back to the OpenAI-compatible GPT base class
+    # with the requested name overridden (the name is what the API receives
+    # as ``model=``), so provider-specific models work unchanged.
+    original_setup = llm_models.LLM.__dict__["setup"].__func__
+
+    def _hgb_setup(cls, ai_binary, name, max_tokens=None, num_samples=None,
+                   temperature=None, temperature_list=None):
+        kwargs: dict[str, Any] = {}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+        if num_samples is not None:
+            kwargs["num_samples"] = num_samples
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        kwargs["temperature_list"] = temperature_list
+        try:
+            return original_setup(cls, ai_binary, name, **kwargs)
+        except ValueError:
+            fallback = next(
+                (s for s in cls.all_llm_subclasses()
+                 if getattr(s, "name", None) == "gpt-4o"), None)
+            if fallback is None:
+                raise
+            instance = fallback(ai_binary, **kwargs)
+            instance.name = name
+            return instance
+
+    llm_models.LLM.setup = classmethod(_hgb_setup)
+
+    # Upstream _get_client only passes api_key; the OpenAI-compatible provider
+    # must also receive the configured base URL.
+    gpt_cls = getattr(llm_models, "GPT", None)
+    if gpt_cls is not None and not getattr(gpt_cls, "_hgb_client_patched", False):
+        original_get_client = gpt_cls._get_client
+
+        def _hgb_get_client(self):
+            kwargs = {"api_key": os.getenv("OPENAI_API_KEY") or os.getenv("API_KEY") or ""}
+            base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("BASE_URL") or ""
+            if base_url:
+                kwargs["base_url"] = base_url
+            return openai_lib.OpenAI(**kwargs)
+
+        gpt_cls._get_client = _hgb_get_client
+        gpt_cls._hgb_client_patched = True
+
+    llm_models.LLM._hgb_model_compat = True
+    _record_patch("model_compat", "arbitrary OpenAI-compatible model names + base_url", True)
+    print("HGB_MODEL_COMPAT: OpenAI-compatible model names and base URL enabled", file=sys.stderr)
+
+
 def _install_hgb_llm_trace() -> None:
     """Patch OSS-Fuzz-Gen LLM calls to save sampled HGB traces."""
     _record_patch("hgb_llm_trace",
@@ -317,27 +380,57 @@ def _install_hgb_llm_trace() -> None:
     if gpt_cls is None or getattr(gpt_cls, "_hgb_trace_installed", False):
         return
 
-    original_create = gpt_cls._create_chat_completion
+    # The pinned upstream revision exposes chat_llm / ask_llm /
+    # chat_llm_with_tools / query_llm; there is no _create_chat_completion.
+    # Wrap the methods that actually issue LLM requests.
+    original_chat_llm = gpt_cls.chat_llm
 
-    def traced_create(self, client: Any, kwargs: dict[str, Any]) -> Any:
-        model = str(kwargs.get("model") or getattr(self, "name", ""))
+    def traced_chat_llm(self: Any, client: Any, prompt: Any) -> Any:
+        messages = list(prompt.get()) if prompt and hasattr(prompt, "get") else []
+        request = {
+            "model": getattr(self, "name", ""),
+            "messages": list(messages),
+            "n": getattr(self, "num_samples", None),
+            "temperature": getattr(self, "temperature", None),
+        }
         return hgb_llm_trace.trace_call(
-            lambda: original_create(self, client, kwargs),
+            lambda: original_chat_llm(self, client, prompt),
             stage="oss-fuzz-gen",
             provider="openai-compatible",
             operation="chat.completions.create",
-            model=model,
-            request=kwargs,
+            model=str(request["model"]),
+            request=request,
         )
 
-    gpt_cls._create_chat_completion = traced_create
+    gpt_cls.chat_llm = traced_chat_llm
+
+    original_ask_llm = gpt_cls.ask_llm
+
+    def traced_ask_llm(self: Any, prompt: Any) -> Any:
+        messages = list(prompt.get()) if prompt and hasattr(prompt, "get") else []
+        request = {
+            "model": getattr(self, "name", ""),
+            "messages": list(messages),
+            "n": getattr(self, "num_samples", None),
+            "temperature": getattr(self, "temperature", None),
+        }
+        return hgb_llm_trace.trace_call(
+            lambda: original_ask_llm(self, prompt),
+            stage="oss-fuzz-gen",
+            provider="openai-compatible",
+            operation="chat.completions.create",
+            model=str(request["model"]),
+            request=request,
+        )
+
+    gpt_cls.ask_llm = traced_ask_llm
 
     original_tools = gpt_cls.chat_llm_with_tools
 
-    def traced_chat_llm_with_tools(self, client: Any, prompt: Any, tools: Any) -> Any:
-        prompt_messages = prompt.get() if prompt else []
+    def traced_chat_llm_with_tools(self: Any, client: Any, prompt: Any, tools: Any) -> Any:
+        prompt_messages = list(prompt.get()) if prompt and hasattr(prompt, "get") else []
         request = {
-            "model": self._completion_model_name(),
+            "model": getattr(self, "name", ""),
             "input": list(getattr(self, "messages", [])) + list(prompt_messages),
             "tools": tools,
         }
@@ -491,13 +584,41 @@ def _write_generation_prompt_audit() -> None:
             examples = collected.get("allowed", [])[:50]
         except Exception:  # noqa: BLE001 - audit is best-effort, never blocks.
             examples = []
-    # The wrapper never opens the reference harness or selected-harness API
-    # metadata in a method-faithful blind run, so both flags are false.
+    # In a blind-project method-faithful run the wrapper never reads the exact
+    # reference harness or selected-harness API metadata, and the generated
+    # benchmark/example artifacts must not contain the reference canary. The
+    # flag is fail-closed by construction but the canary scan is real evidence
+    # (zeta/eta plan §2): scan the benchmark YAML and allowed example files for
+    # the planted reference canary token.
+    reference_canary = os.environ.get("HGB_REF_CANARY", "").strip()
+    exact_in_prompt = False
+    canary_hits: list[dict[str, str]] = []
+    if reference_canary and reference_canary != "HGB_REF_CANARY_none":
+        scan_paths: list[Path] = []
+        benchmark_dir = Path("/workspace/benchmark")
+        for name in ("generated.yaml", "benchmark.yaml", "selection.json"):
+            p = benchmark_dir / name
+            if p.is_file():
+                scan_paths.append(p)
+        for entry in examples:
+            p = Path(entry.get("path", ""))
+            if p.is_file():
+                scan_paths.append(p)
+        for p in dict.fromkeys(scan_paths):
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if reference_canary in text:
+                exact_in_prompt = True
+                canary_hits.append({"file": str(p), "context": text[max(0, text.find(reference_canary) - 40):text.find(reference_canary) + 80]})
     audit = {
-        "exact_reference_harness_in_prompt": False,
+        "exact_reference_harness_in_prompt": exact_in_prompt,
         "selected_harness_api_metadata_used": False,
         "examples": [{"path": e.get("path", ""), "reason": e.get("reason", "allowed_non_target_example")}
                      for e in examples],
+        "canary": reference_canary,
+        "canary_hits": canary_hits,
     }
     try:
         (audit_dir / "prompt_audit.json").write_text(
@@ -517,8 +638,21 @@ def main() -> int:
     if upstream_args and upstream_args[0] == "--":
         upstream_args = upstream_args[1:]
 
-    os.environ.setdefault("LLM_NUM_EXP", os.environ.get("OFG_NUM_EXP", "1"))
-    os.environ.setdefault("LLM_NUM_EVA", os.environ.get("OFG_NUM_EVA", "1"))
+    # LLM_NUM_EXP/LLM_NUM_EVA are parallelism knobs, not generation budgets.
+    # Method-faithful profiles must not silently downgrade them to 1; fall
+    # back to the upstream defaults (2 experiments, 3 evaluations) when
+    # unset. An empty-string env value would break upstream int() parsing, so
+    # treat it as unset.
+    def _num_env(name: str, upstream_default: str) -> None:
+        value = os.environ.get(name, "").strip()
+        if value:
+            os.environ[name] = value
+            return
+        fallback = os.environ.get("OFG_" + name.replace("LLM_", ""), "").strip()  # OFG_NUM_EXP/OFG_NUM_EVA
+        os.environ[name] = fallback or upstream_default
+
+    _num_env("LLM_NUM_EXP", "2")
+    _num_env("LLM_NUM_EVA", "3")
 
     artifact = Path(args.artifact).resolve()
     sys.path.insert(0, str(artifact))
@@ -529,6 +663,7 @@ def main() -> int:
     _patch_oss_fuzz_postprocess_logging()
     _patch_project_target_downloads()
     _patch_coverage_skip()
+    _install_model_compat()
     _install_hgb_llm_trace()
     _install_repair_observability()
     _install_local_introspector_shim(upstream_args)

@@ -1471,9 +1471,15 @@ def test_report_only_missing_row_returns_empty(monkeypatch, tmp_path: Path) -> N
     assert metadata["api_report_row_found"] is False
 
 
-def test_ofg_trim_report_first_name_mismatch_uses_dynamic_fallback(tmp_path: Path) -> None:
+def test_ofg_trim_report_first_name_mismatch_uses_dynamic_fallback(tmp_path: Path, monkeypatch) -> None:
     report = tmp_path / "apis.json"
     write_api_report(report, [{"target": "target", "candidate_api_names": ["missing_report_api"]}])
+    # Reference-derived report use is fail-closed: it requires BOTH explicit
+    # opt-ins AND a non-blind protocol. Without them the report must never be
+    # read, even in report_first mode.
+    monkeypatch.setenv("OFG_REFERENCE_DIAGNOSTIC", "1")
+    monkeypatch.setenv("OFG_ALLOW_REFERENCE_RANKING", "1")
+    monkeypatch.setenv("HGB_BASELINE_PROTOCOL", "see-report")
     args = SimpleNamespace(
         report_mode="report_first",
         api_report=str(report),
@@ -1494,6 +1500,31 @@ def test_ofg_trim_report_first_name_mismatch_uses_dynamic_fallback(tmp_path: Pat
     assert [item["name"] for item in ranked] == ["dynamic_api"]
     assert rejected == []
     assert metadata["api_report_row_found"] is True
+
+
+def test_ofg_trim_default_is_blind_even_with_report_env(tmp_path: Path, monkeypatch) -> None:
+    report = tmp_path / "apis.json"
+    write_api_report(report, [{"target": "target", "candidate_api_names": ["leak_api"]}])
+    monkeypatch.setenv("HGB_BASELINE_PROTOCOL", "blind-project")
+    args = SimpleNamespace(
+        report_mode="report_first",
+        api_report=str(report),
+        target_name="target",
+        project="proj",
+        fuzz_target="fuzzer",
+        max_functions=1,
+        reference_dir="",
+        allow_test_files=False,
+        selection_mode="ranked",
+    )
+
+    ranked, rejected, metadata = ofg_trim._rank_functions(
+        [{"name": "leak_api", "signature": "int leak_api(void)"}],
+        args,
+    )
+
+    assert metadata["blind_mode"] is True
+    assert "api_report_row_found" not in metadata
 
 
 def test_api_report_caps_candidates(tmp_path: Path) -> None:

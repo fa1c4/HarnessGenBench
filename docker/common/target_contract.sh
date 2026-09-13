@@ -366,16 +366,25 @@ hgb_result_read_stages() {
 
 hgb_result_status_from_stages() {
   local stage_file="${1:-$workspace/stages.json}"
-  python3 - "$stage_file" <<'PY_HGB_STAGES_STATUS'
+  local generator="${HGB_GENERATOR:-${2:-unknown}}"
+  python3 - "$stage_file" "$generator" <<'PY_HGB_STAGES_STATUS'
 import json
+import os
 import sys
 from pathlib import Path
 try:
     stages = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except Exception:
     stages = {}
+generator = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("HGB_GENERATOR", "")
+# codeql_database/knowledge_graph are CKGFuzzer-only stages; requiring them
+# for other generators would make a fully-completed OSS-Fuzz-Gen/PromeFuzz/
+# ELFuzz/G2Fuzz run unreachable (every stage completed but status=failed).
+ckg_only = ("codeql_database", "knowledge_graph") if generator == "ckgfuzzer" else ()
 stage_names = [
-    "target_prepared", "codeql_database", "knowledge_graph", "generation",
+    "target_prepared",
+    *ckg_only,
+    "generation",
     "compilation_repair", "candidate_build", "sanitizer_smoke",
     "api_reachability", "campaign", "coverage",
 ]

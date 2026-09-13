@@ -33,11 +33,18 @@ FUZZ_ENTRY_RE = re.compile(
     r"LLVMFuzzerTestOneInput|LLVMFuzzerInitialize|FuzzOneInput|fuzzer_main",
     re.I,
 )
+# Source paths inside vendored/external dependency trees: such functions
+# cannot be built or linked in the project's own FuzzBench build and must
+# lose selection to primary-project functions.
+VENDORED_PATH_MARKERS = (
+    "/external/", "/third_party/", "/vendor/", "/deps/", "/thirdparty/",
+    "/external.", "/3rdparty/",
+)
 BAD_PATH_PARTS = (
     "/test/", "/tests/", "/testing/", "/gtest/", "/gmock/", "/googletest/",
     "/example/", "/examples/", "/sample/", "/samples/", "/demo/", "/demos/",
     "/benchmark/", "/bench/", "/perf/", "/third_party/", "/contrib/",
-    "/fuzz/", "/fuzzer/", "/oss-fuzz/", "/infra/indexer/",
+    "/fuzz/", "/fuzzer/", "/fuzzing/", "/oss-fuzz/", "/infra/indexer/",
 )
 BAD_RETURN_RE = re.compile(
     r"^\s*(public|private|protected)\s*:", re.I,
@@ -137,6 +144,12 @@ def reject_reason(record: dict[str, Any]) -> str:
         return "empty_api_candidate"
     if len(name) <= 1:
         return "generic_single_letter_api"
+    if name.endswith("::") or name.endswith(":") or "(anonymous" in name:
+        return "malformed_name"
+    if name.count("::") > 6 or len(name) > 200:
+        return "template_or_generated_name"
+    if "N/A" in sig and len(sig) < 30:
+        return "malformed_signature"
     if HELPER_NAME_RE.match(name):
         return "runtime_or_compiler_helper"
     if FUZZ_ENTRY_RE.search(name) or FUZZ_ENTRY_RE.search(sig):
@@ -153,6 +166,14 @@ def reject_reason(record: dict[str, Any]) -> str:
 
 def _is_public(record: dict[str, Any]) -> bool:
     """Heuristic for externally reachable / public project functions."""
+    # Trust the report's accessibility analysis when present (local report
+    # conversion sets ``public`` from ``is_accessible``).
+    acc = record.get("public")
+    if isinstance(acc, bool):
+        return acc
+    acc = record.get("is_accessible")
+    if isinstance(acc, bool):
+        return acc
     path = "/" + _source_location(record).replace("\\", "/").lower()
     # Headers and public api dirs are more likely externally reachable.
     if path.endswith((".h", ".hh", ".hpp", ".hxx")):
@@ -287,12 +308,15 @@ def filter_functions(
     project: str = "",
     target_name: str = "",
     fuzz_target: str = "",
+    preferred: list[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Filter and rank functions for benchmark selection.
 
     Ranking is by public visibility, callgraph reachability, type feasibility,
     complexity, and uncovered project relevance — never by reference harness
-    calls. Returns (selected, rejected) where rejected carries a reason.
+    calls. ``preferred`` is an optional committed public-API name list that
+    receives a strong bonus (never derived from the reference harness).
+    Returns (selected, rejected) where rejected carries a reason.
     """
     calltree = parse_calltree("")  # no report dir here; callers pass records
     reachable: set[str] = set()
@@ -302,6 +326,7 @@ def filter_functions(
         for callee in r.get("callees", []):
             reachable.add(callee)
 
+    preferred_set = {p.strip() for p in (preferred or []) if p.strip()}
     selected: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for record in records:
@@ -315,6 +340,9 @@ def filter_functions(
         if record.get("public"):
             score += 50
             reasons.append("public_visibility")
+        if preferred_set and name in preferred_set:
+            score += 150
+            reasons.append("preferred_public_api")
         if name in reachable:
             score += 30
             reasons.append("callgraph_reachable")
@@ -335,6 +363,19 @@ def filter_functions(
         if len(name) <= 3:
             score -= 20
             reasons.append("short_name")
+        # Functions resolved inside vendored/external dependency trees (e.g.
+        # freetype2's external/brotli, external/bzip2) cannot be built or
+        # linked in the project's own FuzzBench build. Penalize them heavily
+        # so project functions win, but never hard-reject (the pool must
+        # never silently empty). Paths that name the project repo itself are
+        # exempt (some introspector overlays nest the primary repo under an
+        # ``external/`` dir, e.g. freetype2-testing/external/freetype2).
+        path_l = (record.get("path") or record.get("source_file") or "").replace("\\", "/").lower()
+        project_l = (project or "").lower()
+        in_primary = bool(project_l) and f"/{project_l}/" in path_l
+        if not in_primary and any(marker in path_l for marker in VENDORED_PATH_MARKERS):
+            score -= 200
+            reasons.append("vendored_external_source")
         selected.append({**record, "_hgb_score": score, "_hgb_score_reasons": reasons})
     selected.sort(key=lambda r: (-int(r.get("_hgb_score", 0)), r["name"]))
     return selected, rejected
@@ -359,10 +400,12 @@ def select_functions(
     project: str = "",
     target_name: str = "",
     fuzz_target: str = "",
+    preferred: list[str] | None = None,
 ) -> dict[str, Any]:
     """Select up to ``max_functions`` candidates and record all scores."""
     selected, rejected = filter_functions(
         records, project=project, target_name=target_name, fuzz_target=fuzz_target,
+        preferred=preferred,
     )
     chosen = selected[:max(1, max_functions)]
     return {
@@ -632,7 +675,10 @@ def build_introspector_report(
         )
     build_cmd = [
         "python3", str(oss_fuzz_dir / "infra" / "helper.py"), "build_fuzzers",
-        "--sanitizer", "address", "--engine", "introspector", "--architecture", "x86_64",
+        # introspector is a SANITIZER choice in helper.py (--sanitizer
+        # introspector), never an engine. Passing --engine introspector would
+        # build a normal address build with an unknown engine.
+        "--sanitizer", "introspector", "--architecture", "x86_64",
         project, str(overlay_dir),
     ]
     result = runner(build_cmd, 3600)
@@ -657,7 +703,11 @@ def build_introspector_report(
             _sh.copy2(src, dst)
             files[name] = True
         elif name == "function_source_map.json":
-            mapping = generate_function_source_map(selected, str(source_dir))
+            # Parse the CONVERTED report (the files copied into
+            # introspector_dir above), never the raw fuzz-introspector dir:
+            # the raw report uses its own record keys and would yield an
+            # empty map.
+            mapping = generate_function_source_map(introspector_dir, str(source_dir))
             dst.write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             files[name] = True
         else:

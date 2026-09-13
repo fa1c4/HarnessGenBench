@@ -525,6 +525,10 @@ def evaluate_candidate(
         return rec
     # In strict profiles the campaign must produce a nonempty final corpus;
     # never fall back to the seed corpus for coverage replay (zeta plan §2/§3).
+    if strict and not campaign.get("copy_out_ok", True):
+        hgb_result.mark_stage(rec.stages, "campaign", "failed")
+        rec.error = "campaign corpus.tar copy-out failed; strict profiles never fall back to the seed corpus"
+        return rec
     final_corpus_file_count = int(campaign.get("final_corpus_file_count", 0) or 0)
     if strict and final_corpus_file_count <= 0:
         hgb_result.mark_stage(rec.stages, "campaign", "failed")
@@ -774,15 +778,27 @@ def _run_native_coverage_control(
     native_work = work_dir / "native_control"
     native_work.mkdir(parents=True, exist_ok=True)
     shutil.copy2(original, overlay_path)
-    native_build = hgb_fuzzbench_builder.build_candidate_image(
+    # The sealed Dockerfile ALSO does a final ``COPY hgb_candidate_overlay/{rel}
+    # /src/{rel}`` after ``COPY source_input/ /src/``, so restoring only
+    # source_input/ leaves the candidate as the last write at the native path
+    # and the "control" would measure candidate-vs-candidate. Overwrite the
+    # candidate-overlay staging path with the reference as well so the native
+    # coverage image compiles the REFERENCE harness. Each candidate's
+    # build_candidate_image re-stages its own candidate into both paths, so
+    # this never contaminates later candidate builds.
+    overlay_staging = context_dir / "hgb_candidate_overlay" / native_rel
+    if overlay_staging.is_file():
+        shutil.copy2(original, overlay_staging)
+    # The native control must be coverage-instrumented: an address build
+    # produces no profraw and the replay would find no coverage report.
+    native_build = hgb_fuzzbench_builder.build_coverage_image(
         context_dir=context_dir,
         dockerfile=dockerfile,
         image_tag=image_tag,
         fuzz_target=fuzz_target,
-        staged_candidate_host=original,
-        native_destination=native_dest,
         work_dir=native_work / "build",
         runner=runner,
+        timeout_seconds=1800,
     )
     if native_build.build_exit_code != 0:
         return None
@@ -935,10 +951,12 @@ def evaluate(
     if not seeds:
         # Materialize libFuzzer's implicit empty seed as an explicit campaign
         # input so strict profiles have a real final corpus artifact to replay.
+        # A NON-empty byte string is used because libFuzzer skips zero-byte
+        # corpus files ("0 files found" -> empty-corpus fuzzing).
         seed_dir = work_dir / "campaign_seeds"
         seed_dir.mkdir(parents=True, exist_ok=True)
         empty_seed = seed_dir / "hgb_empty_seed"
-        empty_seed.write_bytes(b"")
+        empty_seed.write_bytes(b"hgb")
         seeds = [empty_seed]
 
     records: list[CandidateRecord] = []

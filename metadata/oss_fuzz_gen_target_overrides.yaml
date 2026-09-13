@@ -32,6 +32,9 @@ targets:
     candidate_destination: /src/sqlite3/ossfuzz.c
     build_timeout: 1800
     fuzz_timeout: 600
+    # Public documented SQLite C API (not reference-derived): internal
+    # struct-heavy functions (Expr/Parse) are unusable by generated harnesses.
+    preferred_apis: [sqlite3_open, sqlite3_open_v2, sqlite3_prepare_v2, sqlite3_prepare_v3, sqlite3_step, sqlite3_exec, sqlite3_finalize, sqlite3_close, sqlite3_close_v2, sqlite3_reset, sqlite3_bind_text, sqlite3_bind_blob, sqlite3_bind_int, sqlite3_column_count, sqlite3_column_text, sqlite3_column_blob, sqlite3_column_int]
   zlib_zlib_uncompress_fuzzer:
     language: c
     candidate_destination: /src/zlib/zlib_uncompress_fuzzer.c
@@ -50,7 +53,7 @@ targets:
   freetype2_ftfuzzer:
     language: c
     candidate_destination: /src/freetype2/ftfuzzer.cc
-    build_timeout: 1800
+    build_timeout: 3600
     fuzz_timeout: 600
   curl_curl_fuzzer_http:
     language: c

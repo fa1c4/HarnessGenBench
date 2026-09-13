@@ -589,7 +589,9 @@ def test_evaluator_failure_is_not_swallowed_in_entrypoint() -> None:
     # The run_evaluator function must not append `|| true` to the evaluator call.
     assert "hgb_harness_evaluator.py" in entrypoint
     eval_block = entrypoint.split("hgb_harness_evaluator.py", 1)[1]
-    eval_block = eval_block.split("return $?", 1)[0]
+    # The shared evaluator path ends at its return of $ofg_eval_rc; the legacy
+    # monolithic fallback (now fail-closed) ends at its own return 65.
+    eval_block = eval_block.split("return \"$ofg_eval_rc\"", 1)[0]
     assert "|| true" not in eval_block
     # The post-evaluator logic must propagate infra_failure.
     assert "infra_failure" in entrypoint

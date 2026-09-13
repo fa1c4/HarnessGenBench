@@ -97,6 +97,8 @@ def synthesize_benchmark(
     source_dir: str | Path = "",
     max_functions: int = 3,
     target_path: str = "",
+    language: str = "",
+    preferred_apis: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the benchmark dict and selection metadata."""
     selection = select_functions(
@@ -105,11 +107,13 @@ def synthesize_benchmark(
         project=project,
         target_name=target_name,
         fuzz_target=fuzz_target,
+        preferred=preferred_apis,
     )
     selected = selection["selected"]
     if not selected:
         raise ValueError("introspector selection produced no usable functions")
-    language = detect_language(source_dir) if source_dir else "c++"
+    if not language:
+        language = detect_language(source_dir) if source_dir else "c++"
     functions = []
     for record in selected:
         functions.append({
@@ -229,6 +233,12 @@ def main() -> int:
     parser.add_argument("--target-name", required=True)
     parser.add_argument("--fuzz-target", default="")
     parser.add_argument("--max-functions", type=int, default=3)
+    parser.add_argument("--target-path", default="",
+                        help="exact native harness destination in the OSS-Fuzz build context (committed build fact, not reference-derived)")
+    parser.add_argument("--language", default="",
+                        help="force c or c++ instead of source detection")
+    parser.add_argument("--preferred-apis", default="",
+                        help="comma-separated committed public API names that receive a selection bonus")
     parser.add_argument("--benchmark-out", required=True)
     parser.add_argument("--selection-out", required=True)
     args = parser.parse_args()
@@ -245,6 +255,9 @@ def main() -> int:
         fuzz_target=args.fuzz_target,
         source_dir=args.source_dir,
         max_functions=args.max_functions,
+        target_path=args.target_path,
+        language=args.language,
+        preferred_apis=[a.strip() for a in args.preferred_apis.split(",") if a.strip()] or None,
     )
     write_outputs(result, benchmark_path=args.benchmark_out, selection_path=args.selection_out)
     print(json.dumps({"validation": message, "selected": len(result["selection"]["selected"])}, indent=2))

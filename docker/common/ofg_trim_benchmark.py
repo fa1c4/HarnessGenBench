@@ -40,10 +40,16 @@ def _normalise_function(function: Any) -> dict[str, Any] | None:
 def _blind_mode(args: argparse.Namespace) -> bool:
     if getattr(args, "blind", False):
         return True
-    if os.environ.get("OFG_REFERENCE_DIAGNOSTIC", "0").strip().lower() in {"1", "true", "yes"}:
-        return False
+    diagnostic = os.environ.get("OFG_REFERENCE_DIAGNOSTIC", "0").strip().lower() in {"1", "true", "yes"}
+    allow = os.environ.get("OFG_ALLOW_REFERENCE_RANKING", "0").strip().lower() in {"1", "true", "yes"}
     protocol = os.environ.get("HGB_BASELINE_PROTOCOL") or os.environ.get("HGB_PROTOCOL") or ""
-    return protocol.strip().lower() == "blind-project"
+    # Reference-derived report/API data may only drive selection with BOTH
+    # explicit opt-ins AND an explicitly non-blind protocol. The default is
+    # fail-closed blind: without the opt-ins the exact-target API report is
+    # never read, regardless of protocol env.
+    if diagnostic and allow and protocol.strip().lower() != "blind-project":
+        return False
+    return True
 
 
 def _rank_functions(functions: Any, args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:

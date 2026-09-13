@@ -48,7 +48,14 @@ def _secret_values() -> list[str]:
         "CKGFUZZER_EMBEDDING_API_KEY",
         "PROME_FUZZ_EMBEDDING_API_KEY",
     )
-    return [value for value in (os.environ.get(name, "") for name in names) if value]
+    # Placeholder secrets like "-" or "x" would corrupt every hyphen/letter in
+    # the trace (e.g. "chatcmpl-test" -> "chatcmpl[REDACTED]test"); only
+    # redact secrets long enough to be unambiguous.
+    return [
+        value
+        for value in (os.environ.get(name, "") for name in names)
+        if len(value) >= 4
+    ]
 
 
 def redact(value: Any) -> Any:

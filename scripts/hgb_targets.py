@@ -1628,8 +1628,16 @@ def _apply_package_split(
                 "source_suffix": harness.source_suffix,
                 "selection_reason": harness.selection_reason,
             }
-        except Exception:
+        except Exception as exc:
             native_harness = None
+            if require_split:
+                # Fail closed: without the native harness the evaluator cannot
+                # prove the candidate was the final write at the native path,
+                # and the restore path would re-overlay the exact reference
+                # harness over the candidate (HGB5 regression).
+                raise PackageSplitError(
+                    f"native harness selection failed for {fuzz_target}: {exc}"
+                ) from exc
     try:
         hgb_target_package.split_package(
             output,

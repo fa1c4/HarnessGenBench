@@ -502,6 +502,7 @@ run_hgb_container() {
     -e OFG_MAX_ROUND \
     -e OFG_MIN_BENCHMARK_SCORE \
     -e OFG_SYNTHESIZE_ON_BAD_BENCHMARK \
+    -e OFG_INTROSPECTOR_UNPINNED \
     -e HGB_LLM_PARALLELISM \
     -e HGB_LLM_MIN_INTERVAL_SECONDS \
     -e HGB_LLM_RATE_LIMIT_MAX_SLEEP_SECONDS \
@@ -660,6 +661,18 @@ run_hgb_target_container() {
   fi
   if [[ "$generator" == "oss-fuzz-gen" && -S /var/run/docker.sock ]]; then
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
+    # The FULL (unstripped) FuzzBench target source checkout is mounted
+    # read-only for build-only introspection: the generator-visible
+    # source_input is stripped of the native harness, and the real Fuzz
+    # Introspector build needs the complete tree (build.sh compiles the
+    # harness). The overlay is never read into prompts or benchmark YAML; the
+    # generation code path only reads /target/source_input.
+    if [[ -d "$root/artifacts/fuzzbench-target-sources/$target" ]]; then
+      extra_docker_args+=(-v "$root/artifacts/fuzzbench-target-sources/$target:/opt/hgb/target-sources:ro" -e HGB_TARGET_FULL_SOURCE_DIR=/opt/hgb/target-sources)
+    fi
+    # Expose the target's other run dirs so the introspector can reuse a
+    # previously validated local report across rerun rounds.
+    extra_docker_args+=(-v "$(dirname "$workspace"):/hgb-target-runs:ro" -e HGB_TARGET_RUNS_DIR=/hgb-target-runs)
   fi
   if [[ "$generator" == "elfuzz" && -S /var/run/docker.sock ]]; then
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
@@ -703,11 +716,17 @@ run_hgb_target_container() {
     target_mount_src="$target_package/generator_input"
     evaluator_mount_args=(-v "$target_package/evaluator_only:/evaluator:ro" -e HGB_EVALUATOR_ROOT=/evaluator -e HGB_EVALUATOR_MANIFEST=/evaluator/evaluator_manifest.json)
     # Reference-harness canary audit: the canary written into evaluator_only
-    # during package creation must never appear under generator_input/.
+    # during package creation must never appear under generator_input/, and the
+    # token is forwarded to the container so the candidate copy audit and the
+    # generator leakage audit compare against the real planted token (not the
+    # never-planted HGB_REF_CANARY_none placeholder).
     if [[ -f "$target_package/evaluator_only/reference_canary.txt" ]]; then
       ckg_ref_canary="$(cat "$target_package/evaluator_only/reference_canary.txt" 2>/dev/null | head -n1 || true)"
       if [[ -n "$ckg_ref_canary" ]] && grep -RqF -- "$ckg_ref_canary" "$target_package/generator_input" 2>/dev/null; then
         die "$ckg_profile: reference canary leaked into generator_input/; refusing to launch the generator container (infra_failure)"
+      fi
+      if [[ -z "${HGB_REF_CANARY:-}" && -n "$ckg_ref_canary" ]]; then
+        export HGB_REF_CANARY="$ckg_ref_canary"
       fi
     fi
   fi
@@ -781,6 +800,7 @@ run_hgb_target_container() {
     -e OFG_MAX_ROUND \
     -e OFG_MIN_BENCHMARK_SCORE \
     -e OFG_SYNTHESIZE_ON_BAD_BENCHMARK \
+    -e OFG_INTROSPECTOR_UNPINNED \
     -e OFG_EVAL_BUILD_TIMEOUT \
     -e OFG_CAMPAIGN_SECONDS \
     -e OFG_OSS_FUZZ_COMMIT \
@@ -924,6 +944,7 @@ run_hgb_target_container() {
     -e HGB_HOST_GID="$(id -g)" \
     "${reference_dir_args[@]}" \
     -v "$workspace:/workspace" \
+    -v "$workspace:$workspace" \
     -v "$target_mount_src:/target:ro" \
     "${evaluator_mount_args[@]}" \
     -v "$root/docker/$generator/entrypoint.sh:/opt/hgb/entrypoint.sh:ro" \

@@ -56,12 +56,13 @@ _ofg_apply_strict_reproduction_defaults() {
   export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}"
   export OFG_ALLOW_GCS_TARGET_DOWNLOAD="${OFG_ALLOW_GCS_TARGET_DOWNLOAD:-0}"
   export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
-  export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-  export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
+  # OFG_NUM_EXP/OFG_NUM_EVA are LLM parallelism knobs, not generation budgets.
+  # ofg_profile.py forbids =1 in method-faithful profiles, so leave them unset
+  # here and let the wrapper fall back to the upstream defaults (2/3).
   export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
   export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
   export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
-  export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+  export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-14400}"
   export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
   export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
   export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -89,12 +90,10 @@ apply_profile_defaults() {
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-remote}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
       export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-3}"
-      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
       export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
       export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
       export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
-      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-14400}"
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -104,12 +103,10 @@ apply_profile_defaults() {
       export OFG_INTROSPECTOR_MODE="${OFG_INTROSPECTOR_MODE:-remote}"
       export OFG_SKIP_COVERAGE_GAINS="${OFG_SKIP_COVERAGE_GAINS:-0}"
       export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
-      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
       export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
       export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
       export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
-      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-14400}"
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -125,12 +122,10 @@ apply_profile_defaults() {
       export OFG_ALLOW_PROJECT_YAML_FALLBACK="${OFG_ALLOW_PROJECT_YAML_FALLBACK:-0}"
       export OFG_SYNTHESIZE_ON_BAD_BENCHMARK="${OFG_SYNTHESIZE_ON_BAD_BENCHMARK:-0}"
       export OFG_NUM_SAMPLES="${OFG_NUM_SAMPLES:-10}"
-      export OFG_NUM_EXP="${OFG_NUM_EXP:-1}"
-      export OFG_NUM_EVA="${OFG_NUM_EVA:-1}"
       export OFG_NUM_EVALUATIONS="${OFG_NUM_EVALUATIONS:-3}"
       export OFG_MAX_ROUND="${OFG_MAX_ROUND:-5}"
       export OFG_RUN_TIMEOUT="${OFG_RUN_TIMEOUT:-900}"
-      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-7200}"
+      export OFG_GENERATION_TIMEOUT_SECONDS="${OFG_GENERATION_TIMEOUT_SECONDS:-14400}"
       export OFG_MAX_BENCHMARK_FUNCTIONS="${OFG_MAX_BENCHMARK_FUNCTIONS:-3}"
       export HGB_EXCLUDE_FROM_AGGREGATE="${HGB_EXCLUDE_FROM_AGGREGATE:-0}"
       export HGB_ALLOW_REFERENCE_USAGE="${HGB_ALLOW_REFERENCE_USAGE:-0}"
@@ -191,14 +186,25 @@ apply_profile_defaults() {
   export HGB_TASK_FAMILY="harness_generator"
   export HGB_GENERATOR="${HGB_GENERATOR:-oss-fuzz-gen}"
   export HGB_GENERATOR_ARTIFACT_DIR="$artifact"
+  # The host runner passes the campaign budget as HGB_CAMPAIGN_SECONDS; map it
+  # to the evaluator's OFG_CAMPAIGN_SECONDS knob so the requested fuzzing
+  # budget actually reaches the campaign stage.
+  export OFG_CAMPAIGN_SECONDS="${OFG_CAMPAIGN_SECONDS:-${HGB_CAMPAIGN_SECONDS:-60}}"
   export OFG_LLM_PREFLIGHT="${OFG_LLM_PREFLIGHT:-1}"
   export OFG_LLM_REQUEST_TIMEOUT_SECONDS="${OFG_LLM_REQUEST_TIMEOUT_SECONDS:-${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}}"
   export OFG_LLM_MAX_RETRIES="${OFG_LLM_MAX_RETRIES:-0}"
   export HGB_LLM_PARALLELISM="${HGB_LLM_PARALLELISM:-4}"
   export HGB_LLM_MIN_INTERVAL_SECONDS="${HGB_LLM_MIN_INTERVAL_SECONDS:-3}"
   export HGB_LLM_LOCK_DIR="${HGB_LLM_LOCK_DIR:-/tmp/hgb-llm-locks}"
-  export LLM_NUM_EXP="${LLM_NUM_EXP:-$OFG_NUM_EXP}"
-  export LLM_NUM_EVA="${LLM_NUM_EVA:-$OFG_NUM_EVA}"
+  # Only forward LLM_NUM_EXP/LLM_NUM_EVA when a value exists: exporting an
+  # empty string would break upstream int(os.getenv(...)) parsing and an
+  # unset value lets the wrapper apply the upstream defaults (2/3).
+  if [[ -n "${LLM_NUM_EXP:-}" || -n "${OFG_NUM_EXP:-}" ]]; then
+    export LLM_NUM_EXP="${LLM_NUM_EXP:-${OFG_NUM_EXP:-}}"
+  fi
+  if [[ -n "${LLM_NUM_EVA:-}" || -n "${OFG_NUM_EVA:-}" ]]; then
+    export LLM_NUM_EVA="${LLM_NUM_EVA:-${OFG_NUM_EVA:-}}"
+  fi
 }
 
 validate_profile_invariants() {
@@ -216,7 +222,11 @@ oss_fuzz_checkout_ready() {
 }
 materialize_oss_fuzz_checkout() {
   local source_dir="${OFG_OSS_FUZZ_DIR:-/opt/hgb/oss-fuzz}"
-  local run_dir="${OFG_OSS_FUZZ_RUN_DIR:-$workspace/oss-fuzz}"
+  # Docker-in-Docker: the checkout must live under the HOST-visible workspace
+  # path so sibling build containers (via /var/run/docker.sock) can mount it.
+  # common.sh mounts "$workspace" at both /workspace and its host path, so
+  # HGB_WORKSPACE_HOST/oss-fuzz == /workspace/oss-fuzz inside this container.
+  local run_dir="${OFG_OSS_FUZZ_RUN_DIR:-${HGB_WORKSPACE_HOST:-$workspace}/oss-fuzz}"
   rm -rf "$run_dir"
   mkdir -p "$(dirname "$run_dir")"
   if oss_fuzz_checkout_ready "$source_dir"; then
@@ -227,6 +237,76 @@ materialize_oss_fuzz_checkout() {
   oss_fuzz_checkout_ready "$run_dir" || return 1
   printf '%s' "$run_dir"
 }
+
+# ---------------------------------------------------------------------------
+# Patch the materialized (run-dir) OSS-Fuzz project files for known upstream
+# breakages that would otherwise sink the upstream repair loop. Recorded as
+# compat deviations in logs/oss_fuzz_project_patches.log.
+# ---------------------------------------------------------------------------
+patch_oss_fuzz_projects() {
+  local oss_fuzz_dir="$1"
+  local patch_log="$workspace/logs/oss_fuzz_project_patches.log"
+  mkdir -p "$(dirname "$patch_log")"
+  # lcms: the upstream Dockerfile seeds the corpus with ``cd seeds`` relative
+  # to WORKDIR lcms (the dir does not exist there) and copies testbed/*.icc
+  # files that current lcms master no longer ships; the RUN always fails and
+  # the upstream repair loop can never build the lcms image. Make the seed
+  # step correct and best-effort (seeds never gate compilation).
+  local lcms_dockerfile="$oss_fuzz_dir/projects/lcms/Dockerfile"
+  if [[ -f "$lcms_dockerfile" ]] && ! grep -qF "HGB lcms seed step tolerant" "$lcms_dockerfile"; then
+    "$python" - "$lcms_dockerfile" <<'PY_OFG_LCMS_PATCH'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+text = p.read_text(encoding="utf-8", errors="replace")
+old = """RUN mkdir $SRC/seeds && \\
+    cd seeds && \\
+    cp $SRC/lcms/testbed/bad.icc . && \\
+    cp $SRC/lcms/testbed/toosmall.icc . && \\
+    cp $SRC/lcms/testbed/test1.icc . && \\
+    cp $SRC/lcms/testbed/crayons.icc . && \\
+    cp $SRC/lcms/testbed/ibm-t61.icc . && \\
+    #add more seeds from the testbed dir
+    cp $SRC/lcms/testbed/bad_mpe.icc . && \\
+    cp $SRC/lcms/testbed/new.icc . && \\
+    cp $SRC/lcms/testbed/test2.icc . && \\
+    cp $SRC/lcms/testbed/test3.icc . && \\
+    cp $SRC/lcms/testbed/test4.icc . && \\
+    cp $SRC/lcms/testbed/test5.icc . && \\
+    zip -rj $SRC/seed_corpus.zip $SRC/seeds/*
+"""
+new = """RUN mkdir -p $SRC/seeds && \\
+    cd $SRC/seeds && \\
+    for f in bad.icc toosmall.icc test1.icc crayons.icc ibm-t61.icc bad_mpe.icc new.icc test2.icc test3.icc test4.icc test5.icc; do \\
+        cp $SRC/lcms/testbed/$f . 2>/dev/null || true; \\
+    done && \\
+    zip -rj $SRC/seed_corpus.zip $SRC/seeds/* 2>/dev/null || true
+# HGB lcms seed step tolerant
+"""
+if old in text:
+    text = text.replace(old, new)
+elif "HGB lcms seed step tolerant" not in text:
+    # Fallback: patch just the broken ``cd seeds`` line.
+    text = text.replace("    cd seeds && \\", "    cd $SRC/seeds && \\")
+    text = text.replace("zip -rj $SRC/seed_corpus.zip $SRC/seeds/*",
+                        "zip -rj $SRC/seed_corpus.zip $SRC/seeds/* 2>/dev/null || true")
+p.write_text(text, encoding="utf-8")
+print("patched")
+PY_OFG_LCMS_PATCH
+    printf 'ofg_project_patch: lcms Dockerfile seed step made correct and tolerant\n' >>"$patch_log"
+  fi
+
+  # php: current php master removed the --enable-pic configure option (PIC is
+  # always on), so the pinned OSS-Fuzz build.sh fails configure against
+  # floating php HEAD. Drop the obsolete option.
+  local php_build_sh="$oss_fuzz_dir/projects/php/build.sh"
+  if [[ -f "$php_build_sh" ]] && grep -q -- "--enable-pic" "$php_build_sh" && ! grep -qF "HGB php build" "$php_build_sh"; then
+    sed -i 's/ --enable-pic//g; s/--enable-pic //g' "$php_build_sh"
+    sed -i '1i # HGB php build: --enable-pic removed (obsolete in current php master)' "$php_build_sh"
+    printf 'ofg_project_patch: php build.sh dropped obsolete --enable-pic\n' >>"$patch_log"
+  fi
+}
+
 prepare_oss_fuzz_venv() {
   local oss_fuzz_dir="$1"
   local venv_target="${OFG_OSS_FUZZ_VENV:-/opt/hgb/venv}"
@@ -346,6 +426,17 @@ try:
                     print(f'ofg_llm_rate_limited: preflight attempt {attempt} hit rate limit; retrying in {delay:.1f}s')
                     time.sleep(delay)
                     continue
+                # Transient connection failures must also retry: the container
+                # starts its siblings while the host network may still be
+                # flapping, and a single connection error must not sink a run.
+                if attempt < max_attempts and (
+                    'Connection error' in str(exc) or 'APIConnectionError' in str(exc)
+                    or 'RemoteDisconnected' in str(exc) or 'timed out' in str(exc).lower()
+                ):
+                    delay = min(30.0, 3.0 * attempt)
+                    print(f'ofg_llm_connection_error: preflight attempt {attempt} failed; retrying in {delay:.1f}s')
+                    time.sleep(delay)
+                    continue
                 print(f'{type(exc).__name__}: {redact(exc)}')
                 sys.exit(1)
 except Exception as exc:  # noqa: BLE001
@@ -377,6 +468,20 @@ PY_OFG_REDACT
 }
 classify_ofg_failure() {
   local code="$1" log_file="$2"
+  # Timeout takes precedence over stale-log greps: a 124 exit is a timeout even
+  # when the log contains hours-old rate-limit lines (zeta/eta classification).
+  if [[ "$code" == "124" ]]; then
+    if [[ -f "$log_file" ]] && grep -Eiq 'OnePromptPrototyper succeded|Final fuzz target function referenced: True' "$log_file"; then
+      printf 'ofg_post_success_validation_timeout: generated harness compiled and referenced the selected function before later validation timed out'
+      return 0
+    fi
+    if [[ -f "$log_file" ]] && grep -Eiq '===== ROUND .* Recompile|Recompile|fixing build' "$log_file"; then
+      printf 'ofg_recompile_timeout: OSS-Fuzz-Gen timed out while recompiling or repairing the generated harness'
+      return 0
+    fi
+    printf 'ofg_generation_timeout: OSS-Fuzz-Gen generation exceeded the configured timeout'
+    return 0
+  fi
   if [[ -f "$log_file" ]]; then
     if grep -Eiq 'ofg_profile_violation' "$log_file"; then
       printf 'ofg_profile_violation: alpha/paper profile invariants were violated'
@@ -394,16 +499,14 @@ classify_ofg_failure() {
       printf 'ofg_invalid_api_key: OpenAI-compatible API key was rejected'
       return 0
     fi
-    if grep -Eiq 'RateLimitError|Error code: 429|HTTP/1\.1 429|Too Many Requests|rate limit exceeded|ofg_llm_rate_limited' "$log_file"; then
+    # Only recent rate-limit lines (last 1200 chars) count: old 429s from
+    # recovered mid-run retries must not misclassify a later failure.
+    if tail -c 1200 "$log_file" | grep -Eiq 'RateLimitError|Error code: 429|HTTP/1\.1 429|Too Many Requests|rate limit exceeded|ofg_llm_rate_limited'; then
       printf 'ofg_llm_rate_limited: OpenAI-compatible API rate limit was reached; reduce HGB_LLM_PARALLELISM or increase HGB_LLM_MIN_INTERVAL_SECONDS'
       return 0
     fi
     if grep -Eiq 'ofg_empty_llm_response|LLM returned empty response|NoneType.*split|expected non-empty LLM response' "$log_file"; then
       printf 'ofg_empty_llm_response: OpenAI-compatible endpoint returned empty response content'
-      return 0
-    fi
-    if [[ "$code" == "124" ]] && grep -Eiq 'OnePromptPrototyper succeded|Final fuzz target function referenced: True' "$log_file"; then
-      printf 'ofg_post_success_validation_timeout: generated harness compiled and referenced the selected function before later validation timed out'
       return 0
     fi
     if grep -Eiq 'ofg_function_not_referenced|Final fuzz target function referenced: False' "$log_file" && grep -Eiq 'Fuzz target compiles: True' "$log_file"; then
@@ -414,10 +517,6 @@ classify_ofg_failure() {
       printf 'ofg_empty_fix_prompt: OSS-Fuzz-Gen stopped because the repair prompt had no actionable build errors'
       return 0
     fi
-    if [[ "$code" == "124" ]] && grep -Eiq '===== ROUND .* Recompile|Recompile|fixing build' "$log_file"; then
-      printf 'ofg_recompile_timeout: OSS-Fuzz-Gen timed out while recompiling or repairing the generated harness'
-      return 0
-    fi
     if grep -Eiq 'APITimeoutError|ReadTimeout|The read operation timed out|Request timed out|timed out while requesting|LLM request timeout' "$log_file"; then
       printf 'ofg_llm_request_timeout: OpenAI-compatible LLM request timed out after the configured request timeout'
       return 0
@@ -426,14 +525,6 @@ classify_ofg_failure() {
       printf 'missing_oss_fuzz_checkout: OSS-Fuzz checkout is unavailable or invalid; rebuild the image with OFG_INSTALL_OSS_FUZZ=1 or set OFG_OSS_FUZZ_DIR'
       return 0
     fi
-    if [[ "$code" == "124" ]]; then
-      printf 'OSS-Fuzz-Gen timed out'
-      return 0
-    fi
-  fi
-  if [[ "$code" == "124" ]]; then
-    printf 'OSS-Fuzz-Gen timed out'
-    return 0
   fi
   printf 'run_all_experiments exited %s' "$code"
 }
@@ -453,6 +544,388 @@ hgb_ofg_result_status() {
 # type_info.json, report_manifest.json under $workspace/introspector/.
 # In alpha/paper this MUST be real; compat-smoke may use the local shim.
 # ---------------------------------------------------------------------------
+patch_introspector_build() {
+  local oss_fuzz_dir="$1" project="$2" fuzz_target="$3"
+  local build_sh="$oss_fuzz_dir/projects/$project/build.sh"
+  # The project build.sh may legitimately live in the cloned source tree
+  # (e.g. libpng: libpng/contrib/oss-fuzz/build.sh); only the compile-wrapper
+  # patch is unconditional. Guard the per-project build.sh patch separately.
+  local marker="# HGB introspector-scoped build: skip non-target fuzzers under SANITIZER=introspector"
+  if [[ -f "$build_sh" ]]; then
+  case "$project" in
+    jsoncpp)
+      if ! grep -qF "$marker" "$build_sh"; then
+        "$python" - "$build_sh" "$marker" <<'PY_PATCH_JSONCPP'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1]); marker = sys.argv[2]
+text = p.read_text(encoding="utf-8", errors="replace")
+text = text.replace(
+    'if [[ $CFLAGS != *sanitize=memory* ]]; then',
+    f'{marker}\nif [[ $CFLAGS != *sanitize=memory* && $SANITIZER != introspector ]]; then',
+    1,
+)
+p.write_text(text, encoding="utf-8")
+PY_PATCH_JSONCPP
+      fi
+      ;;
+    *) ;;
+  esac
+  fi
+  # Generic introspector-analysis scoping: fuzz-introspector's pre-build
+  # static ``full`` analysis parses every source under $SRC (assert-statement
+  # processing is CPU-bound and quadratic on some files). Install a patched
+  # compile script that runs the full analysis on a pruned copy of the source
+  # tree (dependency vendored trees like LPM/protobuf excluded) so per-target
+  # introspector builds stay tractable. Guarded by a marker for idempotency.
+  local compile_src="$oss_fuzz_dir/infra/base-images/base-builder/compile"
+  local project_dir="$oss_fuzz_dir/projects/$project"
+  local dockerfile="$project_dir/Dockerfile"
+  [[ -f "$compile_src" && -f "$dockerfile" ]] || return 0
+  local compile_marker="# HGB introspector scoped analysis"
+  if grep -qF "$compile_marker" "$project_dir/hgb_compile" 2>/dev/null || grep -qF "hgb_compile" "$dockerfile"; then
+    return 0
+  fi
+  "$python" - "$compile_src" "$project_dir/hgb_compile" "$compile_marker" "$primary_dest" <<'PY_OFG_COMPILE_PATCH'
+import sys
+from pathlib import Path
+src, dst, marker, primary = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+text = src.read_text(encoding="utf-8", errors="replace")
+
+# 1) Setup block inserted before the pre-build light analysis: pruned source
+# copy + assert-statement no-op patch (the assert processing is CPU-bound).
+light_old = "    python3 /fuzz-introspector/src/main.py light\n"
+if light_old not in text:
+    print("no_light_invocation")
+    sys.exit(0)
+if primary:
+    prune_lines = (
+        "    HGB_PRIMARY=\"" + primary + "\"\n"
+        "    if [ -d $SRC/$HGB_PRIMARY ]; then\n"
+        "      mkdir -p /tmp/hgb-analysis-src/$HGB_PRIMARY\n"
+        "      rsync -a --exclude='.git' --exclude='LPM' --exclude='libprotobuf-mutator' "
+        "--exclude='external.protobuf' --exclude='protobuf' --exclude='protobuf-c' "
+        "$SRC/$HGB_PRIMARY/ /tmp/hgb-analysis-src/$HGB_PRIMARY/ 2>/dev/null "
+        "|| cp -r $SRC/$HGB_PRIMARY/. /tmp/hgb-analysis-src/$HGB_PRIMARY/\n"
+        "      for hgb_f in $SRC/*.c $SRC/*.cc $SRC/*.cpp $SRC/*.h build.sh; do "
+        "[ -e \"$hgb_f\" ] && cp \"$hgb_f\" /tmp/hgb-analysis-src/ 2>/dev/null; done\n"
+        "    else\n"
+        "      rsync -a --exclude='.git' --exclude='LPM' --exclude='libprotobuf-mutator' "
+        "--exclude='external.protobuf' --exclude='protobuf' --exclude='protobuf-c' "
+        "$SRC/ /tmp/hgb-analysis-src/ 2>/dev/null || cp -r $SRC/. /tmp/hgb-analysis-src/\n"
+        "    fi\n"
+    )
+else:
+    prune_lines = (
+        "    HGB_PRIMARY=\"\"\n"
+        "    rsync -a --exclude='.git' --exclude='LPM' --exclude='libprotobuf-mutator' "
+        "--exclude='external.protobuf' --exclude='protobuf' --exclude='protobuf-c' "
+        "$SRC/ /tmp/hgb-analysis-src/ 2>/dev/null || cp -r $SRC/. /tmp/hgb-analysis-src/\n"
+    )
+setup = (
+    "    HGB_FULL_SRC=/tmp/hgb-analysis-src\n"
+    "    if [ -d /tmp/hgb-analysis-src ]; then rm -rf /tmp/hgb-analysis-src; fi\n"
+    "    mkdir -p /tmp/hgb-analysis-src\n"
+    + prune_lines
+    + "    HGB_FI_PATCH=/tmp/hgb-fi-patch\n"
+    "    mkdir -p $HGB_FI_PATCH\n"
+    "    cat > $HGB_FI_PATCH/sitecustomize.py <<'HGB_FI_EOF'\n"
+    "try:\n"
+    "    from fuzz_introspector.frontends import frontend_c_cpp as _hgb_fi\n"
+    "    cls = getattr(_hgb_fi, 'FunctionDefinition', None)\n"
+    "    if cls is not None and hasattr(cls, '_process_assert_stmts'):\n"
+    "        cls._process_assert_stmts = lambda self: None\n"
+    "    # _process_field_expr_return_type dominates the report phase (linear\n"
+    "    # scans of every function per callsite). Resolve the callsite name\n"
+    "    # cheaply and skip the O(N) return-type lookup; the return type is\n"
+    "    # not part of the report data we consume.\n"
+    "    if cls is not None and hasattr(cls, '_process_field_expr_return_type'):\n"
+    "        def _hgb_field_expr(self, field_expr, project):\n"
+    "            full_name = ''\n"
+    "            try:\n"
+    "                field = field_expr.child_by_field_name('field')\n"
+    "                if field is None:\n"
+    "                    return (None, '')\n"
+    "                if field.type == 'template_method':\n"
+    "                    name_node = field.child_by_field_name('name')\n"
+    "                    full_name = (name_node.text.decode(encoding='utf-8', errors='ignore')\n"
+    "                                 if name_node and name_node.text else '')\n"
+    "                else:\n"
+    "                    full_name = field.text.decode(encoding='utf-8', errors='ignore') if field.text else ''\n"
+    "                arg = field_expr.child_by_field_name('argument')\n"
+    "                if arg is not None and arg.type == 'field_expression':\n"
+    "                    _, inner_type = _hgb_field_expr(self, arg, project)\n"
+    "                    if inner_type and inner_type != 'void':\n"
+    "                        full_name = inner_type + '::' + full_name\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            return ('', full_name)\n"
+    "        cls._process_field_expr_return_type = _hgb_field_expr\n"
+    "    # extract_callsites walks every AST node of every function and formats\n"
+    "    # each node text; replace it with two direct tree-sitter queries over\n"
+    "    # call_expression/new_expression nodes (the only node types the walk\n"
+    "    # actually processed).\n"
+    "    if cls is not None and hasattr(cls, 'extract_callsites'):\n"
+    "        def _hgb_extract_callsites(self, project):\n"
+    "            if self.base_callsites:\n"
+    "                return\n"
+    "            # The source-level callsite walk/_process_invoke path is\n"
+    "            # quadratic on template-heavy C++; the report's calltree comes\n"
+    "            # from the LTO fuzzer data, so collect new_expression callsites\n"
+    "            # cheaply and skip the per-call resolution entirely.\n"
+    "            callsites = []\n"
+    "            try:\n"
+    "                lang = self.tree_sitter_lang\n"
+    "                for node, _ in lang.query('(new_expression) @ne').captures(self.root):\n"
+    "                    try:\n"
+    "                        ctr = node.child_by_field_name('type')\n"
+    "                        if ctr is not None and ctr.text:\n"
+    "                            _cls = ctr.text.decode(encoding='utf-8', errors='ignore')\n"
+    "                            callsites.append((_cls + '::' + _cls.rsplit('::')[-1],\n"
+    "                                              node.byte_range[1], node.start_point.row + 1))\n"
+    "                    except Exception:\n"
+    "                        pass\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            self.base_callsites = callsites\n"
+    "        cls.extract_callsites = _hgb_extract_callsites\n"
+    "    for _hgb_cname in ('CppProject',):\n"
+    "        _hgb_c = getattr(_hgb_fi, _hgb_cname, None)\n"
+    "        if _hgb_c is None:\n"
+    "            continue\n"
+    "        # _calculate_function_uses rescans every function's callsites per\n"
+    "        # function (O(N^2)); precompute a per-project callsite counter.\n"
+    "        if hasattr(_hgb_c, '_calculate_function_uses'):\n"
+    "            def _hgb_calculate_function_uses(self, target_name):\n"
+    "                _hgb_uc = getattr(self, '_hgb_uses_cache', None)\n"
+    "                if _hgb_uc is None:\n"
+    "                    _hgb_uc = {}\n"
+    "                    for _hgb_sf in self.source_code_files:\n"
+    "                        for _hgb_fn in getattr(_hgb_sf, 'func_defs', []) or []:\n"
+    "                            for _hgb_cs in getattr(_hgb_fn, 'base_callsites', []) or []:\n"
+    "                                _hgb_name = _hgb_cs[0] if _hgb_cs else ''\n"
+    "                                _hgb_uc[_hgb_name] = _hgb_uc.get(_hgb_name, 0) + 1\n"
+    "                    self._hgb_uses_cache = _hgb_uc\n"
+    "                if target_name in _hgb_uc:\n"
+    "                    return _hgb_uc[target_name]\n"
+    "                _hgb_total = 0\n"
+    "                for _hgb_name, _hgb_count in _hgb_uc.items():\n"
+    "                    if _hgb_name.endswith(target_name):\n"
+    "                        _hgb_total += _hgb_count\n"
+    "                return _hgb_total\n"
+    "            setattr(_hgb_c, '_calculate_function_uses', _hgb_calculate_function_uses)\n"
+    "        _hgb_orig = _hgb_c.__dict__.get('_find_source_with_func_def')\n"
+    "        if _hgb_orig is None:\n"
+    "            continue\n"
+    "        def _hgb_patched(self, name):\n"
+    "            _hgb_cache = getattr(self, '_hgb_fd_cache', None)\n"
+    "            if _hgb_cache is None:\n"
+    "                _hgb_cache = {}\n"
+    "                self._hgb_fd_cache = _hgb_cache\n"
+    "            if name in _hgb_cache:\n"
+    "                return _hgb_cache[name]\n"
+    "            _hgb_res = _hgb_orig(self, name)\n"
+    "            _hgb_cache[name] = _hgb_res\n"
+    "            return _hgb_res\n"
+    "        setattr(_hgb_c, '_find_source_with_func_def', _hgb_patched)\n"
+    "    # The HTML report sections (per-file analyses + PNG rendering) dominate\n"
+    "    # the report phase for large projects; only the JSON data files are\n"
+    "    # consumed downstream, so skip the HTML generation entirely.\n"
+    "    try:\n"
+    "        import fuzz_introspector.html_report as _hgb_hr\n"
+    "        for _hgb_attr in ('create_section_optional_analyses',\n"
+    "                          'create_section_required_analyses'):\n"
+    "            if hasattr(_hgb_hr, _hgb_attr):\n"
+    "                setattr(_hgb_hr, _hgb_attr, lambda *a, **k: '')\n"
+    "        for _hgb_attr in ('create_horisontal_calltree_image',\n"
+    "                          'create_percentage_summary_graph',\n"
+    "                          'create_horizontal_calltree_image'):\n"
+    "            if hasattr(_hgb_hr, _hgb_attr):\n"
+    "                setattr(_hgb_hr, _hgb_attr, lambda *a, **k: None)\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "except Exception:\n"
+    "    pass\n"
+    "HGB_FI_EOF\n"
+    f"    {marker}\n"
+)
+light_new = (
+    setup
+    + "    HGB_PREV_CWD=$(pwd)\n"
+    + "    cd /tmp/hgb-analysis-src\n"
+    + "    PYTHONPATH=$HGB_FI_PATCH${PYTHONPATH:+:$PYTHONPATH} python3 /fuzz-introspector/src/main.py light\n"
+    + "    cp -rf /tmp/hgb-analysis-src/inspector $SRC/inspector 2>/dev/null || true\n"
+    + "    cd \"$HGB_PREV_CWD\"\n"
+)
+text = text.replace(light_old, light_new, 1)
+
+# 2) Scope the pre-build full analysis to the pruned tree as well.
+full_old = "    fuzz-introspector full --target-dir=$SRC \\\n"
+if full_old in text:
+    full_new = "    PYTHONPATH=$HGB_FI_PATCH${PYTHONPATH:+:$PYTHONPATH} fuzz-introspector full --target-dir=/tmp/hgb-analysis-src \\\n"
+    text = text.replace(full_old, full_new, 1)
+
+# 3) The post-build report command re-runs the source analysis and must get
+# the same performance patches.
+report_old = "    fuzz-introspector report $REPORT_ARGS\n"
+if report_old in text:
+    text = text.replace(
+        report_old,
+        "    PYTHONPATH=$HGB_FI_PATCH${PYTHONPATH:+:$PYTHONPATH} fuzz-introspector report $REPORT_ARGS\n",
+    )
+
+# 4) The introspector setup block re-installs packages inside the build
+# container on every run; fuzz-introspector is already installed in the base
+# image, so make the network-dependent steps best-effort (they must not kill
+# the build when archives are unreachable). Matches are indentation-agnostic.
+for _hgb_line in (
+    "apt-get install -y libjpeg-dev zlib1g-dev libyaml-dev\n",
+    "python3 -m pip install --upgrade pip setuptools\n",
+    "python3 -m pip install cxxfilt pyyaml beautifulsoup4 lxml soupsieve rust-demangler\n",
+    "python3 -m pip install --prefer-binary matplotlib\n",
+):
+    if _hgb_line in text:
+        text = text.replace(
+            _hgb_line,
+            _hgb_line[:-1] + " 2>/dev/null || true\n",
+        )
+if "python3 -m pip install -e .\n" in text:
+    text = text.replace(
+        "python3 -m pip install -e .\n",
+        "python3 -m pip install -e . 2>/dev/null || true\n",
+    )
+
+# 5) The introspector sanitizer flags use -fuse-ld=gold (LLVMgold LTO), but
+# the pinned base-builder's gold crashes on clang-15 DWARF-5. Downgrade the
+# debug info to DWARF-4 (gold handles it); the LTO analysis is unaffected.
+if "export CFLAGS=\"$CFLAGS -g\"\n" in text:
+    text = text.replace(
+        "export CFLAGS=\"$CFLAGS -g\"\n",
+        "export CFLAGS=\"$CFLAGS -g -gdwarf-4\"\n",
+    )
+    text = text.replace(
+        "export CXXFLAGS=\"$CXXFLAGS -g\"\n",
+        "export CXXFLAGS=\"$CXXFLAGS -g -gdwarf-4\"\n",
+    )
+
+dst.write_text(text, encoding="utf-8")
+print("patched")
+PY_OFG_COMPILE_PATCH
+  # COPY the patched compile into the project image (override base-builder).
+  "$python" - "$dockerfile" "$compile_marker" <<'PY_OFG_DOCKER_PATCH'
+import sys
+from pathlib import Path
+dockerfile, marker = Path(sys.argv[1]), sys.argv[2]
+text = dockerfile.read_text(encoding="utf-8", errors="replace")
+if "hgb_compile" in text:
+    sys.exit(0)
+text = text.rstrip() + "\n" + f"COPY hgb_compile /usr/local/bin/compile\nRUN chmod +x /usr/local/bin/compile\n" + "\n"
+dockerfile.write_text(text, encoding="utf-8")
+PY_OFG_DOCKER_PATCH
+}
+
+# ---------------------------------------------------------------------------
+# Remote Fuzz Introspector (OFG_INTROSPECTOR_MODE=remote): materialize the
+# official project-scoped report from the Fuzz Introspector API used by
+# upstream OSS-Fuzz-Gen data prep. Falls back to the local build on failure.
+# ---------------------------------------------------------------------------
+run_introspector_remote() {
+  local introspector_dir="$1" project="$2"
+  "$python" - "$introspector_dir" "$project" "${OFG_INTROSPECTOR_ENDPOINT:-https://introspector.oss-fuzz.com/api}" \
+    >"$workspace/logs/introspector_remote.log" 2>&1 <<'PY_OFG_REMOTE'
+import json
+import sys
+import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+out_dir = Path(sys.argv[1])
+project = sys.argv[2]
+endpoint = sys.argv[3].rstrip("/")
+
+
+def get(api: str, params: dict, retries: int = 3):
+    url = f"{endpoint}/{api}?" + urllib.parse.urlencode(params)
+    last = None
+    for attempt in range(1, retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "harnessgenbench-ofg"})
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(2 * attempt)
+    raise RuntimeError(f"{api} failed after {retries} attempts: {last}")
+
+
+data = get("all-functions", {"project": project})
+functions = data.get("functions") if isinstance(data, dict) else None
+if not functions:
+    print(f"ofg_introspector_remote_empty: project={project} has no introspector data")
+    sys.exit(1)
+
+import re as _hgb_re
+_CLEAN_NAME_RE = _hgb_re.compile(r"^[A-Za-z_][A-Za-z0-9_:~]*$")
+
+all_functions = []
+type_info = {}
+reach_by_fuzzer: dict[str, list[str]] = {}
+for raw in functions:
+    if not isinstance(raw, dict):
+        continue
+    name = str(raw.get("function_name") or raw.get("raw_function_name") or "").strip()
+    if not name:
+        continue
+    # Skip template/lambda/operator internals: such records are unusable as
+    # benchmark functions (they explode into unbuildable prompts).
+    if "lambda" in name.lower() or not _CLEAN_NAME_RE.match(name):
+        continue
+    debug = raw.get("debug_summary") or {}
+    source = debug.get("source") or {}
+    record = {
+        "name": name,
+        "signature": str(raw.get("function_signature") or name),
+        "source_file": str(raw.get("function_filename") or source.get("source_file") or ""),
+        "source_line": str(source.get("source_line") or ""),
+        "return_type": str(raw.get("return_type") or debug.get("return_type") or ""),
+        "function_arguments": list(raw.get("function_arguments") or []),
+        "complexity": int(raw.get("accummulated_complexity", 0) or 0),
+        "covered": bool(raw.get("is_reached")) or float(raw.get("runtime_coverage_percent", 0) or 0) > 0,
+        "reached_by_fuzzers": list(raw.get("reached_by_fuzzers") or []),
+    }
+    all_functions.append(record)
+    for fuzzer in record["reached_by_fuzzers"]:
+        reach_by_fuzzer.setdefault(str(fuzzer), []).append(name)
+    if debug:
+        type_info[name] = debug
+
+# Synthesize a calltree.json so the adapter can compute the reachable set:
+# fuzzer roots whose children are the functions they reach dynamically.
+tree = [{"function_name": fuzzer, "children": [{"function_name": fn} for fn in fns]}
+        for fuzzer, fns in sorted(reach_by_fuzzer.items())]
+# Include all functions as roots when no per-fuzzer reachability is present.
+if not tree:
+    tree = [{"function_name": r["name"], "children": []} for r in all_functions]
+
+out_dir.mkdir(parents=True, exist_ok=True)
+(out_dir / "all_functions.json").write_text(json.dumps(all_functions, indent=2) + "\n", encoding="utf-8")
+(out_dir / "calltree.json").write_text(json.dumps({"tree": tree}, indent=2) + "\n", encoding="utf-8")
+(out_dir / "type_info.json").write_text(json.dumps(type_info, indent=2) + "\n", encoding="utf-8")
+(out_dir / "report_manifest.json").write_text(json.dumps({
+    "project": project,
+    "mode": "remote",
+    "endpoint": endpoint,
+    "function_count": len(all_functions),
+    "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}, indent=2) + "\n", encoding="utf-8")
+if len(all_functions) < 5:
+    print(f"ofg_introspector_remote_too_few: {len(all_functions)} usable functions; falling back to local build")
+    sys.exit(1)
+print(f"ofg_introspector_remote_ok: {len(all_functions)} functions for {project}")
+PY_OFG_REMOTE
+}
+
 run_introspector() {
   local introspector_dir="$workspace/introspector"
   mkdir -p "$introspector_dir"
@@ -493,18 +966,117 @@ if src.is_dir():
 PY_OFG_STUB
     return 0
   fi
+  # OFG_INTROSPECTOR_MODE=remote: materialize the official Fuzz Introspector
+  # report from the upstream API (the paper's data-prep path). Falls back to
+  # the real local build when the project has no API data.
+  if [[ "${OFG_INTROSPECTOR_MODE:-real}" == "remote" ]]; then
+    local project_remote="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+    if run_introspector_remote "$introspector_dir" "$project_remote"; then
+      return 0
+    fi
+    printf 'ofg_introspector_note: remote introspector fetch failed; falling back to local build\n' >>"$workspace/logs/introspector_build.log"
+  fi
+  # Local introspector builds for large projects take many hours (the
+  # fuzz-introspector analysis is single-threaded). Reuse a previously
+  # validated local report from a sibling run of the same target instead of
+  # rebuilding it every round.
+  if [[ "${OFG_REUSE_INTROSPECTOR_REPORT:-1}" == "1" ]]; then
+    local sibling_report
+    sibling_report="$("$python" - "$workspace" "$introspector_dir" <<'PY_OFG_REUSE' 2>/dev/null || true
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+workspace = Path(os.environ.get("HGB_WORKSPACE_HOST") or sys.argv[1])
+out_dir = Path(sys.argv[2])
+# Sibling run dirs are exposed via HGB_TARGET_RUNS_DIR (the target-level
+# parent, mounted read-only); fall back to the host-path parent.
+runs_root = Path(os.environ.get("HGB_TARGET_RUNS_DIR")) if os.environ.get("HGB_TARGET_RUNS_DIR") else workspace.parent
+run_name = workspace.name
+for sibling in sorted(runs_root.iterdir(), reverse=True):
+    if not sibling.is_dir() or sibling.name == run_name:
+        continue
+    rep = sibling / "introspector"
+    if not (rep / "all_functions.json").is_file() or not (rep / "report_manifest.json").is_file():
+        continue
+    prov = rep / "provenance.json"
+    if prov.is_file():
+        try:
+            data = json.loads(prov.read_text(encoding="utf-8"))
+            if data.get("used_local_shim") or not data.get("function_count"):
+                continue
+        except Exception:
+            continue
+    try:
+        shutil.copytree(rep, out_dir, dirs_exist_ok=True)
+    except OSError:
+        continue
+    print(str(sibling))
+    break
+PY_OFG_REUSE
+  )"
+    if [[ -n "$sibling_report" ]]; then
+      printf 'ofg_introspector_note: reused validated local report from %s\n' "$sibling_report" >>"$workspace/logs/introspector_build.log"
+      return 0
+    fi
+  fi
   # alpha/paper: run the pinned Fuzz Introspector sanitizer/build path. This
-  # is delegated to the OSS-Fuzz infra introspector helper against an isolated
-  # project overlay with a neutral temporary fuzz-entrypoint stub. The real
-  # implementation requires Docker; if it is unavailable we fail truthfully.
+  # is delegated to the OSS-Fuzz infra helper (``build_fuzzers --sanitizer
+  # introspector``) against an isolated project overlay that contains the
+  # pinned FuzzBench primary-repo source plus a neutral temporary
+  # fuzz-entrypoint stub. The real implementation requires Docker; if it is
+  # unavailable we fail truthfully.
   local oss_fuzz_dir="$1"
   local project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
   local fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
   local source_dir="${HGB_TARGET_SOURCE_DIR:-/target/source_input}"
   local overlay_dir="$workspace/introspector_overlay"
   mkdir -p "$overlay_dir"
-  # Stage source into the overlay so Introspector sees complete project source.
-  rsync -a --delete "$source_dir/" "$overlay_dir/src/" 2>/dev/null || true
+  # Stage the PRIMARY project repo root (per /target/source_repos.json) at the
+  # overlay root. helper.py mounts the overlay at the project Dockerfile
+  # WORKDIR (e.g. /src/jsoncpp), so the overlay must match the layout the
+  # Dockerfile's own ``git clone`` produces -- otherwise build.sh cannot find
+  # CMakeLists.txt/Makefile and the introspector build fails.
+  local primary_rel=""
+  local primary_dest=""
+  read -r primary_rel primary_dest <<<"$("$python" - /target/source_repos.json <<'PY_OFG_PRIMARY' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+rel = ""
+dest = ""
+try:
+    records = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    for r in records if isinstance(records, list) else []:
+        if r.get("is_primary_project"):
+            rel = str(r.get("package_path") or "").strip()
+            if rel.startswith("source_input/"):
+                rel = rel[len("source_input/"):]
+            dest = str(r.get("dest") or "").strip().strip("/")
+            break
+except Exception:
+    rel = ""
+print(rel, dest)
+PY_OFG_PRIMARY
+  )"
+  local overlay_src=""
+  # Prefer the FULL unstripped checkout (the stripped /target/source_input is
+  # missing the native harness that build.sh compiles). This overlay is used
+  # ONLY for the real Introspector compile; it is never read into prompts or
+  # benchmark YAML.
+  if [[ -n "$primary_dest" && -d "${HGB_TARGET_FULL_SOURCE_DIR:-/opt/hgb/target-sources}/$primary_dest" ]]; then
+    overlay_src="${HGB_TARGET_FULL_SOURCE_DIR:-/opt/hgb/target-sources}/$primary_dest"
+  elif [[ -n "$primary_rel" && -d "$source_dir/$primary_rel" ]]; then
+    overlay_src="$source_dir/$primary_rel"
+  elif [[ -d "$source_dir" ]]; then
+    overlay_src="$source_dir"
+  fi
+  if [[ -z "$overlay_src" ]]; then
+    printf 'ofg_introspector_build_failed: no primary project source to stage under %s\n' "$source_dir" >>"$workspace/logs/introspector_build.log"
+    return 1
+  fi
+  rsync -a --delete "$overlay_src/" "$overlay_dir/" 2>/dev/null || true
   # Neutral stub fuzz target (linking only; never used as generation context).
   cat >"$overlay_dir/hgb_introspector_stub.c" <<'EOF'
 int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
@@ -512,13 +1084,145 @@ int LLVMFuzzerTestOneInput(const unsigned char *data, unsigned long size) {
 }
 EOF
   local introspector_log="$workspace/logs/introspector_build.log"
+  # Target-scoped introspector build: patch the project build.sh so only the
+  # requested fuzz target is compiled under SANITIZER=introspector. Non-target
+  # fuzzers can pull huge dependency trees (e.g. jsoncpp's proto fuzzer drags
+  # in all of protobuf) and make the Fuzz Introspector analysis take hours.
+  patch_introspector_build "$oss_fuzz_dir" "$project" "$fuzz_target"
+  # Pass the HOST-visible overlay path to helper.py: it starts sibling build
+  # containers through the host Docker socket, and /workspace/... paths only
+  # exist inside this container. common.sh dual-mounts the workspace at its
+  # host path, so HGB_WORKSPACE_HOST/... == /workspace/... here.
+  local host_overlay_dir="${HGB_WORKSPACE_HOST:-$workspace}/introspector_overlay"
+  # Prefer building from the project image with its clone pinned to the exact
+  # FuzzBench revision. The image contains dependency builds (LPM etc.) that a
+  # source overlay would shadow, so pinning the Dockerfile clone is the most
+  # faithful build when the project Dockerfile clones its main repo.
+  local pinned_commit="" primary_url=""
+  read -r pinned_commit primary_url <<<"$("$python" - /target/source_repos.json <<'PY_OFG_PIN' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+commit = ""
+url = ""
+try:
+    records = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    for r in records if isinstance(records, list) else []:
+        if r.get("is_primary_project"):
+            commit = str(r.get("checked_out_commit") or r.get("revision") or "").strip()
+            url = str(r.get("url") or "").strip()
+            break
+except Exception:
+    pass
+print(commit, url)
+PY_OFG_PIN
+  )"
+  local clone_pinned="no_clone"
+  # Projects whose FuzzBench-pinned commit predates the OSS-Fuzz build system
+  # (freetype2's fuzzing/scripts/build-fuzzers.sh, harfbuzz's hb-raster-fuzzer
+  # target, ...) cannot be built at the pinned commit; use the OSS-Fuzz
+  # project.yaml clone for those instead (recorded deviation).
+  local ofg_unpinned="${OFG_INTROSPECTOR_UNPINNED:-}"
+  if [[ -n "$ofg_unpinned" ]] && [[ ",$ofg_unpinned," == *",$project,"* ]]; then
+    clone_pinned="unpinned_by_override"
+    printf 'ofg_introspector_note: project=%s uses the OSS-Fuzz unpinned clone (OFG_INTROSPECTOR_UNPINNED)\n' "$project" >>"$workspace/logs/introspector_build.log"
+  fi
+  if [[ "$clone_pinned" != "unpinned_by_override" && -n "$pinned_commit" && -f "$oss_fuzz_dir/projects/$project/Dockerfile" ]]; then
+    clone_pinned="$("$python" - "$oss_fuzz_dir/projects/$project/Dockerfile" "$primary_url" "$pinned_commit" <<'PY_OFG_PIN_CLONE' 2>/dev/null || printf 'no_clone'
+import re
+import sys
+from pathlib import Path
+dockerfile = Path(sys.argv[1])
+url, commit = sys.argv[2], sys.argv[3]
+text = dockerfile.read_text(encoding="utf-8", errors="replace")
+
+def norm(u: str) -> str:
+    u = u.strip().rstrip("/")
+    u = re.sub(r"^https?://(www\.)?github\.com/", "", u)
+    u = re.sub(r"^https?://(www\.)?gitlab\.com/", "", u)
+    u = re.sub(r"\.git$", "", u)
+    return u.lower()
+
+target = norm(url)
+clone_re = re.compile(r"RUN\s+git\s+clone\b([^\n]*(?:\\\n[^\n]*)*)")
+patched = False
+if target:
+    for m in clone_re.finditer(text):
+        stmt = m.group(0)
+        found = norm(next((u for u in re.findall(r"https?://\S+", stmt) if "github" in u or "gitlab" in u), "")) if re.findall(r"https?://\S+", stmt) else ""
+        urls = [u for u in re.findall(r"https?://\S+", stmt)]
+        if not any(norm(u) == target for u in urls):
+            continue
+        if f"checkout {commit}" in stmt or f"checkout {commit}" in text[m.end():m.end()+200]:
+            patched = False
+            print("already_pinned")
+            sys.exit(0)
+        # Full clone (drop --depth so old commits are reachable) + pinned checkout.
+        new_stmt = re.sub(r"--depth(?:=|\s+)\S+\s*", "", stmt)
+        # Resolve the clone destination: an explicit trailing argument wins
+        # (git clone <url> lcms), otherwise the URL's repo basename.
+        stmt_no_flags = re.sub(r"\s--?[A-Za-z-]+(?:=\S+)?", " ", new_stmt)
+        tokens = [t for t in stmt_no_flags.replace("\\", " ").split() if t and not t.startswith("-")]
+        url_idx = next((i for i, t in enumerate(tokens) if "://" in t), -1)
+        dest_candidates = [t for t in tokens[url_idx + 1:] if not t.startswith("-")] if url_idx >= 0 else []
+        if dest_candidates:
+            dest = dest_candidates[0].rstrip("/").rsplit("/", 1)[-1]
+            if dest.endswith(".git"):
+                dest = dest[:-4]
+        else:
+            dest = target.rsplit("/", 1)[-1]
+        lines = new_stmt.split("\n")
+        last = lines[-1]
+        if last.rstrip().endswith("\\"):
+            last = last.rstrip()[:-1].rstrip() + f" && git -C {dest} checkout {commit} \\"
+        else:
+            last = last.rstrip() + f" && git -C {dest} checkout {commit}"
+        lines[-1] = last
+        text = text.replace(stmt, "\n".join(lines), 1)
+        patched = True
+        break
+if patched:
+    dockerfile.write_text(text, encoding="utf-8")
+    print("patched")
+else:
+    print("no_clone")
+PY_OFG_PIN_CLONE
+  )"
+  fi
   if [[ -x "$oss_fuzz_dir/infra/helper.py" ]]; then
-    (cd "$oss_fuzz_dir" && python3 infra/helper.py build_fuzzers --sanitizer address \
-        --engine introspector --architecture x86_64 \
-        "$project" "$overlay_dir" >"$introspector_log" 2>&1) || {
+    # introspector is a SANITIZER choice in helper.py (--sanitizer introspector),
+    # never an engine. The report lands in build/out/<project>/inspector/.
+    # Retry transient network failures (git clone / TLS) up to 3 times.
+    local ofg_introspector_attempt=0
+    local helper_extra_args=()
+    if [[ "$clone_pinned" != "patched" && "$clone_pinned" != "already_pinned" && "$clone_pinned" != "unpinned_by_override" ]]; then
+      helper_extra_args+=("$host_overlay_dir")
+    fi
+    while true; do
+      ofg_introspector_attempt=$((ofg_introspector_attempt + 1))
+      (cd "$oss_fuzz_dir" && python3 infra/helper.py build_fuzzers --sanitizer introspector \
+          --architecture x86_64 \
+          "$project" "${helper_extra_args[@]}" >"$introspector_log" 2>&1) && break
+      if [[ "$ofg_introspector_attempt" -lt 3 ]] && grep -Eiq 'gnutls|TLS|non-properly terminated|Connection|temporary failure|Failed to fetch|Unable to fetch|SSL|timed out' "$introspector_log"; then
+        printf 'ofg_introspector_retry: transient network failure (attempt %s); retrying\n' "$ofg_introspector_attempt" >>"$introspector_log"
+        sleep $((ofg_introspector_attempt * 30))
+        continue
+      fi
       printf 'ofg_introspector_build_failed: introspector helper exited non-zero\n' >>"$introspector_log"
       return 1
-    }
+    done
+    # Projects whose Dockerfile WORKDIR is /src cannot take a local checkout
+    # (helper.py refuses). Retry against the image-cloned source; the clone is
+    # pinned to the exact FuzzBench revision when the patch above applied.
+    if grep -q 'Cannot use local checkout' "$introspector_log"; then
+      printf 'ofg_introspector_note: WORKDIR=/src project; rebuilding without local overlay\n' >>"$introspector_log"
+      (cd "$oss_fuzz_dir" && python3 infra/helper.py build_fuzzers --sanitizer introspector \
+          --architecture x86_64 \
+          "$project" >"$introspector_log" 2>&1) || {
+        printf 'ofg_introspector_build_failed: introspector helper exited non-zero\n' >>"$introspector_log"
+        return 1
+      }
+    fi
   else
     printf 'ofg_introspector_build_failed: no infra/helper.py in %s\n' "$oss_fuzz_dir" >>"$introspector_log"
     return 1
@@ -545,17 +1249,119 @@ PY_OFG_REPORT_SELECT
     printf 'ofg_introspector_build_failed: no target-scoped inspector report for project=%s fuzz_target=%s\n' "$project" "$fuzz_target" >>"$introspector_log"
     return 1
   fi
+  # The fuzz-introspector report uses its own file names
+  # (all-fuzz-introspector-functions.json, calltree.js, all_debug_info.json).
+  # Convert them to the canonical report files the adapter consumes when the
+  # canonical names are absent.
+  if [[ ! -f "$report_root/all_functions.json" ]]; then
+    "$python" - "$report_root" "$introspector_dir" "$project" <<'PY_OFG_CONVERT_REPORT' >>"$introspector_log" 2>&1
+import json
+import sys
+import time
+from pathlib import Path
+report = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+project = sys.argv[3]
+out_dir.mkdir(parents=True, exist_ok=True)
+functions_raw = []
+for name in ("all-fuzz-introspector-functions.json", "all_functions.js"):
+    p = report / name
+    if p.is_file():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(data, dict):
+                functions_raw = data.get("functions") or []
+            elif isinstance(data, list):
+                functions_raw = data
+            if functions_raw:
+                break
+        except Exception:
+            continue
+all_functions = []
+reachable: set[str] = set()
+import re as _hgb_re
+_CLEAN_NAME_RE = _hgb_re.compile(r"^[A-Za-z_][A-Za-z0-9_:~]*$")
+for r in functions_raw:
+    if not isinstance(r, dict):
+        continue
+    raw_name = str(r.get("Func name") or r.get("raw-function-name") or r.get("function_name") or "").strip()
+    # The report's "Func name" includes the argument list; use the bare name
+    # for filtering and keep the full signature separately.
+    name = raw_name.split("(", 1)[0].strip()
+    if not name:
+        continue
+    if "lambda" in name.lower() or not _CLEAN_NAME_RE.match(name):
+        continue
+    args = r.get("Args") or r.get("function_arguments") or []
+    if not isinstance(args, list):
+        args = []
+    lines_hit = r.get("Func lines hit %")
+    try:
+        lines_hit = float(lines_hit or 0)
+    except (TypeError, ValueError):
+        lines_hit = 0.0
+    callees = r.get("callsites") or r.get("Functions reached") or []
+    if isinstance(callees, dict):
+        callees = [str(k) for k in callees.keys()]
+    if not isinstance(callees, list):
+        callees = []
+    reached_by = r.get("Reached by Fuzzers") or r.get("Combined reached by Fuzzers") or []
+    if not isinstance(reached_by, list):
+        reached_by = []
+    rec = {
+        "name": name,
+        "signature": str(r.get("function_signature") or name),
+        "source_file": str(r.get("Functions filename") or ""),
+        "return_type": str(r.get("return_type") or ""),
+        "function_arguments": [str(a) for a in args],
+        "complexity": int(r.get("Cyclomatic complexity", 0) or 0),
+        "covered": bool(lines_hit > 0),
+        "callees": [str(c) for c in callees],
+        "reached_by_fuzzers": [str(f) for f in reached_by],
+        "public": bool(r.get("is_accessible")) or bool(r.get("is_public")),
+    }
+    all_functions.append(rec)
+    for fz in reached_by:
+        reachable.add(str(fz))
+tree = [{"function_name": f, "children": []} for f in sorted(reachable)]
+if not tree:
+    tree = [{"function_name": r["name"], "children": []} for r in all_functions]
+(out_dir / "all_functions.json").write_text(json.dumps(all_functions, indent=2) + "\n", encoding="utf-8")
+(out_dir / "calltree.json").write_text(json.dumps({"tree": tree}, indent=2) + "\n", encoding="utf-8")
+type_info: dict = {}
+for name in ("all_debug_info.json", "type_info.json"):
+    p = report / name
+    if p.is_file():
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+            if isinstance(loaded, dict):
+                type_info = loaded
+                break
+        except Exception:
+            continue
+(out_dir / "type_info.json").write_text(json.dumps(type_info, indent=2) + "\n", encoding="utf-8")
+(out_dir / "report_manifest.json").write_text(json.dumps({
+    "project": project,
+    "mode": "real",
+    "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+}, indent=2) + "\n", encoding="utf-8")
+print(f"ofg_introspector_report_converted: {len(all_functions)} functions")
+PY_OFG_CONVERT_REPORT
+  fi
   for f in all_functions.json calltree.json type_info.json report_manifest.json; do
     [[ -f "$report_root/$f" ]] && cp "$report_root/$f" "$introspector_dir/$f"
   done
   # Generate function_source_map.json if upstream did not emit it directly.
   if [[ ! -f "$report_root/function_source_map.json" ]]; then
-    "$python" - "$report_root" "$introspector_dir/function_source_map.json" "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" <<'PY_OFG_FSM'
+    "$python" - "$introspector_dir" "$introspector_dir/function_source_map.json" "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" <<'PY_OFG_FSM'
 import json
 import sys
 from pathlib import Path
 sys.path.insert(0, "/opt/hgb/bin")
 from ofg_introspector_adapter import generate_function_source_map
+# Parse the CONVERTED canonical report in $workspace/introspector, never the
+# raw fuzz-introspector dir: the raw report uses its own record keys and the
+# map would come out empty for every function.
 report_dir, out_path, source_root = sys.argv[1:4]
 mapping = generate_function_source_map(report_dir, source_root)
 Path(out_path).write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -563,6 +1369,35 @@ PY_OFG_FSM
   else
     cp "$report_root/function_source_map.json" "$introspector_dir/function_source_map.json"
   fi
+  # Record provenance: mode, commit, function count so the run result proves
+  # the report is real (never a local shim).
+  local function_count=0
+  function_count="$("$python" - "$introspector_dir/all_functions.json" <<'PY_OFG_FCOUNT' 2>/dev/null || printf '0'
+import json
+import sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    funcs = data.get("functions") if isinstance(data, dict) else data
+    print(len(funcs) if isinstance(funcs, list) else 0)
+except Exception:
+    print(0)
+PY_OFG_FCOUNT
+  )"
+  "$python" - "$introspector_dir/provenance.json" "$project" "${OFG_INTROSPECTOR_MODE:-real}" \
+    "${OFG_OSS_FUZZ_COMMIT:-unknown}" "$function_count" <<'PY_OFG_PROV'
+import json
+import sys
+from pathlib import Path
+out, project, mode, oss_commit, function_count = sys.argv[1:6]
+Path(out).write_text(json.dumps({
+    "mode": mode,
+    "project": project,
+    "oss_fuzz_commit": oss_commit,
+    "function_count": int(function_count),
+    "used_local_shim": False,
+}, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+PY_OFG_PROV
   return 0
 }
 
@@ -573,13 +1408,61 @@ PY_OFG_FSM
 synthesize_benchmark_from_introspector() {
   local out_yaml="$1" selection_json="$2"
   local introspector_dir="$workspace/introspector"
+  local project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
+  local fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
+  local target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  # Committed integration facts (metadata/oss_fuzz_gen_target_overrides.yaml):
+  # the exact native harness destination in the OSS-Fuzz build context (so the
+  # upstream build loop compiles the GENERATED harness, never the reference),
+  # the language, and the per-target build timeout. These are static build
+  # facts, not reference-derived content.
+  local target_path="" language="" build_timeout="" preferred_apis=""
+  read -r target_path language build_timeout preferred_apis <<<"$("$python" - /opt/hgb/metadata "$target_name" <<'PY_OFG_OVERRIDE' 2>/dev/null || true
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+from ofg_profile import load_target_overrides
+overrides = load_target_overrides(Path(sys.argv[1]))
+entry = overrides.get("targets", {}).get(sys.argv[2]) or {}
+tpath = str(entry.get("candidate_destination") or "")
+lang = str(entry.get("language") or "")
+btimeout = str(entry.get("build_timeout") or "")
+apis = ",".join(str(a) for a in (entry.get("preferred_apis") or []))
+print(tpath, lang, btimeout, apis)
+PY_OFG_OVERRIDE
+  )"
+  # The upstream OSS-Fuzz-Gen build loop COPYs the generated harness to
+  # benchmark.target_path inside the OSS-Fuzz project image, so target_path
+  # must be the path the OSS-Fuzz build.sh compiles -- the project's own
+  # fuzzer file under /src (e.g. /src/zlib_uncompress_fuzzer.cc). Resolve it
+  # from the pinned OSS-Fuzz project directory; the overrides value is only a
+  # fallback (its FuzzBench-layout paths do not apply to the OSS-Fuzz build).
+  local ofg_project_fuzzer=""
+  if [[ -n "$fuzz_target" && -d "$oss_fuzz_dir/projects/$project" ]]; then
+    ofg_project_fuzzer="$(find "$oss_fuzz_dir/projects/$project" -maxdepth 1 -type f \
+      \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) -printf '%f\n' 2>/dev/null \
+      | grep -E "^${fuzz_target}[^/]*\.(c|cc|cpp)$" | head -n 1 || true)"
+  fi
+  if [[ -n "$ofg_project_fuzzer" ]]; then
+    target_path="/src/$ofg_project_fuzzer"
+    case "$ofg_project_fuzzer" in
+      *.c) language="c" ;;
+      *) language="c++" ;;
+    esac
+  fi
+  if [[ -n "$build_timeout" ]]; then
+    export OFG_EVAL_BUILD_TIMEOUT="${OFG_EVAL_BUILD_TIMEOUT:-$build_timeout}"
+  fi
   "$python" /opt/hgb/bin/ofg_benchmark_synthesis.py \
     --report-dir "$introspector_dir" \
     --source-dir "${HGB_TARGET_SOURCE_DIR:-/target/source_input}" \
-    --project "${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}" \
-    --target-name "${HGB_TARGET:-$(hgb_target_manifest_value target)}" \
-    --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
+    --project "$project" \
+    --target-name "$target_name" \
+    --fuzz-target "$fuzz_target" \
     --max-functions "${OFG_MAX_BENCHMARK_FUNCTIONS:-3}" \
+    --target-path "$target_path" \
+    --language "$language" \
+    --preferred-apis "$preferred_apis" \
     --benchmark-out "$out_yaml" \
     --selection-out "$selection_json" >"$workspace/logs/benchmark_synthesis.log" 2>&1
 }
@@ -625,7 +1508,11 @@ run_evaluator() {
       --strict
     )
     case "$hgb_profile" in
-      reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
+      # Every non-compat profile must build a separate coverage-instrumented
+      # image: the campaign image is SANITIZER=address and produces no
+      # profraw, so reusing it for source-based coverage makes the coverage
+      # stage fail for every candidate (alpha could never reach evaluated).
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
         ofg_evaluator_args+=(--build-coverage-image)
         ;;
     esac
@@ -643,18 +1530,13 @@ run_evaluator() {
     fi
     return "$ofg_eval_rc"
   fi
-  # Monolithic layout fallback (legacy/compat): ofg_evaluator without the split.
-  "$python" /opt/hgb/bin/ofg_evaluator.py \
-    --target-root "${HGB_TARGET_PACKAGE:-/target}" \
-    --candidates-dir "$workspace/generated_harnesses" \
-    --work-dir "$eval_dir" \
-    --fuzz-target "${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}" \
-    --selected-functions $selected_functions \
-    --build-timeout "${OFG_EVAL_BUILD_TIMEOUT:-1800}" \
-    --campaign-seconds "${OFG_CAMPAIGN_SECONDS:-60}" \
-    --strict \
-    >"$workspace/logs/evaluator.log" 2>&1
-  return $?
+  # Monolithic layout fallback (legacy): the monolithic ofg_evaluator cannot
+  # compile the FuzzBench target (its build step runs no compile command) and
+  # fabricates reachability evidence, so it must never produce an evaluated
+  # row. Fail closed for EVERY profile instead of degrading to it.
+  printf 'ofg_evaluator_failed: no split evaluator root found (HGB_EVALUATOR_ROOT/evaluator_only); the monolithic evaluator is unsupported and must never produce evidence\n' \
+    >>"$workspace/logs/evaluator.log"
+  return 65
 }
 
 write_final_result() {
@@ -812,16 +1694,17 @@ if [[ "$mode" == "generate-target" ]]; then
     hgb_write_common_summary missing_oss_fuzz_checkout "$reason" harness_generator
     exit 2
   fi
-  if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 2>&1; then
-    reason="ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv"
-    hgb_ofg_set_stage introspector_build failed
-    write_final_result failed "$reason" 65
-    hgb_write_common_metadata failed "$reason" 65 harness_generator
-    hgb_write_common_summary failed "$reason" harness_generator
-    exit 65
-  fi
+   if ! prepare_oss_fuzz_venv "$oss_fuzz_dir" >"$workspace/logs/oss_fuzz_venv.log" 2>&1; then
+     reason="ofg_oss_fuzz_dependency_setup_failed: missing OSS-Fuzz helper venv"
+     hgb_ofg_set_stage introspector_build failed
+     write_final_result failed "$reason" 65
+     hgb_write_common_metadata failed "$reason" 65 harness_generator
+     hgb_write_common_summary failed "$reason" harness_generator
+     exit 65
+   fi
+   patch_oss_fuzz_projects "$oss_fuzz_dir" || true
 
-  # --- LLM preflight (before any paid request) ---
+   # --- LLM preflight (before any paid request) ---
   if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
     redact_log_file "$workspace/logs/llm_preflight.log"
     reason="$(classify_ofg_failure 1 "$workspace/logs/llm_preflight.log")"
@@ -887,20 +1770,80 @@ if [[ "$mode" == "generate-target" ]]; then
   redact_log_file "$workspace/logs/run.log"
 
   # --- Preserve compiling candidates ---
+  # Upstream names samples ``NN.fuzz_target``; stage them with a real source
+  # suffix so the evaluator's candidate filter accepts them. Prefer repaired
+  # (fixed_targets) over first-generation samples and cap the set at
+  # OFG_NUM_EVALUATIONS so the independent evaluation stays tractable.
+  ofg_candidate_ext=".cc"
+  ofg_benchmark_lang=""
+  ofg_benchmark_lang="$(grep -m1 '^language:' "$benchmark_yaml" 2>/dev/null | awk '{print $2}' || true)"
+  [[ "$ofg_benchmark_lang" == "c" ]] && ofg_candidate_ext=".c"
+  ofg_candidate_max="${OFG_NUM_EVALUATIONS:-3}"
   if [[ -d "$HGB_GENERATION_WORK_DIR" ]]; then
-    n=0
-    while IFS= read -r generated; do
-      n=$((n + 1))
-      cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
-    done < <(find "$HGB_GENERATION_WORK_DIR" -type f \( -path '*/fixed_targets/*' -o -path '*/raw_targets/*' -o -path '*/fuzz_targets/*' \) 2>/dev/null | sort)
+    # Stage the samples that actually COMPILED in the upstream repair loop
+    # (status/<trial>/result.json compiles=true), preferring repaired
+    # (fixed_targets) files, one per function dir up to OFG_NUM_EVALUATIONS.
+    # Staging the first sample of each dir instead feeds the evaluator
+    # candidates the repair loop already rejected.
+    "$python" - "$HGB_GENERATION_WORK_DIR" "$workspace/generated_harnesses" \
+      "${OFG_NUM_EVALUATIONS:-3}" "$ofg_candidate_ext" <<'PY_OFG_STAGE'
+import json
+import shutil
+import sys
+from pathlib import Path
+work = Path(sys.argv[1])
+out = Path(sys.argv[2])
+cap = max(1, int(sys.argv[3]))
+ext = sys.argv[4]
+out.mkdir(parents=True, exist_ok=True)
+picks = []
+for fdir in sorted(work.iterdir()):
+    if not fdir.is_dir() or not fdir.name.startswith("output-"):
+        continue
+    fixed_dir = fdir / "fixed_targets"
+    fuzz_dir = fdir / "fuzz_targets"
+    status_dir = fdir / "status"
+    compiled = []
+    if status_dir.is_dir():
+        for st in sorted(status_dir.iterdir()):
+            if not st.is_dir():
+                continue
+            try:
+                d = json.loads((st / "result.json").read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if d.get("compiles"):
+                compiled.append(st.name)
+    for trial in compiled:
+        src = fixed_dir / f"{trial}.fuzz_target"
+        if not src.is_file():
+            src = fuzz_dir / f"{trial}.fuzz_target"
+        if src.is_file():
+            picks.append((src, trial))
+            break
+    if not compiled:
+        pool = sorted(fixed_dir.glob("*.fuzz_target")) if fixed_dir.is_dir() else []
+        if not pool and fuzz_dir.is_dir():
+            pool = sorted(fuzz_dir.glob("*.fuzz_target"))
+        if pool:
+            picks.append((pool[0], pool[0].stem))
+n = 0
+for src, trial in picks:
+    if n >= cap:
+        break
+    n += 1
+    shutil.copy2(src, out / f"{n}_{trial}.fuzz_target{ext}")
+print(f"ofg_staged_candidates: {n}")
+PY_OFG_STAGE
   fi
   if [[ "$(hgb_count_files "$workspace/generated_harnesses" -type f)" == "0" && -f "$workspace/logs/run.log" ]]; then
-    "$python" - "$workspace/logs/run.log" "$workspace/generated_harnesses" <<'PY_OFG_LOG_HARNESS' || true
+    "$python" - "$workspace/logs/run.log" "$workspace/generated_harnesses" "${OFG_NUM_EVALUATIONS:-3}" <<'PY_OFG_LOG_HARNESS' || true
 import re
 import sys
 from pathlib import Path
 log_path = Path(sys.argv[1])
 out_dir = Path(sys.argv[2])
+max_candidates = max(1, int(sys.argv[3] or 3))
 text = log_path.read_text(encoding='utf-8', errors='replace')
 blocks = re.findall(r"```(?:c\+\+|cpp|cc|c)?\s*\n(.*?)```", text, flags=re.S | re.I)
 count = 0
@@ -908,6 +1851,8 @@ out_dir.mkdir(parents=True, exist_ok=True)
 for block in blocks:
     if 'LLVMFuzzerTestOneInput' not in block:
         continue
+    if count >= max_candidates:
+        break
     block = block.strip() + '\n'
     count += 1
     (out_dir / f'log_candidate_{count}.cc').write_text(block, encoding='utf-8')
@@ -935,6 +1880,46 @@ PY_OFG_LOG_HARNESS
     hgb_write_common_summary failed "$reason" harness_generator
     exit 65
   fi
+
+  # --- Deterministic candidate rescue (upstream's own canonical fixers) ---
+  # Strip LLM pollution tags (a leading <solution> tag provokes cascading
+  # spurious errors), append extern "C" for C++ entries (upstream
+  # append_extern_c), and apply small per-target declaration rescues. Every
+  # change is recorded in rescue_audit.json. The fixes mirror upstream
+  # llm_toolkit/code_fixer.collect_specific_fixes; they never touch the
+  # harness semantics beyond making it compile/link.
+  # The rescue must use the language of the NATIVE harness destination (what
+  # the evaluator actually compiles): e.g. libpng's benchmark YAML says C but
+  # the evaluator compiles the candidate as C++ at the .cc native path, so
+  # extern "C" is required there.
+  ofg_rescue_lang="$ofg_benchmark_lang"
+  if [[ -f "${HGB_EVALUATOR_ROOT:-/evaluator}/native_harness_path.json" ]]; then
+    ofg_rescue_lang="$("$python" - "${HGB_EVALUATOR_ROOT:-/evaluator}/native_harness_path.json" <<'PY_RES_LANG' 2>/dev/null || true
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        value = str(json.load(f).get("language") or "").strip().lower()
+    print("c++" if value in {"c++", "cpp", "cxx"} else ("c" if value == "c" else ""))
+except Exception:
+    print("")
+PY_RES_LANG
+  )"
+  fi
+  [[ -n "$ofg_rescue_lang" ]] || ofg_rescue_lang="$ofg_benchmark_lang"
+  "$python" /opt/hgb/bin/ofg_rescue_candidates.py \
+    --candidates-dir "$workspace/generated_harnesses" \
+    --target "$target_name" \
+    --language "$ofg_rescue_lang" \
+    --audit-out "$workspace/generated_harnesses/rescue_audit.json" \
+    >>"$workspace/logs/evaluator.log" 2>&1 || {
+      reason="ofg_rescue_failed: candidate rescue step failed"
+      hgb_ofg_set_stage candidate_build failed
+      write_final_result failed "$reason" 65
+      hgb_write_common_metadata failed "$reason" 65 harness_generator
+      hgb_write_common_summary failed "$reason" harness_generator
+      exit 65
+    }
   hgb_ofg_set_stage candidate_build completed
 
   # --- Independent evaluator: build, smoke, reachability, campaign, coverage ---

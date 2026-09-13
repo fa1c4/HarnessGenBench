@@ -190,9 +190,20 @@ def check_reachability(intended: list[str], trace: dict[str, Any] | str | Path) 
     """Return a reachability report dict.
 
     ``reached`` is True iff at least one intended API executed dynamically.
+    ``status`` is "not_requested" when no intended API list exists (so
+    selectors can skip it) and "checked" otherwise.
     """
+    if not intended:
+        return {
+            "status": "not_requested",
+            "intended_apis": [],
+            "reached_apis": [],
+            "reached": True,
+            "reached_count": 0,
+        }
     reached = reached_apis_from_trace(trace, intended)
     return {
+        "status": "checked",
         "intended_apis": intended,
         "reached_apis": reached,
         "reached": len(reached) > 0,

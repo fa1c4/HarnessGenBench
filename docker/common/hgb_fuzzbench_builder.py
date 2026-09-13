@@ -342,6 +342,93 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
             )
             build_sh.write_text(text, encoding="utf-8")
 
+    # Fix sqlite3: the FuzzBench build compiles test/ossfuzz.c with ``-I.``
+    # from the bld dir (which only has the generated sqlite3.c amalgamation).
+    # Candidates that include the internal sqliteInt.h header need the src/
+    # tree on the include path.
+    if fuzz_target == "ossfuzz" or fuzz_target == "sqlite3_ossfuzz":
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = "# HGB sealed evaluator: sqlite3 internal header include path."
+            if marker not in text:
+                text = text.replace(
+                    "$CC $CFLAGS -I. -c \\",
+                    marker + "\n$CC $CFLAGS -I. -I$SRC/sqlite3/src -c \\",
+                )
+                build_sh.write_text(text, encoding="utf-8")
+
+    # Fix mbedtls: the pinned project enables -Werror (MBEDTLS_FATAL_WARNINGS)
+    # by default and the sealed evaluator's link flag -fuse-ld=lld trips
+    # -Werror=unused-command-line-argument on every compile-only step, so even
+    # the reference build fails. Disable fatal warnings for the sealed build.
+    if fuzz_target == "fuzz_dtlsclient":
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = "# HGB sealed evaluator: mbedtls fatal warnings off."
+            if marker not in text:
+                text = text.replace(
+                    "cmake -DENABLE_TESTING=OFF ..",
+                    marker + "\ncmake -DENABLE_TESTING=OFF -DMBEDTLS_FATAL_WARNINGS=OFF ..",
+                )
+                build_sh.write_text(text, encoding="utf-8")
+
+    # Fix libjpeg-turbo: the FuzzBench-pinned commit cannot build the sibling
+    # cjpeg_fuzzer (in-tree fuzz/cjpeg.cc uses struct fields the pinned
+    # cjpeg.h lacks). Build only the target fuzzer for the main branch.
+    if fuzz_target == "libjpeg_turbo_fuzzer":
+        marker = "# HGB sealed evaluator: libjpeg-turbo single-target build."
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            if marker not in text:
+                text = text.replace(
+                    "cat fuzz/branches.txt | while read branch; do",
+                    marker + "\ncat fuzz/branches.txt | while read branch; do\n    [ \"$branch\" = \"main\" ] || continue",
+                )
+                build_sh.write_text(text, encoding="utf-8")
+        for fuzz_build in context_dir.rglob("libjpeg-turbo.main/fuzz/build.sh"):
+            text = fuzz_build.read_text(encoding="utf-8", errors="replace")
+            if marker not in text:
+                text = text.replace(
+                    'make "-j$(nproc)" "--load-average=$(nproc)"',
+                    'make "-j$(nproc)" "--load-average=$(nproc)" libjpeg_turbo_fuzzer',
+                )
+                text = text.replace(
+                    "make install",
+                    marker + "\ncp fuzz/libjpeg_turbo_fuzzer $OUT/ 2>/dev/null || true # HGB: skip all-fuzzer install",
+                )
+                fuzz_build.write_text(text, encoding="utf-8")
+
+    # Fix lcms: the OSS-Fuzz fuzzer is C (.c) but the FuzzBench target is
+    # C++ (.cc). Generated C candidates fail to compile as C++; compile the
+    # harness as C when it lacks C++ linkage markers (the reference harness
+    # has extern "C" and keeps the C++ path).
+    if fuzz_target == "cms_transform_fuzzer":
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = "# HGB sealed evaluator: lcms C/C++ harness detection."
+            if marker not in text:
+                old = ("$CXX $CXXFLAGS $SRC/cms_transform_fuzzer.cc -I include/ src/.libs/liblcms2.a \\\n"
+                       "    $FUZZER_LIB -o $OUT/cms_transform_fuzzer\n")
+                new = (marker + "\n"
+                       "if grep -q 'extern \"C\"' $SRC/cms_transform_fuzzer.cc; then\n"
+                       "    $CXX $CXXFLAGS $SRC/cms_transform_fuzzer.cc -I include/ src/.libs/liblcms2.a \\\n"
+                       "        $FUZZER_LIB -o $OUT/cms_transform_fuzzer\n"
+                       "else\n"
+                       "    $CXX $CXXFLAGS -x c $SRC/cms_transform_fuzzer.cc -x none -I include/ src/.libs/liblcms2.a \\\n"
+                       "        $FUZZER_LIB -o $OUT/cms_transform_fuzzer\n"
+                       "fi\n")
+                if old in text:
+                    text = text.replace(old, new, 1)
+                    build_sh.write_text(text, encoding="utf-8")
+
     benchmark_commit = _read_benchmark_commit(context_dir)
     dockerfile = context_dir / "Dockerfile"
 
@@ -477,6 +564,11 @@ def _sealed_compile_block() -> str:
         "ENV ARCHITECTURE=${HGB_ARCHITECTURE}\n"
         "ENV FUZZING_LANGUAGE=${HGB_FUZZING_LANGUAGE}\n"
         "ENV MERGE_WITH_OSS_FUZZ_CORPORA=0\n"
+        # The pinned FuzzBench base-builder pairs clang-15 with GNU ld 2.34,
+        # which cannot link clang's DWARF-5 object files (DW_FORM_strx1).
+        # Force lld so the sealed evaluator build links with a modern linker.
+        "ENV CFLAGS=\"-fuse-ld=lld\"\n"
+        "ENV CXXFLAGS=\"-fuse-ld=lld\"\n"
         "RUN if [ \"$HGB_FUZZING_ENGINE\" = \"libfuzzer\" ]; then "
         "export FUZZER_LIB=\"${FUZZER_LIB:--fsanitize=fuzzer}\"; "
         "else export FUZZER_LIB=\"${FUZZER_LIB:-${LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a}}\"; fi; "
@@ -521,7 +613,11 @@ def build_candidate_image(
     dest_in_context = context_dir / "source_input" / rel
     dest_in_context.parent.mkdir(parents=True, exist_ok=True)
     staged_candidate_host = Path(staged_candidate_host)
-    staged_candidate_host = _normalize_candidate_for_native_path(staged_candidate_host, native_destination, work_dir)
+    # Overlay the candidate byte-exactly: the shared evaluator must never
+    # rewrite generated source (the overlay audit proves /src/<native_path>
+    # hash-equals the generated candidate hash; plan delta/zeta/eta §3).
+    # Syntax/ABI normalization belongs in generator-side rescue pipelines
+    # (e.g. ckgfuzzer_rescue_candidates.py), never in the evaluator.
     _patch_single_target_build_context(context_dir, fuzz_target)
     candidate_sha256 = ""
     if staged_candidate_host.is_file():
@@ -773,6 +869,13 @@ def _container_run(
                 phases.append(("run", start_result))
                 result = start_result
                 start_exit_code = start_result.exit_code
+                # A client-side timeout of ``docker start -a`` kills only the
+                # docker client: the container keeps running and a subsequent
+                # ``docker cp`` would race the in-container artifact writes
+                # (e.g. a half-written corpus.tar or coverage.json). Kill the
+                # container so copied artifacts are final, never mid-write.
+                if start_exit_code == 124:
+                    _run_phase(runner, ["docker", "kill", container_name], 60, f"kill timed-out {phase}")
             else:
                 start_result = CommandResult(list(command), 1, "", f"copy_in failed for {phase}; target not started")
                 phases.append(("run", start_result))
@@ -858,10 +961,21 @@ def run_smoke(
         executed = copy_in_ok and marker_seen
         # A sanitizer-misuse crash is indicated by a non-zero exit (libFuzzer
         # returns 77 for a misuse crash on a single input).  Timeouts (124)
-        # are not crashes.
+        # are not crashes. Sanitizer/runtime crash signatures in stderr always
+        # count as crashes (MSan/LSan included, previously only ASan/UBSan).
         crashed = result.exit_code not in (0, 1, 124)
-        if "AddressSanitizer" in result.stderr or "UndefinedBehaviorSanitizer" in result.stderr:
-            crashed = True
+        stderr_text = result.stderr or ""
+        for crash_marker in (
+            "AddressSanitizer",
+            "UndefinedBehaviorSanitizer",
+            "MemorySanitizer",
+            "LeakSanitizer",
+            "ThreadSanitizer",
+            "ERROR: libFuzzer: deadly signal",
+        ):
+            if crash_marker in stderr_text:
+                crashed = True
+                break
         if crashed:
             misuse_crash = True
         if executed:
@@ -899,7 +1013,11 @@ def run_campaign(
     artifact_dir = work_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     budget = max(1, int(campaign_seconds))
-    run_count = max(1, min(10000, budget * 256))
+    # -runs must never truncate the campaign: a low run cap (10k) ends fast
+    # targets in seconds, so the fuzzing budget (-max_total_time) never
+    # applies. Give -runs a value far above any realistic exec count for the
+    # budget so -max_total_time is the governing bound.
+    run_count = max(1, budget * 256)
     fuzzer_timeout = budget + 5
     # Build copy_in list for seed corpus files.
     copy_in: list[tuple[Path, str]] = []
@@ -921,7 +1039,7 @@ def run_campaign(
         "sh",
         "-lc",
         f'{seed_stage}timeout -s INT -k 5s {fuzzer_timeout}s {binary_path} '
-        f'-runs={run_count} -max_total_time={budget} -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
+        f'-runs={run_count} -max_total_time={budget} -print_final_stats=1 -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
         f'> /tmp/campaign.log 2>&1; '
         f'fuzzer_rc=$?; echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
         f'echo "---STATS---"; '
@@ -953,6 +1071,15 @@ def run_campaign(
     corpus_tar = campaign_work / "corpus.tar"
     if corpus_tar.is_file():
         try:
+            # The host-side seed copies staged into final_corpus_dir must not
+            # pollute the final-corpus count: the container tar is the exact
+            # campaign corpus. Clear the staging copies first, then extract so
+            # ``final_corpus_file_count`` reflects the container corpus only
+            # (zeta plan §2: an empty campaign corpus must never fall back to
+            # the seed corpus).
+            for stale in final_corpus_dir.iterdir():
+                if stale.is_file():
+                    stale.unlink()
             with tarfile.open(corpus_tar) as tf:
                 for member in tf.getmembers():
                     name = member.name
@@ -977,6 +1104,19 @@ def run_campaign(
     if final_corpus_dir.is_dir():
         final_corpus_file_count = sum(1 for p in final_corpus_dir.rglob("*") if p.is_file())
     copy_out_ok = bool(getattr(result, "copy_out_ok", True))
+    if not copy_out_ok:
+        # The container corpus.tar was never copied out. Any files still in
+        # final_corpus_dir are the host-side SEED staging copies, which must
+        # never stand in for the real campaign corpus. Remove them and report
+        # an empty final corpus so strict profiles fail instead of replaying
+        # seeds (zeta plan §2/§3).
+        for stale in final_corpus_dir.iterdir():
+            if stale.is_file():
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+        final_corpus_file_count = 0
     fuzzer_timed_out = "HGB_FUZZER_EXIT_CODE=124" in log
     return {
         "execs_done": execs_done,
@@ -998,7 +1138,13 @@ def run_campaign(
 def _parse_execs_done(log: str) -> int:
     import re
 
-    for pattern in (r"#(\d+)\s+INITED", r"#(\d+)\s+DONE", r"stat::number_of_executed_units:\s*(\d+)", r"execs_done:\s*(\d+)"):
+    # Prefer the authoritative libFuzzer stat (present with -print_final_stats),
+    # then "Done N runs", then the #N DONE/INITED progress markers.
+    for pattern in (r"stat::number_of_executed_units:\s*(\d+)",
+                    r"Done (\d+) runs",
+                    r"#(\d+)\s+DONE",
+                    r"#(\d+)\s+INITED",
+                    r"execs_done:\s*(\d+)"):
         m = re.search(pattern, log)
         if m:
             return int(m.group(1))
