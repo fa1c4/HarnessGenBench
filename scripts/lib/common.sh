@@ -322,6 +322,46 @@ hgb_previous_docker_layerdb_collision_log() {
   return 1
 }
 
+# Ensure the local TEI embedding service is running when a generator is
+# configured to use it. The container can exit (observed exit 0) on a shared
+# host; without this, every PromeFuzz/CKGFuzzer run fails closed with
+# ``promefuzz_embedding_unavailable``. Idempotent: a healthy probe is a no-op.
+hgb_embedding_base_url_in_use() {
+  local url
+  for url in "${PROME_FUZZ_EMBEDDING_BASE_URL:-}" "${CKGFUZZER_EMBEDDING_BASE_URL:-}"; do
+    case "$url" in
+      *:18080*|*host.docker.internal*|*127.0.0.1*|*localhost*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+hgb_embedding_probe_ok() {
+  curl -sS --max-time 10 http://127.0.0.1:18080/v1/embeddings \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"text-embeddings-inference","input":"ping"}' 2>/dev/null | grep -q '"embedding"'
+}
+
+hgb_ensure_embedding_service() {
+  hgb_embedding_base_url_in_use || return 0
+  hgb_embedding_probe_ok && return 0
+  local container="hgb-local-embedding" deadline
+  if docker inspect "$container" >/dev/null 2>&1; then
+    log "restarting local embedding service container: $container"
+    timeout 60 docker start "$container" >/dev/null 2>&1 || true
+  else
+    log "starting local embedding service via scripts/local_embedding_server.sh"
+    timeout 300 bash "$(repo_root)/scripts/local_embedding_server.sh" start >/dev/null 2>&1 || true
+  fi
+  deadline=$((SECONDS + 180))
+  while (( SECONDS < deadline )); do
+    hgb_embedding_probe_ok && { log "local embedding service is ready"; return 0; }
+    sleep 3
+  done
+  log "WARNING: local embedding service is not ready; embedding-backed generators will fail closed"
+  return 1
+}
+
 hgb_build_image() {
   local fuzzer="$1"
   local artifact_name="$2"
@@ -447,7 +487,8 @@ run_hgb_container() {
   shift 3
   ensure_dir "$workspace"
   hgb_add_host_gateway_for_url extra_docker_args "${CKGFUZZER_EMBEDDING_BASE_URL:-}"
-  docker run --rm --init \
+  hgb_add_host_gateway_for_url extra_docker_args "${PROME_FUZZ_EMBEDDING_BASE_URL:-}"
+  docker run --rm --pull=never --init \
     "${extra_docker_args[@]}" \
     -e API_KEY \
     -e USTC_API_KEY \
@@ -570,6 +611,13 @@ run_hgb_container() {
     -e PROME_FUZZ_EMBEDDING_TIMEOUT \
     -e PROME_FUZZ_EMBEDDING_RETRY_TIMES \
     -e PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
+    -e PROME_FUZZ_LLM_MIN_INTERVAL_SECONDS \
+    -e PROME_FUZZ_LLM_429_BACKOFF_SECONDS \
+    -e PROME_FUZZ_EXTRA_CFLAGS \
+    -e PROME_FUZZ_EXTRA_CXXFLAGS \
+    -e PROME_FUZZ_EXTRA_LIBS \
+    -e PROME_FUZZ_EXTRA_LDFLAGS \
+    -e PROME_FUZZ_EVAL_MAX_CANDIDATES \
     -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
     -e PROME_FUZZ_COMPREHEND_TASK \
@@ -616,6 +664,7 @@ run_hgb_target_container() {
   shared_llm_lock_dir="$(hgb_workspace_dir "$root")/llm-locks"
   ensure_dir "$shared_llm_lock_dir"
   hgb_add_host_gateway_for_url extra_docker_args "${CKGFUZZER_EMBEDDING_BASE_URL:-}"
+  hgb_add_host_gateway_for_url extra_docker_args "${PROME_FUZZ_EMBEDDING_BASE_URL:-}"
   extra_docker_args+=(-v "$shared_llm_lock_dir:/hgb-llm-locks" -e HGB_LLM_LOCK_DIR=/hgb-llm-locks)
   artifact_name="$(generator_artifact_name "$generator")"
   generator_commit="$(artifact_commit "$(artifact_dir "$artifact_name" "$root")")"
@@ -675,6 +724,11 @@ run_hgb_target_container() {
     extra_docker_args+=(-v "$(dirname "$workspace"):/hgb-target-runs:ro" -e HGB_TARGET_RUNS_DIR=/hgb-target-runs)
   fi
   if [[ "$generator" == "elfuzz" && -S /var/run/docker.sock ]]; then
+    extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
+  fi
+  if [[ "$generator" == "promefuzz" && -S /var/run/docker.sock ]]; then
+    # The shared harness evaluator builds a sealed candidate image with
+    # `docker build` inside the PromeFuzz container.
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
   fi
   # Generator/evaluator isolation: CKGFuzzer in blind-project must never see
@@ -745,7 +799,12 @@ run_hgb_target_container() {
   # carries reproducible docker image provenance.
   local hgb_docker_image_digest=""
   hgb_docker_image_digest="$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null || true)"
-  docker run --rm --init \
+  # Bound the whole generator container so a transient Docker daemon stall
+  # (e.g. a competing image pull holding the content-store lock) cannot leave a
+  # matrix pair hanging forever. The generation stage timeout is enforced inside
+  # the entrypoint; this is a coarser outer guard with a safety margin.
+  local hgb_docker_run_timeout="${HGB_DOCKER_RUN_TIMEOUT_SECONDS:-$(( ${HGB_GENERATION_TIMEOUT_SECONDS:-10800} + 10800 ))}"
+  timeout --kill-after=60 "$hgb_docker_run_timeout" docker run --rm --pull=never --init \
     --entrypoint /opt/hgb/entrypoint.sh \
     -e HGB_DOCKER_IMAGE_DIGEST="$hgb_docker_image_digest" \
     -e API_KEY \
@@ -879,6 +938,13 @@ run_hgb_target_container() {
     -e PROME_FUZZ_EMBEDDING_TIMEOUT \
     -e PROME_FUZZ_EMBEDDING_RETRY_TIMES \
     -e PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
+    -e PROME_FUZZ_LLM_MIN_INTERVAL_SECONDS \
+    -e PROME_FUZZ_LLM_429_BACKOFF_SECONDS \
+    -e PROME_FUZZ_EXTRA_CFLAGS \
+    -e PROME_FUZZ_EXTRA_CXXFLAGS \
+    -e PROME_FUZZ_EXTRA_LIBS \
+    -e PROME_FUZZ_EXTRA_LDFLAGS \
+    -e PROME_FUZZ_EVAL_MAX_CANDIDATES \
     -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
     -e PROME_FUZZ_POOL_SIZE \

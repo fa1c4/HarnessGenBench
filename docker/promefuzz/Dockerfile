@@ -4,21 +4,55 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv build-essential cmake ninja-build git curl wget ca-certificates pkg-config clang llvm llvm-dev libclang-dev libclang-rt-18-dev clang-format libomp-dev make jq rsync ripgrep universal-ctags bear file zip xz-utils zlib1g-dev libssl-dev libffi-dev libsqlite3-dev libbz2-dev liblzma-dev apt-transport-https gnupg \
   && rm -rf /var/lib/apt/lists/*
 COPY artifacts/promefuzz /opt/hgb/artifacts/promefuzz
+# Upstream bug: check_actual_targets_ast returns the APICollection.safe_iter
+# generator object itself (not its elements) on CGprocessor failure, so
+# scheduler.record_functions_failed raises `KeyError: <generator object ...>`
+# and aborts an entire generation run (seen on freetype2). Materialize the
+# generator so the failure path records real functions. Idempotent.
+RUN python3 - <<'PY_PROMEFUZZ_DRIVER_PATCH'
+from pathlib import Path
+path = Path("/opt/hgb/artifacts/promefuzz/src/generator/driver.py")
+text = path.read_text(encoding="utf-8")
+needle = "return [], [self.function_set.safe_iter]"
+replacement = "return [], list(self.function_set.safe_iter)"
+if needle in text:
+    path.write_text(text.replace(needle, replacement), encoding="utf-8")
+PY_PROMEFUZZ_DRIVER_PATCH
 RUN python3 -m venv /opt/hgb/venv \
   && /opt/hgb/venv/bin/python -m pip install --upgrade pip setuptools wheel \
   && if [ -f /opt/hgb/artifacts/promefuzz/requirements.txt ]; then /opt/hgb/venv/bin/python -m pip install -r /opt/hgb/artifacts/promefuzz/requirements.txt; fi
+ENV NLTK_DATA=/opt/hgb/nltk_data
 RUN /opt/hgb/venv/bin/python -m pip install pdfminer.six nltk \
   && mkdir -p /opt/hgb/nltk_data \
   && /opt/hgb/venv/bin/python - <<'PY_NLTK_DOWNLOAD'
+import os
+import time
+
 import nltk
-for package in (
+
+download_dir = os.environ["NLTK_DATA"]
+packages = (
     "punkt",
     "punkt_tab",
     "averaged_perceptron_tagger",
     "averaged_perceptron_tagger_eng",
-):
-    nltk.download(package, download_dir="/opt/hgb/nltk_data", quiet=True)
+)
+for package in packages:
+    ok = False
+    for _ in range(5):
+        try:
+            if nltk.download(package, download_dir=download_dir, quiet=True):
+                ok = True
+                break
+        except Exception:
+            ok = False
+        time.sleep(3)
+    # Fail the build rather than silently shipping an image without NLTK data.
+    if not ok:
+        raise SystemExit(f"failed to download NLTK package: {package}")
 PY_NLTK_DOWNLOAD
+RUN test -n "$(ls -A /opt/hgb/nltk_data/tokenizers 2>/dev/null)" \
+  && test -n "$(ls -A /opt/hgb/nltk_data/taggers 2>/dev/null)"
 ENV NLTK_DATA=/opt/hgb/nltk_data
 RUN cd /opt/hgb/artifacts/promefuzz \
   && bash ./setup.sh \
@@ -71,7 +105,18 @@ PY_PROMEFUZZ_SELFTEST
 RUN apt-get update && apt-get install -y --no-install-recommends \
     autoconf automake libtool libtool-bin flex bison ragel yasm nasm \
     ruby rake tcl re2c subversion libgcrypt20-dev libcap-dev \
+    libmount-dev libblkid-dev libc++-dev libc++abi-dev meson gperf \
   && ln -sfn /opt/hgb/venv/bin/python /usr/local/bin/python3.8 \
+  && ln -sfn /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.fuzzer-x86_64.a /usr/lib/libFuzzingEngine.a \
   && rm -rf /var/lib/apt/lists/*
+RUN /opt/hgb/venv/bin/python -m pip install jinja2
+# The shared harness evaluator builds a sealed candidate image with `docker
+# build`; install the static Docker CLI (the daemon socket is bind-mounted at
+# runtime by scripts/lib/common.sh).
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.3.1.tgz -o /tmp/docker.tgz \
+  && tar -xzf /tmp/docker.tgz -C /tmp \
+  && cp /tmp/docker/docker /usr/local/bin/docker \
+  && chmod +x /usr/local/bin/docker \
+  && rm -rf /tmp/docker /tmp/docker.tgz
 WORKDIR /opt/hgb/artifacts/promefuzz
 ENTRYPOINT ["/opt/hgb/entrypoint.sh"]

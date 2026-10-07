@@ -109,8 +109,25 @@ Path(db).write_text(json.dumps(entries, indent=2) + "\n", encoding="utf-8")
 print(len(entries))
 PY_SYNTHETIC_COMPILE_DB
 }
+promefuzz_fuzzbench_benchmark_dir() {
+  # In the blind split layout /target is generator_input and omits the
+  # fuzzbench_benchmark recipe; the recipe is not reference-harness content and
+  # is available read-only under the evaluator half's benchmark_copy.
+  if [[ -d /target/fuzzbench_benchmark ]]; then
+    printf '%s\n' /target/fuzzbench_benchmark
+    return 0
+  fi
+  local evaluator_root="${HGB_EVALUATOR_ROOT:-/evaluator}"
+  if [[ -d "$evaluator_root/benchmark_copy" ]]; then
+    printf '%s\n' "$evaluator_root/benchmark_copy"
+    return 0
+  fi
+  printf '%s\n' /target/fuzzbench_benchmark
+}
+
 stage_fuzzbench_source() {
-  local destination="$1" benchmark=/target/fuzzbench_benchmark child name
+  local destination="$1" benchmark child name
+  benchmark="$(promefuzz_fuzzbench_benchmark_dir)"
   rm -rf "$destination"
   mkdir -p "$destination"
   cp -a /target/source_input/. "$destination/"
@@ -120,10 +137,29 @@ stage_fuzzbench_source() {
     rm -rf "$destination/$name"
     cp -a "$child" "$destination/$name"
   done < <(find "$benchmark" -mindepth 1 -maxdepth 1 -print0)
+  # Some FuzzBench recipes have no top-level build.sh (the Dockerfile copies a
+  # project OSS-Fuzz build script instead, e.g. libpng). Replace the soft-skip
+  # stub with a wrapper that runs the discovered project build script.
+  if [[ -f "$destination/build.sh" ]] && grep -q 'target build is unavailable' "$destination/build.sh" 2>/dev/null; then
+    local proj_build="" rel cand
+    for cand in "$destination"/*/contrib/oss-fuzz/build.sh; do
+      [[ -f "$cand" ]] && { proj_build="$cand"; break; }
+    done
+    if [[ -z "$proj_build" ]]; then
+      for cand in "$destination"/*/oss-fuzz/build.sh "$destination"/*/fuzz/build.sh "$destination"/*/tools/oss-fuzz.sh; do
+        [[ -f "$cand" ]] && { proj_build="$cand"; break; }
+      done
+    fi
+    if [[ -n "$proj_build" ]]; then
+      rel="${proj_build#"$destination"/}"
+      printf '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"\nexec bash "$SCRIPT_DIR/%s" "$@"\n' "$rel" >"$destination/build.sh"
+      chmod +x "$destination/build.sh"
+    fi
+  fi
 }
 
 fuzzbench_build_workdir() {
-  local dockerfile="${1:-/target/fuzzbench_benchmark/Dockerfile}" raw workdir=""
+  local dockerfile="${1:-$(promefuzz_fuzzbench_benchmark_dir)/Dockerfile}" raw workdir=""
   [[ -f "$dockerfile" ]] || return 0
   while IFS= read -r raw; do
     [[ -n "$raw" ]] || continue
@@ -149,9 +185,20 @@ fuzzbench_build_workdir() {
 }
 
 fuzzbench_target_build_available() {
-  local build_script="${1:-/target/fuzzbench_benchmark/build.sh}"
-  [[ -f "$build_script" ]] || return 1
-  ! grep -Fq 'FuzzBench benchmark did not include a top-level build.sh; target build is unavailable for this package.' "$build_script"
+  local build_script="${1:-$(promefuzz_fuzzbench_benchmark_dir)/build.sh}"
+  if [[ -f "$build_script" ]] && ! grep -Fq 'FuzzBench benchmark did not include a top-level build.sh; target build is unavailable for this package.' "$build_script"; then
+    return 0
+  fi
+  # The benchmark may omit a top-level build.sh and instead have its Dockerfile
+  # copy a project OSS-Fuzz build script (e.g. libpng's
+  # contrib/oss-fuzz/build.sh). Treat that as buildable so stage_fuzzbench_source
+  # wraps the stub and the exact target build validates each candidate.
+  local src_root="${HGB_TARGET_SOURCE_DIR:-/target/source_input}"
+  local candidate
+  for candidate in "$src_root"/*/contrib/oss-fuzz/build.sh "$src_root"/*/tools/oss-fuzz.sh "$src_root"/*/oss-fuzz/build.sh; do
+    [[ -f "$candidate" ]] && return 0
+  done
+  return 1
 }
 
 is_positive_integer() {
@@ -481,6 +528,11 @@ if [[ "$mode" == "generate-target" ]]; then
   export OPENAI_MODEL="${OPENAI_MODEL:-${MODEL:-gpt-4o-mini}}"
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${PROME_FUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
+  # Global cross-container LLM request throttle. Providers commonly cap a key
+  # at only a few requests per minute; without this, concurrent targets burn the
+  # quota on HTTP 429 retries and generation never finalizes a driver.
+  export PROME_FUZZ_LLM_MIN_INTERVAL_SECONDS="${PROME_FUZZ_LLM_MIN_INTERVAL_SECONDS:-3.5}"
+  export PROME_FUZZ_LLM_429_BACKOFF_SECONDS="${PROME_FUZZ_LLM_429_BACKOFF_SECONDS:-8}"
   export PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR="${PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR:-1}"
   export PROME_FUZZ_PROVIDER_ERROR_FILE="$workspace/logs/provider_error.log"
   export PROME_FUZZ_SKIP_BAD_DOCS="${PROME_FUZZ_SKIP_BAD_DOCS:-1}"
@@ -539,6 +591,19 @@ if [[ "$mode" == "generate-target" ]]; then
       promefuzz_allow_synthetic=1
       ;;
   esac
+  # Method-faithful ALL-COVER with a practical API budget. Leaving this
+  # unbounded makes comprehension cover thousands of functions for large
+  # projects (libxml2 1561, libxslt 1325) and exceed the per-stage timeout, so
+  # bound it to a practical multi-candidate set; compat-smoke keeps the small
+  # deterministic selection.
+  if [[ "$promefuzz_method_faithful" == "1" ]]; then
+    export PROME_FUZZ_MAX_APIS="${PROME_FUZZ_MAX_APIS:-64}"
+    export HGB_SELECTED_API_MAX=0
+    export HGB_SELECTED_API_FALLBACK_MAX=0
+    # The auto-derived intended-API list can miss APIs reached indirectly, so
+    # allow the evaluator to confirm project-symbol execution from coverage.
+    export HGB_REACHABILITY_PROJECT_FALLBACK=1
+  fi
   # Validate profile/protocol invariants before any expensive work.
   if ! "$python" /opt/hgb/bin/promefuzz_profile.py validate --profile "$promefuzz_profile" --protocol "$promefuzz_protocol" >/dev/null 2>"$workspace/logs/profile_validation.log"; then
     violations="$(cat "$workspace/logs/profile_validation.log" 2>/dev/null || printf 'unknown')"
@@ -552,9 +617,9 @@ if [[ "$mode" == "generate-target" ]]; then
   # Official ALL-COVER budgets: practical multi-candidate budget for alpha,
   # upstream/paper-aligned values may override via env.
   export PROME_FUZZ_ALL_COVER_CANDIDATES="${PROME_FUZZ_ALL_COVER_CANDIDATES:-4}"
-  export PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS="${PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS:-5400}"
-  export PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS="${PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS:-64}"
-  export PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS="${PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS:-3}"
+  export PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS="${PROME_FUZZ_ALL_COVER_MAX_WALL_SECONDS:-7200}"
+  export PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS="${PROME_FUZZ_ALL_COVER_MAX_LLM_CALLS:-96}"
+  export PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS="${PROME_FUZZ_ALL_COVER_REPAIR_ATTEMPTS:-5}"
   # Beta plan section 8: define ALL-COVER/generation/campaign budgets in one
   # place. A smaller user-supplied budget is recorded but is not a paper
   # reproduction unless the paper budget matches.
@@ -568,6 +633,43 @@ if [[ "$mode" == "generate-target" ]]; then
   project="${HGB_TARGET_PROJECT:-$(hgb_target_manifest_value project)}"
   fuzz_target="${HGB_TARGET_FUZZ_TARGET:-$(hgb_target_manifest_value fuzz_target)}"
   safe_target="$(printf '%s' "$target_name" | sed 's/[^A-Za-z0-9_]/_/g')"
+  # Consume the per-target build facts override (build/generation timeouts) so
+  # slow FuzzBench recipes are not killed by the default native-build timeout.
+  target_override_json="$("$python" - "$target_name" <<'PY_PROMEFUZZ_TARGET_OVERRIDE'
+import json
+import sys
+sys.path.insert(0, "/opt/hgb/bin")
+import promefuzz_profile
+overrides = promefuzz_profile.load_target_overrides("/opt/hgb/metadata")
+print(json.dumps(promefuzz_profile.preflight_target(sys.argv[1], overrides)))
+PY_PROMEFUZZ_TARGET_OVERRIDE
+)" || target_override_json="{}"
+  if [[ -n "${target_override_json:-}" ]]; then
+    override_build_timeout="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("build_timeout",""))' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_build_timeout" && -z "${PROME_FUZZ_NATIVE_BUILD_TIMEOUT_SECONDS:-}" ]]; then
+      export PROME_FUZZ_NATIVE_BUILD_TIMEOUT_SECONDS="$override_build_timeout"
+    fi
+    override_generation_timeout="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("generation_timeout",""))' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_generation_timeout" ]]; then
+      # Honor the per-target generation budget even though the host also sets
+      # HGB_GENERATION_TIMEOUT_SECONDS (the host value wins otherwise).
+      export PROME_FUZZ_STAGE_TIMEOUT_SECONDS="${PROME_FUZZ_STAGE_TIMEOUT_SECONDS:-$override_generation_timeout}"
+      [[ -z "${HGB_GENERATION_TIMEOUT_SECONDS:-}" ]] && export HGB_GENERATION_TIMEOUT_SECONDS="$override_generation_timeout"
+    fi
+    override_extra_cflags="$("$python" -c 'import json,sys; d=json.load(sys.stdin).get("extra_cflags") or []; print(" ".join(map(str,d)) if isinstance(d,list) else str(d))' <<<"$target_override_json" 2>/dev/null || true)"
+    override_extra_cxxflags="$("$python" -c 'import json,sys; d=json.load(sys.stdin).get("extra_cxxflags") or []; print(" ".join(map(str,d)) if isinstance(d,list) else str(d))' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_extra_cflags" ]]; then export PROME_FUZZ_EXTRA_CFLAGS="$override_extra_cflags"; fi
+    if [[ -n "$override_extra_cxxflags" ]]; then export PROME_FUZZ_EXTRA_CXXFLAGS="$override_extra_cxxflags"; fi
+    override_extra_libs="$("$python" -c 'import json,sys; d=json.load(sys.stdin).get("extra_libs") or []; print(" ".join(map(str,d)) if isinstance(d,list) else str(d))' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_extra_libs" ]]; then export PROME_FUZZ_EXTRA_LIBS="$override_extra_libs"; fi
+    override_extra_ldflags="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("extra_ldflags","") or "")' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_extra_ldflags" ]]; then export PROME_FUZZ_EXTRA_LDFLAGS="$override_extra_ldflags"; fi
+    # Per-target cap on how many finalized drivers the evaluator builds/campaigns.
+    # Large-build targets (php) can otherwise exceed the run timeout while
+    # evaluating every candidate.
+    override_eval_max="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("eval_max_candidates","") or "")' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_eval_max" ]]; then export PROME_FUZZ_EVAL_MAX_CANDIDATES="$override_eval_max"; fi
+  fi
   # --- Delta/Epsilon plan section 2: fail-closed split package assertions ---
   # In blind-project + a strict reproduction profile (reproduction-delta or its
   # canonical alias reproduction-epsilon), the generator mount must be the
@@ -632,17 +734,47 @@ if [[ "$mode" == "generate-target" ]]; then
   fi
   export HGB_SELECTED_API_MAX="${HGB_SELECTED_API_MAX:-8}"
   export HGB_SELECTED_API_FALLBACK_MAX="${HGB_SELECTED_API_FALLBACK_MAX:-4}"
-  # Resolve the native harness destination from manifest metadata (path only,
-  # never the reference harness body).
-  if ! native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination 2>"$workspace/logs/native_harness.log")"; then
-    promefuzz_set_stage target_prepared failed
-    reason="promefuzz_native_harness_unresolved: target package does not identify a native C/C++ harness path"
-    hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
-    promefuzz_write_final_result infra_failure "$reason" 65
-    hgb_write_common_summary failed "$reason" harness_generator
-    exit 65
+  # Resolve the native harness destination from path-only metadata (never the
+  # reference harness body). In the blind split layout the generator mount
+  # (/target = generator_input) intentionally omits the reference-harness
+  # fields, so prefer the evaluator half's native_harness_path.json and fall
+  # back to the generator manifest for monolithic packages.
+  native_harness_destination=""
+  language=""
+  native_harness_evaluator_file="${HGB_EVALUATOR_ROOT:-/evaluator}/native_harness_path.json"
+  if [[ -f "$native_harness_evaluator_file" ]]; then
+    native_harness_destination="$("$python" - "$native_harness_evaluator_file" 2>>"$workspace/logs/native_harness.log" <<'PY_PROMEFUZZ_NATIVE_EVAL_DEST'
+import json
+import sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+destination = str(data.get("container_destination") or "")
+if not destination:
+    raise SystemExit("evaluator native_harness_path.json has no container_destination")
+print(destination)
+PY_PROMEFUZZ_NATIVE_EVAL_DEST
+)" || native_harness_destination=""
+    language="$("$python" - "$native_harness_evaluator_file" 2>>"$workspace/logs/native_harness.log" <<'PY_PROMEFUZZ_NATIVE_EVAL_LANG'
+import json
+import sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(str(data.get("language") or ""))
+PY_PROMEFUZZ_NATIVE_EVAL_LANG
+)" || language=""
   fi
-  language="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field language)"
+  if [[ -z "$native_harness_destination" ]]; then
+    if ! native_harness_destination="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field destination 2>"$workspace/logs/native_harness.log")"; then
+      promefuzz_set_stage target_prepared failed
+      reason="promefuzz_native_harness_unresolved: target package does not identify a native C/C++ harness path"
+      hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
+      promefuzz_write_final_result infra_failure "$reason" 65
+      hgb_write_common_summary failed "$reason" harness_generator
+      exit 65
+    fi
+    language="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target" --field language)"
+  fi
+  [[ -n "$language" ]] || language="c++"
   fuzzbench_build_workdir="$(fuzzbench_build_workdir)"
   promefuzz_pool_size="${PROME_FUZZ_POOL_SIZE:-1}"
   if ! is_positive_integer "$promefuzz_pool_size"; then
@@ -665,17 +797,34 @@ if [[ "$mode" == "generate-target" ]]; then
   fi
   if [[ "$native_build_enabled" == "1" ]]; then
     stage_fuzzbench_source "$native_template"
+    # Apply the sealed evaluator's target-specific build.sh patches to the
+    # native template too, so single-target recipes do not build sibling
+    # fuzzers or run broad steps that cannot succeed in this image.
+    "$python" - "$native_template" "$fuzz_target" <<'PY_PROMEFUZZ_PATCH_BUILD' 2>/dev/null || true
+import sys
+sys.path.insert(0, "/opt/hgb/bin")
+from pathlib import Path
+import hgb_fuzzbench_builder as hgb_builder
+hgb_builder._patch_single_target_build_context(Path(sys.argv[1]), sys.argv[2])
+PY_PROMEFUZZ_PATCH_BUILD
     baseline_source="$native_template/${native_harness_destination#/src/}"
-    # Blind-project: overlay a NEUTRAL fuzz-entrypoint stub at the native
-    # destination, never the exact target reference harness body.
-    "$python" - "$baseline_source" "$language" <<'PY_PROMEFUZZ_NEUTRAL_STUB'
+    # Blind-project: overlay NEUTRAL fuzz-entrypoint stubs at the native
+    # destination and every stripped reference-harness path so multi-fuzzer
+    # build recipes still compile, never the exact target reference harness.
+    "$python" - "$native_template" "$language" "$native_harness_destination" \
+      "${HGB_EVALUATOR_ROOT:-/evaluator}/target_manifest.evaluator.json" <<'PY_PROMEFUZZ_NEUTRAL_STUBS'
 import sys
 from pathlib import Path
 sys.path.insert(0, "/opt/hgb/bin")
 import promefuzz_build_context as pbc
-pbc.write_neutral_stub(Path(sys.argv[1]), sys.argv[2])
-PY_PROMEFUZZ_NEUTRAL_STUB
-    native_harness_json="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target")"
+written = pbc.overlay_neutral_stubs(Path(sys.argv[1]), sys.argv[2], sys.argv[3], Path(sys.argv[4]))
+print(f"neutral_stubs_written={len(written)}")
+PY_PROMEFUZZ_NEUTRAL_STUBS
+    if [[ -f "$native_harness_evaluator_file" ]]; then
+      native_harness_json="$("$python" -c 'import sys; print(open(sys.argv[1]).read().strip())' "$native_harness_evaluator_file" 2>/dev/null || printf '{}')"
+    else
+      native_harness_json="$("$python" /opt/hgb/bin/hgb_target_harness.py --target-root /target --fuzz-target "$fuzz_target")"
+    fi
     printf '%s\n' "$native_harness_json" >"$workspace/promefuzz_native_harness.json"
     export PROME_FUZZ_DRIVER_BUILD_WRAPPER=/opt/hgb/bin/promefuzz_target_build.sh
     export PROME_FUZZ_NATIVE_SOURCE_TEMPLATE="$native_template"
@@ -689,7 +838,7 @@ PY_PROMEFUZZ_NEUTRAL_STUB
     native_build_json=true
     if [[ "${HGB_PROMEFUZZ_VALIDATE_TARGET_BASELINE:-1}" == "1" ]]; then
       baseline_binary="$native_build_root/baseline/$fuzz_target"
-      if ! bash /opt/hgb/bin/promefuzz_target_build.sh "$baseline_source" "$baseline_binary" >"$workspace/logs/baseline-build.log" 2>&1; then
+      if ! PROME_FUZZ_NATIVE_SMOKE_RUN="${PROME_FUZZ_BASELINE_SMOKE_RUN:-0}" bash /opt/hgb/bin/promefuzz_target_build.sh "$baseline_source" "$baseline_binary" >"$workspace/logs/baseline-build.log" 2>&1; then
         promefuzz_set_stage build_context failed
         reason="promefuzz_baseline_build_failed: native baseline build or smoke test failed; inspect baseline-build.log before spending LLM budget"
         hgb_write_common_metadata infra_failure "$reason" 65 harness_generator
@@ -708,6 +857,9 @@ PY_PROMEFUZZ_NEUTRAL_STUB
     --capture-method "${PROME_FUZZ_BUILD_CONTEXT_METHOD:-auto}"
     --build-workdir-relative "$fuzzbench_build_workdir"
     --build-timeout "${PROME_FUZZ_NATIVE_BUILD_TIMEOUT_SECONDS:-900}"
+    --native-harness-destination "$native_harness_destination"
+    --native-harness-language "$language"
+    --benchmark-root "$(promefuzz_fuzzbench_benchmark_dir)"
   )
   [[ "$promefuzz_allow_synthetic" == "1" ]] && promefuzz_build_context_args+=(--allow-synthetic)
   if ! "$python" "${promefuzz_build_context_args[@]}" >"$workspace/logs/build_context.log" 2>&1; then
@@ -840,6 +992,42 @@ PY_PROMEFUZZ_LINK_EMPTY
   libraries=/run/hgb/promefuzz/libraries.toml
   promefuzz_write_config "$config"
   driver_build_args_toml="$driver_build_args_json"
+  # Restrict PromeFuzz's API/header discovery to the target's real include
+  # directories (from the captured build flags) so test-only headers such as
+  # jsoncpp's jsontest.h are not offered as library APIs.
+  header_paths_toml="$("$python" - "$driver_build_args_json" <<'PY_PROMEFUZZ_HEADER_PATHS'
+import json
+import os
+import sys
+try:
+    args = json.loads(sys.argv[1] or "[]")
+except Exception:
+    args = []
+paths = []
+for arg in args:
+    if isinstance(arg, str) and arg.startswith("-I") and len(arg) > 2:
+        candidate = arg[2:]
+        if os.path.isdir(candidate) and candidate not in paths:
+            paths.append(candidate)
+if not paths:
+    # Meson/CMake exports may carry only relative include dirs. Fall back to the
+    # project's own source/include dirs so API discovery still sees headers.
+    root = "/target/source_input"
+    if os.path.isdir(root):
+        paths.append(root)
+        for child in sorted(os.listdir(root)):
+            project = os.path.join(root, child)
+            if not os.path.isdir(project):
+                continue
+            paths.append(project)
+            for sub in ("src", "include", "inc", "lib"):
+                subdir = os.path.join(project, sub)
+                if os.path.isdir(subdir):
+                    paths.append(subdir)
+print(json.dumps(paths[:32] if paths else ["/target/source_input"]))
+PY_PROMEFUZZ_HEADER_PATHS
+)"
+  [[ -n "$header_paths_toml" ]] || header_paths_toml='["/target/source_input"]'
   # Beta plan section 6: wire consumer knowledge into the upstream PromeFuzz
   # config. consumer_cases.json was produced by build_context capture from
   # legitimate examples/tests/docs only (never the reference harness).
@@ -856,7 +1044,7 @@ PY_PROMEFUZZ_LINK_EMPTY
   cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
 [$safe_target]
 language = "$language"
-header_paths = ["/target/source_input"]
+header_paths = $header_paths_toml
 compile_commands_path = "$compile_db"
 document_paths = ["/target/docs"]
 document_has_api_usage = true
@@ -898,6 +1086,83 @@ EOF_PROMEFUZZ_LIBS
   )
   selected_api_count="$(python3 "${api_extract_args[@]}" 2>"$workspace/logs/promefuzz_api_extract.log" || printf '0')"
   selected_api_count="${selected_api_count##*$'\n'}"
+  # When the target builds a shared library, prefer APIs the library actually
+  # exports.  PromeFuzz's ranked selection can otherwise choose internal,
+  # hidden helpers (e.g. curl's ``Curl_*``) that generated drivers cannot call
+  # correctly; restricting to dynamic symbols steers generation to callable
+  # public APIs.  Static-only targets keep the ranked header/source selection.
+  promefuzz_shared_lib="$(python3 - "$workspace/build_context/libraries.json" <<'PY_PROMEFUZZ_SHARED_LIB' 2>/dev/null || true
+import json
+import sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit
+for path in data.get("library_paths") or []:
+    name = str(path)
+    if ".so" in name:
+        print(name)
+        break
+PY_PROMEFUZZ_SHARED_LIB
+)"
+  if [[ -n "$promefuzz_shared_lib" && -f "$promefuzz_shared_lib" ]]; then
+    "$python" - "$selected_api_names_file" "$promefuzz_shared_lib" "${PROME_FUZZ_MAX_APIS:-64}" <<'PY_PROMEFUZZ_EXPORTED_APIS' 2>"$workspace/logs/promefuzz_exported_apis.log" || true
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+names_path = Path(sys.argv[1])
+lib = sys.argv[2]
+try:
+    max_apis = int(sys.argv[3] or 0)
+except ValueError:
+    max_apis = 0
+try:
+    current = json.loads(names_path.read_text(encoding="utf-8"))
+except Exception:
+    current = []
+if not isinstance(current, list):
+    current = []
+nm = "llvm-nm"
+try:
+    result = subprocess.run(
+        [nm, "-D", "--defined-only", lib],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+except FileNotFoundError:
+    result = subprocess.run(
+        ["nm", "-D", "--defined-only", lib],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+exported = []
+for line in result.stdout.splitlines():
+    parts = line.split()
+    if not parts:
+        continue
+    symbol = parts[-1]
+    if symbol and symbol not in exported:
+        exported.append(symbol)
+exported_set = set(exported)
+# Keep the selected candidates that are exported, then add other exported
+# symbols; the PromeFuzz preprocess patch only keeps names that also match its
+# own extracted API set, so extras are harmless.
+ordered = [name for name in current if str(name).split("::")[-1] in exported_set]
+for symbol in exported:
+    if symbol not in ordered:
+        ordered.append(symbol)
+if max_apis > 0:
+    ordered = ordered[:max_apis]
+if ordered:
+    names_path.write_text(json.dumps(ordered, indent=2) + "\n", encoding="utf-8")
+    print(len(ordered))
+PY_PROMEFUZZ_EXPORTED_APIS
+    if [[ -s "$selected_api_names_file" ]]; then
+      exported_count="$(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(len(d))' "$selected_api_names_file" 2>/dev/null || printf '')"
+      [[ -n "$exported_count" ]] && selected_api_count="$exported_count"
+    fi
+  fi
   export PROME_FUZZ_SELECTED_API_NAMES_FILE="$selected_api_names_file"
   export PROME_FUZZ_API_SELECTION_METADATA_FILE="$api_selection_metadata"
   runtime_artifact=/run/hgb/promefuzz/artifact
@@ -915,6 +1180,7 @@ if llm_py.exists():
         llm_text = llm_text.replace("import sys\n", "import sys\nsys.path.insert(0, \"/opt/hgb/bin\")\ntry:\n    import hgb_llm_trace\nexcept Exception:\n    hgb_llm_trace = None\n", 1)
     old = """            completion = self.client.chat.completions.create(**api_params)"""
     new = """            if hgb_llm_trace is not None:
+                hgb_llm_trace.throttle(stage=\"promefuzz\")
                 completion = hgb_llm_trace.trace_call(
                     lambda: self.client.chat.completions.create(**api_params),
                     stage=\"promefuzz\",
@@ -928,7 +1194,7 @@ if llm_py.exists():
     if old in llm_text and "hgb_llm_trace.trace_call" not in llm_text:
         llm_text = llm_text.replace(old, new)
     fail_fast_old = '        except Exception as e:\n            logger.error(f"OpenAI API exception: {e}")\n            return None'
-    fail_fast_new = '        except Exception as e:\n            error_text = str(e)\n            for _secret in (os.environ.get("OPENAI_API_KEY", ""), os.environ.get("API_KEY", "")):\n                if _secret:\n                    error_text = error_text.replace(_secret, "[REDACTED]")\n            logger.error(f"OpenAI API exception: {error_text}")\n            _nonretryable = (\n                "Error code: 400", "Error code: 401", "Error code: 402",\n                "Error code: 403", "Error code: 404", "Error code: 422",\n                "Insufficient Balance", "ExceededBudget", "budget_exceeded",\n                "invalid api key", "invalid_request_error", "model_not_found",\n            )\n            if (os.environ.get("PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR", "1") != "0"\n                    and any(_marker.lower() in error_text.lower() for _marker in _nonretryable)):\n                _message = "hgb_llm_nonretryable: " + error_text\n                _error_file = os.environ.get("PROME_FUZZ_PROVIDER_ERROR_FILE", "")\n                if _error_file:\n                    try:\n                        with open(_error_file, "w", encoding="utf-8") as _handle:\n                            _handle.write(_message + "\\n")\n                    except OSError:\n                        pass\n                logger.critical(_message)\n                os._exit(78)\n            return None'
+    fail_fast_new = '        except Exception as e:\n            error_text = str(e)\n            for _secret in (os.environ.get("OPENAI_API_KEY", ""), os.environ.get("API_KEY", "")):\n                if _secret:\n                    error_text = error_text.replace(_secret, "[REDACTED]")\n            logger.error(f"OpenAI API exception: {error_text}")\n            _nonretryable = (\n                "Error code: 400", "Error code: 401", "Error code: 402",\n                "Error code: 403", "Error code: 404", "Error code: 422",\n                "Insufficient Balance", "ExceededBudget", "budget_exceeded",\n                "invalid api key", "invalid_request_error", "model_not_found",\n            )\n            if (os.environ.get("PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR", "1") != "0"\n                    and any(_marker.lower() in error_text.lower() for _marker in _nonretryable)):\n                _message = "hgb_llm_nonretryable: " + error_text\n                _error_file = os.environ.get("PROME_FUZZ_PROVIDER_ERROR_FILE", "")\n                if _error_file:\n                    try:\n                        with open(_error_file, "w", encoding="utf-8") as _handle:\n                            _handle.write(_message + "\\n")\n                    except OSError:\n                        pass\n                logger.critical(_message)\n                os._exit(78)\n            if "429" in error_text or "rate limit" in error_text.lower():\n                try:\n                    import time as _hgb_time\n                    _hgb_time.sleep(float(os.environ.get("PROME_FUZZ_LLM_429_BACKOFF_SECONDS", "8")))\n                except Exception:\n                    pass\n            return None'
     if "PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR" not in llm_text:
         if "import os\n" not in llm_text:
             llm_text = llm_text.replace("import sys\n", "import os\nimport sys\n", 1)
@@ -1036,6 +1302,14 @@ if driver_py.exists():
             )'''
         if old in text:
             text = text.replace(old, new, 1)
+    # Upstream bug: on CGprocessor failure check_actual_targets_ast returns the
+    # APICollection.safe_iter generator object itself instead of its elements,
+    # so scheduler.record_functions_failed raises `KeyError: <generator object
+    # ...>` and aborts generation (seen on freetype2). Materialize the list.
+    text = text.replace(
+        "return [], [self.function_set.safe_iter]",
+        "return [], list(self.function_set.safe_iter)",
+    )
     text = text.replace('''f"{func.name.split("::")[-1]}("''', '''f"{func.name.split('::')[-1]}("''')
     text = text.replace(
         '''f"Function in fuzz driver does not exist in API collection: {calling["calleeName"]} at {calling["calleeDeclLoc"]}"''',
@@ -1142,7 +1416,7 @@ PY_PROMEFUZZ_LLM_TRACE_PATCH
     fi
     printf '%q ' "${stage_args[@]}" >>"$workspace/command.txt"; printf '\n' >>"$workspace/command.txt"
     stage_code=0
-    (cd "$runtime_artifact" && timeout "${HGB_GENERATION_TIMEOUT_SECONDS:-10800}" "${stage_args[@]}") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
+    (cd "$runtime_artifact" && timeout "${PROME_FUZZ_STAGE_TIMEOUT_SECONDS:-${HGB_GENERATION_TIMEOUT_SECONDS:-10800}}" "${stage_args[@]}") >"$workspace/logs/${stage}.log" 2>&1 || stage_code=$?
     if [[ "$stage" == "stats" ]]; then
       continue
     fi
@@ -1258,8 +1532,12 @@ PY_PROMEFUZZ_KNOWLEDGE_USAGE
   fi
   final_driver_dir="$workspace/promefuzz_out/$safe_target/fuzz_driver"
   temporary_driver_dir="$workspace/promefuzz_out/$safe_target/tmp"
+  # Bound the evaluator's work: each verified candidate needs a full Docker
+  # build + campaign, so evaluate at most this many finalized drivers.
+  eval_max_candidates="${PROME_FUZZ_EVAL_MAX_CANDIDATES:-4}"
   n=0
   while IFS= read -r generated; do
+    [[ "$n" -ge "$eval_max_candidates" ]] && break
     n=$((n + 1))
     cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
   done < <(find "$final_driver_dir" -maxdepth 1 -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | sort)
@@ -1300,8 +1578,14 @@ PY_PROMEFUZZ_KNOWLEDGE_USAGE
         reason='promefuzz_no_api_candidates: PromeFuzz comprehension produced no completed API comprehension records'
       fi
     fi
+    # A generation that produced no sanitized harness is a method quality
+    # failure, never a successful row and never an infrastructure failure.
+    if [[ "$failed_stage" == "generate" && "${generated_harness_count:-0}" -eq 0 ]]; then
+      status=quality_failure
+      reason="promefuzz_no_generated_harness: PromeFuzz generation produced no sanitized target harness (stage exit $code)"
+    fi
   fi
-  deprecated_api_event_count="$(grep -R -hE 'has failed to generate more than [0-9]+ times, deprecated' "$workspace/logs" 2>/dev/null | wc -l | tr -d ' ')"
+  deprecated_api_event_count="$({ grep -R -hE 'has failed to generate more than [0-9]+ times, deprecated' "$workspace/logs" 2>/dev/null || true; } | wc -l | tr -d ' ')"
   if [[ "$code" -eq 0 && "${deprecated_api_event_count:-0}" -gt 0 ]]; then
     status=partial_completed
     reason="PromeFuzz finalized $generated_harness_count sanitized target harnesses but reported $deprecated_api_event_count deprecated API generation events"
@@ -1320,29 +1604,58 @@ PY_PROMEFUZZ_KNOWLEDGE_USAGE
   evaluator_reached_count=0
   evaluator_metrics_json="{}"
   evaluator_selected_json="{}"
-  if [[ "${generated_harness_count:-0}" -gt 0 && "$code" -eq 0 ]]; then
+  # Evaluate any finalized harnesses even when the generation stage exited
+  # nonzero (for example, the ALL-COVER stage hit its wall-clock timeout). The
+  # evaluator decides the canonical status; partial generation that produced a
+  # verified harness is still a successful generation.
+  if [[ "${generated_harness_count:-0}" -gt 0 ]]; then
     eval_dir="$workspace/evaluation"
     mkdir -p "$eval_dir"
     evaluator_root="${HGB_EVALUATOR_ROOT:-/target}"
     verification_code=0
     intended_apis_arg=""
-    if [[ -f "$selected_api_names_file" ]]; then
-      python3 - "$selected_api_names_file" >"$workspace/promefuzz_intended_apis.txt" 2>/dev/null <<'PY_PROMEFUZZ_INTENDED_APIS' || true
-import json, sys
-try:
-    data = json.load(open(sys.argv[1]))
-except Exception:
-    data = []
+    "$python" - "$workspace/generated_harnesses" "$selected_api_names_file" >"$workspace/promefuzz_intended_apis.txt" 2>/dev/null <<'PY_PROMEFUZZ_INTENDED_APIS' || true
+import json
+import re
+import sys
+from pathlib import Path
+
+harness_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("")
+selected_file = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("")
 names = []
-for item in data if isinstance(data, list) else []:
-    if isinstance(item, str):
-        names.append(item.split('::')[-1])
-    elif isinstance(item, dict) and item.get('name'):
-        names.append(str(item.get('name')).split('::')[-1])
-print(','.join(names))
+# Intended APIs are the project symbols the generated drivers actually call.
+# The evaluator later filters this list to symbols declared under the project's
+# primary source roots, so incidental C/C++ identifiers are harmlessly dropped.
+ident_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+if harness_dir.is_dir():
+    for path in sorted(harness_dir.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in ident_re.findall(text):
+            if match not in names:
+                names.append(match)
+# Keep the ranked HGB selection as an additional signal.
+if selected_file.is_file():
+    try:
+        data = json.loads(selected_file.read_text(encoding="utf-8"))
+    except Exception:
+        data = []
+    for item in data if isinstance(data, list) else []:
+        if isinstance(item, str):
+            name = item.split("::")[-1]
+        elif isinstance(item, dict) and item.get("name"):
+            name = str(item.get("name")).split("::")[-1]
+        else:
+            continue
+        if name not in names:
+            names.append(name)
+print(",".join(names[:256]))
 PY_PROMEFUZZ_INTENDED_APIS
-      intended_apis_arg="$(tr -d '\n' <"$workspace/promefuzz_intended_apis.txt" 2>/dev/null || true)"
-    fi
+    intended_apis_arg="$(tr -d '\n' <"$workspace/promefuzz_intended_apis.txt" 2>/dev/null || true)"
     evaluator_args=(
       /opt/hgb/bin/hgb_harness_evaluator.py
       --generator promefuzz
@@ -1363,7 +1676,10 @@ PY_PROMEFUZZ_INTENDED_APIS
     # coverage build, not a stdout fallback. zeta/eta additionally run the
     # native coverage control to produce a line-coverage diff (eta plan §5).
     case "$promefuzz_profile" in
-      reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
+      alpha|paper-faithful|reproduction-gamma|reproduction-delta|reproduction-epsilon|reproduction-zeta|reproduction-eta)
+        # alpha/paper-faithful also require real coverage; the coverage data can
+        # only come from a coverage-instrumented build (a plain ASan/libFuzzer
+        # candidate image emits no .profraw).
         evaluator_args+=(--build-coverage-image)
         ;;
     esac
@@ -1395,27 +1711,33 @@ PY_PROMEFUZZ_INTENDED_APIS
       done
       evaluator_status=""
     fi
-    # Beta plan section 10: derive the canonical status from the evaluator.
-    final_eval_status="$("$python" - "$evaluator_status" "$promefuzz_profile" "$workspace/promefuzz_stages.json" "${verified_harness_count:-0}" "${evaluator_execs_done:-0}" "${evaluator_cov_lines:-}" "${evaluator_reached_count:-0}" <<'PY_PROMEFUZZ_FINAL_STATUS'
+    # Beta plan section 10: derive the canonical status directly from the shared
+    # evaluator result (avoids shell-variable schema drift).
+    final_eval_status="$("$python" - "$eval_result" "$promefuzz_profile" "$workspace/promefuzz_stages.json" "${generated_harness_count:-0}" <<'PY_PROMEFUZZ_FINAL_STATUS'
 import json
-import os
 import sys
 sys.path.insert(0, "/opt/hgb/bin")
 import promefuzz_profile
-evaluator_status = sys.argv[1]
+
+eval_path = sys.argv[1]
 profile = sys.argv[2]
+stages_path = sys.argv[3]
+candidate_count = int(sys.argv[4] or 0)
 try:
-    stages = json.loads(open(sys.argv[3]).read())
+    result = json.loads(open(eval_path).read())
+except Exception:
+    result = {}
+try:
+    stages = json.loads(open(stages_path).read())
 except Exception:
     stages = promefuzz_profile.default_stages()
-candidate_count = int(sys.argv[4] or 0)
-execs_done = int(sys.argv[5] or 0)
-cov_lines = sys.argv[6]
-try:
-    cov_lines_int = int(cov_lines) if cov_lines not in ("", "None") else None
-except ValueError:
-    cov_lines_int = None
-reached_count = int(sys.argv[7] or 0)
+evaluator_status = str(result.get("status", ""))
+metrics = result.get("metrics", {}) or {}
+execs_done = int((metrics.get("campaign", {}) or {}).get("execs_done", 0) or 0)
+covered = (metrics.get("coverage", {}) or {}).get("line_coverage", {}).get("covered")
+cov_lines_int = int(covered) if isinstance(covered, (int, float)) else None
+selected = result.get("selected_candidate", {}) or {}
+reached_count = len((selected.get("api_reachability", {}) or {}).get("reached_apis", []) or [])
 print(promefuzz_profile.finalize_status_from_evaluator(
     evaluator_status,
     stages=stages,

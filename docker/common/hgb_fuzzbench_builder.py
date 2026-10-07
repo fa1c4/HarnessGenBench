@@ -12,6 +12,7 @@ suite can substitute fake runners without touching Docker.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shlex
 import subprocess
@@ -59,7 +60,12 @@ def _run(command: Sequence[str], timeout_seconds: int) -> CommandResult:
 
 
 def safe_token(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]", "-", value)
+    # Docker repository names require alphanumerics separated by single
+    # ``.``/``_``/``-`` characters (no leading/trailing/consecutive separators),
+    # so collapse every separator run and trim the edges.
+    token = re.sub(r"[^A-Za-z0-9._-]", "-", value)
+    token = re.sub(r"[._-]+", "-", token).strip("-")
+    return token or "x"
 
 
 def deterministic_image_tag(
@@ -235,7 +241,17 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
     so the evaluator should compile only the requested FuzzBench target.
     """
 
-    curl_root = context_dir / "source_input" / "curl_fuzzer"
+    # The sealed evaluator context nests sources under ``source_input/`` while
+    # the native build template stages them at the root; resolve whichever
+    # layout is present so both paths get the same single-target patches.
+    curl_root = None
+    for base in (context_dir / "source_input", context_dir, context_dir / "fuzzbench_benchmark"):
+        candidate = base / "curl_fuzzer"
+        if candidate.is_dir():
+            curl_root = candidate
+            break
+    if curl_root is None:
+        curl_root = context_dir / "source_input" / "curl_fuzzer"
     fuzz_targets = curl_root / "scripts" / "fuzz_targets"
     if fuzz_targets.is_file() and fuzz_target.startswith("curl_fuzzer"):
         text = fuzz_targets.read_text(encoding="utf-8", errors="replace")
@@ -278,6 +294,19 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
         )
         if rewritten != text:
             ossfuzz.write_text(rewritten, encoding="utf-8")
+        # zlib.net is frequently unreachable (TLS reset). Point the native
+        # build's own downloader at the GitHub mirror the sealed evaluator uses.
+        for downloader in ("download_zlib.sh", "download_openssl.sh", "download_brotli.sh"):
+            script = curl_root / "scripts" / downloader
+            if not script.is_file():
+                continue
+            text = script.read_text(encoding="utf-8", errors="replace")
+            rewritten = text.replace(
+                "https://zlib.net/zlib.tar.gz",
+                "https://github.com/madler/zlib/archive/refs/tags/v1.2.13.tar.gz",
+            )
+            if rewritten != text:
+                script.write_text(rewritten, encoding="utf-8")
 
     if fuzz_target == "ftfuzzer":
         # libarchive 3.4.3 configure runs a sanitizer-built iconv conftest that
@@ -511,6 +540,22 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
             text = text.replace("./ossfuzz.sh", "./ossfuzz.sh || true")
             build_sh.write_text(text, encoding="utf-8")
 
+    # Fix libpcap: the FuzzBench benchmark build.sh runs a CMake `make` that
+    # also builds the in-tree testprogs/fuzz targets. When the candidate overlay
+    # replaces the selected harness, the in-tree target that links onefile.c
+    # (which calls fuzz_openFile, defined by the reference harness) fails under
+    # `set -e` and aborts the library build. Keep going so libpcap.a is produced;
+    # the benchmark compiles and links the candidate separately afterwards.
+    if fuzz_target in ("fuzz_both", "fuzz_pcap", "fuzz_filter"):
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = "# HGB sealed evaluator: tolerate in-tree fuzzer build failure."
+            if marker not in text and "\nmake\n" in text:
+                text = text.replace("\nmake\n", "\n" + marker + "\nmake -k || true\n", 1)
+                build_sh.write_text(text, encoding="utf-8")
+
     # Fix re2: pin to the benchmark commit that doesn't need abseil.
     if fuzz_target == "fuzzer":
         pin_dockerfile_clone(
@@ -547,6 +592,12 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
 def _sealed_compile_block() -> str:
     """Return the final evaluator compile block appended to sealed Dockerfiles."""
 
+    extra_cflags = os.environ.get("PROME_FUZZ_EXTRA_CFLAGS", "").strip()
+    extra_cxxflags = os.environ.get("PROME_FUZZ_EXTRA_CXXFLAGS", "").strip()
+    extra_libs = os.environ.get("PROME_FUZZ_EXTRA_LIBS", "").strip()
+    extra_ldflags = os.environ.get("PROME_FUZZ_EXTRA_LDFLAGS", "").strip()
+    sealed_cflags = ("-fuse-ld=lld -I/src " + extra_cflags).strip()
+    sealed_cxxflags = ("-fuse-ld=lld -I/src " + extra_cxxflags).strip()
     return (
         "# HGB sealed evaluator candidate build.\n"
         "ARG FUZZING_ENGINE=libfuzzer\n"
@@ -567,9 +618,11 @@ def _sealed_compile_block() -> str:
         # The pinned FuzzBench base-builder pairs clang-15 with GNU ld 2.34,
         # which cannot link clang's DWARF-5 object files (DW_FORM_strx1).
         # Force lld so the sealed evaluator build links with a modern linker.
-        "ENV CFLAGS=\"-fuse-ld=lld\"\n"
-        "ENV CXXFLAGS=\"-fuse-ld=lld\"\n"
-        "RUN if [ \"$HGB_FUZZING_ENGINE\" = \"libfuzzer\" ]; then "
+        f"ENV CFLAGS=\"{sealed_cflags}\"\n"
+        f"ENV CXXFLAGS=\"{sealed_cxxflags}\"\n"
+        + (f"ENV LIBS=\"{extra_libs}\"\n" if extra_libs else "")
+        + (f"ENV LDFLAGS=\"{extra_ldflags}\"\n" if extra_ldflags else "")
+        + "RUN if [ \"$HGB_FUZZING_ENGINE\" = \"libfuzzer\" ]; then "
         "export FUZZER_LIB=\"${FUZZER_LIB:--fsanitize=fuzzer}\"; "
         "else export FUZZER_LIB=\"${FUZZER_LIB:-${LIB_FUZZING_ENGINE_DEPRECATED:-/usr/lib/libFuzzingEngine.a}}\"; fi; "
         "MERGE_WITH_OSS_FUZZ_CORPORA=\"${MERGE_WITH_OSS_FUZZ_CORPORA:-0}\" "
@@ -688,7 +741,7 @@ def build_candidate_image(
         # Section 5.1: verify /out/<fuzz_target> exists and is executable.
         binary_path = f"/out/{Path(fuzz_target).stem}"
         verify_cmd = [
-            "docker", "run", "--rm", image_tag,
+            "docker", "run", "--rm", "--pull=never", image_tag,
             "sh", "-lc", f"test -x {binary_path} && sha256sum {binary_path}",
         ]
         verify = _run_phase(runner, verify_cmd, 120, "verify candidate binary")
@@ -703,7 +756,7 @@ def build_candidate_image(
         # reference) was the final write at the native harness path.
         if rel and candidate_sha256:
             audit_cmd = [
-                "docker", "run", "--rm", image_tag,
+                "docker", "run", "--rm", "--pull=never", image_tag,
                 "sh", "-lc", f"sha256sum /src/{rel} 2>/dev/null || true",
             ]
             audit = _run_phase(runner, audit_cmd, 120, "overlay audit")
@@ -777,7 +830,7 @@ def build_coverage_image(
         image_digest = inspect.stdout.strip()
         binary_path = f"/out/{Path(fuzz_target).stem}"
         verify_cmd = [
-            "docker", "run", "--rm", image_tag,
+            "docker", "run", "--rm", "--pull=never", image_tag,
             "sh", "-lc", f"test -x {binary_path} && sha256sum {binary_path}",
         ]
         verify = _run_phase(runner, verify_cmd, 120, "verify coverage binary")
@@ -827,7 +880,7 @@ def _container_run(
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     container_name = f"hgb-eval-{phase}-{uuid.uuid4().hex[:12]}"
-    create = ["docker", "create", "--name", container_name]
+    create = ["docker", "create", "--pull=never", "--name", container_name]
     if env:
         for pair in env:
             create.extend(["-e", pair])
@@ -1234,10 +1287,20 @@ def run_coverage(
             f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err'
         )
     else:
+        # Replay the corpus one input per process with a bounded per-input
+        # timeout. ``-runs=0`` can hang indefinitely for some harnesses and,
+        # because the command chain used ``&&``, a timeout then discarded the
+        # whole coverage report.
         replay_script = (
-            f'mkdir -p /tmp/cov; {coverage_seed_stage}LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw '
-            f'{binary_path} -runs=0 /tmp/corpus && '
-            f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && '
+            f'mkdir -p /tmp/cov; {coverage_seed_stage}'
+            'n=0; '
+            'for f in /tmp/corpus/*; do '
+            '[ -f "$f" ] || continue; '
+            f'timeout 60 env LLVM_PROFILE_FILE=/tmp/cov/coverage-%p.profraw {binary_path} "$f" >/dev/null 2>&1 || true; '
+            'n=$((n+1)); '
+            'done; '
+            'printf "HGB_INPUTS_REPLAYED=%s\\n" "$n" >&2; '
+            f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/coverage-*.profraw && '
             f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
             f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err; cat /tmp/cov/coverage.json'
         )
@@ -1509,7 +1572,7 @@ def build_g2fuzz_target_variant(
         inspect = _run_phase(runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60, f"inspect {variant} image")
         image_digest = inspect.stdout.strip()
         container_name = f"hgb-g2fuzz-{variant}-{uuid.uuid4().hex[:12]}"
-        create = _run_phase(runner, ["docker", "create", "--name", container_name, image_tag, "true"], 60, f"create {variant}")
+        create = _run_phase(runner, ["docker", "create", "--pull=never", "--name", container_name, image_tag, "true"], 60, f"create {variant}")
         if create.exit_code == 0:
             host_binary = work_dir / "out" / f"target.{variant}"
             cp = _run_phase(
@@ -1724,7 +1787,7 @@ def build_elfuzz_sut(
         image_digest = inspect.stdout.strip()
         # Extract /out/<fuzz_target> from the image via a throwaway container.
         container_name = f"hgb-elfuzz-{engine}-{uuid.uuid4().hex[:12]}"
-        create = _run_phase(runner, ["docker", "create", "--name", container_name, image_tag, "true"], 60, f"create {engine}")
+        create = _run_phase(runner, ["docker", "create", "--pull=never", "--name", container_name, image_tag, "true"], 60, f"create {engine}")
         copy_out = CommandResult(list(create.command), create.exit_code, create.stdout, create.stderr)
         if create.exit_code == 0:
             host_binary = work_dir / "out" / Path(fuzz_target).name

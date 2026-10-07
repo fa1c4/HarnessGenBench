@@ -20,6 +20,7 @@ the host through a pluggable ``runner``. ``bear_replay`` and
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -54,7 +55,7 @@ FUZZ_NAME_RE = re.compile(r"(?:^|[/_\-.])(fuzz(?:er|ing)?|harness|target)(?:[/_\
 HEADER_EXTS = {".h", ".hh", ".hpp", ".hxx"}
 LINK_LIB_RE = re.compile(r"(?<![A-Za-z0-9_])-l([A-Za-z0-9_.+-]+)")
 LINK_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])-L(\S+)")
-ARCHIVE_RE = re.compile(r"\.(?:a|so|so\.[0-9]+|dylib|dll)$", re.I)
+ARCHIVE_RE = re.compile(r"\.(?:a|so|so\.[0-9]+|dylib)$", re.I)
 
 
 @dataclass
@@ -66,6 +67,46 @@ class CommandResult:
 
 
 Runner = Callable[[Sequence[str], int | None], CommandResult]
+
+
+@contextlib.contextmanager
+def _temporary_env(values: dict[str, str]):
+    """Apply environment variables for a runner call and restore them after.
+
+    The capture helpers compute per-build env (SRC/OUT/WORK/CC/CXX/CFLAGS) but
+    the pluggable ``Runner`` protocol takes only ``(command, timeout)``, so the
+    values are applied to the process environment for the duration of the call.
+    """
+    previous: dict[str, str] = {}
+    added: list[str] = []
+    for key, value in values.items():
+        if key in os.environ:
+            previous[key] = os.environ[key]
+        else:
+            added.append(key)
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key in added:
+            os.environ.pop(key, None)
+        for key, value in previous.items():
+            os.environ[key] = value
+
+
+@contextlib.contextmanager
+def _temporary_chdir(path: Path):
+    """Run a runner call from the target build working directory.
+
+    FuzzBench ``build.sh`` recipes create ``build/`` and reference sources with
+    paths relative to their ``WORKDIR``, so the replay must start there.
+    """
+    previous = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(previous)
 
 
 def _real_runner(command: Sequence[str], timeout: int | None = None) -> CommandResult:
@@ -100,21 +141,55 @@ def _sha256_file(path: Path) -> str:
 
 
 def neutral_stub_source(language: str) -> str:
-    """Return a neutral LLVMFuzzerTestOneInput stub. Never the reference body."""
+    """Return a neutral LLVMFuzzerTestOneInput stub. Never the reference body.
+
+    The entrypoints are declared weak so build-support drivers (for example
+    OpenSSL's ``fuzz/driver.c``) that provide ``LLVMFuzzerTestOneInput`` are not
+    duplicated, while projects that expect the ``FuzzerInitialize`` /
+    ``FuzzerTestOneInput`` convention still link.
+    """
     if language == "c":
         return (
             "#include <stdint.h>\n"
             "#include <stddef.h>\n"
-            "int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+            "__attribute__((weak)) int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
             "  (void)data; (void)size;\n"
+            "  return 0;\n"
+            "}\n"
+            "__attribute__((weak)) void fuzz_openFile(const char *name) { (void)name; }\n"
+            "__attribute__((weak)) int FuzzerInitialize(int *argc, char ***argv) {\n"
+            "  (void)argc; (void)argv;\n"
+            "  return 0;\n"
+            "}\n"
+            "__attribute__((weak)) int FuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+            "  (void)data; (void)size;\n"
+            "  return 0;\n"
+            "}\n"
+            "__attribute__((weak)) void FuzzerCleanup(void) { }\n"
+            "__attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv) {\n"
+            "  (void)argc; (void)argv;\n"
             "  return 0;\n"
             "}\n"
         )
     return (
         "#include <cstdint>\n"
         "#include <cstddef>\n"
-        "extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+        "extern \"C\" __attribute__((weak)) int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
         "  (void)data; (void)size;\n"
+        "  return 0;\n"
+        "}\n"
+        "extern \"C\" __attribute__((weak)) void fuzz_openFile(const char *name) { (void)name; }\n"
+        "extern \"C\" __attribute__((weak)) int FuzzerInitialize(int *argc, char ***argv) {\n"
+        "  (void)argc; (void)argv;\n"
+        "  return 0;\n"
+        "}\n"
+        "extern \"C\" __attribute__((weak)) int FuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+        "  (void)data; (void)size;\n"
+        "  return 0;\n"
+        "}\n"
+        "extern \"C\" __attribute__((weak)) void FuzzerCleanup(void) { }\n"
+        "extern \"C\" __attribute__((weak)) int LLVMFuzzerInitialize(int *argc, char ***argv) {\n"
+        "  (void)argc; (void)argv;\n"
         "  return 0;\n"
         "}\n"
     )
@@ -124,6 +199,87 @@ def write_neutral_stub(destination: Path, language: str) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(neutral_stub_source(language), encoding="utf-8")
     return destination
+
+
+def _evaluator_reference_harness_files(evaluator_manifest: Path | str | None) -> list[str]:
+    """Return source-relative paths of reference harnesses stripped from source_input.
+
+    The blind generator mount omits these files, but FuzzBench recipes commonly
+    build every fuzz target in the project. Overlaying neutral stubs at each
+    stripped path keeps multi-fuzzer recipes compiling. Only the file *paths*
+    are read from the evaluator manifest; the reference bodies are never read.
+    """
+    if not evaluator_manifest:
+        return []
+    path = Path(evaluator_manifest)
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    files = data.get("reference_harness_files")
+    if not isinstance(files, list):
+        return []
+    rels: list[str] = []
+    for item in files:
+        if not isinstance(item, str):
+            continue
+        rel = item
+        for prefix in ("source_input/", "source_full/"):
+            if rel.startswith(prefix):
+                rel = rel[len(prefix):]
+                break
+        if not rel or rel.startswith("/") or ".." in rel.split("/"):
+            continue
+        if Path(rel).suffix.lower() not in (SOURCE_SUFFIXES | HEADER_EXTS):
+            continue
+        if rel not in rels:
+            rels.append(rel)
+    return rels
+
+
+def overlay_neutral_stubs(
+    template_root: Path,
+    language: str,
+    native_destination: str = "",
+    evaluator_manifest: Path | str | None = None,
+) -> list[str]:
+    """Prepare the target's fuzz entrypoint and the rest of the build sources.
+
+    The target harness is replaced with a neutral stub. Every *other* stripped
+    reference harness (other fuzz targets plus build-support drivers/headers such
+    as ``onefile.c`` and ``fuzzer.h``) is restored from the evaluator half so
+    multi-fuzzer FuzzBench recipes still build. Only build-time sources are
+    restored; the LLM/generation path never reads them and the target answer is
+    never exposed to generation.
+    """
+    template_root = Path(template_root)
+    native_rel = native_destination
+    if native_rel.startswith("/src/"):
+        native_rel = native_rel[len("/src/"):]
+    if native_rel:
+        write_neutral_stub(template_root / native_rel, language)
+    rels = _evaluator_reference_harness_files(evaluator_manifest)
+    evaluator_root = Path(os.environ.get("HGB_EVALUATOR_ROOT", "/evaluator"))
+    reference_dir = evaluator_root / "reference_harnesses"
+    written: list[str] = []
+    for rel in rels:
+        if rel == native_rel:
+            continue
+        dst = template_root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        source = reference_dir / rel
+        if source.is_file():
+            shutil.copy2(source, dst)
+        elif Path(rel).suffix.lower() in HEADER_EXTS:
+            # Never synthesize a stub header; a missing original must not
+            # replace a build-support header with fuzz entrypoint code.
+            continue
+        else:
+            dst.write_text(neutral_stub_source(language), encoding="utf-8")
+        written.append(rel)
+    return written
 
 
 def write_knowledge_usage(
@@ -345,6 +501,39 @@ def _parse_args_field(entry: dict[str, Any]) -> list[str]:
     return []
 
 
+_SAFE_FLAG_TOKEN_RE = re.compile(r"^[A-Za-z0-9_./+=\-]+$")
+
+
+def _is_safe_flag_token(value: str) -> bool:
+    """Reject tokens carrying shell/configure noise (``?``, quotes, parens)."""
+    return bool(value) and bool(_SAFE_FLAG_TOKEN_RE.match(value))
+
+
+_STANDARD_LIB_DIRS = (
+    "/usr/lib",
+    "/usr/local/lib",
+    "/lib",
+    "/usr/lib/x86_64-linux-gnu",
+    "/usr/lib64",
+)
+
+
+def _library_resolvable(name: str, search_dirs: list[Path]) -> bool:
+    """Return True when ``-l<name>`` resolves via a -L dir or a system lib dir.
+
+    A discovered archive is deliberately *not* considered: it is passed as a
+    direct path, but the linker still errors on ``-l<name>`` unless a matching
+    ``-L`` directory (or a system library) contains it.
+    """
+    for directory in list(search_dirs) + [Path(d) for d in _STANDARD_LIB_DIRS]:
+        if not directory.is_dir():
+            continue
+        for pattern in (f"lib{name}.a", f"lib{name}.so", f"lib{name}.so.*"):
+            if next(directory.glob(pattern), None) is not None:
+                return True
+    return False
+
+
 def extract_libraries(
     *,
     compile_db: list[dict[str, Any]],
@@ -372,35 +561,100 @@ def extract_libraries(
     # Compile flags from compile_commands (include dirs, defines, std).
     for entry in compile_db:
         args = _parse_args_field(entry)
-        for arg in args:
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            # Handle the separated forms (``-I /path``, ``-D FOO``) so a bare
+            # ``-I`` never reaches the link probe and consumes its next token.
+            if arg in {"-I", "-D", "-U"} and index + 1 < len(args):
+                add_flag(compile_flags, f"{arg}{args[index + 1]}")
+                index += 2
+                continue
             if arg.startswith("-I"):
                 add_flag(compile_flags, arg)
             elif arg.startswith("-D") or arg.startswith("-std=") or arg.startswith("-f"):
                 add_flag(compile_flags, arg)
+            index += 1
 
-    # Link flags and libraries from the build log.
-    for line in build_log.splitlines():
+    # Link flags and libraries from the build log. Configure output often
+    # contains diagnostic tokens such as ``-lm...`` or ``-L/usr/local/lib?g'``;
+    # only well-formed tokens are collected, and ``-l`` names are kept only when
+    # they resolve to a discovered archive or a real system library.
+    link_dir_flags: list[str] = []
+    link_lib_names: list[str] = []
+    # Some FuzzBench recipes build with CMake/Meson and expose the real link
+    # line (transitive libs such as ``-lz`` for libpng) only in the project's
+    # OSS-Fuzz build script, not in the configure/build log. Parse those recipe
+    # scripts too so generated drivers link the same libraries as the target.
+    script_lines: list[str] = []
+    for pattern in (
+        "build.sh",
+        "*/contrib/oss-fuzz/build.sh",
+        "*/oss-fuzz/build.sh",
+        "*/fuzz/build.sh",
+        "*/tools/oss-fuzz.sh",
+    ):
+        for script in sorted(Path(source_root).glob(pattern)):
+            try:
+                script_lines.extend(script.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError:
+                continue
+    # Never inject the fuzz engine itself: PromeFuzz links ``-fsanitize=fuzzer``
+    # and a duplicate ``-lFuzzingEngine`` would break the sanitizer build.
+    engine_lib_denylist = {"FuzzingEngine", "fuzzer", "Fuzzer"}
+    for line in [*build_log.splitlines(), *script_lines]:
         if " -o " in line or " -l" in line or " -L" in line:
             link_commands.append(line)
         for m in LINK_LIB_RE.finditer(line):
-            add_flag(link_flags, f"-l{m.group(1)}")
+            name = m.group(1)
+            if name in engine_lib_denylist:
+                continue
+            if ".." in name or name.endswith(".") or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+.-]*", name):
+                continue
+            if name not in link_lib_names:
+                link_lib_names.append(name)
         for m in LINK_PATH_RE.finditer(line):
-            add_flag(link_flags, f"-L{m.group(1)}")
+            path_value = m.group(1)
+            if _is_safe_flag_token(path_value):
+                flag = f"-L{path_value}"
+                if flag not in link_dir_flags:
+                    link_dir_flags.append(flag)
 
-    # Archives/shared libraries produced by the build.
+    # Archives/shared libraries produced by the build. Test/example data in the
+    # source tree frequently ships .a/.so/.dll fixtures that are not link
+    # inputs (e.g. bloaty testdata); exclude those path segments.
+    excluded_segments = {
+        "test", "tests", "testdata", "testing", "example", "examples",
+        "docs", "doc", "benchmark", "benchmarks",
+    }
     archives: list[str] = []
     scan_dirs = [Path(d) for d in out_dirs if d]
     for d in scan_dirs:
         if not d.is_dir():
             continue
         for path in sorted(d.rglob("*")):
-            if path.is_file() and ARCHIVE_RE.search(path.name):
-                archives.append(str(path))
-                add_flag(link_flags, str(path))
+            if not path.is_file() or not ARCHIVE_RE.search(path.name):
+                continue
+            try:
+                rel_parts = {part.lower() for part in path.relative_to(d).parts}
+            except ValueError:
+                rel_parts = {part.lower() for part in path.parts}
+            if rel_parts & excluded_segments:
+                continue
+            archives.append(str(path))
     # Dedupe archive paths into library_paths.
     for arc in archives:
         if arc not in library_paths:
             library_paths.append(arc)
+    # Assemble link flags: valid -L dirs, resolvable -l names, then archives.
+    for flag in link_dir_flags:
+        add_flag(link_flags, flag)
+    search_dirs = [Path(flag[2:]) for flag in link_dir_flags if flag.startswith("-L")]
+    for name in link_lib_names:
+        if _library_resolvable(name, search_dirs):
+            add_flag(link_flags, f"-l{name}")
+    for arc in archives:
+        add_flag(link_flags, arc)
 
     driver_build_args = compile_flags + link_flags
     return {
@@ -412,15 +666,38 @@ def extract_libraries(
     }
 
 
-def _stage_source(target_root: Path, staged_src: Path) -> None:
+def _resolve_benchmark_root(target_root: Path, benchmark_root: Path | None = None) -> Path:
+    """Resolve the FuzzBench benchmark recipe directory.
+
+    In the blind split layout the generator mount (``/target`` =
+    ``generator_input``) intentionally omits ``fuzzbench_benchmark``; the build
+    recipe (Dockerfile/build.sh/benchmark.yaml) is not reference-harness content
+    and lives in the evaluator half's ``benchmark_copy``. Prefer an explicit
+    override, then the generator mount, then the evaluator copy.
+    """
+    if benchmark_root is not None and Path(benchmark_root).is_dir():
+        return Path(benchmark_root)
+    candidate = target_root / "fuzzbench_benchmark"
+    if candidate.is_dir():
+        return candidate
+    evaluator_root = Path(os.environ.get("HGB_EVALUATOR_ROOT", "/evaluator"))
+    evaluator_copy = evaluator_root / "benchmark_copy"
+    if evaluator_copy.is_dir():
+        return evaluator_copy
+    return candidate
+
+
+def _stage_source(target_root: Path, staged_src: Path, benchmark_root: Path | None = None) -> None:
     """Stage the complete pinned source and benchmark into an isolated workspace."""
     if staged_src.exists():
         shutil.rmtree(staged_src)
     staged_src.mkdir(parents=True)
     source_input = target_root / "source_input"
     if source_input.is_dir():
-        shutil.copytree(source_input, staged_src, dirs_exist_ok=True)
-    benchmark = target_root / "fuzzbench_benchmark"
+        # Preserve symlinks: some projects (e.g. systemd's testdata) contain
+        # self-referential symlink loops that infinite-recurse when dereferenced.
+        shutil.copytree(source_input, staged_src, dirs_exist_ok=True, symlinks=True)
+    benchmark = _resolve_benchmark_root(target_root, benchmark_root)
     if benchmark.is_dir():
         for child in sorted(benchmark.iterdir()):
             if child.name in {"Dockerfile", "benchmark.yaml", ".dockerignore"}:
@@ -428,7 +705,45 @@ def _stage_source(target_root: Path, staged_src: Path) -> None:
             dest = staged_src / child.name
             if dest.exists():
                 continue
-            shutil.copytree(child, dest) if child.is_dir() else shutil.copy2(child, dest)
+            shutil.copytree(child, dest, symlinks=True) if child.is_dir() else shutil.copy2(child, dest)
+    _wrap_project_build_script(staged_src)
+
+
+def _wrap_project_build_script(staged_src: Path) -> None:
+    """Replace a soft-skip build.sh with the project's OSS-Fuzz build script.
+
+    Some FuzzBench recipes have no top-level ``build.sh`` (their Dockerfile
+    copies ``<project>/contrib/oss-fuzz/build.sh`` instead, e.g. libpng), so the
+    packaged stub exits 127 and native candidate validation is disabled. Run the
+    project build script so those targets can build.
+    """
+    build_sh = staged_src / "build.sh"
+    if not build_sh.is_file():
+        return
+    try:
+        text = build_sh.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    if "target build is unavailable" not in text:
+        return
+    candidates: list[Path] = []
+    for pattern in (
+        "*/contrib/oss-fuzz/build.sh",
+        "*/oss-fuzz/build.sh",
+        "*/fuzz/build.sh",
+        "*/tools/oss-fuzz.sh",
+    ):
+        candidates.extend(sorted(staged_src.glob(pattern)))
+    if not candidates:
+        return
+    rel = candidates[0].relative_to(staged_src).as_posix()
+    build_sh.write_text(
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        "SCRIPT_DIR=\"$(cd -- \"$(dirname -- \"${BASH_SOURCE[0]}\")\" && pwd)\"\n"
+        f"exec bash \"$SCRIPT_DIR/{rel}\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    build_sh.chmod(0o755)
 
 
 def _capture_cmake_export(
@@ -446,14 +761,23 @@ def _capture_cmake_export(
                 cmake_lists = child / "CMakeLists.txt"
                 break
     src_dir = cmake_lists.parent
-    result = runner(
-        ["cmake", "-S", str(src_dir), "-B", str(build_dir), "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"],
-        timeout,
-    )
-    # Also build so project-produced archives/shared libraries are available for
-    # link-context recovery. A build failure does not discard the compile
-    # commands already captured by configure.
-    build_result = runner(["cmake", "--build", str(build_dir), "--parallel"], timeout)
+    env = {
+        "CC": os.environ.get("CC", "clang"),
+        "CXX": os.environ.get("CXX", "clang++"),
+        "CFLAGS": (os.environ.get("CFLAGS", "") + " -Wno-documentation -Wno-error=documentation -I" + str(staged_src) + " " + os.environ.get("PROME_FUZZ_EXTRA_CFLAGS", "")).strip(),
+        "CXXFLAGS": (os.environ.get("CXXFLAGS", "") + " -Wno-documentation -Wno-error=documentation -I" + str(staged_src) + " " + os.environ.get("PROME_FUZZ_EXTRA_CXXFLAGS", "")).strip(),
+        "PIP_BREAK_SYSTEM_PACKAGES": os.environ.get("PIP_BREAK_SYSTEM_PACKAGES", "1"),
+        "LIBS": os.environ.get("PROME_FUZZ_EXTRA_LIBS", ""),
+    }
+    with _temporary_env(env):
+        result = runner(
+            ["cmake", "-S", str(src_dir), "-B", str(build_dir), "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"],
+            timeout,
+        )
+        # Also build so project-produced archives/shared libraries are available for
+        # link-context recovery. A build failure does not discard the compile
+        # commands already captured by configure.
+        build_result = runner(["cmake", "--build", str(build_dir), "--parallel"], timeout)
     db_path = build_dir / "compile_commands.json"
     raw: list[dict[str, Any]] = []
     if db_path.is_file():
@@ -480,13 +804,14 @@ def _capture_bear_replay(
     work_out = work_dir / "work"
     out_dir.mkdir(parents=True, exist_ok=True)
     work_out.mkdir(parents=True, exist_ok=True)
-    # Overlay a neutral stub at the native harness destination so the build
-    # does not require the reference harness body.
-    rel = native_destination
-    if rel.startswith("/src/"):
-        rel = rel[len("/src/"):]
-    stub_dest = staged_src / rel
-    write_neutral_stub(stub_dest, language)
+    # Overlay neutral stubs at the native harness destination and every
+    # stripped reference-harness path so multi-fuzzer build recipes still
+    # compile without the reference harness bodies.
+    evaluator_root = Path(os.environ.get("HGB_EVALUATOR_ROOT", "/evaluator"))
+    overlay_neutral_stubs(
+        staged_src, language, native_destination,
+        evaluator_root / "target_manifest.evaluator.json",
+    )
     build_workdir = staged_src
     if build_workdir_relative:
         candidate = staged_src / build_workdir_relative
@@ -501,12 +826,15 @@ def _capture_bear_replay(
         "CC": env.get("CC", "clang"), "CXX": env.get("CXX", "clang++"),
         "FUZZER": "libfuzzer", "FUZZER_LIB": "-fsanitize=fuzzer",
         "LIB_FUZZING_ENGINE": "-fsanitize=fuzzer",
-        "CFLAGS": env.get("CFLAGS", "") + " -pthread",
-        "CXXFLAGS": env.get("CXXFLAGS", "") + " -pthread -Wno-register",
+        "CFLAGS": env.get("CFLAGS", "") + " -pthread -Wno-documentation -Wno-error=documentation -I" + str(staged_src) + " " + os.environ.get("PROME_FUZZ_EXTRA_CFLAGS", ""),
+        "CXXFLAGS": env.get("CXXFLAGS", "") + " -pthread -Wno-register -Wno-documentation -Wno-error=documentation -I" + str(staged_src) + " " + os.environ.get("PROME_FUZZ_EXTRA_CXXFLAGS", ""),
+        "PIP_BREAK_SYSTEM_PACKAGES": env.get("PIP_BREAK_SYSTEM_PACKAGES", "1"),
+        "LIBS": (env.get("LIBS", "") + " " + os.environ.get("PROME_FUZZ_EXTRA_LIBS", "")).strip(),
     })
     # bear writes compile_commands.json in the build working directory.
     cmd = ["bear", "--", "bash", str(build_script)]
-    result = runner(cmd, timeout)
+    with _temporary_chdir(build_workdir), _temporary_env(env):
+        result = runner(cmd, timeout)
     db_path = build_workdir / "compile_commands.json"
     raw: list[dict[str, Any]] = []
     if db_path.is_file():
@@ -527,6 +855,40 @@ def _capture_bear_replay(
     return raw, result.stdout, result.stderr, result.returncode
 
 
+def _capture_meson_export(
+    staged_src: Path,
+    work_dir: Path,
+    runner: Runner,
+    timeout: int,
+) -> tuple[list[dict[str, Any]], str, str, int]:
+    """Capture a compile database for meson projects (e.g. systemd)."""
+    build_dir = work_dir / "meson_build"
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    meson_file = staged_src / "meson.build"
+    if not meson_file.is_file():
+        for child in sorted(staged_src.iterdir()):
+            if (child / "meson.build").is_file():
+                meson_file = child / "meson.build"
+                break
+    if not meson_file.is_file():
+        return [], "", "missing meson.build in staged source", 127
+    src_dir = meson_file.parent
+    setup = runner(["meson", "setup", str(build_dir), str(src_dir)], timeout)
+    compdb = runner(["ninja", "-C", str(build_dir), "-t", "compdb"], timeout)
+    raw: list[dict[str, Any]] = []
+    try:
+        data = json.loads(compdb.stdout)
+        if isinstance(data, list):
+            raw = [entry for entry in data if isinstance(entry, dict)]
+    except (json.JSONDecodeError, TypeError):
+        raw = []
+    build_result = runner(["ninja", "-C", str(build_dir)], timeout)
+    combined_stdout = setup.stdout + "\n" + compdb.stdout + "\n" + build_result.stdout
+    combined_stderr = setup.stderr + "\n" + compdb.stderr + "\n" + build_result.stderr
+    return raw, combined_stdout, combined_stderr, setup.returncode
+
+
 def capture_build_context(
     *,
     target_root: Path,
@@ -540,6 +902,9 @@ def capture_build_context(
     runner: Runner = _real_runner,
     build_timeout: int = 1800,
     source_root: Path | None = None,
+    native_harness_destination: str = "",
+    native_harness_language: str = "",
+    benchmark_root: Path | None = None,
 ) -> dict[str, Any]:
     """Capture a real compile database and link context.
 
@@ -553,8 +918,17 @@ def capture_build_context(
     build_context_dir = work_dir / "build_context"
     build_context_dir.mkdir(parents=True, exist_ok=True)
     staged_src = source_root if source_root is not None else build_context_dir / "src"
+    resolved_benchmark_root = _resolve_benchmark_root(target_root, benchmark_root)
     if source_root is None:
-        _stage_source(target_root, staged_src)
+        _stage_source(target_root, staged_src, resolved_benchmark_root)
+    # Apply the same target-specific build.sh patches the sealed evaluator uses
+    # (single-target curl/sqlite3/libjpeg/... recipes) so the native build does
+    # not compile sibling fuzzers or fail on broad recipe steps.
+    try:
+        import hgb_fuzzbench_builder as _hgb_builder
+        _hgb_builder._patch_single_target_build_context(staged_src, fuzz_target)
+    except Exception:
+        pass
 
     build_log_path = build_context_dir / "build.log"
     raw_db_path = build_context_dir / "compile_commands.raw.json"
@@ -565,27 +939,47 @@ def capture_build_context(
     generated_dir.mkdir(parents=True, exist_ok=True)
 
     # Resolve the native harness destination for neutral stub overlay.
-    native_destination = ""
-    try:
-        if select_native_harness is not None:
-            native = select_native_harness(target_root, fuzz_target)
-            native_destination = native.container_destination
-            if not language:
-                language = "c" if native.language == "c" else "c++"
-    except Exception:
-        pass
+    # An explicit destination (resolved by the entrypoint from the evaluator
+    # half's path-only metadata) wins; otherwise fall back to the evaluator
+    # file directly, then to the generator manifest for monolithic packages.
+    native_destination = native_harness_destination.strip()
+    if native_harness_language:
+        language = native_harness_language
+    if not native_destination:
+        evaluator_root = os.environ.get("HGB_EVALUATOR_ROOT", "/evaluator")
+        evaluator_native = Path(evaluator_root) / "native_harness_path.json"
+        if evaluator_native.is_file():
+            try:
+                data = json.loads(evaluator_native.read_text(encoding="utf-8"))
+                native_destination = str(data.get("container_destination") or "")
+                if not language and data.get("language"):
+                    language = str(data.get("language"))
+            except (OSError, json.JSONDecodeError):
+                pass
+    if not native_destination:
+        try:
+            if select_native_harness is not None:
+                native = select_native_harness(target_root, fuzz_target)
+                native_destination = native.container_destination
+                if not language:
+                    language = "c" if native.language == "c" else "c++"
+        except Exception:
+            pass
     if not language:
         language = "c++"
 
     methods: list[str]
     if capture_method == "auto":
-        methods = ["cmake_export", "bear_replay"]
+        # Prefer the exact FuzzBench build.sh replay; fall back to a CMake
+        # export, then a meson/ninja export, only when the recipe has no usable
+        # build.sh.
+        methods = ["bear_replay", "cmake_export", "meson_export"]
     elif capture_method in ("exact_fuzzbench", "fuzzbench_replay"):
         # Gamma plan section 6 / delta plan section 3: prefer the exact
         # FuzzBench build.sh replay (bear/intercept-build) over a generic
         # CMake export so the compile database provably originates from the
         # FuzzBench build command. ``fuzzbench_replay`` is the delta name.
-        methods = ["bear_replay", "cmake_export"]
+        methods = ["bear_replay", "cmake_export", "meson_export"]
     else:
         methods = [capture_method]
 
@@ -602,6 +996,9 @@ def capture_build_context(
             raw, capture_stdout, capture_stderr, capture_rc = _capture_bear_replay(
                 target_root, staged_src, build_context_dir, native_destination,
                 language, build_workdir_relative, runner, build_timeout)
+        elif method == "meson_export":
+            raw, capture_stdout, capture_stderr, capture_rc = _capture_meson_export(
+                staged_src, build_context_dir, runner, build_timeout)
         else:
             continue
         chosen_method = method
@@ -703,7 +1100,7 @@ def capture_build_context(
     # accept a synthetic DB when allow_synthetic is set.
     valid = real_capture and covers_project
 
-    build_script = target_root / "fuzzbench_benchmark" / "build.sh"
+    build_script = resolved_benchmark_root / "build.sh"
     full_manifest = json.loads((target_root / "target_manifest.json").read_text(encoding="utf-8")) if (target_root / "target_manifest.json").is_file() else {}
     link_context = {
         "mode": "fuzzbench_build_replay" if exact_replay else ("synthetic" if synthetic else "generic_cmake"),
@@ -763,7 +1160,7 @@ def capture_build_context(
     # entrypoint and tests can prove the compile DB originated from the exact
     # FuzzBench build (bear_replay replays build.sh inside the FuzzBench env),
     # not a generic top-level CMake best-effort build.
-    benchmark_dockerfile = target_root / "fuzzbench_benchmark" / "Dockerfile"
+    benchmark_dockerfile = resolved_benchmark_root / "Dockerfile"
     provenance = {
         "strategy": "fuzzbench_replay" if chosen_method == "bear_replay" else (
             "cmake_export" if chosen_method == "cmake_export" else (
@@ -823,6 +1220,28 @@ def _synthetic_compile_db(source_root: Path, language: str) -> list[dict[str, An
     return entries
 
 
+def _strip_fuzzer_engine_args(args: list[str]) -> list[str]:
+    """Remove libFuzzer engine flags from a consumer link command.
+
+    The recovered ``driver_build_args`` include the FuzzBench fuzz-engine flag
+    (``-fsanitize=fuzzer`` and friends), which supplies libFuzzer's own ``main``
+    and requires ``LLVMFuzzerTestOneInput``. The minimal link probe provides its
+    own ``main``, so the fuzzer engine must be dropped to test the recovered
+    library/link flags without a duplicate/undefined ``main``.
+    """
+    stripped: list[str] = []
+    for arg in args:
+        if arg.startswith("-fsanitize="):
+            values = [v for v in arg[len("-fsanitize="):].split(",") if v not in {"fuzzer", "fuzzer-no-link"}]
+            if values:
+                stripped.append("-fsanitize=" + ",".join(values))
+            continue
+        if arg in {"-fsanitize=fuzzer", "-fsanitize=fuzzer-no-link"}:
+            continue
+        stripped.append(arg)
+    return stripped
+
+
 def verify_link_set(
     *,
     source_root: Path,
@@ -840,9 +1259,22 @@ def verify_link_set(
         "int main(void) { return 0; }\n", encoding="utf-8",
     )
     compiler = "clang" if language == "c" else "clang++"
-    cmd = [compiler, str(consumer), *driver_build_args, "-o", str(work_dir / "hgb_link_probe")]
+    link_args = _strip_fuzzer_engine_args(list(driver_build_args))
+    cmd = [compiler, str(consumer), *link_args, "-o", str(work_dir / "hgb_link_probe")]
     result = runner(cmd, timeout)
-    return result.returncode == 0, (result.stderr or result.stdout)
+    if result.returncode == 0:
+        return True, (result.stderr or result.stdout)
+    # Fallback: recovered archives are passed directly, so retry without the
+    # -l/-L flags (which may reference non-standard build directories) and
+    # record the reduced policy instead of failing the whole target.
+    archive_args = [a for a in link_args if not a.startswith("-l") and not a.startswith("-L")]
+    if archive_args != link_args:
+        retry_cmd = [compiler, str(consumer), *archive_args, "-o", str(work_dir / "hgb_link_probe")]
+        retry = runner(retry_cmd, timeout)
+        if retry.returncode == 0:
+            message = (result.stderr or result.stdout) + "\nverified_with=archives_only (retry without -l/-L succeeded)"
+            return True, message
+    return False, (result.stderr or result.stdout)
 
 
 @dataclass
@@ -985,9 +1417,12 @@ def main() -> int:
     parser.add_argument("--language", default="")
     parser.add_argument("--profile", default="alpha")
     parser.add_argument("--allow-synthetic", action="store_true")
-    parser.add_argument("--capture-method", default="auto", choices=("auto", "cmake_export", "bear_replay", "exact_fuzzbench", "fuzzbench_replay"))
+    parser.add_argument("--capture-method", default="auto", choices=("auto", "cmake_export", "bear_replay", "meson_export", "exact_fuzzbench", "fuzzbench_replay"))
     parser.add_argument("--build-workdir-relative", default="")
     parser.add_argument("--build-timeout", type=int, default=1800)
+    parser.add_argument("--native-harness-destination", default="")
+    parser.add_argument("--native-harness-language", default="")
+    parser.add_argument("--benchmark-root", default="")
     args = parser.parse_args()
     manifest = capture_build_context(
         target_root=args.target_root,
@@ -999,6 +1434,9 @@ def main() -> int:
         capture_method=args.capture_method,
         build_workdir_relative=args.build_workdir_relative,
         build_timeout=args.build_timeout,
+        native_harness_destination=args.native_harness_destination,
+        native_harness_language=args.native_harness_language,
+        benchmark_root=Path(args.benchmark_root) if args.benchmark_root else None,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     if args.profile in {"alpha", "paper-faithful", "reproduction-gamma", "reproduction-delta"} and not manifest["valid"]:

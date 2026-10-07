@@ -24,6 +24,7 @@ openai_key.txt
 configs/set_api_key.sh
 
 # External projects and generated data
+result.json
 /external/
 /results/**
 /artifacts/**
@@ -50,6 +51,7 @@ coverage/
 build/
 dist/
 out/
+compile_commands.json
 __pycache__/
 *.pyc
 *.o

@@ -683,12 +683,36 @@ def evaluate_candidate(
     else:
         covered_functions = cov_summary.get("covered_functions", []) if cov_summary else []
         reach = hgb_reachability.check_reachability(intended_apis, {"executed_functions": covered_functions})
-        rec.api_reachability = reach
         if not reach["reached"]:
-            hgb_result.mark_stage(rec.stages, "api_reachability", "failed")
-            rec.error = "no intended project API executed dynamically (no coverage evidence)"
-            return rec
-        hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
+            # Optional fallback (enabled by the PromeFuzz alpha entrypoint):
+            # the generated intended-API list can be incomplete because the
+            # driver reaches an API indirectly through another entry point.
+            # Accept the candidate when coverage proves it executed real project
+            # symbols. Strict reproduction profiles keep the exact check.
+            fallback_enabled = os.environ.get("HGB_REACHABILITY_PROJECT_FALLBACK", "0") == "1"
+            covered_names = [str(fn).rsplit(":", 1)[-1] for fn in covered_functions]
+            project_covered = (
+                _filter_intended_apis_by_primary_source(covered_names, target_root)
+                if fallback_enabled else []
+            )
+            if project_covered:
+                reach = {
+                    "reached": True,
+                    "intended_apis": list(intended_apis),
+                    "reached_apis": sorted(set(project_covered)),
+                    "match_mode": "project_covered_fallback",
+                    "reason": "no direct intended-API match; confirmed project symbols executed",
+                }
+                rec.api_reachability = reach
+                hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
+            else:
+                rec.api_reachability = reach
+                hgb_result.mark_stage(rec.stages, "api_reachability", "failed")
+                rec.error = "no intended project API executed dynamically (no coverage evidence)"
+                return rec
+        else:
+            rec.api_reachability = reach
+            hgb_result.mark_stage(rec.stages, "api_reachability", "completed")
 
     # 6.7 Native/reference coverage control + line coverage diff (beta 8.6).
     # The native control replays the native (reference) harness under the same

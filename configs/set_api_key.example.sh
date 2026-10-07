@@ -20,6 +20,20 @@ export API_KEY=""
 # The resolver preserves the base URL path exactly; do not add /v1 unless the
 # selected provider requires it.
 
+# PromeFuzz alpha/paper-faithful require a real semantic embedding service.
+# Point these at an OpenAI-compatible embeddings endpoint (a local
+# text-embeddings-inference server works). host.docker.internal is routable
+# because HGB adds --add-host for PROME_FUZZ_EMBEDDING_BASE_URL.
+# export PROME_FUZZ_EMBEDDING_LLM_TYPE="openai"
+# export PROME_FUZZ_EMBEDDING_MODEL="text-embeddings-inference"
+# export PROME_FUZZ_EMBEDDING_BASE_URL="http://host.docker.internal:18080/v1"
+# export PROME_FUZZ_EMBEDDING_API_KEY="-"
+
+# PromeFuzz LLM rate control: enforce a cross-container minimum interval so
+# concurrent targets do not exhaust a low requests-per-minute provider quota.
+# export PROME_FUZZ_LLM_MIN_INTERVAL_SECONDS="3.5"
+# export PROME_FUZZ_LLM_429_BACKOFF_SECONDS="8"
+
 # Optional LLM API tracing controls. Defaults save the first call and every 10th call.
 # export HGB_LLM_TRACE_ENABLED=1
 # export HGB_LLM_TRACE_SAMPLE_RATE=10

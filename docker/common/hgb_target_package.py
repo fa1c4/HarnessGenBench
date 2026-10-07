@@ -149,7 +149,9 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
 
     ``package_dir`` is the existing prepared package (with ``source_input``,
     ``reference_harnesses``, ``fuzzbench_benchmark``, ``target_manifest.json``).
-    The function is idempotent: re-running it re-syncs the two halves.
+    Compact packages move generator trees into the generator half and leave
+    relative compatibility aliases at the package root. Full packages retain
+    independent copies. Re-running the function re-syncs the two halves.
     Returns a dict with the absolute paths of the two halves.
 
     When ``require_split`` is true the package must contain the files required
@@ -177,6 +179,20 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
 
     generator_input = package / GENERATOR_INPUT_DIR
     evaluator_only = package / EVALUATOR_ONLY_DIR
+    compact = full_manifest.get("source_layout") == "compact"
+    # Recover compact aliases before deleting a previous split. Moving the
+    # canonical trees preserves data/inodes and makes repeated splitting safe.
+    for sub in GENERATOR_SUBDIRS:
+        source = package / sub
+        if source.is_symlink():
+            expected = f"{GENERATOR_INPUT_DIR}/{sub}"
+            if os.readlink(source) != expected:
+                raise PackageSplitError(f"unexpected generator source alias: {source}")
+            canonical = generator_input / sub
+            if not canonical.is_dir():
+                raise PackageSplitError(f"missing compact source tree: {canonical}")
+            source.unlink()
+            os.replace(canonical, source)
     for half in (generator_input, evaluator_only):
         if half.exists():
             shutil.rmtree(half)
@@ -185,7 +201,12 @@ def split_package(package_dir: str | Path, *, native_harness: dict[str, Any] | N
     # generator_input: source_input, docs, seeds, dictionary, build_metadata
     for sub in GENERATOR_SUBDIRS:
         src = package / sub
-        if src.is_dir():
+        if compact:
+            if not src.is_dir():
+                src.mkdir(parents=True, exist_ok=True)
+            os.replace(src, generator_input / sub)
+            src.symlink_to(f"{GENERATOR_INPUT_DIR}/{sub}", target_is_directory=True)
+        elif src.is_dir():
             _copy_tree(src, generator_input / sub)
         else:
             (generator_input / sub).mkdir(parents=True, exist_ok=True)

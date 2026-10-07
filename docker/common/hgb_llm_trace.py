@@ -338,3 +338,56 @@ def summary_counts(root: str | Path | None = None) -> tuple[int, int]:
     data = _read_summary(base)
     return int(data.get("total_count") or 0), int(data.get("sample_count") or 0)
 
+
+def throttle(*, stage: str = "llm", min_interval: float | None = None) -> None:
+    """Enforce a cross-process minimum interval between LLM requests.
+
+    Providers often expose only a small requests-per-minute quota. PromeFuzz
+    issues requests from multiple concurrent containers that all share the
+    ``HGB_LLM_LOCK_DIR`` bind mount, so a shared lock file and timestamp keep
+    the aggregate request rate below the provider limit instead of letting
+    retries burn the quota on HTTP 429 responses.
+    """
+    if min_interval is None:
+        raw = (
+            os.environ.get("PROME_FUZZ_LLM_MIN_INTERVAL_SECONDS")
+            or os.environ.get("HGB_LLM_MIN_INTERVAL_SECONDS")
+            or "0"
+        )
+        try:
+            min_interval = float(raw)
+        except ValueError:
+            min_interval = 0.0
+    if min_interval <= 0:
+        return
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX host
+        return
+    lock_dir = Path(os.environ.get("HGB_LLM_LOCK_DIR") or "/hgb-llm-locks")
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    lock_path = lock_dir / f"{stage}_llm_interval.lock"
+    try:
+        with open(lock_path, "a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                handle.seek(0)
+                last = float((handle.read().strip() or "0"))
+            except (OSError, ValueError):
+                last = 0.0
+            now = time.time()
+            wait = last + min_interval - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.time()
+            handle.seek(0)
+            handle.truncate()
+            handle.write(str(now))
+            handle.flush()
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        return
+

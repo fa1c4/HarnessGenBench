@@ -64,6 +64,7 @@ done
 
 root="$(repo_root)"
 load_hgb_config
+export HGB_TARGET_PACKAGE_CACHE_DIR="${HGB_TARGET_PACKAGE_CACHE_DIR:-$(hgb_workspace_dir "$root")/target-package-cache}"
 if [[ ! -d "$(artifact_dir fuzzbench "$root")/.git" ]]; then
   log "FuzzBench artifact missing; running scripts/clone_artifacts.sh"
   bash "$root/scripts/clone_artifacts.sh"
@@ -74,4 +75,6 @@ if [[ -z "$output" ]]; then
   output="$(hgb_workspace_dir "$root")/targets/$target/$run_id"
 fi
 
-python3 "$SCRIPT_DIR/hgb_targets.py" package "$target" --output "$output" --layout "$layout"
+prepare_args=(package "$target" --output "$output" --layout "$layout")
+[[ "$force" == "1" ]] && prepare_args+=(--force)
+python3 "$SCRIPT_DIR/hgb_targets.py" "${prepare_args[@]}"

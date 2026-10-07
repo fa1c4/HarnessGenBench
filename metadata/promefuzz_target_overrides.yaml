@@ -38,6 +38,11 @@ targets:
     library_output_glob: [objs, libfreetype.a]
     build_timeout: 1800
     generation_timeout: 7200
+    # FreeType headers refuse to compile unless ft2build.h is included first;
+    # force it as a prelude so generated candidates that include
+    # freetype/freetype.h directly still compile.
+    extra_cflags: [-include, ft2build.h]
+    extra_cxxflags: [-include, ft2build.h]
 
   harfbuzz_hb-shape-fuzzer:
     language: c++
@@ -141,7 +146,17 @@ targets:
     compile_db_capture_method: bear_replay
     library_output_glob: [libphp.a]
     build_timeout: 3000
-    generation_timeout: 9000
+    # PHP's target build and full evaluation are very slow; bound generation
+    # and evaluate fewer finalized drivers so the run completes within the
+    # outer container timeout.
+    generation_timeout: 5400
+    eval_max_candidates: 2
+    # PHP's configure links with libc++, while the shipped clang libFuzzer
+    # runtime is built against libstdc++; compile C++ against libc++ and pull in
+    # libstdc++ as a link library so the engine's libstdc++ symbols resolve.
+    extra_cxxflags: [-stdlib=libc++]
+    extra_libs: [-lstdc++]
+    extra_ldflags: "-Wl,--no-as-needed"
 
   re2_fuzzer:
     language: c++

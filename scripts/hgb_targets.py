@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -787,7 +788,7 @@ def materialize_submodules(local: Path, result: dict[str, Any]) -> bool:
     return False
 
 
-def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path) -> dict[str, Any]:
+def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path, *, refresh: bool = False) -> dict[str, Any]:
     artifacts_root = root / "artifacts" / "fuzzbench-target-sources" / target
     artifacts_root.mkdir(parents=True, exist_ok=True)
     local = artifacts_root / repo["dest"]
@@ -832,7 +833,17 @@ def materialize_repo(repo: dict[str, str], target: str, commit: str, root: Path)
             result["revision_status"] = "unavailable"
             return result
     if capture_unpinned:
-        captured = git_head(local)
+        if refresh and result.get("clone_status") == "fetched":
+            branch = str(repo.get("clone_branch") or "HEAD")
+            refreshed = run(["git", "-C", str(local), "rev-parse", "--verify", f"refs/remotes/origin/{branch}"])
+            if refreshed.returncode != 0 or not refreshed.stdout.strip():
+                result["materialize_status"] = "refresh_failed"
+                result["revision_status"] = "unavailable"
+                result["error"] = "cannot resolve fetched upstream revision"
+                return result
+            captured = refreshed.stdout.strip()
+        else:
+            captured = git_head(local)
         if captured == "unknown":
             result["checkout_status"] = "capture_failed"
             result["revision_status"] = "unavailable"
@@ -876,7 +887,7 @@ def copy_extracted_archive(extract_root: Path, local: Path) -> None:
     copy_tree(source, local)
 
 
-def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[str, Any]:
+def materialize_archive(repo: dict[str, str], target: str, root: Path, *, refresh: bool = False) -> dict[str, Any]:
     artifacts_root = root / "artifacts" / "fuzzbench-target-sources" / target
     artifacts_root.mkdir(parents=True, exist_ok=True)
     local = artifacts_root / repo["dest"]
@@ -889,7 +900,7 @@ def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[s
         result["revision_status"] = "unresolved"
         result["materialize_status"] = "revision_unresolved"
         return result
-    if local.is_dir() and any(local.rglob("*")):
+    if not refresh and local.is_dir() and any(local.iterdir()):
         result["materialize_status"] = "cached"
         result["revision_status"] = "resolved_url"
         return result
@@ -919,10 +930,10 @@ def materialize_archive(repo: dict[str, str], target: str, root: Path) -> dict[s
     return result
 
 
-def materialize_source(repo: dict[str, str], target: str, commit: str, root: Path) -> dict[str, Any]:
+def materialize_source(repo: dict[str, str], target: str, commit: str, root: Path, *, refresh: bool = False) -> dict[str, Any]:
     if repo.get("kind") == "archive":
-        return materialize_archive(repo, target, root)
-    return materialize_repo(repo, target, commit, root)
+        return materialize_archive(repo, target, root, refresh=refresh)
+    return materialize_repo(repo, target, commit, root, refresh=refresh)
 
 
 def _dynamic_branch_variable(repo: dict[str, str]) -> str:
@@ -987,9 +998,16 @@ def likely_reference_harness(path: Path, root: Path) -> bool:
     rel = path.relative_to(root).as_posix()
     lower_rel = f"/{rel.lower()}"
     name = path.name.lower()
+    stem = path.stem.lower()
     suffix = path.suffix.lower()
     source_exts = {".c", ".cc", ".cpp", ".cxx"}
     header_exts = {".h", ".hh", ".hpp", ".hxx"}
+    # Build-support entrypoints live under ``/fuzz/`` directories but are not
+    # target harnesses (e.g. libpcap's ``onefile.c`` provides ``main`` and only
+    # declares ``LLVMFuzzerTestOneInput``). Stripping them removes the build's
+    # driver and breaks every fuzz target, so keep them in ``source_input``.
+    if re.match(r"^(?:onefile|driver|standalone|main|fuzz_main|fuzz_driver|fuzzing_driver|afl_driver|libfuzzer_driver)$", stem):
+        return False
     path_hint = any(
         token in lower_rel
         for token in ("/fuzz/", "/fuzzer/", "/fuzzers/", "/oss-fuzz/", "/test/fuzz", "/tests/fuzz")
@@ -1268,9 +1286,10 @@ def copy_selected_reference_harnesses(
         roots.append((source_root, source_label, False))
 
     for root, label, benchmark_local in roots:
-        for candidate in sorted(root.rglob("*")):
-            if not candidate.is_file() or candidate.suffix.lower() not in HARNESS_SOURCE_EXTS:
-                continue
+        source_candidates = [path for path in sorted(root.rglob("*"))
+                             if path.is_file() and path.suffix.lower() in HARNESS_SOURCE_EXTS]
+        source_count = len(source_candidates)
+        for candidate in source_candidates:
             try:
                 rel = candidate.relative_to(root)
             except ValueError:
@@ -1278,10 +1297,8 @@ def copy_selected_reference_harnesses(
             if benchmark_local and any(part in {"seeds", "testcases", "corpus"} for part in rel.parts):
                 continue
             score = _candidate_score(candidate, rel, root, target, fuzz_target, project, build_refs, build_stems, benchmark_local)
-            if benchmark_local:
-                source_count = sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() in HARNESS_SOURCE_EXTS)
-                if source_count == 1:
-                    score += 120
+            if benchmark_local and source_count == 1:
+                score += 120
             if score >= 80:
                 candidates.append((score, candidate, root, label, benchmark_local))
 
@@ -1451,7 +1468,54 @@ def write_summary(output: Path, manifest: dict[str, Any]) -> None:
     (output / "HGB_TARGET_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def package_target(root: Path, target: str, output: Path, layout: str = "compact", require_split: bool = False) -> Path:
+def source_tree_counts(path: Path) -> tuple[int, int, int]:
+    source_count = cmake_count = compile_count = 0
+    for file in path.rglob("*"):
+        if not file.is_file():
+            continue
+        source_count += file.suffix.lower() in SOURCE_EXTS
+        cmake_count += file.name == "CMakeLists.txt"
+        compile_count += file.name == "compile_commands.json"
+    return source_count, cmake_count, compile_count
+
+
+def package_target(root: Path, target: str, output: Path, layout: str = "compact", require_split: bool = False,
+                   *, force: bool = False) -> Path:
+    """Reuse frozen source revisions by default; --force refreshes and republishes."""
+    if layout not in {"compact", "full"}:
+        raise SystemExit(f"unknown target package layout: {layout}")
+    resolved = resolve_target(root, target)
+    benchmark = Path(resolved["benchmark_dir"])
+    if not benchmark.is_dir():
+        raise SystemExit(f"missing FuzzBench benchmark directory: {benchmark}")
+    cache = _load_docker_common_module("hgb_package_cache")
+    if cache is None:
+        raise RuntimeError("hgb_package_cache module is required for safe package preparation")
+    recipes = parse_clone_repos(benchmark / "Dockerfile", root, target)
+    attribute_source_revisions(recipes, resolved.get("project", ""), resolved.get("commit", ""))
+    code_paths = [Path(__file__), Path(cache.__file__),
+                  Path(cache.__file__).with_name("hgb_target_package.py"),
+                  Path(cache.__file__).with_name("ckgfuzzer_target_harness.py")]
+    inputs = {
+        "version": cache.CACHE_VERSION, "target": target, "resolved": resolved,
+        "layout": layout, "require_split": require_split,
+        "split_enabled": os.environ.get("HGB_TARGET_DISABLE_SPLIT", "0") != "1",
+        "source_revision_policy": "reuse-captured-until-force",
+        "environment": {key: os.environ.get(key, "") for key in
+                        ("HGB_TARGET_STRIP_REFERENCE_HARNESS", "HGB_TARGET_DISABLE_SPLIT", "HGB_REF_CANARY",
+                         "HGB_BASELINE_PROFILE", "HGB_BASELINE_PROTOCOL")},
+        "recipes": recipes, "benchmark_stamp": cache.tree_stamp(benchmark),
+        "code": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in code_paths},
+    }
+    def build(stage: Path) -> None:
+        _build_package_target(root, target, stage, layout, require_split, refresh_sources=force)
+        if cache.tree_stamp(benchmark) != inputs["benchmark_stamp"]:
+            raise RuntimeError("benchmark inputs changed during preparation; package was not published")
+    return cache.prepare_package(root, target, output, inputs, build, force=force)
+
+
+def _build_package_target(root: Path, target: str, output: Path, layout: str = "compact", require_split: bool = False,
+                          *, refresh_sources: bool = False) -> Path:
     if layout not in {"compact", "full"}:
         raise SystemExit(f"unknown target package layout: {layout}")
     resolved = resolve_target(root, target)
@@ -1482,7 +1546,10 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     source_root = output / ("source_full" if layout == "full" else "source_input")
 
     def materialize_and_copy(repo: dict[str, str]) -> None:
-        record = materialize_source(repo, target, "", root)
+        if refresh_sources:
+            record = materialize_source(repo, target, "", root, refresh=True)
+        else:
+            record = materialize_source(repo, target, "", root)
         materialized.append(record)
         local = Path(record.get("artifact_path", ""))
         if (
@@ -1529,9 +1596,7 @@ def package_target(root: Path, target: str, output: Path, layout: str = "compact
     reference_files = strip_reference_harnesses(source_root, output / "source_input", output / "reference_harnesses", strip, source_label=source_label)
     copy_selected_docs(source_root, output / "docs")
     seed_count, dictionary_count = copy_seeds_and_dicts(benchmark_copy, output / "seeds", output / "dictionary")
-    source_file_count = count_source_files(output / "source_input")
-    cmake_file_count = count_named_files(output / "source_input", "CMakeLists.txt")
-    compile_commands_count = count_named_files(output / "source_input", "compile_commands.json")
+    source_file_count, cmake_file_count, compile_commands_count = source_tree_counts(output / "source_input")
     source_fallback_statuses = sorted({str(r.get("materialize_status", "")) for r in materialized if r.get("cache_fallback")})
     source_revision_statuses = sorted({str(r.get("revision_status", "")) for r in materialized})
     captured_unpinned_sources = [
@@ -1679,6 +1744,8 @@ def main(argv: list[str] | None = None) -> int:
     package_parser.add_argument("target")
     package_parser.add_argument("--output", required=True)
     package_parser.add_argument("--layout", choices=("compact", "full"), default=os.environ.get("HGB_TARGET_PACKAGE_LAYOUT", "compact"))
+    package_parser.add_argument("--force", action="store_true",
+                                help="refresh sources and build a new package version; otherwise reuse captured revisions")
     package_parser.add_argument("--require-split", action="store_true",
                                 help="fail closed if the generator_input/evaluator_only split cannot be created")
     args = parser.parse_args(argv)
@@ -1716,14 +1783,20 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 require_split = True
         try:
-            output = package_target(root, args.target, Path(args.output), layout=args.layout, require_split=require_split)
+            output = package_target(root, args.target, Path(args.output), layout=args.layout, require_split=require_split, force=args.force)
         except PackageSplitError as exc:
             # Write an infra_failure result.json so the host runner can surface
             # the fail-closed split failure instead of mounting a monolithic
             # package that would leak reference harnesses to the generator.
-            out_dir = Path(args.output).resolve()
-            out_dir.mkdir(parents=True, exist_ok=True)
-            (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+            out_dir = Path(args.output).absolute()
+            if (out_dir / "target_manifest.json").is_file():
+                # Do not write failure metadata into a published package used by
+                # another job. Store this failed attempt beside the output alias.
+                failure_path = out_dir.parent / f".{out_dir.name}.preparation-failure.json"
+            else:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+                failure_path = out_dir / "result.json"
             result = {
                 "schema_version": 2,
                 "generator": os.environ.get("HGB_GENERATOR", ""),
@@ -1739,7 +1812,7 @@ def main(argv: list[str] | None = None) -> int:
                 "method_variant": os.environ.get("HGB_BASELINE_PROFILE", ""),
                 "excluded_from_aggregate": True,
             }
-            (out_dir / "result.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            failure_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             print(f"infra_failure: target_split_failed: {exc}", file=sys.stderr)
             return 3
         print(output)

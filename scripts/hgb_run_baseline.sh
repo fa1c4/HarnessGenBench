@@ -5,6 +5,10 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 source "$SCRIPT_DIR/lib/common.sh"
 
+# Load the local API/embedding config before any profile guard so the single
+# target path does not require the caller to `source configs/set_api_key.sh`.
+load_hgb_config
+
 usage() {
   cat >&2 <<'EOF'
 Usage:
@@ -21,6 +25,7 @@ Options:
   --layout MODE          Target package layout passed to hgb_generate_harness.sh.
   --save-mode MODE       Save mode passed to hgb_generate_harness.sh.
   --timeout SECONDS      Generation timeout.
+  --parallel-worker N    Concurrency for --target-set matrix runs.
 EOF
 }
 
@@ -35,6 +40,7 @@ strict=0
 target_layout="compact"
 save_mode="compact"
 timeout_seconds="${HGB_GENERATION_TIMEOUT_SECONDS:-10800}"
+parallel_worker=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -82,6 +88,10 @@ while [[ $# -gt 0 ]]; do
       timeout_seconds="${2:-}"
       shift 2
       ;;
+    --parallel-worker|--jobs)
+      parallel_worker="${2:-}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -91,6 +101,16 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+# Guard against the common `--target valuable` typo: when the --target value is
+# actually a named target set, treat it as --target-set and delegate to the
+# matrix runner instead of failing to resolve it as a single FuzzBench target.
+if [[ -n "$target" && -z "$target_set" ]]; then
+  if bash "$SCRIPT_DIR/hgb_targets.sh" list --sets 2>/dev/null | grep -Fxq -- "$target"; then
+    target_set="$target"
+    target=""
+  fi
+fi
 
 # When --target-set is used instead of --target, delegate to the matrix runner
 # so the plan's canonical matrix command works:
@@ -102,6 +122,8 @@ if [[ -n "$target_set" ]]; then
   matrix_args=(--generator "$generator" --target-set "$target_set")
   [[ -n "$profile" ]] && matrix_args+=(--profile "$profile")
   [[ -n "$protocol" ]] && matrix_args+=(--protocol "$protocol")
+  [[ -n "$run_id" ]] && matrix_args+=(--run-id "$run_id")
+  [[ -n "$parallel_worker" ]] && matrix_args+=(--parallel-worker "$parallel_worker")
   [[ -n "${HGB_CAMPAIGN_SECONDS:-}" ]] && matrix_args+=(--campaign-seconds "$HGB_CAMPAIGN_SECONDS")
   [[ "$strict" == "1" ]] && matrix_args+=(--strict)
   [[ "$dry_run" == "1" ]] && matrix_args+=(--dry-run)

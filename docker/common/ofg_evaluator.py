@@ -297,12 +297,12 @@ def run_build(
         context_dir = Path(context_dir)
     dockerfile = context_dir / "Dockerfile"
     tag = image_tag or _deterministic_image_tag(work_dir, fuzz_target)
-    build = runner(["docker", "build", "--file", str(dockerfile), "-t", tag, str(context_dir)], timeout)
+    build = runner(["docker", "build", "--pull=false", "--file", str(dockerfile), "-t", tag, str(context_dir)], timeout)
     if _rc(build) != 0:
         return False, build, tag, context_dir
     # Verify /out/<fuzz_target> exists and is executable inside the image.
     binary = f"/out/{fuzz_target}"
-    verify = runner(["docker", "run", "--rm", "--name", f"{tag}-verify", tag,
+    verify = runner(["docker", "run", "--rm", "--pull=never", "--name", f"{tag}-verify", tag,
                      "sh", "-lc", f"test -x {binary}"], timeout)
     ok = _rc(verify) == 0
     return ok, (verify if not ok else build), tag, context_dir
@@ -420,7 +420,7 @@ def evaluate_candidate(
     record["stages"]["candidate_build"] = "completed"
 
     # Sanitizer smoke on empty input (beta 8.3).
-    smoke = runner(["docker", "run", "--rm", "--name", f"{image_tag}-smoke", image_tag,
+    smoke = runner(["docker", "run", "--rm", "--pull=never", "--name", f"{image_tag}-smoke", image_tag,
                     "sh", "-lc", f"/out/{fuzz_target} -runs=1"], campaign_seconds)
     crashed = _rc(smoke) not in (0, 1, 77)
     if "AddressSanitizer" in _err(smoke) or "UndefinedBehaviorSanitizer" in _err(smoke):
@@ -437,7 +437,7 @@ def evaluate_candidate(
     record["api_reachability"] = {"intended_apis": intended, "reached": True}
 
     # Campaign: fixed-budget libFuzzer, require nonzero executions (beta 8.5).
-    campaign = runner(["docker", "run", "--rm", "--name", f"{image_tag}-campaign", image_tag,
+    campaign = runner(["docker", "run", "--rm", "--pull=never", "--name", f"{image_tag}-campaign", image_tag,
                        "sh", "-lc", f"mkdir -p /tmp/corpus && /out/{fuzz_target} "
                        f"-max_total_time={max(1, campaign_seconds)} /tmp/corpus"],
                       campaign_seconds + 30)
@@ -451,7 +451,7 @@ def evaluate_candidate(
         return record
 
     # Coverage: real report file, not process exit (beta 8.6).
-    cov = runner(["docker", "run", "--rm", "--name", f"{image_tag}-coverage", image_tag,
+    cov = runner(["docker", "run", "--rm", "--pull=never", "--name", f"{image_tag}-coverage", image_tag,
                   "sh", "-lc", f"mkdir -p /tmp/cov /tmp/corpus && "
                   f"LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw /out/{fuzz_target} -runs=0 /tmp/corpus && "
                   f"llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && "

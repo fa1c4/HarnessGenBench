@@ -16,6 +16,7 @@ Options:
   --jobs N                   Backward-compatible alias for --parallel-worker.
   --allow-input-generators   Legacy flag for input-generation baselines that still require opt-in.
   --target-package-mode MODE Prepare targets once per matrix run with shared, or once per pair with per-pair (default: shared).
+  --force-target-packages     Refresh sources and rebuild prepared target packages.
   --layout compact|full      Target package layout for prepared packages (default: compact).
   --save-mode compact|debug  Compact removes duplicate transient outputs; debug preserves them (default: compact).
   --continue-on-error        Record every pair and continue after failures (default).
@@ -35,6 +36,7 @@ allow_input=0
 continue_on_error=1
 target_package_mode="shared"
 target_layout="compact"
+force_target_packages=0
 save_mode="compact"
 run_id=""
 profile=""
@@ -71,6 +73,10 @@ while [[ $# -gt 0 ]]; do
     --target-package-mode)
       target_package_mode="${2:-}"
       shift 2
+      ;;
+    --force-target-packages)
+      force_target_packages=1
+      shift
       ;;
     --layout|--target-layout)
       target_layout="${2:-}"
@@ -148,6 +154,26 @@ done
 run_id="${run_id:-$(make_timestamp)}"
 if [[ -n "$profile" ]]; then export HGB_BASELINE_PROFILE="$profile"; fi
 if [[ -n "$protocol" ]]; then export HGB_BASELINE_PROTOCOL="$protocol"; fi
+# The matrix path invokes hgb_generate_harness.sh directly, bypassing the
+# host-side profile guards in hgb_run_baseline.sh. Re-apply the PromeFuzz
+# strict-reproduction required env here so sealed split packaging and exact
+# build-context capture are in effect for every pair.
+if [[ ",$generators," == *"promefuzz"* ]]; then
+  case "$profile" in
+    reproduction-zeta|reproduction-eta)
+      export PROMEFUZZ_EMBEDDING_PROVIDER="${PROMEFUZZ_EMBEDDING_PROVIDER:-real}"
+      export PROMEFUZZ_ALLOW_HASH_EMBEDDING=0
+      export PROMEFUZZ_ALLOW_SYNTHETIC_COMPILE_DB=0
+      export PROMEFUZZ_ALLOW_EMPTY_LINK_ARGS=0
+      export PROMEFUZZ_REQUIRE_CONSUMER_CASES=1
+      export HGB_TARGET_REQUIRE_SPLIT=1
+      export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-fuzzbench_replay}"
+      ;;
+    reproduction-delta|reproduction-epsilon)
+      export PROME_FUZZ_BUILD_CONTEXT_METHOD="${PROME_FUZZ_BUILD_CONTEXT_METHOD:-fuzzbench_replay}"
+      ;;
+  esac
+fi
 matrix_dir="$(hgb_workspace_dir "$root")/matrix/$run_id"
 row_dir="$matrix_dir/rows"
 ensure_dir "$matrix_dir"
@@ -158,6 +184,8 @@ printf 'generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n' >"$matrix_fil
   printf 'run_id=%s\n' "$run_id"
   printf 'target_package_mode=%s\n' "$target_package_mode"
   printf 'target_layout=%s\n' "$target_layout"
+  printf 'force_target_packages=%s\n' "$force_target_packages"
+  printf 'source_revision_policy=reuse-captured-until-force\n'
   printf 'save_mode=%s\n' "$save_mode"
   printf 'parallel_worker=%s\n' "$parallel_worker"
 } >"$matrix_dir/run_config.txt"
@@ -182,7 +210,8 @@ pair_row_file() {
 declare -A shared_target_packages=()
 
 prepare_shared_target_packages() {
-  local target output
+  local target output prepared package_key
+  local prepare_args=()
   local selected_targets=()
   if [[ "$target_package_mode" != "shared" ]]; then
     return 0
@@ -193,13 +222,20 @@ prepare_shared_target_packages() {
     selected_targets=("${target_list[@]}")
   fi
   for target in "${selected_targets[@]}"; do
-    if [[ -n "${shared_target_packages[$target]:-}" ]]; then
+    package_key="$target|${HGB_BASELINE_PROFILE:-}|${HGB_BASELINE_PROTOCOL:-}|${HGB_TARGET_REQUIRE_SPLIT:-0}|${HGB_TARGET_DISABLE_SPLIT:-0}|${HGB_TARGET_STRIP_REFERENCE_HARNESS:-1}|${HGB_REF_CANARY:-}"
+    if [[ -n "${shared_target_packages[$package_key]:-}" ]]; then
+      shared_target_packages["$target"]="${shared_target_packages[$package_key]}"
       continue
     fi
     output="$(hgb_workspace_dir "$root")/target-packages/$run_id/$target"
     log "preparing shared target package for $target: $output"
-    bash "$SCRIPT_DIR/hgb_prepare_target.sh" --target "$target" --run-id "$run_id" --output "$output" --layout "$target_layout" >/dev/null
-    shared_target_packages["$target"]="$output"
+    prepare_args=(--target "$target" --run-id "$run_id" --output "$output" --layout "$target_layout")
+    [[ "$force_target_packages" == "1" ]] && prepare_args+=(--force)
+    prepared="$(bash "$SCRIPT_DIR/hgb_prepare_target.sh" "${prepare_args[@]}")"
+    # Keep the immutable version path, rather than an alias a later generator
+    # may republish with different package/isolation settings.
+    shared_target_packages["$package_key"]="$prepared"
+    shared_target_packages["$target"]="$prepared"
   done
 }
 
@@ -221,17 +257,25 @@ preflight_generator() {
     return 0
   fi
 
+  # Embedding-backed generators depend on the local TEI service; ensure it is
+  # running so a stopped container does not fail every pair closed.
+  case "$generator" in
+    promefuzz|ckgfuzzer) hgb_ensure_embedding_service || true ;;
+  esac
+
   image="$(hgb_image_name "$generator" "$artifact_name" "$root")"
   if ! docker image inspect "$image" >/dev/null 2>&1; then
     log "building generator image once for $generator: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
-  elif [[ "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && grep -Fq "OFG_LOCAL_INTROSPECTOR_SHIM" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "OFG_OSS_FUZZ_VENV" /opt/hgb/entrypoint.sh && test -x /opt/hgb/oss-fuzz-venv/bin/python && grep -Fq "ofg_llm_rate_limited" /opt/hgb/entrypoint.sh && grep -Fq -- '--build-coverage-image' /opt/hgb/entrypoint.sh && test -x /opt/hgb/bin/hgb_harness_evaluator.py' >/dev/null 2>&1; then
+  elif [[ "${HGB_SKIP_IMAGE_PREFLIGHT:-0}" == "1" ]]; then
+    log "skipping ${generator} image staleness preflight (HGB_SKIP_IMAGE_PREFLIGHT=1): $image"
+  elif [[ "$generator" == "oss-fuzz-gen" ]] && ! docker run --rm --pull=never --entrypoint /bin/bash "$image" -lc 'test -f /opt/hgb/oss-fuzz/infra/helper.py && test -x /opt/hgb/bin/ofg_trim_benchmark.py && grep -Fq "OFG_LOCAL_INTROSPECTOR_SHIM" /opt/hgb/bin/ofg_run_wrapper.py && grep -Fq "OFG_OSS_FUZZ_VENV" /opt/hgb/entrypoint.sh && test -x /opt/hgb/oss-fuzz-venv/bin/python && grep -Fq "ofg_llm_rate_limited" /opt/hgb/entrypoint.sh && grep -Fq -- '--build-coverage-image' /opt/hgb/entrypoint.sh && test -x /opt/hgb/bin/hgb_harness_evaluator.py' >/dev/null 2>&1; then
     log "rebuilding stale OSS-Fuzz-Gen image without /opt/hgb/oss-fuzz or current OSS-Fuzz-Gen fixes: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
-  elif [[ "$generator" == "ckgfuzzer" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh && grep -Fq 'HGB_API_SELECTION_MODE="\${HGB_API_SELECTION_MODE:-ranked}"' /opt/hgb/entrypoint.sh && grep -Fq -- '--selection-mode "\${HGB_API_SELECTION_MODE:-ranked}"' /opt/hgb/entrypoint.sh && grep -Fq 'embed_batch_size: \${CKGFUZZER_EMBEDDING_BATCH_SIZE:-100}' /opt/hgb/entrypoint.sh && test -f /opt/hgb/build-markers/ckgfuzzer_api_selection_ranked_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_entrypoint_python_init_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_ustc_embedding_runtime_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_embedding_model_name_override_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_local_embedding_theta3_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_embedding_batch_size_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_evaluator_compile_coverage_seed_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_codeql_cache_graph_counts_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_bloaty_staged_project_rescue_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_compile_cache_key_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_late_sanitizer_env_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_inline_compile_env_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_reachability_cpp_symbols_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_split_benchmark_context_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_candidate_language_normalization_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_cwe_index_cache_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_external_verifier_check_defer_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_legacy_fuzzer_lib_alias_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_cpp_fuzzer_entrypoint_abi_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_target_rescue_candidates_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_curl_single_target_sealed_deps_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_campaign_internal_timeout_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_primary_api_plan_filter_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_expanded_target_rescues_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_all_valuable_rescues_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_zero_candidate_rescue_override_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_function_like_api_plan_filter_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_remaining_targets_fix_theta_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_blind_project_name_only_report_apis_v1" >/dev/null 2>&1; then
+  elif [[ "$generator" == "ckgfuzzer" ]] && ! docker run --rm --pull=never --entrypoint /bin/bash "$image" -lc "grep -Fq 'timeout=float(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'max_retries=int(llm_config.get' /opt/hgb/artifacts/ckgfuzzer/fuzzing_llm_engine/models/get_model.py && grep -Fq 'CKGFUZZER_LLM_MAX_RETRIES' /opt/hgb/entrypoint.sh && grep -Fq 'HGB_API_SELECTION_MODE="\${HGB_API_SELECTION_MODE:-ranked}"' /opt/hgb/entrypoint.sh && grep -Fq -- '--selection-mode "\${HGB_API_SELECTION_MODE:-ranked}"' /opt/hgb/entrypoint.sh && grep -Fq 'embed_batch_size: \${CKGFUZZER_EMBEDDING_BATCH_SIZE:-100}' /opt/hgb/entrypoint.sh && test -f /opt/hgb/build-markers/ckgfuzzer_api_selection_ranked_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_entrypoint_python_init_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_ustc_embedding_runtime_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_embedding_model_name_override_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_local_embedding_theta3_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_embedding_batch_size_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_evaluator_compile_coverage_seed_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_codeql_cache_graph_counts_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_bloaty_staged_project_rescue_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_compile_cache_key_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_late_sanitizer_env_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_coverage_inline_compile_env_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_reachability_cpp_symbols_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_split_benchmark_context_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_candidate_language_normalization_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_cwe_index_cache_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_external_verifier_check_defer_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_legacy_fuzzer_lib_alias_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_cpp_fuzzer_entrypoint_abi_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_target_rescue_candidates_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_curl_single_target_sealed_deps_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_campaign_internal_timeout_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_primary_api_plan_filter_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_expanded_target_rescues_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_all_valuable_rescues_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_zero_candidate_rescue_override_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_function_like_api_plan_filter_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_rescue_first_fast_path_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_remaining_targets_fix_theta_v1 && test -f /opt/hgb/build-markers/ckgfuzzer_blind_project_name_only_report_apis_v1" >/dev/null 2>&1; then
     log "rebuilding stale CKGFuzzer image without current LLM timeout/retry, API selection, entrypoint Python, USTC embedding, embedding model-name, or local embedding, embedding batch-size, or evaluator compile/coverage seed, CodeQL cache graph-count, staged Bloaty rescue, coverage compile-cache-key, late sanitizer ENV, inline compile-env, C++ reachability-symbol, split benchmark-context, candidate language-normalization, or CWE index-cache, external verifier check-defer, legacy FUZZER_LIB alias, C++ fuzzer-entrypoint ABI, or target rescue-candidate, curl single-target sealed-dependency, campaign internal-timeout, primary API-plan filter, expanded target-rescue, all valuable rescue, zero-candidate rescue override, function-like API-plan filter, or rescue-first fast-path wiring, or theta remaining-target fixes, or blind-project name-only report APIs: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
-  elif [[ "$generator" == "promefuzz" ]] && ! docker run --rm --entrypoint /bin/bash "$image" -lc "test -f /opt/hgb/bin/promefuzz_target_build.sh && test -f /opt/hgb/bin/promefuzz_profile.py && test -f /opt/hgb/bin/promefuzz_build_context.py && test -f /opt/hgb/bin/hgb_harness_evaluator.py && command -v wget >/dev/null && command -v autoreconf >/dev/null && command -v nasm >/dev/null && command -v tclsh >/dev/null && test -x /usr/local/bin/python3.8 && test -f /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.ubsan_standalone-x86_64.a && dpkg-query -W -f='\${db:Status-Status}' zlib1g-dev 2>/dev/null | grep -qx installed && grep -Fq 'fuzzbench_target_build_available' /opt/hgb/entrypoint.sh && grep -Fq 'promefuzz_build_context.py' /opt/hgb/entrypoint.sh && grep -Fq 'promefuzz_profile.py validate' /opt/hgb/entrypoint.sh && grep -Fq 'hgb_harness_evaluator.py' /opt/hgb/entrypoint.sh && grep -Fq 'consumer_case_paths' /opt/hgb/entrypoint.sh && grep -Fq 'verify_and_record_link_set' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
+  elif [[ "$generator" == "promefuzz" ]] && ! docker run --rm --pull=never --entrypoint /bin/bash "$image" -lc "test -f /opt/hgb/bin/promefuzz_target_build.sh && test -f /opt/hgb/bin/promefuzz_profile.py && test -f /opt/hgb/bin/promefuzz_build_context.py && test -f /opt/hgb/bin/hgb_harness_evaluator.py && command -v wget >/dev/null && command -v autoreconf >/dev/null && command -v nasm >/dev/null && command -v tclsh >/dev/null && test -x /usr/local/bin/python3.8 && test -f /usr/lib/llvm-18/lib/clang/18/lib/linux/libclang_rt.ubsan_standalone-x86_64.a && dpkg-query -W -f='\${db:Status-Status}' zlib1g-dev 2>/dev/null | grep -qx installed && grep -Fq 'fuzzbench_target_build_available' /opt/hgb/entrypoint.sh && grep -Fq 'promefuzz_build_context.py' /opt/hgb/entrypoint.sh && grep -Fq 'promefuzz_profile.py validate' /opt/hgb/entrypoint.sh && grep -Fq 'hgb_harness_evaluator.py' /opt/hgb/entrypoint.sh && grep -Fq 'consumer_case_paths' /opt/hgb/entrypoint.sh && grep -Fq 'verify_and_record_link_set' /opt/hgb/entrypoint.sh" >/dev/null 2>&1; then
     log "rebuilding stale PromeFuzz image without current target-build validation: $image"
     hgb_build_image "$generator" "$artifact_name" "$root" >/dev/null
   fi
@@ -495,6 +539,7 @@ run_pair() {
   if [[ "$target_package_mode" == "shared" ]]; then
     args+=(--target-package "${shared_target_packages[$target]}")
   fi
+  if [[ "$target_package_mode" == "per-pair" && "$force_target_packages" == "1" ]]; then args+=(--force); fi
   if [[ "$dry_run" == "1" ]]; then args+=(--dry-run); fi
   if [[ "$allow_input" == "1" ]]; then args+=(--allow-input-generator); fi
 
@@ -547,6 +592,18 @@ wait_for_generator() {
 
 pair_index=0
 for generator in "${generator_list[@]}"; do
+  # Default profile/protocol per generator when the caller omitted them. Without
+  # this, a matrix run for a blind harness generator reasons with an empty
+  # protocol, mounts the monolithic (non-blind) target package, and every target
+  # fails its native build (missing restored harnesses) or leaks references.
+  case "$generator" in
+    g2fuzz|elfuzz) generator_protocol="${protocol:-paper-native}" ;;
+    *) generator_protocol="${protocol:-blind-project}" ;;
+  esac
+  generator_profile="${profile:-alpha}"
+  export HGB_BASELINE_PROFILE="$generator_profile"
+  export HGB_BASELINE_PROTOCOL="$generator_protocol"
+  log "matrix pair defaults: generator=$generator profile=$generator_profile protocol=$generator_protocol"
   eligible_targets=()
   for target in "${target_list[@]}"; do
     if generator_supports_target "$generator" "$target"; then
