@@ -205,6 +205,27 @@ def test_eta_evaluator_full_loop_with_native_control(tmp_path: Path) -> None:
     assert Path(cand_json["coverage"]["coverage_report_path"]).is_file()
 
 
+def test_evaluator_can_stop_after_first_fully_verified_candidate(tmp_path: Path) -> None:
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    (candidates_dir / "cand_002.c").write_text(
+        "int LLVMFuzzerTestOneInput(const unsigned char *d, long n){return 1;}\n",
+        encoding="utf-8",
+    )
+    runner = _Runner(candidate_path=str(candidates_dir / "cand_001.c"))
+    result = evaluator.evaluate(
+        generator="ckgfuzzer", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="reproduction-eta", campaign_seconds=10,
+        strict=True, runner=runner, intended_apis=["hgb_sample_api"], seeds=[],
+        build_coverage_image=True, stop_on_first_success=True,
+    )
+    assert result["status"] == hgb_result.STATUS_EVALUATED
+    assert result["candidate_count"] == 2
+    assert result["artifacts"]["evaluated_candidate_count"] == 1
+    assert (work_dir / "candidates/cand_001.json").is_file()
+    assert not (work_dir / "candidates/cand_002.json").exists()
+
+
 def test_zeta_evaluator_still_accepts_stdout_coverage(tmp_path: Path) -> None:
     # zeta is an alias of the strict family but does not enforce the eta-only
     # copied-coverage-report requirement; stdout coverage is still accepted.

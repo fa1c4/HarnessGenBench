@@ -39,10 +39,36 @@ def count_promefuzz_fixes(workspace: Path) -> int:
     return count
 
 
+def ckg_feedback_fix_attempts(workspace: Path) -> int:
+    """Count model revisions made after independent compiler feedback."""
+    repair_dir = workspace / "repair"
+    if not repair_dir.is_dir():
+        return 0
+    count = 0
+    for directory in repair_dir.glob("feedback_*"):
+        if not directory.is_dir():
+            continue
+        attempts = read_json(directory / "repair_attempts.json")
+        if "count" in attempts:
+            count += max(0, int(attempts["count"]))
+            continue
+        provenance = read_json(directory / "repair_provenance.json")
+        if provenance:
+            count += max(1, int(provenance.get("repair_attempt_count") or 1))
+    return count
+
+
 def repair_rounds(workspace: Path, baseline: str) -> tuple[int | None, str]:
     summary = read_json(workspace / "api_traces" / "summary.json")
     manual = read_json(workspace / "manual_driver_fix_rounds.json")
     extra = int(manual.get("count") or 0)
+    manual_source = "+manual_driver_fix_rounds.json" if extra else ""
+    if baseline == "ckgfuzzer":
+        metadata = read_json(workspace / "metadata.json")
+        method = metadata.get("ckgfuzzer") or {}
+        if isinstance(method, dict) and isinstance(method.get("compilation_repair_attempts"), int):
+            return (method["compilation_repair_attempts"] + ckg_feedback_fix_attempts(workspace) + extra,
+                    "metadata.json:ckgfuzzer.compilation_repair_attempts+repair/feedback_*/repair_provenance.json" + manual_source)
     if "driver_fix_rounds" in summary:
         source = "api_traces/summary.json:driver_fix_rounds"
         return int(summary["driver_fix_rounds"]) + extra, source + ("+manual_driver_fix_rounds.json" if extra else "")
@@ -55,10 +81,9 @@ def repair_rounds(workspace: Path, baseline: str) -> tuple[int | None, str]:
         directory = workspace / "generation" / "work" / "repair_iterations"
         return len(list(directory.glob("round_*.txt"))) if directory.is_dir() else 0, "generation/work/repair_iterations"
     if baseline == "ckgfuzzer":
-        metadata = read_json(workspace / "metadata.json")
-        method = metadata.get("ckgfuzzer") or {}
-        if isinstance(method, dict) and isinstance(method.get("compilation_repair_attempts"), int):
-            return method["compilation_repair_attempts"], "metadata.json:ckgfuzzer.compilation_repair_attempts"
+        feedback = ckg_feedback_fix_attempts(workspace)
+        if feedback or extra:
+            return feedback + extra, "repair/feedback_*/repair_provenance.json" + manual_source
         return None, "not_reported"
     return None, "not_applicable_input_generator"
 

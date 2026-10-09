@@ -127,6 +127,26 @@ def test_model_config_separates_ustc_chat_from_local_embedding() -> None:
     assert config["embedding_base_url_kind"] == "host_local"
 
 
+def test_deepseek_flash_chat_uses_separate_local_embedding() -> None:
+    config = ckgfuzzer_model_config.resolve_ckgfuzzer_model_config(
+        {
+            "HGB_LLM_PROVIDER": "deepseek",
+            "API_KEY": "test-chat-key",
+            "OPENAI_BASE_URL": "https://api.deepseek.com/v1",
+            "CKGFUZZER_LLM_MODEL": "deepseek-flash",
+            "CKGFUZZER_EMBEDDING_BACKEND": "openai_compatible_local_tei_cpu",
+            "CKGFUZZER_EMBEDDING_MODEL": "text-embeddings-inference",
+            "CKGFUZZER_EMBEDDING_BASE_URL": "http://host.docker.internal:18080/v1",
+            "CKGFUZZER_EMBEDDING_API_KEY": "local",
+        },
+        profile="reproduction-eta",
+    )
+    assert config["provider"] == "deepseek"
+    assert config["chat_model"] == "deepseek-flash"
+    assert config["embedding_model"] == "text-embeddings-inference"
+    assert config["embedding_base_url_kind"] == "host_local"
+
+
 def test_model_config_full_preflight_uses_separate_embedding_endpoint() -> None:
     def chat_opener(req, timeout=None):
         assert req.full_url == "https://api.llm.ustc.edu.cn/v1/chat/completions"

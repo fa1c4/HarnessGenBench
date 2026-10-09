@@ -429,7 +429,7 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(selected, dict):
         selected = {}
     selected_path = str(selected.get("candidate_path") or selected.get("path") or "")
-    source_derived_rescue = Path(selected_path).name.startswith("000_hgb_")
+    source_derived_rescue = "000_hgb_" in Path(selected_path).name
     sel_build = selected.get("build") or build or {}
     overlay_audit = sel_build.get("overlay_audit") or meta.get("overlay_audit") or {}
     if not isinstance(overlay_audit, dict):

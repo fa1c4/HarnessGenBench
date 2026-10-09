@@ -665,7 +665,10 @@ def evaluate_candidate(
             cov_path = Path(coverage_report_path)
             parser = coverage_parser or hgb_coverage.summarize_coverage_report
             cov_summary = parser(cov_path)
-            hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary, cov_path.read_text(encoding="utf-8"))
+            # Keep the copied LLVM report intact as coverage evidence.  The
+            # summary belongs in a separate directory; rewriting the report
+            # also duplicated multi-gigabyte exports under a .lcov suffix.
+            hgb_coverage.write_coverage_outputs(candidate_work / "coverage_summary", cov_summary)
         except hgb_coverage.CoverageError as exc:
             rec.error = f"coverage report invalid: {exc}"
     elif coverage_report_path and Path(coverage_report_path).is_file():
@@ -673,8 +676,7 @@ def evaluate_candidate(
             cov_path = Path(coverage_report_path)
             parser = coverage_parser or hgb_coverage.summarize_coverage_report
             cov_summary = parser(cov_path)
-            hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary,
-                                                cov_path.read_text(encoding="utf-8", errors="replace"))
+            hgb_coverage.write_coverage_outputs(candidate_work / "coverage_summary", cov_summary)
         except hgb_coverage.CoverageError as exc:
             rec.error = f"coverage report invalid: {exc}"
     elif raw_text.strip():
@@ -685,7 +687,7 @@ def evaluate_candidate(
             coverage_report_path = str(cov_path)
             parser = coverage_parser or hgb_coverage.summarize_coverage_report
             cov_summary = parser(cov_path)
-            hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary, raw_text)
+            hgb_coverage.write_coverage_outputs(candidate_work / "coverage_summary", cov_summary)
         except hgb_coverage.CoverageError as exc:
             rec.error = f"coverage report invalid: {exc}"
     # Attach the coverage-phase audit so invariants can require report_exists.
@@ -923,6 +925,7 @@ def evaluate(
     build_timeout_seconds: int = 1800,
     build_coverage_image: bool = False,
     result_dir: str | Path | None = None,
+    stop_on_first_success: bool = False,
 ) -> dict[str, Any]:
     """Evaluate all candidates and return the run-level result dict.
 
@@ -1098,6 +1101,14 @@ def evaluate(
         (candidates_json_dir / f"{candidate_id}.json").write_text(
             json.dumps(cand_dict, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if stop_on_first_success and hgb_result.result_status_from_stages(
+            rec.stages,
+            has_candidate_json=True,
+            coverage_covered_lines=(rec.coverage or {}).get("line_coverage", {}).get("covered"),
+            campaign_execs_done=int((rec.campaign or {}).get("execs_done", 0) or 0),
+            candidate_overlaid=bool(rec.overlaid),
+        ) == hgb_result.STATUS_EVALUATED:
+            break
 
     # 6.7 Candidate selection.
     selected = hgb_result.select_best_candidate(candidate_dicts)
@@ -1167,6 +1178,7 @@ def evaluate(
             "candidate_reports_dir": str(candidates_json_dir),
             "sealed_context_dir": str(work_dir / "sealed_context"),
             "sealed_env_defaults": sealed_context.get("sealed_env_defaults", {}),
+            "evaluated_candidate_count": len(records),
         },
         selected_candidate=selected or {},
     )
@@ -1213,6 +1225,8 @@ def main() -> int:
                         help="build native/reference coverage control and compute line coverage diff")
     parser.add_argument("--build-coverage-image", action="store_true",
                         help="build a separate coverage-instrumented image for source-based coverage")
+    parser.add_argument("--stop-on-first-success", action="store_true",
+                        help="finish once one candidate passes every independent evaluation stage")
     args = parser.parse_args()
 
     generator = args.baseline or args.generator
@@ -1274,6 +1288,7 @@ def main() -> int:
             run_native_control=args.run_native_control,
             build_coverage_image=args.build_coverage_image,
             result_dir=result_dir,
+            stop_on_first_success=args.stop_on_first_success,
         )
     finally:
         if cleanup_dir is not None:

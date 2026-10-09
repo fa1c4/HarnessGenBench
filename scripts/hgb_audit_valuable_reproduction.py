@@ -43,7 +43,7 @@ def checked_run(baseline: str, run: Path) -> tuple[bool, str, int, int]:
             return False, "incomplete evaluator stages: " + ", ".join(missing), 0, 0
         if baseline == "ckgfuzzer":
             selected = (result.get("selected_candidate") or {}).get("candidate_path", "")
-            if "hgb_" in Path(selected).name:
+            if "000_hgb_" in Path(selected).name:
                 return False, "selected HGB source-derived rescue driver; upstream CKGFuzzer generation was bypassed", 0, 0
             if meta.get("analysis_mode") != "codeql" or int(meta.get("codeql_graph_nodes") or 0) <= 0:
                 return False, "missing real CodeQL graph evidence", 0, 0

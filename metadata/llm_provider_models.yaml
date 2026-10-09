@@ -35,6 +35,7 @@ ustc:
 
 deepseek:
   chat_models:
+    - deepseek-flash
     - deepseek-v4-pro
     - deepseek-v4-flash
   embedding_models: []

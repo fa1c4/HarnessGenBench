@@ -342,9 +342,10 @@ def audit_leakage(
     }
 
     for scan_dir in scan_dirs:
-        if not scan_dir or not scan_dir.is_dir():
+        if not scan_dir or not scan_dir.exists():
             continue
-        for path in sorted(scan_dir.rglob("*")):
+        paths = [scan_dir] if scan_dir.is_file() else sorted(scan_dir.rglob("*"))
+        for path in paths:
             if not path.is_file():
                 continue
             if path.suffix.lower() not in text_exts and path.suffix != "":
@@ -358,7 +359,7 @@ def audit_leakage(
 
     return {
         "canary": canary,
-        "scanned_dirs": [str(d) for d in scan_dirs if d and d.is_dir()],
+        "scanned_dirs": [str(d) for d in scan_dirs if d and d.exists()],
         "leaked": len(hits) > 0,
         "hit_count": len(hits),
         "hits": hits[:50],

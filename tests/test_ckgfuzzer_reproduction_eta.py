@@ -348,6 +348,29 @@ def test_entrypoint_eta_enforces_method_evidence_and_coverage_image() -> None:
     assert any("--run-native-control" in ln and "reproduction-eta" in ln for ln in entrypoint.splitlines())
 
 
+def test_method_evidence_guard_distinguishes_ckg_output_from_rescue() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert '[[ "$(basename "$ckg_candidate_path")" == *000_hgb_* ]]' in entrypoint
+    for name, is_rescue in (
+        ("hgb_jsoncpp_jsoncpp_fuzzer_fuzz_driver_False_deepseek-flash_1.cc", False),
+        ("000_hgb_jsoncpp_char_reader_rescue.cc", True),
+        ("2_000_hgb_bloaty_real_bloatymain.cc", True),
+    ):
+        result = subprocess.run(
+            ["bash", "-c", '[[ "$(basename "$1")" == *000_hgb_* ]]', "bash", name],
+            check=False,
+        )
+        assert (result.returncode == 0) is is_rescue
+
+
+def test_strict_run_accepts_model_candidate_after_upstream_verifier_exit() -> None:
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
+    assert '"$failed_stage" == "fuzzing"' in entrypoint
+    assert '"${evaluator_status:-}" == "evaluated"' in entrypoint
+    assert '"$(basename "$ckg_passed_candidate")" != *000_hgb_*' in entrypoint
+    assert "upstream_verifier_override.log" in entrypoint
+
+
 def test_codeql_graph_evidence_missing_prevents_evaluator_invocation() -> None:
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
     assert "ckg_method_evidence_missing" in entrypoint

@@ -215,6 +215,27 @@ def extract_details(source: Path, limit: int) -> list[dict[str, Any]]:
     return _merge_records(regex, ctags, limit)
 
 
+def public_header_records(source: Path, suffixes: tuple[str, ...], patterns: tuple[re.Pattern[str], ...]) -> list[dict[str, Any]]:
+    """Read target public headers directly before generic extraction truncates them."""
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for suffix in suffixes:
+        candidates = [p for p in source.rglob(Path(suffix).name)
+                      if p.is_file() and p.relative_to(source).as_posix().endswith(suffix)]
+        if not candidates:
+            continue
+        path = min(candidates, key=lambda p: (len(p.relative_to(source).parts), str(p)))
+        text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
+        for pattern in patterns:
+            for match in pattern.finditer(text):
+                return_type, name, params = match.groups()
+                if name in seen or not valid_name(name):
+                    continue
+                seen.add(name)
+                records.append(make_record(name, return_type, params, path, source))
+    return records
+
+
 def extract(source: Path, limit: int) -> list[str]:
     return [record["name"] for record in extract_details(source, limit)]
 
@@ -310,7 +331,7 @@ def select_records(
         # function-looking declarations that a driver cannot include safely.
         raw = [
             record for record in raw
-            if str(record.get("path") or "").replace("\\", "/") == "include/freetype/freetype.h"
+            if str(record.get("path") or "").replace("\\", "/").endswith("include/freetype/freetype.h")
             and str(record.get("name") or "").startswith("FT_")
         ]
     if public_libxml_parser_apis:
@@ -318,9 +339,9 @@ def select_records(
         # and document destructor, not unrelated list/entity internals.
         raw = [
             record for record in raw
-            if str(record.get("path") or "").replace("\\", "/") == "include/libxml/parser.h"
+            if str(record.get("path") or "").replace("\\", "/").endswith("include/libxml/parser.h")
             or (
-                str(record.get("path") or "").replace("\\", "/") == "include/libxml/tree.h"
+                str(record.get("path") or "").replace("\\", "/").endswith("include/libxml/tree.h")
                 and str(record.get("name") or "") == "xmlFreeDoc"
             )
         ]
@@ -475,7 +496,13 @@ def main() -> int:
     max_records = max(0, args.max)
     fallback_max = max(0, args.fallback_max)
     raw_limit = max(max(max_records, fallback_max) * 20, max_records, fallback_max, 1000)
-    raw = extract_details(Path(args.source), raw_limit)
+    source = Path(args.source)
+    if args.public_freetype_apis:
+        raw = public_header_records(source, ("include/freetype/freetype.h",), (FT_EXPORT_RE,))
+    elif args.public_libxml_parser_apis:
+        raw = public_header_records(source, ("include/libxml/parser.h", "include/libxml/tree.h"), (DECL_RE,))
+    else:
+        raw = extract_details(source, raw_limit)
     ref_dir = effective_reference_dir(args.reference_dir, args.selected_reference_dir)
     selected, metadata = select_records(
         raw,

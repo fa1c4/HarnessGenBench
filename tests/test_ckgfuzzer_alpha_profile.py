@@ -174,6 +174,23 @@ def test_canary_leakage_audit_detects_token(tmp_path: Path) -> None:
     assert any("leaked.txt" in h["file"] for h in result["hits"])
 
 
+def test_canary_audit_scans_generator_log_without_evaluator_output(tmp_path: Path) -> None:
+    canary = "HGB_REF_CANARY_testtoken123"
+    generator_input = tmp_path / "generator_input"
+    generator_input.mkdir()
+    generator_log = tmp_path / "fuzzing.log"
+    generator_log.write_text("normal generation\n")
+    evaluator = tmp_path / "evaluation"
+    evaluator.mkdir()
+    (evaluator / "result.json").write_text(canary)
+    assert not profile.audit_leakage(generator_input, canary, extra_dirs=[generator_log])["leaked"]
+    generator_log.write_text(canary)
+    assert profile.audit_leakage(generator_input, canary, extra_dirs=[generator_log])["leaked"]
+    entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text()
+    assert '--extra-dir "$workspace/logs/fuzzing.log"' in entrypoint
+    assert '--extra-dir "$workspace"' not in entrypoint
+
+
 def test_entrypoint_has_leakage_audit_hook() -> None:
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
     assert "HGB_REF_CANARY" in entrypoint

@@ -70,6 +70,39 @@ def test_alpha_fails_on_empty_codeql_graph() -> None:
     assert payload_ok["build_context"] == "fuzzbench_replay"
 
 
+def test_openh264_stages_nested_repository_at_build_root(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    repo = target / "source_input/openh264"
+    repo.mkdir(parents=True)
+    (repo / "Makefile").write_text("libraries:\n\t@true\n")
+    (repo / "codec.cpp").write_text("int codec() { return 1; }\n")
+    (target / "target_manifest.generator.json").write_text(
+        json.dumps({"target": "openh264_decoder_fuzzer"}))
+    project = tmp_path / "project"
+    analysis = tmp_path / "analysis"
+    result = stage_project.stage_project(target, project, analysis, "hgb_openh264_decoder_fuzzer")
+    assert (project / "Makefile").is_file()
+    assert (analysis / "codec.cpp").is_file()
+    assert not (project / "openh264").exists()
+    assert result["staged_source_dir"] == str(repo)
+
+
+def test_zlib_stages_uncompress_definition_at_build_root(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    repo = target / "source_input/zlib"
+    repo.mkdir(parents=True)
+    (repo / "uncompr.c").write_text("int uncompress(void) { return 0; }\n")
+    (target / "target_manifest.generator.json").write_text(
+        json.dumps({"target": "zlib_zlib_uncompress_fuzzer"}))
+    project = tmp_path / "project"
+    analysis = tmp_path / "analysis"
+    result = stage_project.stage_project(target, project, analysis, "hgb_zlib_zlib_uncompress_fuzzer")
+    assert (project / "uncompr.c").is_file()
+    assert (analysis / "uncompr.c").is_file()
+    assert not (project / "zlib").exists()
+    assert result["staged_source_dir"] == str(repo)
+
+
 def test_alpha_does_not_emit_skip_check_compilation() -> None:
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
     assert "ckg_compilation_args" in entrypoint

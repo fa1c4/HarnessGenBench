@@ -81,6 +81,22 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
     benchmark = target_root / "fuzzbench_benchmark"
     if not source_input.is_dir():
         raise SystemExit(f"missing source_input: {source_input}")
+    manifest_path = target_root / "target_manifest.generator.json"
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.is_file() else {}
+    source_payload = source_input
+    # OpenH264's package has a single repository nested one level below
+    # source_input. Its benchmark build runs `make libraries` from $SRC, so
+    # stage the repository root at $SRC while keeping the benchmark harness
+    # and evaluator-only files out of the generator context.
+    if (manifest.get("target") == "openh264_decoder_fuzzer"
+            and (source_input / "openh264/Makefile").is_file()):
+        source_payload = source_input / "openh264"
+    # The Zlib package has the same one-level repository layout.  Its API
+    # definitions (including uncompress in uncompr.c) must be rooted at $SRC
+    # for the CKGFuzzer CodeQL build and source extractor to see them.
+    if (manifest.get("target") == "zlib_zlib_uncompress_fuzzer"
+            and (source_input / "zlib/uncompr.c").is_file()):
+        source_payload = source_input / "zlib"
 
     if project_dir.exists():
         shutil.rmtree(project_dir)
@@ -89,8 +105,8 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
     project_dir.mkdir(parents=True, exist_ok=True)
     analysis_dir.mkdir(parents=True, exist_ok=True)
 
-    _copy_contents(source_input, project_dir)
-    _copy_contents(source_input, analysis_dir)
+    _copy_contents(source_payload, project_dir)
+    _copy_contents(source_payload, analysis_dir)
 
     # Reproduce Dockerfile COPY build.sh/*.dict/fuzzer sources to $SRC.  These
     # files are needed for build replay, but intentionally not copied to the
@@ -124,6 +140,7 @@ def stage_project(target_root: Path, project_dir: Path, analysis_dir: Path, proj
         "project_dir": str(project_dir),
         "project_name": project_name,
         "source_input_dir": str(source_input),
+        "staged_source_dir": str(source_payload),
         "workdir": workdir,
         "build_context": "fuzzbench_replay" if has_benchmark else "source_input_only",
     }
