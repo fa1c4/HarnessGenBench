@@ -663,17 +663,19 @@ def test_matrix_script_has_theta2_api_selection_preflight_before_target_prep() -
     assert "extract_api_list.py accepts: ranked, selected_harness, selected_harness_fallback." in script
 
 
-def test_entrypoint_runs_rescue_candidates_before_candidate_count_gate() -> None:
+def test_entrypoint_limits_rescue_candidates_to_compatibility_runs() -> None:
     entrypoint = (REPO_ROOT / "docker/ckgfuzzer/entrypoint.sh").read_text(encoding="utf-8")
     rescue_pos = entrypoint.index("ckgfuzzer_rescue_candidates.py")
     evaluator_gate_pos = entrypoint.index('if [[ "${generated_harness_count:-0}" -gt 0 ]]; then', rescue_pos)
     assert rescue_pos < evaluator_gate_pos
     fuzzing_pos = entrypoint.index('python "$fuzzing_py"', rescue_pos)
     assert rescue_pos < fuzzing_pos
-    assert '${CKGFUZZER_RESCUE_FIRST:-1}' in entrypoint
+    assert '${CKGFUZZER_RESCUE_FIRST:-0}' in entrypoint
+    assert '"$ckg_method_faithful" != "1"' in entrypoint
     assert '${rescue_candidates_installed:-0}' in entrypoint
     assert 'rescue_candidates_installed=1' in entrypoint
-    assert 'allowing source-derived rescue candidate despite empty CodeQL graph' in entrypoint
+    assert 'allowing source-derived rescue candidate despite empty CodeQL graph' not in entrypoint
+    assert 'selected source-derived rescue or missing real CodeQL/LLM evidence' in entrypoint
     assert 'source-derived rescue candidate fully evaluated; overriding upstream CKGFuzzer stage exit' in entrypoint
 
 

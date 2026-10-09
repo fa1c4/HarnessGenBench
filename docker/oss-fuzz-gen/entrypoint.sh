@@ -1608,7 +1608,7 @@ result = {
     "profile": profile,
     "protocol": protocol,
     "target": target,
-    "applicability": "applicable",
+    "applicability": os.environ.get("OFG_APPLICABILITY", "applicable"),
     "status": status,
     "reason": reason,
     "stages": stages,
@@ -1667,6 +1667,25 @@ if [[ "$mode" == "generate-target" ]]; then
     hgb_write_common_metadata failed "$reason" 65 harness_generator
     hgb_write_common_summary failed "$reason" harness_generator
     exit 65
+  fi
+
+  target_name="${HGB_TARGET:-$(hgb_target_manifest_value target)}"
+  ofg_scope_reason="$("$python" - /opt/hgb/metadata "$target_name" <<'PY_OFG_SCOPE'
+import sys
+from pathlib import Path
+sys.path.insert(0, "/opt/hgb/bin")
+from ofg_profile import load_target_overrides
+entry = (load_target_overrides(Path(sys.argv[1])).get("targets") or {}).get(sys.argv[2]) or {}
+if entry.get("applicability") == "not_applicable":
+    print(entry.get("applicability_reason") or "outside_oss_fuzz_gen_scope")
+PY_OFG_SCOPE
+)"
+  if [[ -n "$ofg_scope_reason" ]]; then
+    export OFG_APPLICABILITY=not_applicable
+    write_final_result not_applicable "$ofg_scope_reason" 0
+    hgb_write_common_metadata not_applicable "$ofg_scope_reason" 0 harness_generator
+    hgb_write_common_summary not_applicable "$ofg_scope_reason" harness_generator
+    exit 0
   fi
 
   if ! hgb_api_key_present; then
@@ -1988,6 +2007,7 @@ PY_OFG_PROPAGATE
   hgb_write_common_metadata "$final_status" "$reason" "$final_code" harness_generator
   hgb_write_common_summary "$final_status" "$reason" harness_generator
   if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+    python3 /opt/hgb/bin/hgb_record_statistics.py --workspace "$workspace" --baseline oss-fuzz-gen --snapshot-fixes 2>/dev/null || true
     rm -rf "$HGB_GENERATION_WORK_DIR" "$workspace/generation/pip-cache" "$workspace/oss-fuzz" "$workspace/introspector_overlay"
   fi
   exit "$final_code"

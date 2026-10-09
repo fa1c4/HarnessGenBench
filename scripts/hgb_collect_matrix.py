@@ -428,6 +428,8 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
     selected = meta.get("selected_candidate") or {}
     if not isinstance(selected, dict):
         selected = {}
+    selected_path = str(selected.get("candidate_path") or selected.get("path") or "")
+    source_derived_rescue = Path(selected_path).name.startswith("000_hgb_")
     sel_build = selected.get("build") or build or {}
     overlay_audit = sel_build.get("overlay_audit") or meta.get("overlay_audit") or {}
     if not isinstance(overlay_audit, dict):
@@ -467,6 +469,7 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         and final_corpus_file_count > 0
         and not exact_copy
         and not near_duplicate_reference
+        and not source_derived_rescue
         and matches_candidate is True
     )
     paper_equivalent_delta = bool(profile == "reproduction-delta" and _strict_paper_equivalent)
@@ -504,6 +507,7 @@ def extract_ckgfuzzer_row(meta: dict[str, Any]) -> dict[str, Any]:
         "reference_canary_leak": bool(candidate.get("contains_reference_canary") or leak_audit.get("leaked")),
         "near_duplicate_reference": near_duplicate_reference,
         "exact_copy": exact_copy,
+        "source_derived_rescue": source_derived_rescue,
         "matches_candidate": matches_candidate,
         "final_corpus_file_count": final_corpus_file_count,
         "copy_out_ok": copy_out_ok,

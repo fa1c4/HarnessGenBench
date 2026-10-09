@@ -141,7 +141,7 @@ def base_env(tmp_path: Path, cli: Path, binary: Path, project_root: Path) -> dic
             "ELFUZZ_REQUIRE_GPU": "0",
             "ELFUZZ_SKIP_DOWNLOAD": "1",
             "ELFUZZ_STAGE_TIMEOUT_SECONDS": "60",
-            "HGB_BASELINE_PROFILE": "alpha",
+            "HGB_BASELINE_PROFILE": "compat-smoke",
             "HGB_BASELINE_PROTOCOL": "paper-native",
             "HGB_METADATA_DIR": str(ROOT / "metadata"),
             "HGB_GENERATOR_ARTIFACT_DIR": str(ROOT / "artifacts" / "elfuzz"),
@@ -387,6 +387,9 @@ def test_alpha_cannot_use_smoke_defaults() -> None:
     assert alpha["evolution_iterations"] >= 2
     assert alpha["produce_seconds"] >= 61
     assert alpha["excluded_from_aggregate"] is False
+    assert alpha["require_coverage_build"] is True
+    assert alpha["require_containerized_sut_runtime"] is True
+    assert alpha["reject_prebuilt_binary"] is True
     with pytest.raises(elf.PipelineError):
         elf.budget_for_profile("alpha", {"ELFUZZ_EVOLUTION_ITERATIONS": "1", "ELFUZZ_PRODUCE_SECONDS": "60"})
     smoke = elf.budget_for_profile("compat-smoke", {})

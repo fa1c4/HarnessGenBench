@@ -40,11 +40,13 @@ targets:
     candidate_destination: /src/zlib/zlib_uncompress_fuzzer.c
     build_timeout: 1200
     fuzz_timeout: 600
+    preferred_apis: [uncompress, uncompress2, inflateInit_, inflate, inflateEnd, compress]
   openssl_x509:
     language: c
     candidate_destination: /src/openssl/fuzz/x509.c
     build_timeout: 2400
     fuzz_timeout: 600
+    preferred_apis: [X509_new, d2i_X509, X509_free, X509_verify, X509_get_subject_name, PEM_read_bio_X509]
   re2_fuzzer:
     language: c++
     candidate_destination: /src/re2/fuzzer.cc
@@ -75,11 +77,13 @@ targets:
     candidate_destination: /src/libjpeg-turbo/libjpeg_turbo_fuzzer.cc
     build_timeout: 1800
     fuzz_timeout: 600
+    preferred_apis: [tjInitDecompress, tjDecompressHeader3, tjDecompress2, jpeg_read_header, jpeg_start_decompress]
   libpcap_fuzz_both:
     language: c
     candidate_destination: /src/libpcap/fuzz_both.c
     build_timeout: 1800
     fuzz_timeout: 600
+    preferred_apis: [pcap_open_dead, pcap_compile, pcap_loop, pcap_dispatch, pcap_datalink, pcap_next_ex]
   libxslt_xpath:
     language: c
     candidate_destination: /src/libxslt/xpath.c
@@ -105,7 +109,12 @@ targets:
     candidate_destination: /src/php-src/sapi/fuzzer/fuzzer-parser.c
     build_timeout: 3000
     fuzz_timeout: 600
+    preferred_apis: [zend_eval_string, php_json_decode_ex, zend_string_init]
   systemd_fuzz-link-parser:
+    # The pinned systemd tools/oss-fuzz.sh deliberately exits 1 for
+    # SANITIZER=introspector, which OSS-Fuzz-Gen requires for API selection.
+    applicability: not_applicable
+    applicability_reason: upstream_fuzz_introspector_unsupported
     language: c
     candidate_destination: /src/systemd/src/fuzz/fuzz-link-parser.c
     build_timeout: 2400

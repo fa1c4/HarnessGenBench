@@ -138,7 +138,7 @@ def base_env(tmp_path: Path, cli: Path, binary: Path, project_root: Path) -> dic
             "ELFUZZ_SKIP_DOWNLOAD": "1",
             "ELFUZZ_STAGE_TIMEOUT_SECONDS": "60",
             "ELFUZZ_COVERAGE_REPLAY": "0",
-            "HGB_BASELINE_PROFILE": "alpha",
+            "HGB_BASELINE_PROFILE": "compat-smoke",
             "HGB_BASELINE_PROTOCOL": "paper-native",
             "HGB_METADATA_DIR": str(ROOT / "metadata"),
             "HGB_GENERATOR_ARTIFACT_DIR": str(ROOT / "artifacts" / "elfuzz"),

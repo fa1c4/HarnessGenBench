@@ -255,6 +255,17 @@ native_binary="$OUT/$fuzz_target"
 }
 mkdir -p "$(dirname "$candidate_binary")"
 if [[ "$smoke_run" == "1" ]]; then
+  # Some FuzzBench recipes (systemd in particular) link the fuzz binary to a
+  # shared library built under WORK without installing it in the loader path.
+  # Resolve only libraries that ldd reports missing; keep the recipe's own
+  # build tree as the source of truth.
+  while IFS= read -r missing_library; do
+    [[ -n "$missing_library" ]] || continue
+    library_path="$(find "$run_source" "$run_work" "$run_out" -name "$missing_library" -print -quit 2>/dev/null || true)"
+    if [[ -n "$library_path" && -f "$library_path" ]]; then
+      export LD_LIBRARY_PATH="$(dirname "$library_path")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    fi
+  done < <(ldd "$native_binary" 2>/dev/null | awk '$2 == "=>" && $3 == "not" {print $1}')
   smoke_input_dir="$native_root/smoke-inputs"
   mkdir -p "$smoke_input_dir"
   : >"$smoke_input_dir/empty"

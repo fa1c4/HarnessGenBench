@@ -380,6 +380,24 @@ def _install_hgb_llm_trace() -> None:
     if gpt_cls is None or getattr(gpt_cls, "_hgb_trace_installed", False):
         return
 
+    original_retry = gpt_cls.with_retry_on_error
+
+    def observed_retry(self: Any, func: Any, api_errs: Any) -> Any:
+        attempts = 0
+
+        def observed_call() -> Any:
+            nonlocal attempts
+            attempts += 1
+            if attempts > 1:
+                hgb_llm_trace.record_retry(stage="oss-fuzz-gen")
+            response = func()
+            hgb_llm_trace.record_usage_only(response)
+            return response
+
+        return original_retry(self, observed_call, api_errs)
+
+    gpt_cls.with_retry_on_error = observed_retry
+
     # The pinned upstream revision exposes chat_llm / ask_llm /
     # chat_llm_with_tools / query_llm; there is no _create_chat_completion.
     # Wrap the methods that actually issue LLM requests.

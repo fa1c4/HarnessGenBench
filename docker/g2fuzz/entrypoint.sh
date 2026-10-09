@@ -238,6 +238,8 @@ def _create(model, messages, temperature):
             delay = min(60.0, 5.0 * (2 ** min(attempt, 3)))
         else:
             delay = _HGB_RATE_SLEEP * (2 ** min(attempt, 3))
+        if hgb_llm_trace is not None and attempt < _HGB_MAX_RETRIES:
+            hgb_llm_trace.record_retry(stage="g2fuzz")
         print(f\"HGB_LLM_RETRY: transient provider failure ({{type(last_exc).__name__}}); retrying in {{delay:.1f}}s (attempt {{attempt + 1}}/{{_HGB_MAX_RETRIES}})\", file=sys.stderr)
         _hgb_time.sleep(delay)
     raise last_exc

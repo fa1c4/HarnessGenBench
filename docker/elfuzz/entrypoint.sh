@@ -401,7 +401,11 @@ if [[ "$mode" == "generate-target" ]]; then
   export HGB_LLM_REQUEST_TIMEOUT_SECONDS="${HGB_LLM_REQUEST_TIMEOUT_SECONDS:-1200}"
   export ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS="${ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS:-$HGB_LLM_REQUEST_TIMEOUT_SECONDS}"
   export ELFUZZ_EVOLUTION_SECONDS="${ELFUZZ_EVOLUTION_SECONDS:-1800}"
-  export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-0}"
+  if [[ "$HGB_BASELINE_PROFILE" == "compat-smoke" || "$HGB_BASELINE_PROFILE" == "ci-smoke" ]]; then
+    export ELFUZZ_COVERAGE_REPLAY="${ELFUZZ_COVERAGE_REPLAY:-0}"
+  else
+    export ELFUZZ_COVERAGE_REPLAY=1
+  fi
   export ELFUZZ_SANITIZER="${ELFUZZ_SANITIZER:-address}"
   # reproduction-gamma (plan elfuzz_reproduction_gamma.md), reproduction-delta
   # (plan elfuzz_reproduction_delta.md), reproduction-epsilon (epsilon plan

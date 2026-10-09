@@ -583,6 +583,7 @@ def preflight_target(
         "library_output_glob": entry.get("library_output_glob", ""),
         "build_timeout": entry.get("build_timeout", ""),
         "generation_timeout": entry.get("generation_timeout", ""),
+        "eval_build_timeout": entry.get("eval_build_timeout", ""),
         "extra_cflags": entry.get("extra_cflags", []),
         "extra_cxxflags": entry.get("extra_cxxflags", []),
         "extra_libs": entry.get("extra_libs", []),

@@ -77,6 +77,7 @@ _LCOV_LINE = re.compile(r"^LF:(\d+)$")
 _LCOV_COVERED = re.compile(r"^LH:(\d+)$")
 _LCOV_FNF = re.compile(r"^FNF:(\d+)$")
 _LCOV_FNH = re.compile(r"^FNH:(\d+)$")
+_LCOV_FNDA = re.compile(r"^FNDA:(\d+),(.+)$")
 
 
 def parse_lcov(text: str) -> dict[str, Any]:
@@ -86,6 +87,7 @@ def parse_lcov(text: str) -> dict[str, Any]:
     lines_covered = 0
     funcs_total = 0
     funcs_covered = 0
+    covered_functions: set[str] = set()
     for raw in text.splitlines():
         m = _LCOV_LINE.match(raw)
         if m:
@@ -102,6 +104,10 @@ def parse_lcov(text: str) -> dict[str, Any]:
         m = _LCOV_FNH.match(raw)
         if m:
             funcs_covered += int(m.group(1))
+            continue
+        m = _LCOV_FNDA.match(raw)
+        if m and int(m.group(1)) > 0:
+            covered_functions.add(m.group(2))
     line_percent = round(100.0 * lines_covered / lines_total, 2) if lines_total else 0.0
     func_percent = round(100.0 * funcs_covered / funcs_total, 2) if funcs_total else 0.0
     return {
@@ -109,6 +115,7 @@ def parse_lcov(text: str) -> dict[str, Any]:
         "function_coverage": {"covered": funcs_covered, "total": funcs_total, "percent": func_percent},
         "regions": {"covered": 0, "total": 0, "percent": 0.0},
         "edge_coverage": None,
+        "covered_functions": sorted(covered_functions),
         "source": "lcov",
     }
 

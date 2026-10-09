@@ -597,7 +597,12 @@ if [[ "$mode" == "generate-target" ]]; then
   # bound it to a practical multi-candidate set; compat-smoke keeps the small
   # deterministic selection.
   if [[ "$promefuzz_method_faithful" == "1" ]]; then
-    export PROME_FUZZ_MAX_APIS="${PROME_FUZZ_MAX_APIS:-64}"
+    case "${HGB_TARGET_PROJECT:-}" in
+      freetype2) export PROME_FUZZ_MAX_APIS="${PROME_FUZZ_MAX_APIS:-4}" ;;
+      libxml2) export PROME_FUZZ_MAX_APIS="${PROME_FUZZ_MAX_APIS:-12}" ;;
+      systemd) export PROME_FUZZ_MAX_APIS="${PROME_FUZZ_MAX_APIS:-24}" ;;
+      *) export PROME_FUZZ_MAX_APIS="${PROME_FUZZ_MAX_APIS:-64}" ;;
+    esac
     export HGB_SELECTED_API_MAX=0
     export HGB_SELECTED_API_FALLBACK_MAX=0
     # The auto-derived intended-API list can miss APIs reached indirectly, so
@@ -655,6 +660,10 @@ PY_PROMEFUZZ_TARGET_OVERRIDE
       # HGB_GENERATION_TIMEOUT_SECONDS (the host value wins otherwise).
       export PROME_FUZZ_STAGE_TIMEOUT_SECONDS="${PROME_FUZZ_STAGE_TIMEOUT_SECONDS:-$override_generation_timeout}"
       [[ -z "${HGB_GENERATION_TIMEOUT_SECONDS:-}" ]] && export HGB_GENERATION_TIMEOUT_SECONDS="$override_generation_timeout"
+    fi
+    override_eval_build_timeout="$("$python" -c 'import json,sys; print(json.load(sys.stdin).get("eval_build_timeout",""))' <<<"$target_override_json" 2>/dev/null || true)"
+    if [[ -n "$override_eval_build_timeout" && -z "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-}" ]]; then
+      export HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT="$override_eval_build_timeout"
     fi
     override_extra_cflags="$("$python" -c 'import json,sys; d=json.load(sys.stdin).get("extra_cflags") or []; print(" ".join(map(str,d)) if isinstance(d,list) else str(d))' <<<"$target_override_json" 2>/dev/null || true)"
     override_extra_cxxflags="$("$python" -c 'import json,sys; d=json.load(sys.stdin).get("extra_cxxflags") or []; print(" ".join(map(str,d)) if isinstance(d,list) else str(d))' <<<"$target_override_json" 2>/dev/null || true)"
@@ -846,6 +855,15 @@ PY_PROMEFUZZ_NEUTRAL_STUBS
         hgb_write_common_summary failed "$reason" harness_generator
         exit 65
       fi
+      if [[ "$project" == "systemd" ]]; then
+        # The FuzzBench recipe links generated binaries against this shared
+        # object in its build tree. The sanitizer starts them from another
+        # directory, so make the recipe's own output visible to the loader.
+        systemd_shared="$(find "$native_build_root" -type f -name 'libsystemd-shared-*.so' -print -quit 2>/dev/null || true)"
+        if [[ -n "$systemd_shared" ]]; then
+          export LD_LIBRARY_PATH="$(dirname "$systemd_shared")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+        fi
+      fi
     fi
   fi
   # --- Real compile database capture from the pinned FuzzBench build ---
@@ -908,6 +926,32 @@ try:
 except Exception:
     print("[]")
 PY_PROMEFUZZ_DRIVER_ARGS
+)"
+  fi
+  if [[ "$project" == "freetype2" && -f "$libraries_json" ]]; then
+    # FreeType's public header requires ft2build.h first. The native build
+    # wrapper supplies this prelude, but PromeFuzz's CGprocessor uses the
+    # independent driver_build_args. Without the same flags it emits an empty
+    # call graph even for drivers that call FT_New_Memory_Face and FT_Load_Char.
+    driver_build_args_json="$("$python" - "$libraries_json" "$workspace/build_context/src/freetype2/include" <<'PY_PROMEFUZZ_FREETYPE_DRIVER_ARGS'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+args = list(data.get("driver_build_args") or [])
+include_dir = Path(sys.argv[2])
+if include_dir.is_dir():
+    flag = "-I" + str(include_dir)
+    if flag not in args:
+        args.append(flag)
+    if "-include" not in args:
+        args.extend(["-include", "ft2build.h"])
+data["driver_build_args"] = args
+path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+print(json.dumps(args))
+PY_PROMEFUZZ_FREETYPE_DRIVER_ARGS
 )"
   fi
   # Beta plan section 5: enforce nonempty, verified link/build context. In
@@ -992,10 +1036,24 @@ PY_PROMEFUZZ_LINK_EMPTY
   libraries=/run/hgb/promefuzz/libraries.toml
   promefuzz_write_config "$config"
   driver_build_args_toml="$driver_build_args_json"
+  project_source_dir="$("$python" - "$project" <<'PY_PROMEFUZZ_PROJECT_SOURCE'
+from pathlib import Path
+import sys
+
+root = Path('/target/source_input')
+project = sys.argv[1].lower().replace('_', '-').strip()
+children = [path for path in root.iterdir() if path.is_dir()] if root.is_dir() else []
+exact = [path for path in children if path.name.lower().replace('_', '-') == project]
+prefix = [path for path in children if path.name.lower().replace('_', '-').startswith(project + '-')]
+chosen = (exact or prefix or (children if len(children) == 1 else []))[:1]
+print(chosen[0] if chosen else root)
+PY_PROMEFUZZ_PROJECT_SOURCE
+)"
+  export PROME_FUZZ_PROJECT_SOURCE_DIR="$project_source_dir"
   # Restrict PromeFuzz's API/header discovery to the target's real include
   # directories (from the captured build flags) so test-only headers such as
   # jsoncpp's jsontest.h are not offered as library APIs.
-  header_paths_toml="$("$python" - "$driver_build_args_json" <<'PY_PROMEFUZZ_HEADER_PATHS'
+  header_paths_toml="$("$python" - "$driver_build_args_json" "$project_source_dir" <<'PY_PROMEFUZZ_HEADER_PATHS'
 import json
 import os
 import sys
@@ -1004,6 +1062,10 @@ try:
 except Exception:
     args = []
 paths = []
+root = sys.argv[2]
+for candidate in (os.path.join(root, "include"), root, os.path.join(root, "src")):
+    if os.path.isdir(candidate) and candidate not in paths:
+        paths.append(candidate)
 for arg in args:
     if isinstance(arg, str) and arg.startswith("-I") and len(arg) > 2:
         candidate = arg[2:]
@@ -1012,7 +1074,6 @@ for arg in args:
 if not paths:
     # Meson/CMake exports may carry only relative include dirs. Fall back to the
     # project's own source/include dirs so API discovery still sees headers.
-    root = "/target/source_input"
     if os.path.isdir(root):
         paths.append(root)
         for child in sorted(os.listdir(root)):
@@ -1041,16 +1102,28 @@ PY_PROMEFUZZ_HEADER_PATHS
       consumer_case_paths_toml='["/workspace/knowledge/consumer_cases"]'
     fi
   fi
+  # These projects ship broad developer documentation trees. Index the files
+  # relevant to each parser target so unrelated manuals do not monopolize the
+  # shared embedding service during parallel evaluation.
+  document_paths_toml='["/target/docs"]'
+  case "$target_name" in
+    systemd_fuzz-link-parser)
+      document_paths_toml='["/target/docs/systemd/docs/PREDICTABLE_INTERFACE_NAMES.md", "/target/docs/systemd/docs/NETWORK_ONLINE.md", "/target/docs/systemd/docs/PORTABILITY_AND_STABILITY.md"]'
+      ;;
+    php_php-fuzz-parser_0dbedb)
+      document_paths_toml='["/target/docs/php-src/docs/parameter-parsing-api.md", "/target/docs/php-src/docs/input-filter.md", "/target/docs/php-src/docs/streams.md"]'
+      ;;
+  esac
   cat >"$libraries" <<EOF_PROMEFUZZ_LIBS
 [$safe_target]
 language = "$language"
 header_paths = $header_paths_toml
 compile_commands_path = "$compile_db"
-document_paths = ["/target/docs"]
+document_paths = $document_paths_toml
 document_has_api_usage = true
 output_path = "$workspace/promefuzz_out/$safe_target"
-source_paths = ["/target/source_input"]
-exclude_paths = ["/target/source_input/test", "/target/source_input/tests", "/target/source_input/example", "/target/source_input/examples", "/target/source_input/third_party", "/target/source_input/benchmark", "/target/source_input/benchmarks"]
+source_paths = ["$project_source_dir"]
+exclude_paths = ["$project_source_dir/test", "$project_source_dir/tests", "$project_source_dir/example", "$project_source_dir/examples", "$project_source_dir/third_party", "$project_source_dir/benchmark", "$project_source_dir/benchmarks"]
 driver_headers = []
 driver_build_args = $driver_build_args_toml
 consumer_build_args = $driver_build_args_toml
@@ -1074,9 +1147,13 @@ EOF_PROMEFUZZ_LIBS
   # --- Public API preprocessing (no reference-harness filtering) ---
   api_selection_metadata="$workspace/promefuzz_api_selection.json"
   selected_api_names_file="$workspace/promefuzz_selected_apis.json"
+  api_source_dir="$project_source_dir"
+  if [[ "$project" == "systemd" && "$fuzz_target" == "fuzz-link-parser" && -d "$project_source_dir/src/udev/net" ]]; then
+    api_source_dir="$project_source_dir/src/udev/net"
+  fi
   api_extract_args=(
     /opt/hgb/bin/extract_api_list.py
-    --source /target/source_input --out "$selected_api_names_file"
+    --source "$api_source_dir" --out "$selected_api_names_file"
     --max "${PROME_FUZZ_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}"
     --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}"
     --selection-mode "${HGB_API_SELECTION_MODE:-ranked}"
@@ -1084,6 +1161,11 @@ EOF_PROMEFUZZ_LIBS
     --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target"
     --selection-metadata "$api_selection_metadata"
   )
+  if [[ "$project" == "freetype2" ]]; then
+    api_extract_args+=(--public-freetype-apis)
+  elif [[ "$project" == "libxml2" ]]; then
+    api_extract_args+=(--public-libxml-parser-apis)
+  fi
   selected_api_count="$(python3 "${api_extract_args[@]}" 2>"$workspace/logs/promefuzz_api_extract.log" || printf '0')"
   selected_api_count="${selected_api_count##*$'\n'}"
   # When the target builds a shared library, prefer APIs the library actually
@@ -1091,7 +1173,7 @@ EOF_PROMEFUZZ_LIBS
   # hidden helpers (e.g. curl's ``Curl_*``) that generated drivers cannot call
   # correctly; restricting to dynamic symbols steers generation to callable
   # public APIs.  Static-only targets keep the ranked header/source selection.
-  promefuzz_shared_lib="$(python3 - "$workspace/build_context/libraries.json" <<'PY_PROMEFUZZ_SHARED_LIB' 2>/dev/null || true
+  promefuzz_shared_lib="$(python3 - "$workspace/build_context/libraries.json" "$project" <<'PY_PROMEFUZZ_SHARED_LIB' 2>/dev/null || true
 import json
 import sys
 from pathlib import Path
@@ -1099,11 +1181,24 @@ try:
     data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 except Exception:
     raise SystemExit
-for path in data.get("library_paths") or []:
-    name = str(path)
-    if ".so" in name:
-        print(name)
-        break
+project = sys.argv[2].lower().replace("-", "")
+prefixes = {
+    "openssl": ("libcrypto.so", "libssl.so"),
+    "freetype2": ("libfreetype.so",),
+}.get(project, (f"lib{project}.so", f"{project}.so"))
+# Plugins such as OpenSSL's fips.so and legacy.so are not the target library.
+# Prefer libcrypto over libssl when both are present for an X.509 target.
+for prefix in prefixes:
+    for path in data.get("library_paths") or []:
+        name = Path(str(path)).name.lower()
+        if name == prefix or name.startswith(prefix + "."):
+            print(path)
+            raise SystemExit
+if project == "openssl":
+    for path in data.get("library_paths") or []:
+        if Path(str(path)).name.lower() == "libcrypto.a":
+            print(path)
+            raise SystemExit
 PY_PROMEFUZZ_SHARED_LIB
 )"
   if [[ -n "$promefuzz_shared_lib" && -f "$promefuzz_shared_lib" ]]; then
@@ -1126,14 +1221,16 @@ except Exception:
 if not isinstance(current, list):
     current = []
 nm = "llvm-nm"
+static_archive = Path(lib).suffix == ".a"
+nm_flags = ["-g", "--defined-only"] if static_archive else ["-D", "--defined-only"]
 try:
     result = subprocess.run(
-        [nm, "-D", "--defined-only", lib],
+        [nm, *nm_flags, lib],
         capture_output=True, text=True, timeout=120, check=False,
     )
 except FileNotFoundError:
     result = subprocess.run(
-        ["nm", "-D", "--defined-only", lib],
+        ["nm", *nm_flags, lib],
         capture_output=True, text=True, timeout=120, check=False,
     )
 exported = []
@@ -1145,13 +1242,23 @@ for line in result.stdout.splitlines():
     if symbol and symbol not in exported:
         exported.append(symbol)
 exported_set = set(exported)
+# Core certificate parse/inspect operations are public symbols declared in
+# OpenSSL headers. They are absent from a source-order-limited candidate pool
+# dominated by apps/, even though PromeFuzz's own API extractor sees them.
+preferred = (
+    ["d2i_X509", "i2d_X509", "X509_new", "X509_free", "X509_verify", "X509_print",
+     "X509_check_host", "X509_check_email", "X509_check_ip_asc"]
+    if Path(lib).name == "libcrypto.a" else []
+)
 # Keep the selected candidates that are exported, then add other exported
 # symbols; the PromeFuzz preprocess patch only keeps names that also match its
 # own extracted API set, so extras are harmless.
-ordered = [name for name in current if str(name).split("::")[-1] in exported_set]
-for symbol in exported:
-    if symbol not in ordered:
-        ordered.append(symbol)
+ordered = [name for name in preferred if name in exported_set]
+ordered.extend(name for name in current if str(name).split("::")[-1] in exported_set and name not in ordered)
+if not static_archive:
+    for symbol in exported:
+        if symbol not in ordered:
+            ordered.append(symbol)
 if max_apis > 0:
     ordered = ordered[:max_apis]
 if ordered:
@@ -1193,6 +1300,15 @@ if llm_py.exists():
                 completion = self.client.chat.completions.create(**api_params)"""
     if old in llm_text and "hgb_llm_trace.trace_call" not in llm_text:
         llm_text = llm_text.replace(old, new)
+    retry_marker = '                    logger.warning(\n                        f"Query attempt {i + 1} failed, {\'retrying\' if i + 1 < self.retry_times else \'aborting\'}"'
+    if retry_marker in llm_text and "hgb_llm_trace.record_retry(stage=\"promefuzz\")" not in llm_text:
+        llm_text = llm_text.replace(
+            retry_marker,
+            '                    if i + 1 < self.retry_times and hgb_llm_trace is not None:\n'
+            '                        hgb_llm_trace.record_retry(stage="promefuzz")\n'
+            + retry_marker,
+            1,
+        )
     fail_fast_old = '        except Exception as e:\n            logger.error(f"OpenAI API exception: {e}")\n            return None'
     fail_fast_new = '        except Exception as e:\n            error_text = str(e)\n            for _secret in (os.environ.get("OPENAI_API_KEY", ""), os.environ.get("API_KEY", "")):\n                if _secret:\n                    error_text = error_text.replace(_secret, "[REDACTED]")\n            logger.error(f"OpenAI API exception: {error_text}")\n            _nonretryable = (\n                "Error code: 400", "Error code: 401", "Error code: 402",\n                "Error code: 403", "Error code: 404", "Error code: 422",\n                "Insufficient Balance", "ExceededBudget", "budget_exceeded",\n                "invalid api key", "invalid_request_error", "model_not_found",\n            )\n            if (os.environ.get("PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR", "1") != "0"\n                    and any(_marker.lower() in error_text.lower() for _marker in _nonretryable)):\n                _message = "hgb_llm_nonretryable: " + error_text\n                _error_file = os.environ.get("PROME_FUZZ_PROVIDER_ERROR_FILE", "")\n                if _error_file:\n                    try:\n                        with open(_error_file, "w", encoding="utf-8") as _handle:\n                            _handle.write(_message + "\\n")\n                    except OSError:\n                        pass\n                logger.critical(_message)\n                os._exit(78)\n            if "429" in error_text or "rate limit" in error_text.lower():\n                try:\n                    import time as _hgb_time\n                    _hgb_time.sleep(float(os.environ.get("PROME_FUZZ_LLM_429_BACKOFF_SECONDS", "8")))\n                except Exception:\n                    pass\n            return None'
     if "PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR" not in llm_text:
@@ -1201,6 +1317,25 @@ if llm_py.exists():
         if fail_fast_old in llm_text:
             llm_text = llm_text.replace(fail_fast_old, fail_fast_new)
     llm_py.write_text(llm_text)
+sanitizer_py = root / "src/generator/sanitizer.py"
+if sanitizer_py.exists():
+    sanitizer_text = sanitizer_py.read_text()
+    marker = "        prompter = prompter_class(fuzz_driver.llm_chat)"
+    if marker in sanitizer_text and "hgb_llm_trace.record_driver_fix" not in sanitizer_text:
+        sanitizer_text = sanitizer_text.replace(
+            marker,
+            '        try:\n'
+            '            import sys\n'
+            '            if "/opt/hgb/bin" not in sys.path:\n'
+            '                sys.path.insert(0, "/opt/hgb/bin")\n'
+            '            import hgb_llm_trace\n'
+            '            hgb_llm_trace.record_driver_fix(stage="promefuzz")\n'
+            '        except ImportError:\n'
+            '            pass\n'
+            + marker,
+            1,
+        )
+        sanitizer_py.write_text(sanitizer_text)
 rag_py = root / "src/llm/rag.py"
 utils_py = root / "src/utils.py"
 if rag_py.exists():
@@ -1310,11 +1445,83 @@ if driver_py.exists():
         "return [], [self.function_set.safe_iter]",
         "return [], list(self.function_set.safe_iter)",
     )
+    # Clang can report the public declaration in an installed header while
+    # preprocessing recorded the definition in the project source. Match the
+    # same unambiguous API by name when those locations differ.
+    text = text.replace(
+        'target = api_collection.get_by_decl_location(calling["calleeDeclLoc"])',
+        'target = api_collection.get_by_decl_location(calling["calleeDeclLoc"])\n'
+        '            if target is None:\n'
+        '                name_matches = api_collection.get_by_name(calling["calleeName"])\n'
+        '                if len(name_matches) == 1:\n'
+        '                    target = name_matches[0]',
+    )
     text = text.replace('''f"{func.name.split("::")[-1]}("''', '''f"{func.name.split('::')[-1]}("''')
     text = text.replace(
         '''f"Function in fuzz driver does not exist in API collection: {calling["calleeName"]} at {calling["calleeDeclLoc"]}"''',
         '''f"Function in fuzz driver does not exist in API collection: {calling['calleeName']} at {calling['calleeDeclLoc']}"''',
     )
+    # Upstream subprocess.run(shell=True, timeout=1) kills only the shell on
+    # timeout. libFuzzer children continue indefinitely and accumulate across
+    # sanitization rounds. Run each attempt in its own process group and reap
+    # the entire group when the one-second smoke window ends.
+    if "PROME_FUZZ_SANITIZER_PROCESS_GROUP" not in text:
+        old_run = '''        try:
+            output = subprocess.run(
+                run_cmd,
+                timeout=None if timeout < 0 else timeout,
+                cwd=str(dest_path),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                shell=True,
+                text=True,
+                errors="replace",
+                check=True,
+            ).stdout
+            logger.debug(f"Run output: {output}")
+        except subprocess.TimeoutExpired as e:
+            _cleanup()
+            return "OK", e.output
+        except subprocess.CalledProcessError as e:
+            _cleanup()
+            return "CRASH", e.output
+        except Exception as e:
+            _cleanup()
+            raise e'''
+        new_run = '''        # PROME_FUZZ_SANITIZER_PROCESS_GROUP
+        import signal
+        process = subprocess.Popen(
+            [str(bin_path), *extra_run_args],
+            cwd=str(dest_path),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            start_new_session=True,
+        )
+        try:
+            output, _ = process.communicate(timeout=None if timeout < 0 else timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            output, _ = process.communicate()
+            _cleanup()
+            return "OK", output
+        except Exception:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            _cleanup()
+            raise
+        logger.debug(f"Run output: {output}")
+        _cleanup()
+        return ("OK" if process.returncode == 0 else "CRASH"), output'''
+        if old_run in text:
+            text = text.replace(old_run, new_run, 1)
     driver_py.write_text(text)
 preprocess_py = root / "cli/preprocess.py"
 if preprocess_py.exists():
@@ -1333,7 +1540,14 @@ if preprocess_py.exists():
 
     def _hgb_api_rank(func):
         text = " ".join(str(getattr(func, attr, "")) for attr in ("header", "name", "loc", "decl_loc")).lower()
+        project_source = os.environ.get("PROME_FUZZ_PROJECT_SOURCE_DIR", "").lower().rstrip("/")
         penalty = 0
+        if project_source and project_source not in text:
+            penalty += 100
+        if "/include/" in text and "/internal/" not in text:
+            penalty -= 50
+        if "/internal/" in text:
+            penalty += 30
         for token in ("/test", "/tests", "/example", "/examples", "test::", "testing"):
             if token in text:
                 penalty += 10
@@ -1371,7 +1585,7 @@ if preprocess_py.exists():
         before = api.count
         matched = [func for func in api.funcs if str(getattr(func, "name", "")).split("::")[-1] in selected_rank]
         if matched:
-            api.funcs = sorted(matched, key=lambda func: (selected_rank.get(str(getattr(func, "name", "")).split("::")[-1], 9999), _hgb_api_rank(func)))
+            api.funcs = sorted(matched, key=lambda func: (_hgb_api_rank(func)[0], selected_rank.get(str(getattr(func, "name", "")).split("::")[-1], 9999), _hgb_api_rank(func)[1:]))
             if max_apis > 0:
                 api.funcs = api.funcs[:max_apis]
             logger.info(f"Filtered API functions from {before} to {api.count} using HGB selected FuzzBench harness APIs.")
@@ -1541,6 +1755,49 @@ PY_PROMEFUZZ_KNOWLEDGE_USAGE
     n=$((n + 1))
     cp "$generated" "$workspace/generated_harnesses/${n}_$(basename "$generated")" 2>/dev/null || true
   done < <(find "$final_driver_dir" -maxdepth 1 -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | sort)
+  if [[ "$project" == "php" && "$fuzz_target" == "php-fuzz-parser" ]]; then
+    "$python" - "$workspace/generated_harnesses" "$workspace/promefuzz_php_driver_repairs.json" <<'PY_PROMEFUZZ_PHP_INIT'
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "/opt/hgb/bin")
+from hgb_llm_trace import record_driver_fix
+
+driver_dir, audit_path = map(Path, sys.argv[1:3])
+repairs = []
+prelude = (
+    "#include <Zend/zend_alloc.h>\n"
+    "#ifdef __cplusplus\nextern \"C\"\n#endif\n"
+    "int LLVMFuzzerInitialize(int *argc, char ***argv) {\n"
+    "    (void)argc; (void)argv;\n"
+    "    start_memory_manager();\n"
+    "    return 0;\n"
+    "}\n"
+)
+for path in sorted(driver_dir.iterdir()):
+    if path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
+        continue
+    text = path.read_text(encoding="utf-8", errors="replace")
+    if "Zend/" not in text or re.search(r"\bLLVMFuzzerInitialize\s*\(", text):
+        continue
+    # PHP's emalloc-backed APIs require AG(mm_heap) before the first input.
+    # Its fuzzer target otherwise provides only a weak no-op initializer.
+    repaired = prelude + text
+    path.write_text(repaired, encoding="utf-8")
+    repairs.append({
+        "candidate": path.name,
+        "reason": "initialize Zend memory manager before generated API calls",
+        "before_sha256": hashlib.sha256(text.encode()).hexdigest(),
+        "after_sha256": hashlib.sha256(repaired.encode()).hexdigest(),
+        "driver_fix_rounds": 1,
+    })
+    record_driver_fix(stage="promefuzz_php_memory_manager")
+audit_path.write_text(json.dumps({"repairs": repairs}, indent=2) + "\n", encoding="utf-8")
+PY_PROMEFUZZ_PHP_INIT
+  fi
   temporary_harness_attempt_count="$(find "$temporary_driver_dir" -type f \( -name 'fuzz_driver_*.c' -o -name 'fuzz_driver_*.cc' -o -name 'fuzz_driver_*.cpp' -o -name 'fuzz_driver_*.cxx' \) 2>/dev/null | wc -l | tr -d ' ')"
   generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
   if [[ "$code" -eq 0 && "${generated_harness_count:-0}" -eq 0 ]]; then
@@ -1623,10 +1880,15 @@ from pathlib import Path
 harness_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("")
 selected_file = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("")
 names = []
-# Intended APIs are the project symbols the generated drivers actually call.
-# The evaluator later filters this list to symbols declared under the project's
-# primary source roots, so incidental C/C++ identifiers are harmlessly dropped.
-ident_re = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+scaffold_names = {
+    "LLVMFuzzerTestOneInput", "LLVMFuzzerInitialize", "FuzzerTestOneInput",
+    "FuzzerInitialize", "FuzzerCleanup", "start_memory_manager",
+}
+# Prefer the APIs named in PromeFuzz's driver header, then direct calls. A
+# general identifier scan includes comments, local variables and types; it
+# can fill the evaluator's bounded list before later candidate APIs appear.
+header_api_re = re.compile(r"^//\s*([A-Za-z_][A-Za-z0-9_]*)\s+at\s+", re.M)
+call_re = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 if harness_dir.is_dir():
     for path in sorted(harness_dir.rglob("*")):
         if not path.is_file() or path.suffix.lower() not in {".c", ".cc", ".cpp", ".cxx"}:
@@ -1635,9 +1897,15 @@ if harness_dir.is_dir():
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for match in ident_re.findall(text):
-            if match not in names:
+        header_names = header_api_re.findall(text)
+        for match in header_names:
+            if match not in scaffold_names and match not in names:
                 names.append(match)
+        if not header_names:
+            code = re.sub(r"/\*.*?\*/|//[^\n]*", "", text, flags=re.S)
+            for match in call_re.findall(code):
+                if match not in scaffold_names and match not in names:
+                    names.append(match)
 # Keep the ranked HGB selection as an additional signal.
 if selected_file.is_file():
     try:
@@ -1651,7 +1919,7 @@ if selected_file.is_file():
             name = str(item.get("name")).split("::")[-1]
         else:
             continue
-        if name not in names:
+        if name not in scaffold_names and name not in names:
             names.append(name)
 print(",".join(names[:256]))
 PY_PROMEFUZZ_INTENDED_APIS
@@ -1691,13 +1959,13 @@ PY_PROMEFUZZ_INTENDED_APIS
     "$python" "${evaluator_args[@]}" >"$workspace/logs/evaluator.log" 2>&1 || verification_code=$?
     eval_result="$eval_dir/result.json"
     if [[ -f "$eval_result" ]]; then
-      evaluator_status="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(d.get("status",""))' "$eval_result" 2>/dev/null || printf '')"
-      evaluator_execs_done="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print((d.get("metrics",{}) or {}).get("campaign",{}).get("execs_done",0))' "$eval_result" 2>/dev/null || printf 0)"
-      evaluator_cov_lines="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); v=(d.get("metrics",{}) or {}).get("coverage",{}).get("line_coverage",{}).get("covered"); print("" if v is None else v)' "$eval_result" 2>/dev/null || true)"
-      evaluator_reached_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(len(sel.get("api_reachability",{}).get("reached_apis",[]) or []))' "$eval_result" 2>/dev/null || printf 0)"
-      evaluator_metrics_json="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("metrics",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
-      evaluator_selected_json="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("selected_candidate",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
-      verified_harness_count="$(python3 -c 'import json; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(1 if sel.get("overlaid") and all((d.get("stages",{}) or {}).get(s)=="completed" for s in ("candidate_overlay","copy_audit","candidate_build","sanitizer_smoke","api_reachability","campaign","coverage")) else 0)' "$eval_result" 2>/dev/null || printf '0')"
+      evaluator_status="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("status",""))' "$eval_result" 2>/dev/null || printf '')"
+      evaluator_execs_done="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print((d.get("metrics",{}) or {}).get("campaign",{}).get("execs_done",0))' "$eval_result" 2>/dev/null || printf 0)"
+      evaluator_cov_lines="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); v=(d.get("metrics",{}) or {}).get("coverage",{}).get("line_coverage",{}).get("covered"); print("" if v is None else v)' "$eval_result" 2>/dev/null || true)"
+      evaluator_reached_count="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(len(sel.get("api_reachability",{}).get("reached_apis",[]) or []))' "$eval_result" 2>/dev/null || printf 0)"
+      evaluator_metrics_json="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("metrics",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
+      evaluator_selected_json="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(json.dumps(d.get("selected_candidate",{}) or {}))' "$eval_result" 2>/dev/null || printf '{}')"
+      verified_harness_count="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sel=d.get("selected_candidate",{}) or {}; print(1 if sel.get("overlaid") and all((d.get("stages",{}) or {}).get(s)=="completed" for s in ("candidate_overlay","copy_audit","candidate_build","sanitizer_smoke","api_reachability","campaign","coverage")) else 0)' "$eval_result" 2>/dev/null || printf '0')"
       # Beta plan section 9: set campaign/coverage/reachability stages ONLY
       # from the shared evaluator output, never from a build-only success.
       for stage in candidate_overlay copy_audit candidate_build sanitizer_smoke api_reachability campaign coverage; do
@@ -1804,9 +2072,6 @@ PY_PROMEFUZZ_FINAL_STATUS
       printf 'Reference leakage audit passed: no canary leakage detected\n' >"$workspace/logs/leakage_audit.log"
     fi
   fi
-  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
-    rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out"
-  fi
   api_selection_extra="$(hgb_api_selection_metadata_json "$api_selection_metadata")"
   extra=$(printf '%s  "libraries_file": "%s",\n  "compile_commands_path": "%s",\n  "api_candidate_count": %s,\n  "api_selection_metadata": "%s",\n  "command_file": "%s",\n  "failed_stage": "%s",\n  "native_build_enabled": %s,\n  "native_harness_destination": "%s",\n  "final_harness_count": %s,\n  "temporary_harness_attempt_count": %s,\n  "deprecated_api_event_count": %s,\n  "driver_build_args": %s,\n  "verified_harness_count": %s,\n  "candidate_verification_exit_code": "%s"' "$api_selection_extra" "$(hgb_json_escape "$libraries")" "$(hgb_json_escape "$compile_db_for_metadata")" "${selected_api_count:-0}" "$(hgb_json_escape "$api_selection_metadata")" "$(hgb_json_escape "$workspace/command.txt")" "$(hgb_json_escape "$failed_stage")" "$native_build_json" "$(hgb_json_escape "$native_harness_destination")" "${generated_harness_count:-0}" "${temporary_harness_attempt_count:-0}" "${deprecated_api_event_count:-0}" "$driver_build_args_json" "${verified_harness_count:-0}" "$(hgb_json_escape "$verification_code")")
   hgb_write_common_metadata "$status" "$reason" "$code" harness_generator "$extra"
@@ -1836,6 +2101,12 @@ PY_PROMEFUZZ_FINAL_STATUS
   export PROME_FUZZ_GENERATION_MODE="ALL-COVER"
   promefuzz_write_final_result "$status" "$reason" "$code" "$promefuzz_leakage_audit"
   hgb_write_common_summary "$status" "$reason" harness_generator
+  # A concurrent native-build cleanup can make rm report "Directory not
+  # empty". Keep the evaluation result even when compact cleanup races it.
+  if [[ "${HGB_SAVE_MODE:-compact}" == "compact" ]]; then
+    rm -rf "$workspace/promefuzz_build" "$workspace/promefuzz_native_build" "$workspace/promefuzz_out" \
+      2>"$workspace/logs/compact_cleanup.log" || true
+  fi
   exit "$code"
 fi
 [[ "$mode" == "smoke-pugixml" || "$mode" == "smoke" ]] || { echo "unknown mode: $mode" >&2; exit 64; }

@@ -318,20 +318,52 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
                 continue
             text = build_sh.read_text(encoding="utf-8", errors="replace")
             marker = "# HGB sealed evaluator: avoid sanitizer-built libarchive iconv conftest."
-            if marker in text:
-                continue
-            lines = text.splitlines()
-            injection = [
-                marker,
-                "export am_cv_func_iconv=yes",
-                "export am_cv_lib_iconv=no",
-                "export am_cv_func_iconv_works=yes",
-            ]
-            if lines and lines[0].startswith("#!"):
-                lines = [lines[0], *injection, *lines[1:]]
-            else:
-                lines = [*injection, *lines]
-            build_sh.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            if marker not in text:
+                lines = text.splitlines()
+                injection = [
+                    marker,
+                    "export am_cv_func_iconv=yes",
+                    "export am_cv_lib_iconv=no",
+                    "export am_cv_func_iconv_works=yes",
+                ]
+                if lines and lines[0].startswith("#!"):
+                    lines = [lines[0], *injection, *lines[1:]]
+                else:
+                    lines = [*injection, *lines]
+                text = "\n".join(lines) + "\n"
+            # FreeType's generated C++ driver may include freetype.h directly.
+            # Apply its required prelude only to the final driver compilation;
+            # libarchive is built first and cannot include this project header.
+            text = text.replace(
+                "$CXX $CXXFLAGS -std=c++11 -I include -I . src/tools/ftfuzzer/ftfuzzer.cc",
+                "$CXX $CXXFLAGS -include ft2build.h -std=c++11 -I include -I . src/tools/ftfuzzer/ftfuzzer.cc",
+            )
+            build_sh.write_text(text, encoding="utf-8")
+
+    if fuzz_target == "fuzz-link-parser":
+        # Meson builds generated C drivers with -Werror=missing-prototypes.
+        # Declare the standard libFuzzer ABI through a build-only header so
+        # the candidate source remains byte-for-byte identical to PromeFuzz's
+        # sanitized output.
+        entrypoint_header = context_dir / "hgb_fuzzer_entrypoint.h"
+        entrypoint_header.write_text(
+            "#include <stddef.h>\n#include <stdint.h>\n"
+            "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
+            "int LLVMFuzzerTestOneInput(const uint8_t *, size_t);\n"
+            "#ifdef __cplusplus\n}\n#endif\n",
+            encoding="utf-8",
+        )
+        df = context_dir / "Dockerfile"
+        if df.is_file():
+            text = df.read_text(encoding="utf-8", errors="replace")
+            copy_line = "COPY hgb_fuzzer_entrypoint.h /src/hgb_fuzzer_entrypoint.h"
+            if copy_line not in text:
+                marker = "# HGB sealed evaluator candidate build."
+                if marker in text:
+                    text = text.replace(marker, copy_line + "\n" + marker, 1)
+                else:
+                    text = text.rstrip() + "\n" + copy_line + "\n"
+                df.write_text(text, encoding="utf-8")
 
     makefile = curl_root / "Makefile.am"
     if makefile.is_file() and fuzz_target.startswith("curl_fuzzer"):
@@ -486,6 +518,36 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
             "https://github.com/php/php-src.git",
             "0dbedb3dbdb27bd3acde65e448ff7bdf2260e620",
         )
+        if dockerfile.is_file():
+            text = dockerfile.read_text(encoding="utf-8", errors="replace")
+            # Ubuntu's package mirror intermittently resets connections during
+            # the evaluator image build. Retrying the same pinned dependencies
+            # avoids discarding a valid generated PHP candidate.
+            text = text.replace("apt-get update", "apt-get -o Acquire::Retries=5 update")
+            text = text.replace("apt-get install", "apt-get -o Acquire::Retries=5 install")
+            dockerfile.write_text(text, encoding="utf-8")
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            text = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = "# HGB sealed evaluator: cache PHP's optimize-strlen runtime probe."
+            if marker not in text:
+                lines = text.splitlines()
+                injection = [marker, "export ac_cv_have_broken_gcc_strlen_opt=no"]
+                if lines and lines[0].startswith("#!"):
+                    lines = [lines[0], *injection, *lines[1:]]
+                else:
+                    lines = [*injection, *lines]
+                text = "\n".join(lines) + "\n"
+            # Opcache is optional for the parser fuzzer. The pinned PHP recipe
+            # unconditionally copies its module even when configure omitted it.
+            if "if [ -f modules/opcache.so ]" not in text:
+                for destination in ("$OUT/modules", "/out/modules"):
+                    text = text.replace(
+                        f"cp modules/opcache.so {destination}",
+                        f"if [ -f modules/opcache.so ]; then cp modules/opcache.so {destination}; fi",
+                    )
+            build_sh.write_text(text, encoding="utf-8")
         if not php_pinned:
             for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
                 if not build_sh.is_file():
@@ -589,15 +651,32 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
             build_sh.write_text(text, encoding="utf-8")
 
 
-def _sealed_compile_block() -> str:
+def _sealed_compile_block(fuzz_target: str = "") -> str:
     """Return the final evaluator compile block appended to sealed Dockerfiles."""
 
     extra_cflags = os.environ.get("PROME_FUZZ_EXTRA_CFLAGS", "").strip()
     extra_cxxflags = os.environ.get("PROME_FUZZ_EXTRA_CXXFLAGS", "").strip()
+    if fuzz_target == "ftfuzzer":
+        # The FreeType prelude belongs to the target driver, not the global
+        # environment used while configuring libarchive in the same recipe.
+        extra_cflags = re.sub(r"(?<!\S)-include\s+ft2build\.h(?=\s|$)", "", extra_cflags).strip()
+        extra_cxxflags = re.sub(r"(?<!\S)-include\s+ft2build\.h(?=\s|$)", "", extra_cxxflags).strip()
     extra_libs = os.environ.get("PROME_FUZZ_EXTRA_LIBS", "").strip()
     extra_ldflags = os.environ.get("PROME_FUZZ_EXTRA_LDFLAGS", "").strip()
-    sealed_cflags = ("-fuse-ld=lld -I/src " + extra_cflags).strip()
-    sealed_cxxflags = ("-fuse-ld=lld -I/src " + extra_cxxflags).strip()
+    # Meson appends -Werror=unused-command-line-argument to compile-only
+    # probes. Keep its linker selection in LDFLAGS for systemd so the gperf
+    # type probe does not reject a linker-only option before any link occurs.
+    linker_flag = "-fuse-ld=lld "
+    project_include = ""
+    if fuzz_target == "fuzz-link-parser":
+        linker_flag = ""
+        extra_ldflags = ("-fuse-ld=lld " + extra_ldflags).strip()
+        # PromeFuzz selects systemd's internal udev/net/link-config.h. Meson
+        # exposes its leaf include directory to this fuzzer, but the generated
+        # driver uses the project-relative udev/net/... spelling.
+        project_include = "-I/src/systemd/src -include /src/hgb_fuzzer_entrypoint.h "
+    sealed_cflags = (linker_flag + "-I/src " + project_include + extra_cflags).strip()
+    sealed_cxxflags = (linker_flag + "-I/src " + project_include + extra_cxxflags).strip()
     return (
         "# HGB sealed evaluator candidate build.\n"
         "ARG FUZZING_ENGINE=libfuzzer\n"
@@ -694,18 +773,22 @@ def build_candidate_image(
                 text = text.rstrip() + "\n" + overlay_copy + "\n"
             compile_marker = "# HGB sealed evaluator candidate build."
             if compile_marker not in text:
-                text = text.rstrip() + "\n" + _sealed_compile_block()
+                text = text.rstrip() + "\n" + _sealed_compile_block(fuzz_target)
             else:
                 compile_tail = text[text.rfind(compile_marker):]
                 if (
                     "RUN FUZZING_ENGINE=\"$HGB_FUZZING_ENGINE\" SANITIZER=\"$HGB_SANITIZER\"" not in compile_tail
                     or "FUZZER_LIB" not in compile_tail
+                    or (
+                        fuzz_target == "fuzz-link-parser"
+                        and 'ENV LDFLAGS="-fuse-ld=lld' not in compile_tail
+                    )
                 ):
                     # Older sealed contexts only changed HGB_BUILD_VARIANT before
                     # compile. Use unique HGB_* args plus inline env assignments so
                     # the compile process sees SANITIZER=coverage even if legacy
                     # Docker reuses earlier ENV layers from the ASan candidate build.
-                    text = text[:text.rfind(compile_marker)].rstrip() + "\n" + _sealed_compile_block()
+                    text = text[:text.rfind(compile_marker)].rstrip() + "\n" + _sealed_compile_block(fuzz_target)
             df.write_text(text, encoding="utf-8")
 
     build_command = [
@@ -992,9 +1075,14 @@ def run_smoke(
         if Path(seed).is_file():
             invocations.append((Path(seed), Path(seed).name))
     misuse_crash = False
+    timed_out = False
     any_executed = False
     for host_input, label in invocations:
         container_input = f"/tmp/smoke_{label}"
+        php_asan_prefix = (
+            'export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}symbolize=0"; '
+            if binary_path.endswith("/php-fuzz-parser") else ""
+        )
         # The container echoes the start marker to stderr, then execs the
         # target on the copied input. Execution is proven ONLY by the marker
         # plus a successful input copy -- never by the exit code or nonempty
@@ -1004,7 +1092,8 @@ def run_smoke(
             work_dir=work_dir / "smoke" / label,
             runner=runner,
             timeout_seconds=timeout_seconds,
-            command=["sh", "-lc", f"echo {HGB_TARGET_START_MARKER} >&2; exec {binary_path} {container_input}"],
+            command=["sh", "-lc", f"echo {HGB_TARGET_START_MARKER} >&2; "
+                     f"{php_asan_prefix}exec {binary_path} {container_input}"],
             phase=f"smoke_{label}",
             copy_in=[(host_input, container_input)],
         )
@@ -1017,7 +1106,9 @@ def run_smoke(
         # are not crashes. Sanitizer/runtime crash signatures in stderr always
         # count as crashes (MSan/LSan included, previously only ASan/UBSan).
         crashed = result.exit_code not in (0, 1, 124)
-        stderr_text = result.stderr or ""
+        # docker start -a commonly forwards the target's stderr through its
+        # own stdout. Inspect both streams or assertion crashes are accepted.
+        stderr_text = combined_log
         for crash_marker in (
             "AddressSanitizer",
             "UndefinedBehaviorSanitizer",
@@ -1031,18 +1122,22 @@ def run_smoke(
                 break
         if crashed:
             misuse_crash = True
+        if result.exit_code == 124:
+            timed_out = True
         if executed:
             any_executed = True
         samples.append({
             "label": label,
             "exit_code": result.exit_code,
             "crashed": crashed,
+            "timed_out": result.exit_code == 124,
             "executed": executed,
             "copy_in_ok": copy_in_ok,
             "marker_seen": marker_seen,
             "stderr": result.stderr[:4000],
         })
-    return {"samples": samples, "misuse_crash": misuse_crash, "any_executed": any_executed}
+    return {"samples": samples, "misuse_crash": misuse_crash, "timed_out": timed_out,
+            "any_executed": any_executed}
 
 
 def run_campaign(
@@ -1088,10 +1183,14 @@ def run_campaign(
         '[ -e "$f" ] || continue; cp "$f" "/tmp/corpus/$(basename "$f")"; '
         'done; '
     )
+    asan_prefix = (
+        'ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}symbolize=0" '
+        if binary_path.endswith("/php-fuzz-parser") else ""
+    )
     cmd = [
         "sh",
         "-lc",
-        f'{seed_stage}timeout -s INT -k 5s {fuzzer_timeout}s {binary_path} '
+        f'{seed_stage}{asan_prefix}timeout -s INT -k 5s {fuzzer_timeout}s {binary_path} '
         f'-runs={run_count} -max_total_time={budget} -print_final_stats=1 -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
         f'> /tmp/campaign.log 2>&1; '
         f'fuzzer_rc=$?; echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
@@ -1152,7 +1251,14 @@ def run_campaign(
     log = result.stdout + "\n" + result.stderr
     execs_done = _parse_execs_done(log)
     new_units = _parse_new_units(log)
-    crashes = int("SUMMARY: AddressSanitizer" in log or "SUMMARY: UndefinedBehaviorSanitizer" in log)
+    crashes = int(any(marker in log for marker in (
+        "ERROR: libFuzzer: deadly signal",
+        "ERROR: AddressSanitizer",
+        "SUMMARY: AddressSanitizer",
+        "SUMMARY: UndefinedBehaviorSanitizer",
+        "WARNING: MemorySanitizer",
+        "ERROR: LeakSanitizer",
+    )))
     final_corpus_file_count = 0
     if final_corpus_dir.is_dir():
         final_corpus_file_count = sum(1 for p in final_corpus_dir.rglob("*") if p.is_file())
@@ -1266,6 +1372,13 @@ def run_coverage(
         'done; '
     )
     cov_work = work_dir / "coverage"
+    # PHP's full binary can make llvm-cov's JSON export consume hundreds of
+    # gigabytes. LCOV is a real source-based report with line and per-function
+    # execution counts, and streams with much lower memory use.
+    use_lcov = binary_path.endswith("/php-fuzz-parser") and not require_coverage_report
+    report_name = "coverage.lcov" if use_lcov else "coverage.json"
+    export_command = (f'llvm-cov export -format=lcov {binary_path}' if use_lcov
+                      else f'llvm-cov export -format=text {binary_path}')
     if require_coverage_report:
         # Eta replay: execute every copied corpus file once in a per-file loop
         # (one process per input, one profraw per input via the %p pattern), so
@@ -1283,7 +1396,7 @@ def run_coverage(
             'printf "HGB_INPUTS_REPLAYED=%s\\n" "$n" >&2; '
             'test "$n" -gt 0; '
             f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/coverage-*.profraw && '
-            f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
+            f'{export_command} -instr-profile=/tmp/cov/merged.profdata '
             f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err'
         )
     else:
@@ -1301,8 +1414,9 @@ def run_coverage(
             'done; '
             'printf "HGB_INPUTS_REPLAYED=%s\\n" "$n" >&2; '
             f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/coverage-*.profraw && '
-            f'llvm-cov export -format=text {binary_path} -instr-profile=/tmp/cov/merged.profdata '
-            f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err; cat /tmp/cov/coverage.json'
+            f'{export_command} -instr-profile=/tmp/cov/merged.profdata '
+            f'> /tmp/cov/{report_name} 2>/tmp/cov/cov.err; '
+            + ("printf 'HGB_COVERAGE_READY\\n'" if use_lcov else "cat /tmp/cov/coverage.json")
         )
     cmd = ["sh", "-lc", replay_script]
     result = _container_run(
@@ -1313,11 +1427,11 @@ def run_coverage(
         command=cmd,
         phase="coverage",
         copy_in=copy_in if copy_in else None,
-        copy_out=("/tmp/cov/coverage.json", cov_work / "coverage.json"),
+        copy_out=(f"/tmp/cov/{report_name}", cov_work / report_name),
     )
     copy_in_ok = bool(getattr(result, "copy_in_ok", True))
     copy_out_ok = bool(getattr(result, "copy_out_ok", True))
-    cov_path = cov_work / "coverage.json"
+    cov_path = cov_work / report_name
     # Parse the executed-file count from the HGB_INPUTS_REPLAYED marker the eta
     # replay loop writes to stderr.  Fall back to the copy_in count for the
     # legacy -runs=0 replay path.
@@ -1670,7 +1784,8 @@ def verify_g2fuzz_target_triple(afl_binary: Path, cmp_binary: Path, cov_binary: 
 # -- ELFuzz native+coverage SUT builder ------------------------------------
 
 ELFUZZ_NATIVE_ENGINE = "libfuzzer"
-ELFUZZ_COVERAGE_ENGINE = "coverage"
+ELFUZZ_COVERAGE_ENGINE = "libfuzzer"
+ELFUZZ_COVERAGE_SANITIZER = "coverage"
 
 
 def _elfuzz_build_args(*, engine: str, sanitizer: str) -> list[str]:
@@ -1679,16 +1794,22 @@ def _elfuzz_build_args(*, engine: str, sanitizer: str) -> list[str]:
     The FuzzBench base-builder ``compile`` script reads ``FUZZING_ENGINE`` and
     ``SANITIZER`` build args and invokes the benchmark ``build.sh`` with the
     matching ``CC``/``CXX``/``FUZZER_LIB``/``SRC``/``WORK``/``OUT`` environment,
-    producing ``/out/<fuzz_target>``.  The native variant uses the libFuzzer
-    engine (one-input execution via ``@@``); the coverage variant uses the
-    FuzzBench coverage engine, which instruments with
-    ``-fprofile-instr-generate -fcoverage-mapping`` and a replay main.
+    producing ``/out/<fuzz_target>``. Both variants use libFuzzer to replay a
+    corpus. The coverage variant uses SANITIZER=coverage for LLVM source-based
+    coverage. HGB_* args reach the appended compile block and distinguish the
+    coverage build from a cached address build.
     """
 
     return [
         "--build-arg", f"FUZZING_ENGINE={engine}",
         "--build-arg", f"SANITIZER={sanitizer}",
         "--build-arg", "ARCHITECTURE=x86_64",
+        "--build-arg", "FUZZING_LANGUAGE=c++",
+        "--build-arg", f"HGB_FUZZING_ENGINE={engine}",
+        "--build-arg", f"HGB_SANITIZER={sanitizer}",
+        "--build-arg", "HGB_ARCHITECTURE=x86_64",
+        "--build-arg", "HGB_FUZZING_LANGUAGE=c++",
+        "--build-arg", f"HGB_BUILD_VARIANT={sanitizer}-{engine}",
     ]
 
 

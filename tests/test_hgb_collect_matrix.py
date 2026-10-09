@@ -74,6 +74,14 @@ def test_extract_ckgfuzzer_row_eta_paper_equivalent() -> None:
     assert row["coverage_report_path"] == "/tmp/coverage.json"
 
 
+def test_extract_ckgfuzzer_row_rejects_source_derived_rescue() -> None:
+    meta = _eta_meta()
+    meta["selected_candidate"]["candidate_path"] = "/tmp/000_hgb_jsoncpp_rescue.cc"
+    row = collector.extract_ckgfuzzer_row(meta)
+    assert row["source_derived_rescue"] is True
+    assert row["paper_equivalent_strict"] is False
+
+
 def test_extract_ckgfuzzer_row_eta_flips_on_coverage_gap() -> None:
     # copy_out_ok False flips the eta gate.
     meta = _eta_meta()

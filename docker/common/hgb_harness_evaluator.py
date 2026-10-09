@@ -157,8 +157,32 @@ def _filter_intended_apis_by_primary_source(intended_apis: list[str], target_roo
     roots = _primary_source_roots(target_root)
     if not roots:
         return intended_apis
-    filtered = [api for api in intended_apis if _symbol_visible_in_roots(api.split("::")[-1], roots)]
-    return filtered
+    # Scan each source file once. The previous per-API scan read and stripped
+    # every PHP/systemd source file hundreds of times before building a single
+    # candidate image.
+    wanted = {
+        api.split("::")[-1].strip() for api in intended_apis
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api.split("::")[-1].strip())
+    }
+    visible: set[str] = set()
+    call_like = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+    for root in roots:
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix.lower() not in SOURCE_TEXT_SUFFIXES:
+                continue
+            try:
+                source = path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for match in call_like.finditer(_source_without_comments_or_strings(source)):
+                symbol = match.group(1)
+                if symbol in wanted:
+                    visible.add(symbol)
+            if visible == wanted:
+                break
+        if visible == wanted:
+            break
+    return [api for api in intended_apis if api.split("::")[-1].strip() in visible]
 
 
 @dataclass
@@ -494,6 +518,10 @@ def evaluate_candidate(
         runner=runner,
     )
     rec.sanitizer_smoke = smoke
+    if smoke.get("timed_out"):
+        hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "failed")
+        rec.error = "sanitizer smoke timed out"
+        return rec
     if smoke.get("misuse_crash"):
         hgb_result.mark_stage(rec.stages, "sanitizer_smoke", "failed")
         rec.error = "sanitizer misuse crash on smoke samples"
@@ -519,6 +547,10 @@ def evaluate_candidate(
         runner=runner,
     )
     rec.campaign = campaign
+    if strict and int(campaign.get("crashes", 0) or 0) > 0:
+        hgb_result.mark_stage(rec.stages, "campaign", "failed")
+        rec.error = "campaign reported a sanitizer or libFuzzer crash"
+        return rec
     if int(campaign.get("execs_done", 0) or 0) <= 0:
         hgb_result.mark_stage(rec.stages, "campaign", "failed")
         rec.error = "campaign recorded execs_done <= 0"
@@ -634,6 +666,15 @@ def evaluate_candidate(
             parser = coverage_parser or hgb_coverage.summarize_coverage_report
             cov_summary = parser(cov_path)
             hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary, cov_path.read_text(encoding="utf-8"))
+        except hgb_coverage.CoverageError as exc:
+            rec.error = f"coverage report invalid: {exc}"
+    elif coverage_report_path and Path(coverage_report_path).is_file():
+        try:
+            cov_path = Path(coverage_report_path)
+            parser = coverage_parser or hgb_coverage.summarize_coverage_report
+            cov_summary = parser(cov_path)
+            hgb_coverage.write_coverage_outputs(candidate_work / "coverage", cov_summary,
+                                                cov_path.read_text(encoding="utf-8", errors="replace"))
         except hgb_coverage.CoverageError as exc:
             rec.error = f"coverage report invalid: {exc}"
     elif raw_text.strip():

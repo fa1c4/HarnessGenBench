@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -545,8 +546,8 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
         # inherits the paper-faithful budget and, like reproduction-gamma,
         # rejects a prebuilt ELFUZZ_TARGET_BINARY and requires a real
         # coverage-instrumented replay.
-        strict = profile in {"reproduction-gamma", "reproduction-delta", "reproduction-epsilon", "reproduction-zeta", "reproduction-eta"}
-        zeta = profile in {"reproduction-zeta", "reproduction-eta"}
+        strict = True
+        zeta = profile in {"paper-faithful", "reproduction-zeta", "reproduction-eta"}
         budget = {
             "profile": profile,
             "evolution_iterations": env_int("ELFUZZ_EVOLUTION_ITERATIONS", 50),
@@ -594,8 +595,9 @@ def budget_for_profile(profile: str, env: dict[str, str] | None = None) -> dict[
         "tgi_waiting_seconds": env_int("ELFUZZ_TGI_WAITING_SECONDS", 1200),
         "excluded_from_aggregate": False,
         "paper_core": False,
-        "reject_prebuilt_binary": False,
-        "require_coverage_build": False,
+        "reject_prebuilt_binary": True,
+        "require_coverage_build": True,
+        "require_containerized_sut_runtime": True,
         "method_variant": "alpha",
         "source": "alpha-defaults",
     }
@@ -1086,6 +1088,16 @@ class ELFuzzPipeline:
         # The workspace is the per-target run directory; the SUT tree is nested.
         return self.workspace / "sut"
 
+    def _docker_host_path(self, path: Path) -> Path:
+        """Translate a workspace path to the matching host bind mount path."""
+        host_workspace = os.environ.get("HGB_WORKSPACE_HOST")
+        if host_workspace:
+            try:
+                return Path(host_workspace) / path.resolve().relative_to(self.workspace.resolve())
+            except ValueError:
+                pass
+        return path.resolve()
+
     def _benchmark_dir(self) -> Path:
         """Resolve the exact FuzzBench benchmark directory for this target."""
 
@@ -1104,6 +1116,7 @@ class ELFuzzPipeline:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
             import hgb_fuzzbench_builder  # type: ignore
         engine = hgb_fuzzbench_builder.ELFUZZ_NATIVE_ENGINE if variant == "native" else hgb_fuzzbench_builder.ELFUZZ_COVERAGE_ENGINE
+        sanitizer = os.environ.get("ELFUZZ_SANITIZER", "address") if variant == "native" else hgb_fuzzbench_builder.ELFUZZ_COVERAGE_SANITIZER
         sut_root = self._sut_root()
         work_dir = sut_root / variant
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -1121,7 +1134,7 @@ class ELFuzzPipeline:
             runner=self.runner,
             timeout_seconds=stage_timeout(3600),
             engine=engine,
-            sanitizer=os.environ.get("ELFUZZ_SANITIZER", "address"),
+            sanitizer=sanitizer,
         )
         # Persist the build log under the canonical build_logs path.
         logs_dir = sut_root / "build_logs"
@@ -1919,7 +1932,9 @@ class ELFuzzPipeline:
         timeout = timeout or int(self.adapter.get("timeout_seconds", 5))
         import tempfile
 
-        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        input_dir = self.workspace / "target" / "validation_inputs"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=input_dir, delete=False) as tmp:
             tmp.write(sample)
             sample_path = Path(tmp.name)
         try:
@@ -1932,16 +1947,19 @@ class ELFuzzPipeline:
                 binary = f"/out/{fuzz_target}" if fuzz_target else str(self.target_binary)
                 if native_tag:
                     abs_input = str(sample_path.resolve())
+                    host_input = str(self._docker_host_path(sample_path))
                     if input_mode == "stdin":
-                        shell = f"cat {abs_input} | {binary}"
-                        cmd = ["docker", "run", "--rm", "-i", "-v", f"{abs_input}:{abs_input}:ro", native_tag, "sh", "-lc", shell]
+                        shell = f"cat {shlex.quote(abs_input)} | {shlex.quote(binary)}"
+                        cmd = ["docker", "run", "--rm", "-i", "-v", f"{host_input}:{abs_input}:ro", native_tag, "sh", "-lc", shell]
                     else:
-                        args = " ".join(a if a != "@@" else abs_input for a in argv)
-                        shell = f"{binary} {args}"
-                        cmd = ["docker", "run", "--rm", "-v", f"{abs_input}:{abs_input}:ro", native_tag, "sh", "-lc", shell]
+                        args = " ".join(shlex.quote(a if a != "@@" else abs_input) for a in argv)
+                        shell = f"{shlex.quote(binary)} {args}"
+                        cmd = ["docker", "run", "--rm", "-v", f"{host_input}:{abs_input}:ro", native_tag, "sh", "-lc", shell]
                     try:
                         result = self.runner(cmd, timeout)
-                        return {"ran": True, "exit_code": getattr(result, "exit_code", 0), "timed_out": False, "containerized": True}
+                        exit_code = getattr(result, "exit_code", 0)
+                        return {"ran": True, "exit_code": exit_code, "timed_out": exit_code == 124, "containerized": True,
+                                "stderr": str(getattr(result, "stderr", ""))[-1000:]}
                     except Exception as exc:
                         return {"ran": False, "exit_code": 127, "timed_out": False, "error": str(exc), "containerized": True}
             if input_mode == "stdin":
@@ -1983,7 +2001,12 @@ class ELFuzzPipeline:
             "sample_b": res_b,
             "distinguishable": res_a.get("exit_code") == res_b.get("exit_code"),
             "missing_input_invocation": missing,
-            "valid": bool(res_a.get("ran") and res_b.get("ran")),
+            "valid": bool(
+                res_a.get("ran") and res_b.get("ran")
+                and res_a.get("exit_code") in (0, 1)
+                and res_b.get("exit_code") in (0, 1)
+                and not res_a.get("timed_out") and not res_b.get("timed_out")
+            ),
         }
         json_dump(self.workspace / "target" / "input_contract.json", contract)
         return contract
@@ -2238,15 +2261,29 @@ class ELFuzzPipeline:
         if not cov_bin or not Path(cov_bin).is_file():
             return {"exit_code": 127, "report_path": None, "inputs_replayed": 0, "raw_text": ""}
         inputs_replayed = sum(1 for p in corpus_dir.iterdir() if p.is_file()) if corpus_dir.is_dir() else 0
-        cov_json = work_dir / "coverage.json"
-        cmd = [
-            "sh", "-lc",
-            f"set -e; mkdir -p /tmp/cov; cp -r {corpus_dir}/. /tmp/corpus/ 2>/dev/null || true; "
-            f"LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw {cov_bin} -runs=0 /tmp/corpus && "
-            f"llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && "
-            f"llvm-cov export -format=text {cov_bin} -instr-profile=/tmp/cov/merged.profdata "
-            f"> {cov_json} 2>/tmp/cov/cov.err; cat {cov_json}",
-        ]
+        raw_report = work_dir / "coverage.lcov"
+        if bool(self.budget.get("require_containerized_sut_runtime")):
+            coverage_tag = str(self.sut_record.get("coverage", {}).get("image_tag", ""))
+            fuzz_target = str(self.sut_record.get("fuzz_target", ""))
+            if not coverage_tag or not fuzz_target:
+                return {"exit_code": 127, "report_path": None, "inputs_replayed": 0, "raw_text": ""}
+            image_binary = f"/out/{fuzz_target}"
+            cmd = [
+                "docker", "run", "--rm", "-v", f"{self._docker_host_path(corpus_dir)}:/tmp/corpus:ro",
+                coverage_tag, "sh", "-lc",
+                f"set -e; mkdir -p /tmp/cov; "
+                f"LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw {image_binary} -runs=0 /tmp/corpus >/tmp/cov/run.log 2>&1; "
+                f"llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw; "
+                f"llvm-cov export -summary-only -format=text {image_binary} -instr-profile=/tmp/cov/merged.profdata",
+            ]
+        else:
+            cmd = [
+                "sh", "-lc",
+                f"set -e; mkdir -p /tmp/cov /tmp/corpus; cp -r {corpus_dir}/. /tmp/corpus/; "
+                f"LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw {cov_bin} -runs=0 /tmp/corpus >/tmp/cov/run.log 2>&1; "
+                f"llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw; "
+                f"llvm-cov export -summary-only -format=text {cov_bin} -instr-profile=/tmp/cov/merged.profdata",
+            ]
         try:
             result = self.runner(cmd, 600)
         except Exception as exc:
@@ -2256,9 +2293,9 @@ class ELFuzzPipeline:
             encoding="utf-8",
         )
         report_text = getattr(result, "stdout", "") or ""
-        if report_text.strip().startswith("{"):
-            cov_json.write_text(report_text, encoding="utf-8")
-        report_path = cov_json if cov_json.is_file() and cov_json.read_text(encoding="utf-8", errors="replace").strip() else None
+        if report_text.strip() and getattr(result, "exit_code", 0) == 0:
+            raw_report.write_text(report_text, encoding="utf-8")
+        report_path = raw_report if raw_report.is_file() and raw_report.read_text(encoding="utf-8", errors="replace").strip() else None
         return {
             "exit_code": getattr(result, "exit_code", 0),
             "report_path": str(report_path) if report_path else None,

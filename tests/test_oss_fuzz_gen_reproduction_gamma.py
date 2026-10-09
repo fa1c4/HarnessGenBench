@@ -37,6 +37,29 @@ hgb_target_package = _load_module("hgb_target_package_gamma", "docker/common/hgb
 matrix_collector = _load_module("hgb_collect_matrix_gamma", "scripts/hgb_collect_matrix.py")
 
 
+@pytest.mark.parametrize(
+    ("name", "signature", "path", "reason"),
+    [
+        ("EXTRACT_BE_U_2", "uint16_t EXTRACT_BE_U_2(const void *)", "/src/libpcap/extract.h", "macro_like_name"),
+        ("_tj3LoadImageFromFileHandle12", "void _tj3LoadImageFromFileHandle16(void)", "/src/libjpeg/turbojpeg.c", "signature_name_mismatch"),
+        ("file_uncompress", "int file_uncompress(char *)", "/src/minigzip_fuzzer.c", "fuzz_driver_source"),
+        ("pcap_open_dead", "pcap_t * pcap_open_dead(int, int)", "/src/libpcap/pcap.c", ""),
+    ],
+)
+def test_introspector_rejects_unlinkable_api_names(name, signature, path, reason):
+    record = {"name": name, "signature": signature, "path": path}
+    assert ofg_introspector.reject_reason(record) == reason
+
+
+def test_systemd_explicitly_skips_unsupported_upstream_introspector():
+    overrides = ofg_profile.load_target_overrides(REPO_ROOT / "metadata")
+    systemd = overrides["targets"]["systemd_fuzz-link-parser"]
+    assert systemd["applicability"] == "not_applicable"
+    assert systemd["applicability_reason"] == "upstream_fuzz_introspector_unsupported"
+    entrypoint = (REPO_ROOT / "docker/oss-fuzz-gen/entrypoint.sh").read_text(encoding="utf-8")
+    assert entrypoint.index('if [[ -n "$ofg_scope_reason" ]]') < entrypoint.index('if ! hgb_api_key_present; then')
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

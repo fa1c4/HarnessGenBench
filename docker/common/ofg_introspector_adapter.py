@@ -144,6 +144,14 @@ def reject_reason(record: dict[str, Any]) -> str:
         return "empty_api_candidate"
     if len(name) <= 1:
         return "generic_single_letter_api"
+    # Introspector may report preprocessor macros as functions. A generated
+    # driver cannot link an out-of-line call to one of these names.
+    if re.fullmatch(r"[A-Z][A-Z0-9_]*", name):
+        return "macro_like_name"
+    # Some reports carry a display name that differs from the declaration.
+    # Such a name gives the generator a symbol that does not exist.
+    if sig and re.search(r"\b" + re.escape(name) + r"\s*\(", sig) is None:
+        return "signature_name_mismatch"
     if name.endswith("::") or name.endswith(":") or "(anonymous" in name:
         return "malformed_name"
     if name.count("::") > 6 or len(name) > 200:
@@ -161,6 +169,9 @@ def reject_reason(record: dict[str, Any]) -> str:
     for part in BAD_PATH_PARTS:
         if part in path:
             return "irrelevant_source_path"
+    basename = path.rsplit("/", 1)[-1]
+    if "fuzz" in basename or basename.startswith("minigzip"):
+        return "fuzz_driver_source"
     return ""
 
 

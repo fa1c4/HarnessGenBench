@@ -51,6 +51,11 @@ def _post_upstream(url: str, key: str, oa_req: dict) -> tuple[dict, int]:
                 return json.loads(resp.read()), int(resp.getcode())
         except urllib.error.HTTPError as exc:
             if exc.code in retry_codes and attempt < max_attempts - 1:
+                try:
+                    import hgb_llm_trace
+                    hgb_llm_trace.record_retry(stage="elfuzz")
+                except ImportError:
+                    pass
                 delay = min(cap_delay, base_delay * (2 ** attempt))
                 time.sleep(delay)
                 continue
@@ -121,6 +126,11 @@ class TGIProxyHandler(BaseHTTPRequestHandler):
         url = f"{base}/v1/chat/completions"
         try:
             oa_resp, _ = _post_upstream(url, key, oa_req)
+            try:
+                import hgb_llm_trace
+                hgb_llm_trace.record_usage_only(oa_resp)
+            except ImportError:
+                pass
         except urllib.error.HTTPError as exc:
             err_body = exc.read().decode("utf-8", "replace")[:2000]
             self._json(exc.code, {"error": err_body})

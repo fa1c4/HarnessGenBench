@@ -27,6 +27,11 @@ OF_DECL_RE = re.compile(
     r"([A-Za-z_][A-Za-z0-9_:]*)\s+OF\s*\(\((.*?)\)\)\s*;",
     re.S,
 )
+FT_EXPORT_RE = re.compile(
+    r"\bFT_EXPORT\s*\(\s*([^()]+?)\s*\)\s*"
+    r"(FT_[A-Za-z0-9_]+)\s*\((.*?)\)\s*;",
+    re.S,
+)
 SKIP = {
     "if",
     "for",
@@ -177,7 +182,7 @@ def regex_records(source: Path, limit: int) -> list[dict[str, Any]]:
             text = strip_comments(path.read_text(encoding="utf-8", errors="replace"))
         except OSError:
             continue
-        matches = list(OF_DECL_RE.finditer(text)) + list(DECL_RE.finditer(text))
+        matches = list(FT_EXPORT_RE.finditer(text)) + list(OF_DECL_RE.finditer(text)) + list(DECL_RE.finditer(text))
         for match in matches:
             return_type, name, params = match.groups()
             short_name = name.split("::")[-1]
@@ -296,7 +301,29 @@ def select_records(
     api_report: str = "",
     report_mode: str = "report_first",
     allow_name_only_report_apis: bool = False,
+    public_freetype_apis: bool = False,
+    public_libxml_parser_apis: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if public_freetype_apis:
+        # FreeType declares its callable APIs through FT_EXPORT in the main
+        # public header. Its bundled gzip and internal headers contain many
+        # function-looking declarations that a driver cannot include safely.
+        raw = [
+            record for record in raw
+            if str(record.get("path") or "").replace("\\", "/") == "include/freetype/freetype.h"
+            and str(record.get("name") or "").startswith("FT_")
+        ]
+    if public_libxml_parser_apis:
+        # The XML target consumes documents. Keep its public parser interface
+        # and document destructor, not unrelated list/entity internals.
+        raw = [
+            record for record in raw
+            if str(record.get("path") or "").replace("\\", "/") == "include/libxml/parser.h"
+            or (
+                str(record.get("path") or "").replace("\\", "/") == "include/libxml/tree.h"
+                and str(record.get("name") or "") == "xmlFreeDoc"
+            )
+        ]
     report_metadata: dict[str, Any] = {}
     if report_mode != "dynamic_only":
         report_names, report_metadata = select_report_api_names(
@@ -364,6 +391,23 @@ def select_records(
         reference_dir=reference_dir,
         keep_rejected=keep_rejected,
     )
+    if public_freetype_apis:
+        # Drive the in-memory font parsing path first. It consumes fuzzer
+        # bytes directly and needs only a small lifecycle API set.
+        preferred = (
+            "FT_Init_FreeType", "FT_New_Memory_Face",
+            "FT_Load_Char", "FT_Done_Face",
+        )
+        priority = {name: index for index, name in enumerate(preferred)}
+        ranked.sort(key=lambda record: priority.get(str(record.get("name") or ""), len(priority)))
+    if public_libxml_parser_apis:
+        preferred = (
+            "xmlReadMemory", "xmlCtxtReadMemory", "xmlParseMemory", "xmlReadDoc",
+            "xmlParseDoc", "xmlFreeDoc", "xmlInitParser", "xmlCleanupParser",
+            "xmlNewParserCtxt", "xmlFreeParserCtxt", "xmlCtxtReadDoc", "xmlReadFile",
+        )
+        priority = {name: index for index, name in enumerate(preferred)}
+        ranked.sort(key=lambda record: priority.get(str(record.get("name") or ""), len(priority)))
     reference_calls = load_reference_calls(reference_dir)
     direct = [
         record for record in ranked
@@ -418,6 +462,8 @@ def main() -> int:
         choices=("report_first", "report_only", "dynamic_only"),
     )
     parser.add_argument("--allow-name-only-report-apis", action="store_true")
+    parser.add_argument("--public-freetype-apis", action="store_true")
+    parser.add_argument("--public-libxml-parser-apis", action="store_true")
     parser.add_argument(
         "--selection-mode",
         default=os.environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"),
@@ -444,6 +490,8 @@ def main() -> int:
         api_report=args.api_report,
         report_mode=args.report_mode,
         allow_name_only_report_apis=args.allow_name_only_report_apis,
+        public_freetype_apis=args.public_freetype_apis,
+        public_libxml_parser_apis=args.public_libxml_parser_apis,
     )
     if args.details:
         data = selected

@@ -146,6 +146,7 @@ targets:
     compile_db_capture_method: bear_replay
     library_output_glob: [libphp.a]
     build_timeout: 3000
+    eval_build_timeout: 3600
     # PHP's target build and full evaluation are very slow; bound generation
     # and evaluate fewer finalized drivers so the run completes within the
     # outer container timeout.

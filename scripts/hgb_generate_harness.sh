@@ -119,7 +119,30 @@ fi
 [[ "$save_mode" == "compact" || "$save_mode" == "debug" ]] || die "--save-mode must be compact or debug"
 
 root="$(repo_root)"
+if [[ "$generator" == "promefuzz" && -z "${HGB_API_KEY_CONFIG:-}" && -f "$root/configs/set_api_key_ds.sh" ]]; then
+  export HGB_API_KEY_CONFIG="$root/configs/set_api_key_ds.sh"
+fi
+if [[ "$generator" == "promefuzz" && "${HGB_API_KEY_CONFIG:-}" == "$root/configs/set_api_key_ds.sh" ]]; then
+  # The outer compatibility runner may have already resolved another config
+  # into these higher-priority variables. Let the explicitly selected DS file
+  # supply all three values before hgb_resolve_llm_provider runs again.
+  unset HGB_LLM_API_KEY USTC_API_KEY OPENAI_API_KEY
+  unset HGB_LLM_BASE_URL USTC_BASE_URL USTC_API_BASE OPENAI_BASE_URL
+  unset HGB_LLM_MODEL OPENAI_MODEL
+fi
 load_hgb_config
+
+# The DS credential file configures the chat model only. PromeFuzz also needs
+# its independent local embedding service for API selection and generation.
+# Keep caller-provided embedding settings when a different service is used.
+if [[ "$generator" == "promefuzz" ]]; then
+  export PROME_FUZZ_EMBEDDING_LLM_TYPE="${PROME_FUZZ_EMBEDDING_LLM_TYPE:-openai}"
+  export PROME_FUZZ_EMBEDDING_MODEL="${PROME_FUZZ_EMBEDDING_MODEL:-text-embeddings-inference}"
+  export PROME_FUZZ_EMBEDDING_BASE_URL="${PROME_FUZZ_EMBEDDING_BASE_URL:-http://host.docker.internal:18080/v1}"
+  export PROME_FUZZ_EMBEDDING_API_KEY="${PROME_FUZZ_EMBEDDING_API_KEY:-local}"
+  export PROME_FUZZ_EMBEDDING_TIMEOUT="${PROME_FUZZ_EMBEDDING_TIMEOUT:-300}"
+  export PROME_FUZZ_EMBEDDING_RETRY_TIMES="${PROME_FUZZ_EMBEDDING_RETRY_TIMES:-5}"
+fi
 
 # Host-side ELFuzz classification gate: contractually Invalid (non-text) targets
 # are resolved from the committed manifest before artifact checkout, Docker
@@ -134,6 +157,7 @@ if [[ "$generator" == "elfuzz" ]]; then
     ensure_dir "$workspace/logs"
     python3 "$root/docker/common/elfuzz_target_pipeline.py" write-invalid --target "$target" --metadata-root "$root/metadata" --out "$workspace/result.json" >/dev/null
     cp "$workspace/result.json" "$workspace/metadata.json"
+    python3 "$root/docker/common/hgb_record_statistics.py" --workspace "$workspace" --baseline "$generator" --target "$target" --run-id "$run_id" --exit-code 0
     printf 'Invalid: ELFuzz supports text-input targets only\n' >&2
     printf '%s\n' "$workspace"
     exit 0
@@ -165,6 +189,23 @@ fuzz_target="$(extract_json_string fuzz_target "$manifest")"
 
 workspace="$(workspace_generator_target_run_dir "$generator" "$target" "$run_id" "$root")"
 ensure_dir "$workspace/logs"
+
+record_statistics_on_exit() {
+  local exit_code=$?
+  trap - EXIT
+  if [[ "$generator" == "promefuzz" ]]; then
+    if ! python3 "$root/docker/common/hgb_reconcile_promefuzz_result.py" --workspace "$workspace"; then
+      log "PromeFuzz evaluator result reconciliation failed for $target/$run_id"
+    fi
+  fi
+  if ! python3 "$root/docker/common/hgb_record_statistics.py" --workspace "$workspace" --baseline "$generator" --target "$target" --run-id "$run_id" --exit-code "$exit_code"; then
+    log "statistics collection failed for $generator/$target/$run_id"
+  fi
+}
+trap record_statistics_on_exit EXIT
+if ! python3 "$root/docker/common/hgb_record_statistics.py" --workspace "$workspace" --baseline "$generator" --target "$target" --run-id "$run_id" --status running; then
+  log "statistics initialization failed for $generator/$target/$run_id"
+fi
 
 # Self-heal the local embedding service for embedding-backed generators so a
 # stopped container does not fail the run closed.
@@ -203,6 +244,9 @@ fi
   printf 'image=%s\n' "$image"
   printf 'target_layout=%s\n' "$target_layout"
   printf 'save_mode=%s\n' "$save_mode"
+  if [[ "$generator" == "promefuzz" ]]; then
+    printf 'api_key_config=%s\n' "${HGB_API_KEY_CONFIG:-$root/configs/set_api_key.sh}"
+  fi
 } >"$workspace/host_command.txt"
 
 export HGB_DRY_RUN="$dry_run"

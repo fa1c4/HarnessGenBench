@@ -155,7 +155,7 @@ load_hgb_config() {
     CKGFUZZER_API_SELECTION_MODE
   )
   root="$(repo_root)"
-  config="$root/configs/set_api_key.sh"
+  config="${HGB_API_KEY_CONFIG:-$root/configs/set_api_key.sh}"
   legacy_env="$root/.env"
 
   for _hgb_name in "${_hgb_preserve_names[@]}"; do
@@ -230,14 +230,32 @@ extract_json_string() {
   local key="$1"
   local file="$2"
   [[ -f "$file" ]] || return 0
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" "$file" | head -n 1
+  python3 - "$key" "$file" <<'PY'
+import json
+import sys
+try:
+    value = json.load(open(sys.argv[2], encoding="utf-8")).get(sys.argv[1], "")
+except (OSError, ValueError):
+    value = ""
+if isinstance(value, (str, int, float)) and not isinstance(value, bool):
+    print(value)
+PY
 }
 
 extract_json_number() {
   local key="$1"
   local file="$2"
   [[ -f "$file" ]] || return 0
-  sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$file" | head -n 1
+  python3 - "$key" "$file" <<'PY'
+import json
+import sys
+try:
+    value = json.load(open(sys.argv[2], encoding="utf-8")).get(sys.argv[1])
+except (OSError, ValueError):
+    value = None
+if isinstance(value, (int, float)) and not isinstance(value, bool):
+    print(value)
+PY
 }
 
 artifact_commit() {
@@ -337,9 +355,10 @@ hgb_embedding_base_url_in_use() {
 }
 
 hgb_embedding_probe_ok() {
-  curl -sS --max-time 10 http://127.0.0.1:18080/v1/embeddings \
-    -H 'Content-Type: application/json' \
-    -d '{"model":"text-embeddings-inference","input":"ping"}' 2>/dev/null | grep -q '"embedding"'
+  # TEI can spend minutes embedding large documents while its health endpoint
+  # remains responsive. A timed-out sample request must not restart a healthy
+  # container and discard in-flight work from other parallel generators.
+  curl -fsS --max-time 5 http://127.0.0.1:18080/health >/dev/null 2>&1
 }
 
 hgb_ensure_embedding_service() {
@@ -347,7 +366,7 @@ hgb_ensure_embedding_service() {
   hgb_embedding_probe_ok && return 0
   local container="hgb-local-embedding" deadline
   if docker inspect "$container" >/dev/null 2>&1; then
-    log "restarting local embedding service container: $container"
+    log "starting local embedding service container: $container"
     timeout 60 docker start "$container" >/dev/null 2>&1 || true
   else
     log "starting local embedding service via scripts/local_embedding_server.sh"

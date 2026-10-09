@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import uuid
+import fcntl
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -204,19 +205,83 @@ def _read_summary(root: Path) -> dict[str, Any]:
         }
 
 
-def _write_summary(root: Path, sampled: bool) -> None:
-    summary = _read_summary(root)
-    summary["schema_version"] = SCHEMA_VERSION
-    summary["total_count"] = int(summary.get("total_count") or 0) + 1
-    if sampled:
-        summary["sample_count"] = int(summary.get("sample_count") or 0) + 1
-    summary["sample_rate"] = str(sample_rate())
-    summary["trace_file"] = str(_samples_path(root))
-    summary["updated_at"] = datetime.now(timezone.utc).isoformat()
-    _summary_path(root).write_text(
-        json.dumps(summary, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+def _usage_value(value: Any, *names: str) -> int | None:
+    for name in names:
+        item = value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            return item
+    return None
+
+
+def token_usage(response: Any, usage: Any = None) -> tuple[int | None, int | None]:
+    """Read billed token counts; never estimate from prompt or response text."""
+    candidates = [usage, usage_from_response(response), response]
+    for candidate in candidates:
+        for _ in range(3):
+            if candidate is None:
+                break
+            read = _usage_value(candidate, "prompt_tokens", "input_tokens")
+            written = _usage_value(candidate, "completion_tokens", "output_tokens")
+            if read is not None or written is not None:
+                return read, written
+            candidate = (candidate.get("raw") or candidate.get("usage")) if isinstance(candidate, dict) else (getattr(candidate, "raw", None) or getattr(candidate, "usage", None))
+    return None, None
+
+
+def _update_summary(root: Path, update: dict[str, int], *, sampled: bool = False) -> None:
+    # Several generator workers can write the same run's trace concurrently.
+    with (root / "summary.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        summary = _read_summary(root)
+        summary["schema_version"] = SCHEMA_VERSION
+        summary["usage_accounting_version"] = 1
+        for key, amount in update.items():
+            summary[key] = int(summary.get(key) or 0) + amount
+        if sampled:
+            summary["sample_count"] = int(summary.get("sample_count") or 0) + 1
+        summary["sample_rate"] = str(sample_rate())
+        summary["trace_file"] = str(_samples_path(root))
+        summary["updated_at"] = datetime.now(timezone.utc).isoformat()
+        temporary = root / f"summary.{os.getpid()}.{threading.get_ident()}.tmp"
+        temporary.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temporary, _summary_path(root))
+
+
+def record_retry(*, stage: str = "llm") -> None:
+    """Record a retry decision made by a baseline's own retry loop."""
+    try:
+        root = trace_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        _update_summary(root, {"retry_count": 1})
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"retry counter failed ({stage}): {exc}")
+
+
+def record_driver_fix(*, stage: str = "driver") -> None:
+    """Count one attempted generated-driver revision by the baseline."""
+    try:
+        root = trace_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        _update_summary(root, {"driver_fix_rounds": 1})
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"driver fix counter failed ({stage}): {exc}")
+
+
+def record_usage_only(response: Any) -> None:
+    """Capture usage when an upstream wrapper returns text instead of the response."""
+    try:
+        root = trace_dir()
+        root.mkdir(parents=True, exist_ok=True)
+        read, written = token_usage(response)
+        _update_summary(root, {
+            "input_tokens": read or 0,
+            "output_tokens": written or 0,
+            "input_usage_missing_count": int(read is None),
+            "output_usage_missing_count": int(written is None),
+            "usage_only_count": 1,
+        })
+    except Exception as exc:  # noqa: BLE001
+        _warn(f"usage counter failed: {exc}")
 
 
 def usage_from_response(response: Any) -> Any:
@@ -248,15 +313,29 @@ def record(
     started_at: float | None = None,
     usage: Any = None,
 ) -> None:
-    """Record one attempted API interaction, sampling full payloads."""
-    if not enabled():
-        return
+    """Count every API interaction; sample full payloads only when enabled."""
     sequence = _next_sequence()
     reason = sample_decision(sequence)
     root = trace_dir()
     try:
         root.mkdir(parents=True, exist_ok=True)
-        _write_summary(root, bool(reason))
+        read_tokens, written_tokens = token_usage(response, usage)
+        if stage == "oss-fuzz-gen":
+            # The upstream method wrapper may return text or a raw response.
+            # Its inner provider call is counted by record_usage_only().
+            read_tokens, written_tokens = None, None
+        counters = {"total_count": 1}
+        if error is not None:
+            counters["error_count"] = 1
+        else:
+            counters["input_tokens"] = read_tokens or 0
+            counters["output_tokens"] = written_tokens or 0
+            # OSS-Fuzz-Gen's outer method returns only text. Its inner provider
+            # call is accounted for by record_usage_only().
+            outer_text = stage == "oss-fuzz-gen"
+            counters["input_usage_missing_count"] = int(read_tokens is None and not outer_text)
+            counters["output_usage_missing_count"] = int(written_tokens is None and not outer_text)
+        _update_summary(root, counters, sampled=bool(reason))
         if not reason:
             return
         now = time.time()
@@ -390,4 +469,3 @@ def throttle(*, stage: str = "llm", min_interval: float | None = None) -> None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
     except OSError:
         return
-

@@ -1389,6 +1389,30 @@ if openai_path.exists():
         text = text.replace(old, new, 1)
     openai_path.write_text(text)
 PY_CKG_LLM_TRACE_PATCH
+  python3 - "$artifact/fuzzing_llm_engine/roles/compilation_fix_agent.py" <<'PY_CKG_FIX_COUNTER_PATCH'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+if path.is_file():
+    source = path.read_text()
+    marker = "    def fix_compilation(self, error, code):"
+    if marker in source and "hgb_llm_trace.record_driver_fix" not in source:
+        source = source.replace(
+            marker,
+            marker + "\n"
+            "        try:\n"
+            "            import sys\n"
+            "            if '/opt/hgb/bin' not in sys.path:\n"
+            "                sys.path.insert(0, '/opt/hgb/bin')\n"
+            "            import hgb_llm_trace\n"
+            "            hgb_llm_trace.record_driver_fix(stage='ckgfuzzer')\n"
+            "        except ImportError:\n"
+            "            pass",
+            1,
+        )
+        path.write_text(source)
+PY_CKG_FIX_COUNTER_PATCH
   ckg_runtime_patch_log="$workspace/logs/runtime_patch.log"
   if ! python3 /opt/hgb/bin/ckgfuzzer_runtime_patch.py "$artifact" >"$ckg_runtime_patch_log" 2>&1; then
     cat "$ckg_runtime_patch_log" >&2 || true
@@ -2109,7 +2133,9 @@ PY_CKG_COMBINED_GRAPH_COUNTS_POST_CACHE
       hgb_result_set_stage "$workspace/stages.json" knowledge_graph completed
     fi
   fi
-  if [[ "$code" == "0" && "${CKGFUZZER_RESCUE_FIRST:-1}" == "1" ]]; then
+  # Source-derived HGB rescue drivers are compatibility diagnostics. A
+  # method-faithful run must execute upstream fuzzing.py and its repair loop.
+  if [[ "$code" == "0" && "$ckg_method_faithful" != "1" && "${CKGFUZZER_RESCUE_FIRST:-0}" == "1" ]]; then
     rescue_candidates_json="$workspace/logs/rescue_candidates.pre_fuzzing.json"
     if PYTHONPATH="/opt/hgb/bin${PYTHONPATH:+:$PYTHONPATH}" python3 /opt/hgb/bin/ckgfuzzer_rescue_candidates.py         --project "$project"         --fuzz-target "$fuzz_target"         --target-name "$target_name"         --candidates "$workspace/generated_harnesses"         >"$rescue_candidates_json" 2>"$workspace/logs/rescue_candidates.pre_fuzzing.stderr"; then
       generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
@@ -2211,14 +2237,16 @@ PY_CKG_COMBINED_GRAPH_COUNTS_POST_CACHE
     fi
   fi
   rescue_candidates_json="$workspace/logs/rescue_candidates.json"
-  if PYTHONPATH="/opt/hgb/bin${PYTHONPATH:+:$PYTHONPATH}" python3 /opt/hgb/bin/ckgfuzzer_rescue_candidates.py         --project "$project"         --fuzz-target "$fuzz_target"         --target-name "$target_name"         --candidates "$workspace/generated_harnesses"         >"$rescue_candidates_json" 2>"$workspace/logs/rescue_candidates.stderr"; then
-    generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
-    if jq -e '.installed == true' "$rescue_candidates_json" >/dev/null 2>&1; then
-      rescue_candidates_installed=1
-      rescue_candidates_reason="$(jq -r '.reason // ""' "$rescue_candidates_json" 2>/dev/null || printf '')"
+  if [[ "$ckg_method_faithful" != "1" ]]; then
+    if PYTHONPATH="/opt/hgb/bin${PYTHONPATH:+:$PYTHONPATH}" python3 /opt/hgb/bin/ckgfuzzer_rescue_candidates.py         --project "$project"         --fuzz-target "$fuzz_target"         --target-name "$target_name"         --candidates "$workspace/generated_harnesses"         >"$rescue_candidates_json" 2>"$workspace/logs/rescue_candidates.stderr"; then
+      generated_harness_count="$(count_files "$workspace/generated_harnesses" -type f)"
+      if jq -e '.installed == true' "$rescue_candidates_json" >/dev/null 2>&1; then
+        rescue_candidates_installed=1
+        rescue_candidates_reason="$(jq -r '.reason // ""' "$rescue_candidates_json" 2>/dev/null || printf '')"
+      fi
+    else
+      printf 'CKGFuzzer rescue candidate helper failed; continuing with generated candidates.\n' >>"$workspace/logs/rescue_candidates.stderr"
     fi
-  else
-    printf 'CKGFuzzer rescue candidate helper failed; continuing with generated candidates.\n' >>"$workspace/logs/rescue_candidates.stderr"
   fi
   if [[ "${generated_harness_count:-0}" -gt 0 ]]; then
     # Target-specific source-only rescue for Bloaty's real top-level API.  Some
@@ -2227,7 +2255,7 @@ PY_CKG_COMBINED_GRAPH_COUNTS_POST_CACHE
     # generator can see bloaty's public/internal source headers, so replace that
     # known mock pattern with a minimal real-API candidate that calls the actual
     # project implementation and never reads evaluator-only reference harnesses.
-    if [[ "$project" == "bloaty" || "$ckg_project" == "bloaty" || "$ckg_project" == hgb_bloaty_* ]] && grep -Rqs 'BloatyMain' "$ckg_db/api_list.json" "$ckg_db/src/src_api_code.json" 2>/dev/null; then
+    if [[ "$ckg_method_faithful" != "1" ]] && [[ "$project" == "bloaty" || "$ckg_project" == "bloaty" || "$ckg_project" == hgb_bloaty_* ]] && grep -Rqs 'BloatyMain' "$ckg_db/api_list.json" "$ckg_db/src/src_api_code.json" 2>/dev/null; then
       hgb_bloaty_needs_rescue=0
       while IFS= read -r -d '' cand; do
         if grep -Eq 'Forward declarations for Bloaty types|Forward declarations for incomplete types|Mock implementation|mock implementations|Mock InputFileFactory|class Options;|bool BloatyMain\(|set_input_file|set_output_file|DATA_SOURCE_|set_sort_by|set_max_rows|add_source_filter|CreateFromBuffer' "$cand" 2>/dev/null && ! grep -q 'bloaty::BloatyMain' "$cand" 2>/dev/null; then
@@ -2336,7 +2364,7 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
       # Strict reproduction profiles (reproduction-eta and its backward
       # compatible aliases reproduction-zeta, reproduction-epsilon, and
       # reproduction-delta): require nonzero method evidence before evaluation.
-      if [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" ]]; then
+      if [[ "$ckg_method_faithful" == "1" ]]; then
         ckg_method_missing=0
         for ckg_evidence in codeql_db.json api_list.json api_summaries.jsonl api_combinations.jsonl llm_trace.jsonl; do
           if [[ ! -s "$ckg_method_dir/$ckg_evidence" ]]; then
@@ -2344,7 +2372,7 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
             ckg_method_missing=1
           fi
         done
-        if [[ "$ckg_method_missing" == "1" && "${rescue_candidates_installed:-0}" != "1" ]]; then
+        if [[ "$ckg_method_missing" == "1" ]]; then
           code=9
           failed_stage=method_evidence
           status=failed
@@ -2353,11 +2381,9 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
           hgb_write_common_metadata "$status" "$reason" "$code" harness_generator
           hgb_write_common_summary "$status" "$reason" harness_generator
           exit "$code"
-        elif [[ "$ckg_method_missing" == "1" ]]; then
-          printf '%s: allowing source-derived rescue candidate despite incomplete CKG method evidence: %s\n' "$ckg_profile" "$rescue_candidates_reason" >>"$workspace/logs/method_evidence.log"
         fi
         # CodeQL database must have nonzero query results (graph nodes/edges).
-        if [[ "${ckg_codeql_graph_nodes_final:-0}" -le 0 && "${ckg_codeql_graph_edges_final:-0}" -le 0 && "${rescue_candidates_installed:-0}" != "1" ]]; then
+        if [[ "${ckg_codeql_graph_nodes_final:-0}" -le 0 && "${ckg_codeql_graph_edges_final:-0}" -le 0 ]]; then
           code=9
           failed_stage=method_evidence
           status=failed
@@ -2366,8 +2392,6 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
           hgb_write_common_metadata "$status" "$reason" "$code" harness_generator
           hgb_write_common_summary "$status" "$reason" harness_generator
           exit "$code"
-        elif [[ "${ckg_codeql_graph_nodes_final:-0}" -le 0 && "${ckg_codeql_graph_edges_final:-0}" -le 0 ]]; then
-          printf '%s: allowing source-derived rescue candidate despite empty CodeQL graph: %s\n' "$ckg_profile" "$rescue_candidates_reason" >>"$workspace/logs/method_evidence.log"
         fi
       fi
       verification_ran=true
@@ -2535,7 +2559,7 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
       *) status=quality_failure; reason="ckg_evaluator_status=${evaluator_status}" ;;
     esac
   fi
-  if [[ "$code" -ne 0 && "${rescue_candidates_installed:-0}" == "1" && "${evaluator_status:-}" == "evaluated" && -n "${evaluator_cov_lines:-}" && "${evaluator_execs_done:-0}" -gt 0 ]]; then
+  if [[ "$code" -ne 0 && "$ckg_method_faithful" != "1" && "${rescue_candidates_installed:-0}" == "1" && "${evaluator_status:-}" == "evaluated" && -n "${evaluator_cov_lines:-}" && "${evaluator_execs_done:-0}" -gt 0 ]]; then
     printf 'source-derived rescue candidate fully evaluated; overriding upstream CKGFuzzer stage exit %s (%s): %s\n' "$code" "$failed_stage" "$rescue_candidates_reason" >"$workspace/logs/rescue_override.log"
     code=0
     failed_stage=none
@@ -2647,6 +2671,16 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
   fi
   if [[ -z "$ckg_candidate_path" && "${generated_harness_count:-0}" -gt 0 ]]; then
     ckg_candidate_path="$(find "$workspace/generated_harnesses" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) -print -quit 2>/dev/null || true)"
+  fi
+  if [[ "$ckg_method_faithful" == "1" && "$status" == "evaluated" ]]; then
+    if [[ "$(basename "$ckg_candidate_path")" == *hgb_* ]] ||
+       [[ "$analysis_mode" != "codeql" ]] ||
+       [[ "${ckg_codeql_graph_nodes_final:-0}" -le 0 ]]; then
+      code=9
+      status=quality_failure
+      failed_stage=method_evidence
+      reason='ckg_method_evidence_missing: selected source-derived rescue or missing real CodeQL/LLM evidence'
+    fi
   fi
   if [[ -n "$ckg_candidate_path" && -f "$ckg_candidate_path" ]]; then
     ckg_candidate_sha256="$(sha256sum "$ckg_candidate_path" | awk '{print $1}' 2>/dev/null || true)"
