@@ -1013,7 +1013,10 @@ def evaluate(
 
     if seeds is None:
         seeds_dir = target_root / "seeds"
-        seeds = sorted(p for p in seeds_dir.iterdir() if p.is_file()) if seeds_dir.is_dir() else []
+        # Target packages can preserve the benchmark's own ``seeds/``
+        # directory under this wrapper directory (seeds/seeds/*.jpg).
+        # Include those public inputs in both smoke and campaign replay.
+        seeds = sorted(p for p in seeds_dir.rglob("*") if p.is_file()) if seeds_dir.is_dir() else []
     else:
         seeds = [Path(p) for p in seeds if Path(p).is_file()]
     if not seeds:

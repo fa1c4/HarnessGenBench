@@ -305,6 +305,99 @@ PY_OFG_LCMS_PATCH
     sed -i '1i # HGB php build: --enable-pic removed (obsolete in current php master)' "$php_build_sh"
     printf 'ofg_project_patch: php build.sh dropped obsolete --enable-pic\n' >>"$patch_log"
   fi
+  # PHP's GCC optimize-strlen configure probe loops indefinitely when this
+  # pinned revision is compiled by the OSS-Fuzz Clang/ASan toolchain. The
+  # probe checks a GCC-specific optimization, so cache its negative result.
+  if [[ "${HGB_TARGET_PROJECT:-}" == "php" && -f "$php_build_sh" ]] &&
+     ! grep -qF "HGB php clang configure probe" "$php_build_sh"; then
+    "$python" - "$php_build_sh" <<'PY_OFG_PHP_CONFIGURE'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+source = p.read_text(encoding="utf-8")
+needle = "./configure $BUILD_FLAG \\"
+if needle not in source:
+    raise SystemExit("PHP configure invocation changed unexpectedly")
+source = source.replace(needle,
+    "export ac_cv_have_broken_gcc_strlen_opt=no # HGB php clang configure probe\n"
+    "export ASAN_OPTIONS=\"${ASAN_OPTIONS:+$ASAN_OPTIONS:}abort_on_error=1:symbolize=0\" # HGB php configure ASan\n"
+    + needle, 1)
+p.write_text(source, encoding="utf-8")
+PY_OFG_PHP_CONFIGURE
+    printf 'ofg_project_patch: php skipped GCC-only optimize-strlen probe under clang/ASan\n' >>"$patch_log"
+  fi
+  # The floating php master requires autoconf >= 2.71 while the OSS-Fuzz
+  # builder image has 2.69. Use the public FuzzBench target revision for the
+  # generation image as well as for the independent evaluator. This also
+  # keeps the generated driver aligned with the requested PHP target.
+  if [[ "${HGB_TARGET_PROJECT:-}" == "php" ]]; then
+    local php_dockerfile="$oss_fuzz_dir/projects/php/Dockerfile"
+    if [[ -f "$php_dockerfile" && -f /target/source_repos.json ]] &&
+       ! grep -qF "HGB pinned php target revision" "$php_dockerfile"; then
+      if "$python" - "$php_dockerfile" /target/source_repos.json <<'PY_OFG_PHP_PIN'
+import json
+import re
+import sys
+from pathlib import Path
+
+dockerfile = Path(sys.argv[1])
+records = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+commit = next((str(record.get("checked_out_commit") or record.get("revision") or "")
+               for record in records if record.get("is_primary_project")), "")
+if not re.fullmatch(r"[0-9a-f]{40}", commit):
+    raise SystemExit("PHP primary source commit is missing or invalid")
+source = dockerfile.read_text(encoding="utf-8")
+pattern = r"(?m)^(RUN git clone --depth 1 --branch master https://github\.com/php/php-src\.git php-src)$"
+def pin_clone(match):
+    return (match.group(1) + " && " + chr(92) + "\n"
+            + "    git -C php-src fetch --depth 1 origin " + commit
+            + " && " + chr(92) + "\n"
+            + "    git -C php-src checkout --detach " + commit
+            + "\n# HGB pinned php target revision")
+updated, count = re.subn(pattern, pin_clone, source)
+if count != 1:
+    raise SystemExit("PHP Dockerfile clone command changed unexpectedly")
+dockerfile.write_text(updated, encoding="utf-8")
+PY_OFG_PHP_PIN
+      then
+        printf 'ofg_project_patch: php Dockerfile clone pinned to target source revision\n' >>"$patch_log"
+      else
+        return 1
+      fi
+    fi
+  fi
+  # The introspector report may be reused from a sibling run, so pin the
+  # systemd generation image independently of the introspector build path.
+  if [[ "$project" == "systemd" ]]; then
+    local systemd_dockerfile="$oss_fuzz_dir/projects/systemd/Dockerfile"
+    if [[ -f "$systemd_dockerfile" && -f /target/source_repos.json ]] &&
+       ! grep -qF "HGB pinned systemd target revision" "$systemd_dockerfile"; then
+      if "$python" - "$systemd_dockerfile" /target/source_repos.json <<'PY_OFG_SYSTEMD_PIN'
+import json
+import re
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+records = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+commit = next((str(r.get("checked_out_commit") or r.get("revision") or "")
+               for r in records if r.get("is_primary_project")), "")
+if not re.fullmatch(r"[0-9a-f]{40}", commit):
+    raise SystemExit("systemd primary source commit is missing or invalid")
+source = p.read_text(encoding="utf-8")
+old = "RUN git clone --depth 1 https://github.com/systemd/systemd systemd"
+if source.count(old) != 1:
+    raise SystemExit("systemd Dockerfile clone command changed unexpectedly")
+new = ("RUN git clone https://github.com/systemd/systemd systemd && "
+       f"git -C systemd checkout {commit}\n# HGB pinned systemd target revision")
+p.write_text(source.replace(old, new, 1), encoding="utf-8")
+PY_OFG_SYSTEMD_PIN
+      then
+        printf 'ofg_project_patch: systemd Dockerfile clone pinned to target source revision\n' >>"$patch_log"
+      else
+        return 1
+      fi
+    fi
+  fi
 }
 
 prepare_oss_fuzz_venv() {
@@ -569,6 +662,38 @@ p.write_text(text, encoding="utf-8")
 PY_PATCH_JSONCPP
       fi
       ;;
+    systemd)
+      # The pinned systemd source exits immediately for the introspector
+      # sanitizer. Remove only that explicit refusal in the isolated
+      # OSS-Fuzz build container; leave the Meson build and sanitizer flags
+      # intact so this still has to produce a real introspector report.
+      if ! grep -qF 'HGB systemd introspector build' "$build_sh"; then
+        "$python" - "$build_sh" <<'PY_OFG_SYSTEMD_INTROSPECTOR'
+import sys
+from pathlib import Path
+
+p = Path(sys.argv[1])
+source = p.read_text(encoding="utf-8")
+needle = "tools/oss-fuzz.sh\n"
+if needle not in source:
+    raise SystemExit("systemd OSS-Fuzz build command changed unexpectedly")
+patch = '''# HGB systemd introspector build: remove the pinned source's explicit refusal.
+if [[ "${SANITIZER:-}" == introspector ]]; then
+    sed -i '/^    if \\[\\[ "\\$SANITIZER" == introspector \\]\\]; then$/,/^    fi$/d' tools/oss-fuzz.sh
+    # Build the requested fuzzer only; corpus downloads do not affect the
+    # introspector report and can fail independently of compilation.
+    # Meson compiles feature probes with -Werror; the linker-only gold flag
+    # is rejected by Clang in those compile commands. Keep it in LDFLAGS.
+    export CFLAGS="${CFLAGS//-fuse-ld=gold/}"
+    export CXXFLAGS="${CXXFLAGS//-fuse-ld=gold/}"
+    sed -i 's/ninja -v -C "\$build" fuzzers/ninja -v -C "\$build" fuzz-link-parser\\ncp "\$build\/fuzz-link-parser" "\$OUT\/fuzz-link-parser"\\nexit 0/' tools/oss-fuzz.sh
+fi
+'''
+p.write_text(source.replace(needle, patch + needle, 1), encoding="utf-8")
+PY_OFG_SYSTEMD_INTROSPECTOR
+        printf 'ofg_introspector_patch: systemd explicit sanitizer refusal removed in isolated build\n' >>"$workspace/logs/oss_fuzz_project_patches.log"
+      fi
+      ;;
     *) ;;
   esac
   fi
@@ -583,7 +708,9 @@ PY_PATCH_JSONCPP
   local dockerfile="$project_dir/Dockerfile"
   [[ -f "$compile_src" && -f "$dockerfile" ]] || return 0
   local compile_marker="# HGB introspector scoped analysis"
-  if grep -qF "$compile_marker" "$project_dir/hgb_compile" 2>/dev/null || grep -qF "hgb_compile" "$dockerfile"; then
+  if [[ -s "$project_dir/hgb_compile" ]] &&
+     grep -qF "$compile_marker" "$project_dir/hgb_compile" &&
+     grep -qF "hgb_compile" "$dockerfile"; then
     return 0
   fi
   "$python" - "$compile_src" "$project_dir/hgb_compile" "$compile_marker" "$primary_dest" <<'PY_OFG_COMPILE_PATCH'
@@ -598,7 +725,17 @@ light_old = "    python3 /fuzz-introspector/src/main.py light\n"
 if light_old not in text:
     print("no_light_invocation")
     sys.exit(0)
-if primary:
+if primary == "systemd":
+    # FI's source pass otherwise parses every systemd fuzzer and unrelated
+    # subsystem. The compiled target still links against the real project;
+    # restrict only the source-index pass to this target's API and driver.
+    prune_lines = (
+        "    HGB_PRIMARY=systemd\n"
+        "    mkdir -p /tmp/hgb-analysis-src/systemd/src/udev/net\n"
+        "    cp $SRC/systemd/src/udev/net/*.[ch] "
+        "/tmp/hgb-analysis-src/systemd/src/udev/net/\n"
+    )
+elif primary:
     prune_lines = (
         "    HGB_PRIMARY=\"" + primary + "\"\n"
         "    if [ -d $SRC/$HGB_PRIMARY ]; then\n"
@@ -811,6 +948,24 @@ if "export CFLAGS=\"$CFLAGS -g\"\n" in text:
 dst.write_text(text, encoding="utf-8")
 print("patched")
 PY_OFG_COMPILE_PATCH
+  if [[ ! -s "$project_dir/hgb_compile" ]]; then
+    # A different pinned OSS-Fuzz compile script may have no patchable light
+    # invocation. Do not leave a Dockerfile COPY for a file that was never
+    # created: the upstream generator rebuilds this project image per round.
+    "$python" - "$dockerfile" <<'PY_OFG_MISSING_COMPILE'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+lines = [line for line in lines if line.strip() not in {
+    "COPY hgb_compile /usr/local/bin/compile",
+    "RUN chmod +x /usr/local/bin/compile",
+}]
+p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY_OFG_MISSING_COMPILE
+    printf 'ofg_introspector_note: compile wrapper unavailable; project Dockerfile kept buildable\n' >>"$workspace/logs/introspector_build.log"
+    return 0
+  fi
   # COPY the patched compile into the project image (override base-builder).
   "$python" - "$dockerfile" "$compile_marker" <<'PY_OFG_DOCKER_PATCH'
 import sys
@@ -1721,7 +1876,14 @@ PY_OFG_SCOPE
      hgb_write_common_summary failed "$reason" harness_generator
      exit 65
    fi
-   patch_oss_fuzz_projects "$oss_fuzz_dir" || true
+   if ! patch_oss_fuzz_projects "$oss_fuzz_dir"; then
+     reason="ofg_project_patch_failed: could not prepare the public project source at the target revision"
+     hgb_ofg_set_stage target_prepared failed
+     write_final_result failed "$reason" 65
+     hgb_write_common_metadata failed "$reason" 65 harness_generator
+     hgb_write_common_summary failed "$reason" harness_generator
+     exit 65
+   fi
 
    # --- LLM preflight (before any paid request) ---
   if ! ofg_llm_preflight "$workspace/logs/llm_preflight.log"; then
@@ -1757,6 +1919,21 @@ PY_OFG_SCOPE
     exit 65
   fi
   hgb_ofg_set_stage introspector_build completed
+  # hgb_compile is only needed by the introspector image. Upstream's project
+  # preparation removes this extra file before building driver containers,
+  # so restore a buildable Dockerfile for the generation/repair loop.
+  if [[ -f "$oss_fuzz_dir/projects/$project/Dockerfile" ]]; then
+    "$python" - "$oss_fuzz_dir/projects/$project/Dockerfile" <<'PY_OFG_RESTORE_DOCKERFILE'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text(encoding="utf-8").splitlines()
+drop = {"COPY hgb_compile /usr/local/bin/compile", "RUN chmod +x /usr/local/bin/compile"}
+updated = [line for line in lines if line.strip() not in drop]
+if len(updated) != len(lines):
+    p.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY_OFG_RESTORE_DOCKERFILE
+  fi
 
   # --- Synthesize target-aware benchmark YAML (no answer leakage) ---
   generated_yaml="$workspace/benchmark/generated.yaml"
@@ -1801,9 +1978,9 @@ PY_OFG_SCOPE
   if [[ -d "$HGB_GENERATION_WORK_DIR" ]]; then
     # Stage the samples that actually COMPILED in the upstream repair loop
     # (status/<trial>/result.json compiles=true), preferring repaired
-    # (fixed_targets) files, one per function dir up to OFG_NUM_EVALUATIONS.
-    # Staging the first sample of each dir instead feeds the evaluator
-    # candidates the repair loop already rejected.
+    # (fixed_targets) files, up to OFG_NUM_EVALUATIONS. Keep every compiled
+    # trial in that budget because independent target builds may reject one
+    # trial while accepting another.
     "$python" - "$HGB_GENERATION_WORK_DIR" "$workspace/generated_harnesses" \
       "${OFG_NUM_EVALUATIONS:-3}" "$ofg_candidate_ext" <<'PY_OFG_STAGE'
 import json
@@ -1839,13 +2016,12 @@ for fdir in sorted(work.iterdir()):
             src = fuzz_dir / f"{trial}.fuzz_target"
         if src.is_file():
             picks.append((src, trial))
-            break
     if not compiled:
         pool = sorted(fixed_dir.glob("*.fuzz_target")) if fixed_dir.is_dir() else []
         if not pool and fuzz_dir.is_dir():
             pool = sorted(fuzz_dir.glob("*.fuzz_target"))
-        if pool:
-            picks.append((pool[0], pool[0].stem))
+        for src in pool[:cap]:
+            picks.append((src, src.stem))
 n = 0
 for src, trial in picks:
     if n >= cap:

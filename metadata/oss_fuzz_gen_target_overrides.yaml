@@ -111,14 +111,11 @@ targets:
     fuzz_timeout: 600
     preferred_apis: [zend_eval_string, php_json_decode_ex, zend_string_init]
   systemd_fuzz-link-parser:
-    # The pinned systemd tools/oss-fuzz.sh deliberately exits 1 for
-    # SANITIZER=introspector, which OSS-Fuzz-Gen requires for API selection.
-    applicability: not_applicable
-    applicability_reason: upstream_fuzz_introspector_unsupported
     language: c
-    candidate_destination: /src/systemd/src/fuzz/fuzz-link-parser.c
+    candidate_destination: /src/systemd/src/udev/net/fuzz-link-parser.c
     build_timeout: 2400
     fuzz_timeout: 600
+    preferred_apis: [link_load_one, link_config_ctx_new]
   bloaty_fuzz_target:
     language: c++
     candidate_destination: /src/bloaty/fuzz_target.cc

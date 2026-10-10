@@ -16,8 +16,10 @@ import hashlib
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import yaml
 
@@ -317,6 +319,8 @@ def _install_model_compat() -> None:
     # with the requested name overridden (the name is what the API receives
     # as ``model=``), so provider-specific models work unchanged.
     original_setup = llm_models.LLM.__dict__["setup"].__func__
+    base_url = os.getenv("OPENAI_BASE_URL") or os.getenv("BASE_URL") or ""
+    single_completion_provider = urlsplit(base_url).hostname == "api.deepseek.com"
 
     def _hgb_setup(cls, ai_binary, name, max_tokens=None, num_samples=None,
                    temperature=None, temperature_list=None):
@@ -324,7 +328,10 @@ def _install_model_compat() -> None:
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
         if num_samples is not None:
-            kwargs["num_samples"] = num_samples
+            # DeepSeek supports only n=1 on chat.completions. Upstream also
+            # runs args.num_samples independent trials; that trial count is
+            # retained, while each model request returns its one used choice.
+            kwargs["num_samples"] = 1 if single_completion_provider else num_samples
         if temperature is not None:
             kwargs["temperature"] = temperature
         kwargs["temperature_list"] = temperature_list
@@ -360,7 +367,33 @@ def _install_model_compat() -> None:
 
     llm_models.LLM._hgb_model_compat = True
     _record_patch("model_compat", "arbitrary OpenAI-compatible model names + base_url", True)
+    if single_completion_provider:
+        _record_patch("single_completion_provider", "DeepSeek chat API requires n=1; upstream trial count remains unchanged", True)
     print("HGB_MODEL_COMPAT: OpenAI-compatible model names and base URL enabled", file=sys.stderr)
+
+
+def _install_project_image_reuse() -> None:
+    """Build each static project image once per experiment worker process."""
+    from tool.container_tool import ProjectContainerTool  # pylint: disable=import-outside-toplevel
+
+    if getattr(ProjectContainerTool, "_hgb_project_image_reuse", False):
+        return
+    original = ProjectContainerTool._prepare_project_image
+    image_lock = threading.Lock()
+    images: dict[str, str] = {}
+
+    def prepare_once(self: Any, project_name: str) -> str:
+        # Upstream's three trial threads otherwise launch three --no-cache
+        # builds against the same project tag and source context at once.
+        # Candidate files are copied into separate containers after this step.
+        with image_lock:
+            if project_name not in images:
+                images[project_name] = original(self, project_name)
+            return images[project_name]
+
+    ProjectContainerTool._prepare_project_image = prepare_once
+    ProjectContainerTool._hgb_project_image_reuse = True
+    _record_patch("project_image_reuse", "reuse identical static project image across trial threads", True)
 
 
 def _install_hgb_llm_trace() -> None:
@@ -682,6 +715,7 @@ def main() -> int:
     _patch_project_target_downloads()
     _patch_coverage_skip()
     _install_model_compat()
+    _install_project_image_reuse()
     _install_hgb_llm_trace()
     _install_repair_observability()
     _install_local_introspector_shim(upstream_args)

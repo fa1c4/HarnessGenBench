@@ -7,8 +7,11 @@ import py_compile
 import re
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
+from types import ModuleType
 
 
 sys.path.insert(0, str(Path("docker/common").resolve()))
@@ -34,6 +37,58 @@ llm_trace = load_module("hgb_llm_trace", "docker/common/hgb_llm_trace.py")
 ckg_runtime_patch = load_module("ckgfuzzer_runtime_patch", "docker/common/ckgfuzzer_runtime_patch.py")
 ckg_api_recovery = load_module("ckgfuzzer_api_recovery", "docker/common/ckgfuzzer_api_recovery.py")
 ckg_candidate_verifier = load_module("ckgfuzzer_candidate_verifier", "docker/common/ckgfuzzer_candidate_verifier.py")
+ofg_wrapper = load_module("ofg_run_wrapper_model_compat", "docker/common/ofg_run_wrapper.py")
+
+
+def test_deepseek_model_compat_retains_trials_with_single_choice_requests(monkeypatch) -> None:
+    class FakeLLM:
+        @classmethod
+        def setup(cls, ai_binary, name, **kwargs):
+            return SimpleNamespace(name=name, ai_binary=ai_binary, **kwargs)
+
+    class FakeGPT:
+        def _get_client(self):
+            return None
+
+    package = ModuleType("llm_toolkit")
+    models = ModuleType("llm_toolkit.models")
+    models.LLM = FakeLLM
+    models.GPT = FakeGPT
+    package.models = models
+    openai = ModuleType("openai")
+    openai.OpenAI = lambda **kwargs: kwargs
+    monkeypatch.setitem(sys.modules, "llm_toolkit", package)
+    monkeypatch.setitem(sys.modules, "llm_toolkit.models", models)
+    monkeypatch.setitem(sys.modules, "openai", openai)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com")
+
+    ofg_wrapper._install_model_compat()
+    configured = FakeLLM.setup("", "deepseek-chat", num_samples=5)
+    assert configured.num_samples == 1
+    assert configured.name == "deepseek-chat"
+
+
+def test_project_image_is_built_once_for_parallel_trials(monkeypatch) -> None:
+    builds: list[str] = []
+
+    class FakeProjectContainerTool:
+        def _prepare_project_image(self, project_name: str) -> str:
+            builds.append(project_name)
+            time.sleep(0.02)
+            return "gcr.io/oss-fuzz/" + project_name
+
+    package = ModuleType("tool")
+    container_tool = ModuleType("tool.container_tool")
+    container_tool.ProjectContainerTool = FakeProjectContainerTool
+    package.container_tool = container_tool
+    monkeypatch.setitem(sys.modules, "tool", package)
+    monkeypatch.setitem(sys.modules, "tool.container_tool", container_tool)
+
+    ofg_wrapper._install_project_image_reuse()
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        images = list(executor.map(lambda _: FakeProjectContainerTool()._prepare_project_image("php"), range(3)))
+    assert images == ["gcr.io/oss-fuzz/php"] * 3
+    assert builds == ["php"]
 
 
 

@@ -114,18 +114,121 @@ def _declare_openssl_ctx(text: str) -> tuple[str, bool]:
     if not changed:
         return text, False
     # Insert right after the fuzzer entry opening brace.
-    m = re.search(r"(LLVMFuzzerTestOneInput\s*\([^)]*\)\s*\{)\n", text)
+    m = re.search(r"((?:LLVM)?FuzzerTestOneInput\s*\([^)]*\)\s*\{)\n", text)
     if not m:
         return text, False
     text = text[: m.end()] + decls + text[m.end():]
     return text, True
 
 
+def _adapt_openssl_fuzz_abi(text: str) -> tuple[str, bool]:
+    """Supply the public OpenSSL fuzz driver hooks around generated API calls."""
+    changed = False
+    if re.search(r"\bLLVMFuzzerTestOneInput\s*\(", text) and not re.search(
+        r"\bFuzzerTestOneInput\s*\(", text
+    ):
+        text = re.sub(r"\bLLVMFuzzerTestOneInput(?=\s*\()", "FuzzerTestOneInput", text)
+        changed = True
+    if not re.search(r"\bFuzzerTestOneInput\s*\(", text):
+        return text, changed
+    if not re.search(r"\bFuzzerInitialize\s*\(", text):
+        text += "\nint FuzzerInitialize(int *argc, char ***argv) { (void)argc; (void)argv; return 0; }\n"
+        changed = True
+    if not re.search(r"\bFuzzerCleanup\s*\(", text):
+        text += "\nvoid FuzzerCleanup(void) {}\n"
+        changed = True
+    return text, changed
+
+
+def _adapt_php_fuzzer_lifecycle(text: str) -> tuple[str, bool]:
+    """Initialize PHP's fuzz SAPI and give its JSON scanner a padded buffer."""
+    if not re.search(r"\bLLVMFuzzerTestOneInput\s*\(", text):
+        return text, False
+    changed = False
+    if not re.search(r'#include\s+[<"]fuzzer-sapi\.h[>"]', text):
+        include = re.search(r'(#include\s+[<"](?:main/)?php\.h[>"][^\n]*\n)', text)
+        if include:
+            text = text[: include.end()] + '#include "fuzzer-sapi.h"\n' + text[include.end():]
+        else:
+            text = '#include <main/php.h>\n#include "fuzzer-sapi.h"\n' + text
+        changed = True
+    if not re.search(r"\bLLVMFuzzerInitialize\s*\(", text):
+        text += "\nint LLVMFuzzerInitialize(int *argc, char ***argv) {\n"
+        text += "    (void)argc; (void)argv;\n"
+        text += "    return fuzzer_init_php(NULL) == SUCCESS ? 0 : 1;\n}\n"
+        changed = True
+    if not re.search(r"\bhgb_generated_test_one_input\s*\(", text):
+        generated_starts_request = bool(re.search(r"\bfuzzer_request_startup\s*\(", text))
+        for header in ("stdlib.h", "string.h"):
+            if not re.search(r'#include\s+[<"]' + re.escape(header) + r'[>"]', text):
+                text = f"#include <{header}>\n" + text
+        text, renamed = re.subn(
+            r"\bLLVMFuzzerTestOneInput(?=\s*\()",
+            "hgb_generated_test_one_input",
+            text,
+            count=1,
+        )
+        if renamed:
+            text += "\nint LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {\n"
+            text += "    if (size == (size_t)-1) return 0;\n"
+            text += "    uint8_t *padded = (uint8_t *)malloc(size + 1);\n"
+            text += "    if (padded == NULL) return 0;\n"
+            text += "    if (size != 0) memcpy(padded, data, size);\n"
+            text += "    padded[size] = 0;\n"
+            if not generated_starts_request:
+                text += "    if (fuzzer_request_startup() != SUCCESS) { free(padded); return 0; }\n"
+            text += "    int rc = hgb_generated_test_one_input(padded, size);\n"
+            if not generated_starts_request:
+                text += "    fuzzer_request_shutdown();\n"
+            text += "    free(padded);\n"
+            text += "    return rc;\n}\n"
+            changed = True
+    return text, changed
+
+
+def _adapt_systemd_link_parser(text: str) -> tuple[str, bool]:
+    """Correct generated names against the pinned systemd link-config API."""
+    if not re.search(r"\blink_load_one\s*\(", text):
+        return text, False
+    original = text
+    for old, new in (
+        ('"networkd-link.h"', '"link-config.h"'),
+        ("link_config_context_new", "link_config_ctx_new"),
+        ("link_config_context_freep", "link_config_ctx_freep"),
+        ("link_config_context_free", "link_config_ctx_free"),
+        ("#include <cstdlib>", "#include <stdlib.h>"),
+        ("#include <cstdint>", "#include <stdint.h>"),
+    ):
+        text = text.replace(old, new)
+    # The benchmark overlays this source onto fuzz-link-parser.c. Upstream
+    # sometimes names its candidate .cc, but this destination is compiled as C.
+    text = re.sub(r'extern\s+"C"\s+(?=int\s+LLVMFuzzerTestOneInput)', "", text)
+    if not re.search(r'#include\s+"link-config\.h"', text):
+        text = '#include "link-config.h"\n' + text
+    return text, text != original
+
+
 TARGET_RESCUES: dict[str, list[dict[str, Any]]] = {
     "openssl_x509": [
         {
+            "name": "adapt_openssl_fuzz_abi",
+            "apply": _adapt_openssl_fuzz_abi,
+        },
+        {
             "name": "declare_libctx_propq",
             "apply": _declare_openssl_ctx,
+        },
+    ],
+    "php_php-fuzz-parser_0dbedb": [
+        {
+            "name": "adapt_php_fuzzer_lifecycle",
+            "apply": _adapt_php_fuzzer_lifecycle,
+        },
+    ],
+    "systemd_fuzz-link-parser": [
+        {
+            "name": "adapt_systemd_link_parser",
+            "apply": _adapt_systemd_link_parser,
         },
     ],
 }

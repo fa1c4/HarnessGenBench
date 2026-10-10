@@ -1200,7 +1200,11 @@ def run_campaign(
         f'cat /tmp/campaign.log; '
         f'cd /tmp && tar -cf /tmp/corpus.tar corpus 2>/dev/null || true',
     ]
-    timeout = timeout_seconds or (budget + 60)
+    # The in-container ``timeout`` above enforces the fuzzing budget. Give
+    # ``docker start -a`` time for fuzzer shutdown, corpus archiving, and log
+    # draining under concurrent image builds; a client timeout loses
+    # the final libFuzzer statistics even after the fixed budget has ended.
+    timeout = timeout_seconds or (budget + 240)
     campaign_work = work_dir / "campaign"
     final_corpus_dir = work_dir / "corpus"
     final_corpus_dir.mkdir(parents=True, exist_ok=True)
