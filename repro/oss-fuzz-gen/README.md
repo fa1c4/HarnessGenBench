@@ -107,5 +107,5 @@ bash scripts/oss_fuzz_gen_collect_report.sh workspace/oss-fuzz-gen/<run-id>
 The Docker image copies the **pinned** `artifacts/oss-fuzz-gen` and
 `artifacts/oss-fuzz` checkouts (see `metadata/work_index.yaml`). Cloning a
 floating OSS-Fuzz `master` is forbidden. Configure LLM settings with
-`configs/set_api_key.sh`; OSS-Fuzz-Gen also receives `/var/run/docker.sock`
+`~/api_keys/HarnessGenBench/set_api_key.sh`; OSS-Fuzz-Gen also receives `/var/run/docker.sock`
 because upstream invokes Docker/OSS-Fuzz builders.

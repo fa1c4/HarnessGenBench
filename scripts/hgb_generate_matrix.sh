@@ -178,6 +178,8 @@ matrix_dir="$(hgb_workspace_dir "$root")/matrix/$run_id"
 row_dir="$matrix_dir/rows"
 ensure_dir "$matrix_dir"
 ensure_dir "$row_dir"
+# Keep any relative output from matrix helpers within this run's workspace.
+cd "$matrix_dir"
 matrix_file="$matrix_dir/matrix.tsv"
 printf 'generator\ttarget\tstatus\tworkspace\tmetadata\tsummary\n' >"$matrix_file"
 {

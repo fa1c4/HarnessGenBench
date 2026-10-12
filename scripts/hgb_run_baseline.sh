@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/common.sh"
 
 # Load the local API/embedding config before any profile guard so the single
-# target path does not require the caller to `source configs/set_api_key.sh`.
+# target path does not require the caller to `source ~/api_keys/HarnessGenBench/set_api_key.sh`.
 load_hgb_config
 
 usage() {

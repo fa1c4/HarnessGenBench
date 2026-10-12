@@ -1,193 +1,97 @@
 # HarnessGenBench
 
-HarnessGenBench keeps reproducible, Docker-based smoke workflows for recent fuzz harness generation systems.
+HarnessGenBench reproduces five fuzzing baselines on a curated set of 20 FuzzBench targets. OSS-Fuzz-Gen, PromeFuzz, and CKGFuzzer generate harnesses; G2Fuzz and ELFuzz generate inputs for fixed harnesses. Runs use Docker and write outputs under `workspace/`.
 
-## Configuration
+## Requirements
 
-Secrets are local only. Create the real config from the tracked placeholder:
+Run commands from the repository root on Linux. You need Python 3, Git, Make, Docker Engine, access to the Docker socket, enough disk for target builds and model files, and network access to fetch upstream artifacts and images. The setup scripts install baseline tools into their Docker images.
+
+| Baseline | Additional requirements | Image setup |
+| --- | --- | --- |
+| OSS-Fuzz-Gen | Pinned OSS-Fuzz checkout, Fuzz Introspector, target build, and an OpenAI-compatible chat API. | `make docker-build-oss-fuzz-gen` |
+| PromeFuzz | Real target compilation database (captured with Bear/CMake), chat API, and a semantic embedding endpoint. | `make docker-build-promefuzz` |
+| CKGFuzzer | CodeQL CLI/database, chat API, and a local semantic embedding model. The setup script installs CodeQL in the image. | `make docker-build-ckgfuzzer` |
+| G2Fuzz | Modified AFL++ and target `.afl`/`.cmp` binaries, built from the pinned FuzzBench target, plus a chat API. | `make docker-build-g2fuzz` |
+| ELFuzz | TGI-compatible generation service and target build. Native TGI needs model access and an NVIDIA runtime; on a host without that runtime, the integration can use the configured chat API through its TGI proxy. | `make docker-build-elfuzz` |
+
+Fetch upstream sources and build the images:
 
 ```bash
-cp configs/set_api_key.example.sh configs/set_api_key.sh
-$EDITOR configs/set_api_key.sh
-source configs/set_api_key.sh
+make artifacts
+make docker-build
 ```
 
-Do not commit `configs/set_api_key.sh` or any generated workspace output.
+## Configure your API key
 
-### OpenAI-compatible provider profiles
-
-All remote-LLM harness generators use the same profile resolver. Set
-`HGB_LLM_PROVIDER` to `ustc`, `deepseek`, `custom`, or `auto`; the first two
-supply the appropriate base URL and default model. `HGB_LLM_API_KEY`,
-`HGB_LLM_BASE_URL`, and `HGB_LLM_MODEL` override a profile. Existing
-`API_KEY`, `BASE_URL`, and `MODEL` settings remain supported.
+Keep credentials outside the repository in `~/api_keys/HarnessGenBench/set_api_key.sh`. The scripts load this path by default. Create it from the tracked template only if the file does not already exist:
 
 ```bash
-# USTC defaults to https://api.llm.ustc.edu.cn and glm-5.2
-export HGB_LLM_PROVIDER=ustc
-export API_KEY='...'
+mkdir -p -m 700 ~/api_keys/HarnessGenBench
+cp -n configs/set_api_key.example.sh ~/api_keys/HarnessGenBench/set_api_key.sh
+chmod 600 ~/api_keys/HarnessGenBench/set_api_key.sh
+$EDITOR ~/api_keys/HarnessGenBench/set_api_key.sh
+source ~/api_keys/HarnessGenBench/set_api_key.sh
+bash scripts/hgb_llm_preflight.sh --live
+```
 
-# DeepSeek defaults to https://api.deepseek.com and deepseek-v4-pro
+For example, put your **own** key in that file:
+
+```bash
 export HGB_LLM_PROVIDER=deepseek
-export API_KEY='...'
-# export HGB_LLM_MODEL=deepseek-v4-flash
+export API_KEY='YOUR_API_KEY'
 ```
 
-Inspect the resolved configuration without a network request with
-`bash scripts/hgb_llm_preflight.sh`; append `--live` to send one minimal
-OpenAI-compatible chat request. The command never prints the credential.
-ELFuzz remains a local TGI/Hugging Face input-generation workflow; it receives
-profile metadata but does not use the remote chat API.
+For another OpenAI-compatible provider, set `HGB_LLM_PROVIDER=custom` and provide `HGB_LLM_API_KEY`, `HGB_LLM_BASE_URL`, and `HGB_LLM_MODEL` in the same file. The template documents the built-in `deepseek` and `ustc` profiles. The preflight command sends one small chat request and does not print the credential. Keep real credentials out of the repository. Use `HGB_API_KEY_CONFIG` to select another file under `~/api_keys/`.
 
-CKGFuzzer defaults to a 900-second OpenAI-compatible request timeout and three
-SDK retries. These are built into the integration; set
-`CKGFUZZER_LLM_REQUEST_TIMEOUT_SECONDS` or `CKGFUZZER_LLM_MAX_RETRIES` only to
-override them for an individual run.
+### Local embeddings for CKGFuzzer and PromeFuzz
 
-## Artifact Refresh
-
-Upstream source checkouts live under ignored `artifacts/`. Refreshing artifacts fetches current upstream HEAD, overwrites `metadata/work_index.yaml`, and checks out the pinned commit recorded there:
+The current CKGFuzzer reproduction uses [Qwen/Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) locally through the CPU Text Embeddings Inference server. Download and start it from the repository root:
 
 ```bash
-make artifacts
+python3 -m pip install -U huggingface_hub
+python3 scripts/download_embedding_model.py
+source configs/local_embedding.example.sh
+bash scripts/local_embedding_server.sh start
+bash scripts/local_embedding_server.sh probe
 ```
 
-`plans/` is intentionally ignored. Historical host-side checkouts are not part of the active workflow.
+The example exports `CKGFUZZER_EMBEDDING_BACKEND=openai_compatible_local_tei_cpu`, `CKGFUZZER_EMBEDDING_MODEL=text-embeddings-inference`, `CKGFUZZER_EMBEDDING_BASE_URL=http://host.docker.internal:18080/v1`, and `CKGFUZZER_EMBEDDING_MODEL_SOURCE=Qwen/Qwen3-Embedding-0.6B`. Its local embedding API key is `-`; your chat API key remains separate. You can copy these exports into `~/api_keys/HarnessGenBench/set_api_key.sh` for later shells.
 
-## Docker Reproduction Workflow
-
-All reproduction runs execute inside HGB Docker images and write primary outputs under ignored `workspace/<fuzzer>/<run_id>/`.
+PromeFuzz also needs real embeddings. To use the same local server, add these exports to `~/api_keys/HarnessGenBench/set_api_key.sh` (or export them in the shell before running):
 
 ```bash
-make artifacts
-make docker-build-oss-fuzz-gen
-make smoke-oss-fuzz-gen
-make smoke-ckgfuzzer
-make smoke-promefuzz
-make smoke-elfuzz
-make smoke-g2fuzz
+export PROME_FUZZ_EMBEDDING_LLM_TYPE=openai
+export PROME_FUZZ_EMBEDDING_MODEL=text-embeddings-inference
+export PROME_FUZZ_EMBEDDING_BASE_URL=http://host.docker.internal:18080/v1
+export PROME_FUZZ_EMBEDDING_API_KEY=-
 ```
 
-Useful direct commands:
+## Reproduce the 20 valuable targets
+
+`bash scripts/hgb_targets.sh list valuable` prints the target set. Run these commands after loading your API configuration and starting the embedding service. They use the profiles from the verified reproduction audit:
 
 ```bash
-bash scripts/oss_fuzz_gen_setup.sh
-bash scripts/oss_fuzz_gen_smoke.sh || true
-bash scripts/ckgfuzzer_setup.sh
-bash scripts/ckgfuzzer_smoke.sh || true
-bash scripts/promefuzz_build_docker.sh
-bash scripts/promefuzz_smoke_pugixml.sh || true
-bash scripts/elfuzz_start_container.sh --smoke || true
-bash scripts/g2fuzz_setup.sh
-bash scripts/hgb_run_baseline.sh --generator g2fuzz --target libpng_libpng_read_fuzzer --profile alpha --protocol paper-native
+bash scripts/hgb_run_baseline_matrix.sh --generator oss-fuzz-gen --profile alpha --protocol blind-project --targets valuable --parallel-worker 5 --strict
+bash scripts/hgb_run_baseline_matrix.sh --generator promefuzz --profile alpha --protocol blind-project --targets valuable --parallel-worker 5 --strict
+bash scripts/hgb_run_baseline_matrix.sh --generator ckgfuzzer --profile reproduction-eta --protocol blind-project --targets valuable --parallel-worker 5 --strict
+bash scripts/hgb_run_baseline_matrix.sh --generator g2fuzz --profile alpha --protocol paper-native --targets valuable --parallel-worker 5 --strict
+bash scripts/hgb_run_baseline_matrix.sh --generator elfuzz --profile alpha --protocol paper-native --targets valuable --parallel-worker 5 --strict
 ```
 
-LLM-backed smoke runs may fail because credentials, quota, model access, Docker-in-Docker, or upstream CLIs are unavailable. They should still leave `metadata.json`, logs, and `HGB_SUMMARY.md` in `workspace/`.
+`--parallel-worker` controls target concurrency; the matrix runner defaults to 5. ELFuzz applies only to the nine text-input targets listed in `metadata/elfuzz_target_adapters.yaml`; its other eleven valuable targets are recorded as not applicable. The runner serializes ELFuzz's shared TGI service. `--strict` exits nonzero when an applicable pair does not reach `evaluated`. Matrix summaries live under `workspace/matrix/<run_id>/`; per-baseline statistics are in `workspace/<baseline>/statistics.json`.
 
-CKGFuzzer requires the CodeQL CLI for target-aware generation. The CKGFuzzer Docker image installs the CodeQL bundle during `bash scripts/ckgfuzzer_setup.sh` by default. Set `HGB_INSTALL_CODEQL=0` only when rebuilding a smaller image for dry runs or when mounting an external CodeQL checkout with `HGB_CODEQL_DIR`.
+## Run generation and fuzzing separately
 
-### CKGFuzzer profiles and protocols
-
-CKGFuzzer is a `harness_generator` baseline. The canonical command is:
+Phase A records the verified generated harnesses and inputs for every applicable pair. Existing artifacts are reused; generation runs only where an artifact is missing.
 
 ```bash
-bash scripts/hgb_run_baseline.sh \
-  --generator ckgfuzzer \
-  --target jsoncpp_jsoncpp_fuzzer \
-  --profile alpha \
-  --protocol blind-project \
-  --strict
+python3 scripts/hgb_eval_all.py --phase generate --parallel-worker 32
 ```
 
-`alpha` and `paper-faithful` require a real CodeQL database and knowledge graph, a real embedding service (`CKGFUZZER_EMBEDDING_MODEL` must not be `mock`/`local`/empty), upstream LLM API summaries, the upstream API-combination planner, and the upstream compilation-check/repair loop. Mock/hash embeddings, `CKGFUZZER_LOCAL_API_SUMMARY=1`, `CKGFUZZER_LOCAL_API_COMBINATION=1`, source-only graph fallback, and `--skip_check_compilation` are forbidden in `alpha` and `paper-faithful`; a failed or empty CodeQL graph is a failed run, not a successful source fallback.
-
-`compat-smoke` may retain deterministic/mock fallbacks and tiny budgets, but its results are excluded from scientific aggregates (`excluded_from_aggregate=true`, `method_variant=compat-smoke`) and it is never selected by default.
-
-In `blind-project`, CKGFuzzer never receives the exact FuzzBench reference harness, a path to it, or `metadata/fuzzbench_selected_harness_apis.json`. APIs are discovered from public headers, source declarations, project docs, and protocol-allowed examples/tests. A canary leakage audit proves the reference harness never reaches CKG prompts, logs, API lists, summaries, embeddings, or candidates.
-
-Successful generation means exact FuzzBench build + smoke + reachability + campaign + coverage (`status=evaluated`), not merely a saved `.c/.cc` file. `dry_run`, `partial_completed`, `soft_skip`, and `generation_completed` are not `evaluated`.
-
-### OSS-Fuzz-Gen profiles and protocols
-
-OSS-Fuzz-Gen is a `harness_generator` baseline. The canonical command is:
+Phase B starts a fresh 24-hour fuzzing campaign from each saved Phase A artifact. It reuses verified harness images when present, does not repeat successful Phase A smoke checks, and does not call a baseline's generator or LLM. Run it after Phase A succeeds:
 
 ```bash
-bash scripts/hgb_run_baseline.sh \
-  --generator oss-fuzz-gen \
-  --target jsoncpp_jsoncpp_fuzzer \
-  --profile alpha \
-  --protocol blind-project \
-  --strict
+python3 scripts/hgb_eval_all.py --phase fuzz --parallel-worker 32
 ```
 
-`alpha` and `paper-faithful` require a real Fuzz Introspector build (`all_functions.json`/`calltree.json`/`type_info.json`/`report_manifest.json`), a target-aware benchmark YAML synthesized from that introspector output, real coverage, automatic compile/build repair (>=3 samples, default 5 repair rounds), and an independent exact-FuzzBench evaluator. The local introspector shim, `OFG_SKIP_COVERAGE_GAINS=1`, empty coverage shims, no-op processes, tiny 1/1/1 budgets, reference-harness examples, and reference-derived API ranking are forbidden in `alpha` and `paper-faithful`; missing benchmark YAML must synthesize or fail (never a soft skip). The OSS-Fuzz checkout is pinned and immutable (`detached-pinned-immutable` in `metadata/work_index.yaml`); cloning floating `master` is forbidden.
-
-`compat-smoke` may use the local introspector shim, 1/1/1 budgets, and coverage skip, but its results are excluded from scientific aggregates (`excluded_from_aggregate=true`, `method_variant=compat-smoke`) and it is never the default.
-
-In `blind-project`, OSS-Fuzz-Gen never receives the exact FuzzBench reference harness (`HGB_TARGET_REFERENCE_DIR` is withheld), never downloads the current target answer via GCS, and never ranks APIs by reference harness calls. A canary leakage audit proves the reference harness never reaches prompts, benchmark YAML, examples, logs, API rankings, or candidates. Successful generation means the independent evaluator reaches `status=evaluated`; only `evaluated` counts as a successful alpha matrix row.
-
-### PromeFuzz profiles and protocols
-
-PromeFuzz is a `harness_generator` baseline. The canonical command is:
-
-```bash
-bash scripts/hgb_run_baseline.sh \
-  --generator promefuzz \
-  --target jsoncpp_jsoncpp_fuzzer \
-  --profile alpha \
-  --protocol blind-project \
-  --strict
-```
-
-`alpha` and `paper-faithful` require a real compile database captured from the pinned FuzzBench build (`docker/common/promefuzz_build_context.py` replays the build under `bear`/CMake export with a neutral fuzz-entrypoint stub, never the reference harness body), real link/library context with non-empty `driver_build_args`, legitimate consumer knowledge when available, a real semantic embedding provider (`PROME_FUZZ_EMBEDDING_LLM_TYPE` must not be `mock`/`local`/`hash`; `PROME_FUZZ_EMBEDDING_MODEL` must not be `hgb-hash-embedding`), the official ALL-COVER generation path with practical multi-candidate budgets, iterative native target build validation through `docker/common/promefuzz_target_build.sh`, and the common harness evaluator (`docker/common/promefuzz_evaluator.py`, reusing `ofg_evaluator`) for build + sanitizer smoke + API reachability + fixed-budget campaign + coverage. Synthetic compile databases (`HGB_PROMEFUZZ_SYNTHETIC_COMPILE_DB=1`), hash/mock embeddings, `selected_harness_fallback`/`selected_harness` API selection, `report_first`/`report_only` API report modes, empty `driver_build_args`, and method-changing fallbacks are forbidden in `alpha` and `paper-faithful`; a missing real build context is a concrete failure, not a soft skip.
-
-`compat-smoke` may use the synthetic compile database and local hash embeddings for offline wiring tests only, must set `excluded_from_aggregate=true` and `method_variant=compat-smoke`, and is never selected by default.
-
-In `blind-project`, PromeFuzz never receives the exact FuzzBench reference harness, `metadata/fuzzbench_selected_harness_apis.json`, or reference-derived API filtering; APIs are discovered from public headers/source/build evidence. A canary leakage audit proves the reference harness never reaches prompts, logs, configs, API collections, embeddings, or candidates. Successful generation means the independent evaluator reaches `status=evaluated`; only `evaluated` counts as a successful alpha matrix row.
-
-G2Fuzz is evaluated as an input-generator plus modified-AFL++ workflow. It requires a native target pair (`.afl` and `.cmp`) for the fixed FuzzBench harness; missing target binaries are reported as `infra_missing`, not as a successful or soft-skipped run. `g2fuzz-data` is optional comparison data and is mounted only when explicitly requested with `G2FUZZ_USE_DATA=1`.
-
-## FuzzBench Target Integration
-
-List targets:
-
-```bash
-make artifacts
-make targets
-bash scripts/hgb_targets.sh list --sets
-bash scripts/hgb_targets.sh list valuable
-```
-
-Use `--targets valuable` for the curated high-signal deduplicated target set, or `--targets deduped` for all unique project/fuzz-target representatives.
-
-Prepare a target package:
-
-```bash
-make target-smoke TARGET=jsoncpp_jsoncpp_fuzzer
-```
-
-Generate a harness with one generator:
-
-```bash
-source configs/set_api_key.sh
-make generate GENERATOR=promefuzz TARGET=jsoncpp_jsoncpp_fuzzer
-```
-
-Dry-run without calling an LLM:
-
-```bash
-make generate-dry-run GENERATOR=ckgfuzzer TARGET=jsoncpp_jsoncpp_fuzzer
-```
-
-Run a small matrix:
-
-```bash
-bash scripts/hgb_generate_matrix.sh \
-  --generators oss-fuzz-gen,ckgfuzzer,promefuzz \
-  --targets jsoncpp_jsoncpp_fuzzer,zlib_zlib_uncompress_fuzzer \
-  --dry-run
-```
-
-ELFuzz and G2Fuzz are input-generation baselines, not source-level harness generators, and are evaluated in a separate `input_generator` leaderboard; matrix summaries split `input_generator` from `harness_generator`. G2Fuzz target-aware runs use `scripts/hgb_run_baseline.sh` directly and report `status=evaluated` only after target-pair discovery, generator synthesis, input validation, modified-AFL campaign execution, and coverage/queue metric collection. ELFuzz synthesizes and evolves input-producing fuzzer programs against a fixed native FuzzBench target (the harness is never generated), then runs a final `elfuzz run rq1.afl` campaign. Applicability is manifest-driven (`metadata/elfuzz_target_adapters.yaml`): the nine text-input targets in `valuable` are applicable and run the full `synth`/`produce`/`run`/coverage workflow; the eleven non-text targets are contractually `Invalid` (`status=not_applicable`, `applicability=Invalid`, `reason_code=elfuzz_non_text_target`) and are resolved before Docker model download, TGI, synthesis, or fuzzing. `alpha` uses nontrivial upstream-default-or-greater budgets (never the 1-iteration/60-second `compat-smoke` values); eligible runs are serialized because the upstream workflow starts a global `tgi-server` Docker container. The legacy `--allow-input-generator` flag is a deprecated no-op; the runner resolves the task family from `metadata/baseline_contracts.yaml`.
-
-If Docker reports a layerdb collision during image preflight, HGB records a per-image guard and later runs fail quickly instead of repeating the image pull. Stop competing builds and have the Docker administrator repair the daemon storage; then retry explicitly with `HGB_RETRY_DOCKER_LAYERDB_BUILD=1`. HGB never prunes or modifies `/data/docker` automatically.
+The default is 64 workers. Each replay container is limited to one logical CPU and 8 GiB RAM; `--memory-budget-gib` limits the combined replay-container allocation. Docker image builds also use host memory. Generated harnesses, inputs, fuzzing artifacts, logs, and temporary run files go under `workspace/`; evaluation reports remain under `results/eval_all/`. The scripts do not write generated files directly into the repository root. Phase A writes `results/eval_all/YYYY-MM-DD.phase_a.json` and `.phase_a.csv`. Phase B updates `results/eval_all/YYYY-MM-DD.csv` as jobs finish, with `N/A` for out-of-scope pairs. Use `--plan` with either phase to inspect its jobs without launching Docker, and `--resume` to continue an existing CSV. Saved-input libFuzzer campaigns continue after crash, OOM, and target timeout findings and preserve their artifact files. ELFuzz Phase B labels its method variant `saved-input-libfuzzer`.

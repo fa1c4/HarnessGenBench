@@ -140,7 +140,7 @@ latest_workspace_run() {
 }
 
 load_hgb_config() {
-  local root config legacy_env
+  local config
   local _hgb_name
   local -A _hgb_preserved_env=()
   local _hgb_preserve_names=(
@@ -154,9 +154,7 @@ load_hgb_config() {
     HGB_API_SELECTION_MODE
     CKGFUZZER_API_SELECTION_MODE
   )
-  root="$(repo_root)"
-  config="${HGB_API_KEY_CONFIG:-$root/configs/set_api_key.sh}"
-  legacy_env="$root/.env"
+  config="${HGB_API_KEY_CONFIG:-$HOME/api_keys/HarnessGenBench/set_api_key.sh}"
 
   for _hgb_name in "${_hgb_preserve_names[@]}"; do
     if [[ -v $_hgb_name ]]; then
@@ -168,14 +166,7 @@ load_hgb_config() {
     # shellcheck disable=SC1090
     source "$config"
   else
-    printf 'WARNING: %s is missing. LLM-backed reproduction may fail. Copy configs/set_api_key.example.sh first.\n' "$config" >&2
-    if [[ -f "$legacy_env" ]]; then
-      printf 'WARNING: loading legacy .env for compatibility; prefer configs/set_api_key.sh.\n' >&2
-      set -a
-      # shellcheck disable=SC1090
-      source "$legacy_env"
-      set +a
-    fi
+    printf 'WARNING: %s is missing. LLM-backed reproduction may fail. Copy configs/set_api_key.example.sh to ~/api_keys/HarnessGenBench/set_api_key.sh first.\n' "$config" >&2
   fi
 
   for _hgb_name in "${_hgb_preserve_names[@]}"; do
@@ -576,6 +567,7 @@ run_hgb_container() {
     -e ELFUZZ_EVOLUTION_SECONDS \
     -e ELFUZZ_PRODUCE_SECONDS \
     -e ELFUZZ_AFL_SECONDS \
+    -e DOCKER_NAME \
     -e ELFUZZ_STAGE_TIMEOUT_SECONDS \
     -e ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
     -e ELFUZZ_HELP_ONLY \
@@ -824,6 +816,18 @@ run_hgb_target_container() {
   # matrix pair hanging forever. The generation stage timeout is enforced inside
   # the entrypoint; this is a coarser outer guard with a safety margin.
   local hgb_docker_run_timeout="${HGB_DOCKER_RUN_TIMEOUT_SECONDS:-$(( ${HGB_GENERATION_TIMEOUT_SECONDS:-10800} + 10800 ))}"
+  if [[ -n "${HGB_DOCKER_CPUS:-}" ]]; then
+    [[ "$HGB_DOCKER_CPUS" =~ ^[1-9][0-9]*$ ]] || die "HGB_DOCKER_CPUS must be a positive integer"
+    extra_docker_args+=(--cpus "$HGB_DOCKER_CPUS")
+  fi
+  if [[ -n "${HGB_DOCKER_CPUSET:-}" ]]; then
+    [[ "$HGB_DOCKER_CPUSET" =~ ^[0-9]+$ ]] || die "HGB_DOCKER_CPUSET must be one logical CPU number"
+    extra_docker_args+=(--cpuset-cpus "$HGB_DOCKER_CPUSET")
+  fi
+  if [[ -n "${HGB_DOCKER_MEMORY:-}" ]]; then
+    [[ "$HGB_DOCKER_MEMORY" =~ ^[1-9][0-9]*[kKmMgG]?$ ]] || die "HGB_DOCKER_MEMORY must be a positive Docker memory size"
+    extra_docker_args+=(--memory "$HGB_DOCKER_MEMORY" --memory-swap "$HGB_DOCKER_MEMORY")
+  fi
   timeout --kill-after=60 "$hgb_docker_run_timeout" docker run --rm --pull=never --init \
     --entrypoint /opt/hgb/entrypoint.sh \
     -e HGB_DOCKER_IMAGE_DIGEST="$hgb_docker_image_digest" \
@@ -897,6 +901,7 @@ run_hgb_target_container() {
     -e ELFUZZ_EVOLUTION_ITERATIONS \
     -e ELFUZZ_PRODUCE_SECONDS \
     -e ELFUZZ_AFL_SECONDS \
+    -e DOCKER_NAME \
     -e ELFUZZ_STAGE_TIMEOUT_SECONDS \
     -e ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
     -e ELFUZZ_HELP_ONLY \
@@ -1006,6 +1011,16 @@ run_hgb_target_container() {
     -e HGB_BASELINE_PROTOCOL \
     -e HGB_STRICT \
     -e HGB_CAMPAIGN_SECONDS \
+    -e HGB_DOCKER_CPUS \
+    -e HGB_DOCKER_CPUSET \
+    -e HGB_DOCKER_MEMORY \
+    -e HGB_CKG_EVALUATOR_TIMEOUT_SECONDS \
+    -e HGB_EVAL_ALL_STOP_AFTER_SUCCESS \
+    -e OMP_NUM_THREADS \
+    -e OPENBLAS_NUM_THREADS \
+    -e MKL_NUM_THREADS \
+    -e NUMEXPR_NUM_THREADS \
+    -e TOKENIZERS_PARALLELISM \
     -e HGB_EVALUATOR_ROOT \
     -e PROME_FUZZ_SKIP_BAD_DOCS \
     -e PROME_FUZZ_MAX_DOC_BYTES \

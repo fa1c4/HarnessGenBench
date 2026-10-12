@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Example local embedding configuration for CKGFuzzer strict reproduction.
+# Never put a real API key in the code directory; store it under ~/api_keys/.
 # Source this after configuring your chat LLM provider/key.
 
 export CKGFUZZER_EMBEDDING_BACKEND="openai_compatible_local_tei_cpu"

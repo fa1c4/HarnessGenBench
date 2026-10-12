@@ -6,9 +6,10 @@
 set -uo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR/.."
-[[ -f configs/set_api_key_ds.sh ]] || { printf 'missing configs/set_api_key_ds.sh\n' >&2; exit 2; }
-source configs/set_api_key_ds.sh
-export HGB_API_KEY_CONFIG="$PWD/configs/set_api_key_ds.sh"
+hgb_ds_config="$HOME/api_keys/HarnessGenBench/set_api_key_ds.sh"
+[[ -f "$hgb_ds_config" ]] || { printf 'missing %s\n' "$hgb_ds_config" >&2; exit 2; }
+source "$hgb_ds_config"
+export HGB_API_KEY_CONFIG="$hgb_ds_config"
 export HGB_SKIP_IMAGE_PREFLIGHT=1
 export PROME_FUZZ_EVAL_MAX_CANDIDATES=4
 

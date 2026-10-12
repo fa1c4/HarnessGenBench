@@ -52,7 +52,6 @@ DEFAULT_EXCLUDE_DIRS = {
     "node_modules", ".venv", "venv", "env", ".cache", "pip-cache",
 }
 DEFAULT_SECRET_FILES = {
-    "configs/set_api_key.sh",
     ".env",
     "openai_key.txt",
     "api_key.txt",
@@ -146,7 +145,9 @@ def should_exclude(path: Path, repo: Path) -> str | None:
         return "excluded transient/cache directory"
     if rel in DEFAULT_SECRET_FILES:
         return "excluded known secret file"
-    if path.name in {"set_api_key.sh", "openai_key.txt", "api_key.txt", "hf_token.txt"}:
+    if (path.name.startswith("set_api_key") and path.suffix == ".sh") or path.name in {
+        "openai_key.txt", "api_key.txt", "hf_token.txt"
+    }:
         return "excluded known secret file"
     if path.parent.name == "results" and PACKAGE_RE.match(path.name):
         return "excluded previous generation package zip"

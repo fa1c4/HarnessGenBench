@@ -802,6 +802,31 @@ def _is_crash_exit(exit_code: int | None, stderr: str = "") -> bool:
     return False
 
 
+def filter_replay_initial_corpus(initial: Path, target_binary: Path,
+                                 adapter_argv: list[str], timeout_seconds: float) -> dict[str, Any]:
+    """Remove saved seeds that would abort AFL's initial dry-run."""
+    if "@@" not in adapter_argv:
+        raise PipelineError("infra_missing", "replay seed filter requires @@ file input", 66)
+    excluded = []
+    for seed in sorted(p for p in initial.iterdir() if p.is_file()):
+        command = [str(target_binary), *(str(seed) if arg == "@@" else arg for arg in adapter_argv)]
+        try:
+            completed = subprocess.run(command, stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL, timeout=timeout_seconds,
+                                       check=False)
+            reason = f"exit_{completed.returncode}" if completed.returncode else ""
+        except subprocess.TimeoutExpired:
+            reason = "timeout"
+        if reason:
+            excluded.append({"name": seed.name, "sha256": sha256_file(seed), "reason": reason})
+            seed.unlink()
+    retained = count_files(initial)
+    if not retained:
+        raise PipelineError("quality_failure", "all saved seeds failed the replay dry-run", 65)
+    return {"source": "phase_a_saved_inputs", "timeout_seconds": timeout_seconds,
+            "excluded": excluded, "retained": retained}
+
+
 class G2FuzzPipeline:
     def __init__(
         self,
@@ -2383,6 +2408,17 @@ class G2FuzzPipeline:
     def run_campaign(self) -> None:
         assert self.invocation is not None
         initial = self.assemble_initial_corpus()
+        if os.environ.get("G2FUZZ_REPLAY_FILTER_SEEDS") == "1":
+            # A generated input that hangs or crashes during AFL's initial
+            # dry-run aborts the entire campaign. Keep the usable Phase A
+            # inputs and record every excluded seed for audit.
+            timeout_seconds = float(os.environ.get("G2FUZZ_REPLAY_SEED_TIMEOUT_SECONDS", "1.2"))
+            record = filter_replay_initial_corpus(
+                initial, self.target_afl, list(self.invocation["adapter_argv"]), timeout_seconds,
+            )
+            json_dump(self.workspace / "seeds/replay_filter.json", record)
+            self.seed_counts[initial.name] = count_files(initial)
+            self.seed_bytes[initial.name] = dir_bytes(initial)
         afl_fuzz = self.afl_fuzz_path()
         # Delta invariant (plan section 5): the AFL command must use G2Fuzz's
         # modified afl-fuzz with a CmpLog target (-c) and the G2Fuzz repo (-k).
@@ -2402,6 +2438,8 @@ class G2FuzzPipeline:
             os.environ.get("G2FUZZ_MEMORY_MB", "none"),
             "-k",
             str(self.artifact_dir),
+            *(["-t", os.environ["G2FUZZ_AFL_EXEC_TIMEOUT_MS"]]
+              if os.environ.get("G2FUZZ_AFL_EXEC_TIMEOUT_MS") else []),
             "--",
             str(self.target_afl),
             *self.invocation["adapter_argv"],
@@ -2951,6 +2989,65 @@ class G2FuzzPipeline:
                 lines.append(f"- `{path.relative_to(self.workspace)}`")
         (self.workspace / "HGB_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def replay_saved(self, source_run: Path) -> int:
+        """Run the native G2Fuzz campaign from Phase A artifacts, without program_gen."""
+        try:
+            source_run = source_run.resolve(strict=True)
+            source_result = read_json(source_run / "result.json")
+            if source_result.get("status") != "evaluated" or source_result.get("target") != self.target:
+                raise PipelineError("infra_missing", "Phase A G2Fuzz result is missing or mismatched", 66)
+            source_seeds = source_run / "seeds" / "g2_generated"
+            source_pair = source_run / "target"
+            if not (source_pair / "target.afl").is_file() or not (source_pair / "target.cmp").is_file():
+                raise PipelineError("infra_missing", "Phase A G2Fuzz target pair is missing", 66)
+            if not source_seeds.is_dir() or not any(
+                p.is_file() and is_generated_input_candidate(p) for p in source_seeds.rglob("*")
+            ):
+                raise PipelineError("infra_missing", "Phase A G2Fuzz generated seeds are missing", 66)
+            self.preflight()
+            old_pair_dir = os.environ.get("G2FUZZ_TARGET_DIR")
+            os.environ["G2FUZZ_TARGET_DIR"] = str(source_pair)
+            try:
+                self.build_target_pair()
+            finally:
+                if old_pair_dir is None:
+                    os.environ.pop("G2FUZZ_TARGET_DIR", None)
+                else:
+                    os.environ["G2FUZZ_TARGET_DIR"] = old_pair_dir
+            source_cov = source_pair / "target.cov"
+            if source_cov.is_file():
+                shutil.copy2(source_cov, self.target_cov)
+            shutil.copytree(source_seeds, self.workspace / "seeds" / "g2_generated", dirs_exist_ok=True)
+            source_generators = source_run / "generators" / "source"
+            if source_generators.is_dir():
+                shutil.copytree(source_generators, self.workspace / "generators" / "source", dirs_exist_ok=True)
+            self.generated_generator_count = int(source_result.get("generator_count") or 0)
+            self.generated_input_count = sum(
+                p.is_file() and is_generated_input_candidate(p)
+                for p in (self.workspace / "seeds" / "g2_generated").rglob("*")
+            )
+            self.stages["input_generators_created"] = stage_record(
+                "complete", "reused_phase_a", source_run=str(source_run),
+                generator_count=self.generated_generator_count,
+                generated_input_count=self.generated_input_count,
+            )
+            json_dump(self.workspace / "replay_provenance.json", {
+                "phase": "B", "source_run": str(source_run),
+                "generated_input_count": self.generated_input_count,
+                "generator_count": self.generated_generator_count,
+            })
+            self.validate_generated_inputs()
+            self.run_campaign()
+            self.collect_coverage()
+            if self._evaluated_ok():
+                self.write_outputs("evaluated", "none", 0)
+                return 0
+            self.write_outputs("quality_failure", "Phase B evaluated invariants were not met", 65)
+            return 65
+        except PipelineError as exc:
+            self.write_outputs(exc.status, exc.reason, exc.code)
+            return exc.code
+
     def full(self) -> int:
         try:
             self.preflight()
@@ -3009,9 +3106,11 @@ def make_pipeline(args: argparse.Namespace) -> G2FuzzPipeline:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("full", "preflight", "build-target-pair", "generate-inputs", "run-campaign", "evaluate"):
+    for name in ("full", "preflight", "build-target-pair", "generate-inputs", "run-campaign", "evaluate", "replay"):
         p = sub.add_parser(name)
         add_common_args(p)
+        if name == "replay":
+            p.add_argument("--source-run", required=True, type=Path)
     validate_parser = sub.add_parser("validate-adapters")
     validate_parser.add_argument("--metadata-root", default=str(default_metadata_root()))
     dump_parser = sub.add_parser("dump-adapter")
@@ -3029,6 +3128,8 @@ def main(argv: list[str] | None = None) -> int:
         pipeline = make_pipeline(args)
         if args.command == "full":
             return pipeline.full()
+        if args.command == "replay":
+            return pipeline.replay_saved(args.source_run)
         pipeline.preflight()
         if args.command == "preflight":
             pipeline.write_outputs("dry_run_ok", "preflight completed", 0)

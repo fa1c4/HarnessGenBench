@@ -71,7 +71,7 @@ import sys
 path = Path(sys.argv[1])
 text = path.read_text()
 old = '        subprocess.run(["sudo", "docker", "stop", "tgi-server"], check=True, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)'
-new = '        try:\n            subprocess.run(["sudo", "docker", "stop", "tgi-server"], check=False, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n        except Exception as exc:\n            print(f"[HGB] ignoring tgi-server cleanup failure: {exc}")'
+new = '        try:\n            subprocess.run(["sudo", "docker", "stop", os.environ.get("DOCKER_NAME", "tgi-server")], check=False, cwd=PROJECT_ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n        except Exception as exc:\n            print(f"[HGB] ignoring TGI cleanup failure: {exc}")'
 if old in text and "ignoring tgi-server cleanup failure" not in text:
     path.write_text(text.replace(old, new, 1))
 PY_ELFUZZ_CLEANUP_PATCH
@@ -82,6 +82,7 @@ patch_elfuzz_sibling_paths() {
   [[ -f "$getcov" ]] || return 0
   python3 - "$getcov" "$ELFUZZ_PROJECT_ROOT/start_tgi_servers.sh" "$ELFUZZ_PROJECT_ROOT/start_tgi_servers_debug.sh" <<'PY_ELFUZZ_SIBLING_PATH_PATCH'
 from pathlib import Path
+import os
 import sys
 
 getcov = Path(sys.argv[1])
@@ -99,7 +100,11 @@ for raw_path in sys.argv[2:]:
     old = "volume=./tmp/fastdata/hfcache/transformers/"
     new = "volume=${ELFUZZ_TGI_CACHE_DIR:-./tmp/fastdata/hfcache/transformers/}\\nmkdir -p \"$volume\""
     if old in text:
-        path.write_text(text.replace(old, new, 1))
+        text = text.replace(old, new, 1)
+    name = os.environ.get('DOCKER_NAME', '')
+    if name:
+        text = text.replace('${DOCKER_NAME:-tgi-server}', '${DOCKER_NAME:-' + name + '}')
+    path.write_text(text)
 PY_ELFUZZ_SIBLING_PATH_PATCH
 }
 

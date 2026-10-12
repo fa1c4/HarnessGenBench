@@ -1,7 +1,8 @@
 # Local secrets and legacy host state
 .env
 *.env
-configs/set_api_key.sh
+configs/set_api_key*.sh
+!configs/set_api_key.example.sh
 external/
 results/
 workspace/

@@ -16,6 +16,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -44,6 +45,7 @@ class CommandResult:
     copy_in_ok: bool = True
     start_exit_code: int | None = None
     copy_out_ok: bool = True
+    run_wall_seconds: float | None = None
 
 
 def _run(command: Sequence[str], timeout_seconds: int) -> CommandResult:
@@ -964,6 +966,21 @@ def _container_run(
     work_dir.mkdir(parents=True, exist_ok=True)
     container_name = f"hgb-eval-{phase}-{uuid.uuid4().hex[:12]}"
     create = ["docker", "create", "--pull=never", "--name", container_name]
+    cpu_limit = os.environ.get("HGB_DOCKER_CPUS", "")
+    if cpu_limit:
+        if not cpu_limit.isdecimal() or int(cpu_limit) < 1:
+            raise ValueError("HGB_DOCKER_CPUS must be a positive integer")
+        create.extend(["--cpus", cpu_limit])
+    cpu_set = os.environ.get("HGB_DOCKER_CPUSET", "")
+    if cpu_set:
+        if not cpu_set.isdecimal():
+            raise ValueError("HGB_DOCKER_CPUSET must be one logical CPU number")
+        create.extend(["--cpuset-cpus", cpu_set])
+    memory_limit = os.environ.get("HGB_DOCKER_MEMORY", "")
+    if memory_limit:
+        if not re.fullmatch(r"[1-9][0-9]*[kKmMgG]?", memory_limit):
+            raise ValueError("HGB_DOCKER_MEMORY must be a positive Docker memory size")
+        create.extend(["--memory", memory_limit, "--memory-swap", memory_limit])
     if env:
         for pair in env:
             create.extend(["-e", pair])
@@ -1001,7 +1018,9 @@ def _container_run(
             # If a required input copy failed, do not start the target: the
             # phase is failed and the marker can never legitimately appear.
             if copy_in_ok:
+                run_started = time.monotonic()
                 start_result = _run_phase(runner, ["docker", "start", "-a", container_name], timeout_seconds, f"run {phase}")
+                start_result.run_wall_seconds = round(time.monotonic() - run_started, 3)
                 phases.append(("run", start_result))
                 result = start_result
                 start_exit_code = start_result.exit_code
@@ -1149,6 +1168,7 @@ def run_campaign(
     campaign_seconds: int,
     runner: Runner = _run,
     timeout_seconds: int | None = None,
+    keep_going: bool = False,
 ) -> dict:
     """Run a fixed-budget libFuzzer campaign and parse execs_done from the log.
 
@@ -1161,11 +1181,16 @@ def run_campaign(
     artifact_dir = work_dir / "artifacts"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     budget = max(1, int(campaign_seconds))
-    # -runs must never truncate the campaign: a low run cap (10k) ends fast
-    # targets in seconds, so the fuzzing budget (-max_total_time) never
-    # applies. Give -runs a value far above any realistic exec count for the
-    # budget so -max_total_time is the governing bound.
-    run_count = max(1, budget * 256)
+    # libFuzzer treats -runs=0 as seed-only replay. -1 removes the run cap so
+    # -max_total_time governs the campaign.
+    run_count = -1
+    # Phase B campaigns must keep running after a discovered crash or an
+    # individual worker reaches libFuzzer's RSS limit. Fork mode restarts the
+    # worker and writes crash/oom inputs under the artifact prefix.
+    continuation_flags = (
+        "-fork=1 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1 "
+        if keep_going else ""
+    )
     fuzzer_timeout = budget + 5
     # Build copy_in list for seed corpus files.
     copy_in: list[tuple[Path, str]] = []
@@ -1191,14 +1216,18 @@ def run_campaign(
         "sh",
         "-lc",
         f'{seed_stage}{asan_prefix}timeout -s INT -k 5s {fuzzer_timeout}s {binary_path} '
-        f'-runs={run_count} -max_total_time={budget} -print_final_stats=1 -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
+        f'{continuation_flags}-runs={run_count} -max_total_time={budget} '
+        f'-print_final_stats=1 -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
         f'> /tmp/campaign.log 2>&1; '
         f'fuzzer_rc=$?; echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
         f'echo "---STATS---"; '
         f'ls /tmp/corpus | wc -l; '
         f'ls /tmp/artifacts 2>/dev/null | wc -l; '
-        f'cat /tmp/campaign.log; '
-        f'cd /tmp && tar -cf /tmp/corpus.tar corpus 2>/dev/null || true',
+        # A full 24-hour libFuzzer log can exhaust the evaluator's memory
+        # when the Docker client captures stdout. The final statistics and
+        # recent findings are retained without copying the whole log.
+        f'tail -n 2000 /tmp/campaign.log; '
+        f'cd /tmp && tar -cf /tmp/corpus.tar corpus artifacts 2>/dev/null || true',
     ]
     # The in-container ``timeout`` above enforces the fuzzing budget. Give
     # ``docker start -a`` time for fuzzer shutdown, corpus archiving, and log
@@ -1208,6 +1237,7 @@ def run_campaign(
     campaign_work = work_dir / "campaign"
     final_corpus_dir = work_dir / "corpus"
     final_corpus_dir.mkdir(parents=True, exist_ok=True)
+    campaign_start = time.monotonic()
     result = _container_run(
         image_tag=image_tag,
         work_dir=campaign_work,
@@ -1218,11 +1248,13 @@ def run_campaign(
         copy_in=copy_in if copy_in else None,
         copy_out=("/tmp/corpus.tar", campaign_work / "corpus.tar"),
     )
+    campaign_wall_seconds = round(
+        result.run_wall_seconds if result.run_wall_seconds is not None
+        else time.monotonic() - campaign_start, 3,
+    )
     # Extract the final campaign corpus so the coverage stage can replay it.
-    # The tar contains a top-level ``corpus/`` directory; strip that component
-    # so the final corpus files land directly in final_corpus_dir and are
-    # counted recursively (zeta plan §2: the old extraction left files under
-    # ``corpus/`` while queue_count only counted top-level files).
+    # Preserve both the final corpus and any crash/OOM artifacts. Never mix
+    # artifact files into the corpus used for coverage replay.
     import tarfile
     corpus_tar = campaign_work / "corpus.tar"
     if corpus_tar.is_file():
@@ -1233,36 +1265,40 @@ def run_campaign(
             # ``final_corpus_file_count`` reflects the container corpus only
             # (zeta plan §2: an empty campaign corpus must never fall back to
             # the seed corpus).
-            for stale in final_corpus_dir.iterdir():
-                if stale.is_file():
-                    stale.unlink()
+            for directory in (final_corpus_dir, artifact_dir):
+                for stale in directory.iterdir():
+                    if stale.is_file():
+                        stale.unlink()
             with tarfile.open(corpus_tar) as tf:
                 for member in tf.getmembers():
-                    name = member.name
-                    # Strip the leading directory component (``corpus/``).
-                    if "/" in name:
-                        name = name.split("/", 1)[1]
+                    top, _, name = member.name.partition("/")
+                    destination = final_corpus_dir if top == "corpus" else artifact_dir if top == "artifacts" else None
+                    if destination is None:
+                        continue
                     if not name or name.endswith("/"):
                         continue
                     stripped = member.replace(name=name)
                     try:
-                        tf.extract(stripped, final_corpus_dir, filter="data")
+                        tf.extract(stripped, destination, filter="data")
                     except TypeError:
-                        tf.extract(stripped, final_corpus_dir)
+                        tf.extract(stripped, destination)
         except (OSError, tarfile.TarError):
             pass
     (campaign_work / "campaign.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
     log = result.stdout + "\n" + result.stderr
     execs_done = _parse_execs_done(log)
     new_units = _parse_new_units(log)
-    crashes = int(any(marker in log for marker in (
+    crash_marker_seen = any(marker in log for marker in (
         "ERROR: libFuzzer: deadly signal",
         "ERROR: AddressSanitizer",
         "SUMMARY: AddressSanitizer",
         "SUMMARY: UndefinedBehaviorSanitizer",
         "WARNING: MemorySanitizer",
         "ERROR: LeakSanitizer",
-    )))
+    ))
+    crash_artifacts = sorted(str(p) for p in artifact_dir.glob("crash-*") if p.is_file())
+    oom_artifacts = sorted(str(p) for p in artifact_dir.glob("oom-*") if p.is_file())
+    crashes = max(int(crash_marker_seen), len(crash_artifacts))
     final_corpus_file_count = 0
     if final_corpus_dir.is_dir():
         final_corpus_file_count = sum(1 for p in final_corpus_dir.rglob("*") if p.is_file())
@@ -1282,11 +1318,16 @@ def run_campaign(
         final_corpus_file_count = 0
     fuzzer_timed_out = "HGB_FUZZER_EXIT_CODE=124" in log
     return {
+        "configured_duration_seconds": budget,
+        "campaign_wall_seconds": campaign_wall_seconds,
         "execs_done": execs_done,
         "new_units": new_units,
         "crashes": crashes,
         "timeouts": int(result.exit_code == 124 or fuzzer_timed_out),
-        "ooms": int("out-of-memory" in log.lower() or "SUMMARY: libFuzzer: out-of-memory" in log),
+        "ooms": max(int("out-of-memory" in log.lower()), len(oom_artifacts)),
+        "crash_artifacts": crash_artifacts,
+        "oom_artifacts": oom_artifacts,
+        "keep_going": keep_going,
         "peak_rss_mb": _parse_peak_rss(log),
         "exit_code": result.exit_code,
         "log": str(campaign_work / "campaign.log"),
@@ -1303,15 +1344,13 @@ def _parse_execs_done(log: str) -> int:
 
     # Prefer the authoritative libFuzzer stat (present with -print_final_stats),
     # then "Done N runs", then the #N DONE/INITED progress markers.
+    counts = []
     for pattern in (r"stat::number_of_executed_units:\s*(\d+)",
-                    r"Done (\d+) runs",
-                    r"#(\d+)\s+DONE",
-                    r"#(\d+)\s+INITED",
+                    r"Done (\d+) runs", r"#(\d+)\s+DONE",
+                    r"#(\d+)\s+INITED", r"#(\d+):\s+cov:",
                     r"execs_done:\s*(\d+)"):
-        m = re.search(pattern, log)
-        if m:
-            return int(m.group(1))
-    return 0
+        counts.extend(int(value) for value in re.findall(pattern, log))
+    return max(counts, default=0)
 
 
 def _parse_new_units(log: str) -> int:
@@ -1340,6 +1379,7 @@ def run_coverage(
     runner: Runner = _run,
     timeout_seconds: int = 600,
     require_coverage_report: bool = False,
+    coverage_format: str = "auto",
 ) -> dict:
     """Replay the final corpus under a coverage-instrumented binary.
 
@@ -1379,7 +1419,12 @@ def run_coverage(
     # PHP's full binary can make llvm-cov's JSON export consume hundreds of
     # gigabytes. LCOV is a real source-based report with line and per-function
     # execution counts, and streams with much lower memory use.
-    use_lcov = binary_path.endswith("/php-fuzz-parser") and not require_coverage_report
+    if coverage_format not in {"auto", "json", "lcov"}:
+        raise ValueError("coverage_format must be auto, json, or lcov")
+    use_lcov = coverage_format == "lcov" or (
+        coverage_format == "auto" and binary_path.endswith("/php-fuzz-parser")
+        and not require_coverage_report
+    )
     report_name = "coverage.lcov" if use_lcov else "coverage.json"
     export_command = (f'llvm-cov export -format=lcov {binary_path}' if use_lcov
                       else f'llvm-cov export -format=text {binary_path}')
@@ -1401,7 +1446,7 @@ def run_coverage(
             'test "$n" -gt 0; '
             f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/coverage-*.profraw && '
             f'{export_command} -instr-profile=/tmp/cov/merged.profdata '
-            f'> /tmp/cov/coverage.json 2>/tmp/cov/cov.err'
+            f'> /tmp/cov/{report_name} 2>/tmp/cov/cov.err'
         )
     else:
         # Replay the corpus one input per process with a bounded per-input
@@ -1420,7 +1465,9 @@ def run_coverage(
             f'llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/coverage-*.profraw && '
             f'{export_command} -instr-profile=/tmp/cov/merged.profdata '
             f'> /tmp/cov/{report_name} 2>/tmp/cov/cov.err; '
-            + ("printf 'HGB_COVERAGE_READY\\n'" if use_lcov else "cat /tmp/cov/coverage.json")
+            + ("printf 'HGB_COVERAGE_READY\\n'"
+               if use_lcov or os.environ.get("HGB_PHASE_B_REPLAY") == "1"
+               else "cat /tmp/cov/coverage.json")
         )
     cmd = ["sh", "-lc", replay_script]
     result = _container_run(
@@ -1910,26 +1957,28 @@ def build_elfuzz_sut(
     if build_result.exit_code == 0:
         inspect = _run_phase(runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60, f"inspect {engine} image")
         image_digest = inspect.stdout.strip()
-        # Extract /out/<fuzz_target> from the image via a throwaway container.
-        container_name = f"hgb-elfuzz-{engine}-{uuid.uuid4().hex[:12]}"
-        create = _run_phase(runner, ["docker", "create", "--pull=never", "--name", container_name, image_tag, "true"], 60, f"create {engine}")
-        copy_out = CommandResult(list(create.command), create.exit_code, create.stdout, create.stderr)
-        if create.exit_code == 0:
-            host_binary = work_dir / "out" / Path(fuzz_target).name
-            cp = _run_phase(
-                runner,
-                ["docker", "cp", f"{container_name}:/out/{fuzz_target}", str(host_binary)],
-                120,
-                f"copy {engine} binary",
-            )
-            copy_out = cp
-            if cp.exit_code == 0 and host_binary.is_file():
-                extracted = True
-                binary_path = str(host_binary)
-                binary_sha256 = _sha256_file(host_binary)
-            _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {engine}")
-        else:
-            _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {engine}")
+        # Docker's daemon can be busy after a large image build. A transient
+        # create/copy failure must not discard an image that contains /out.
+        host_binary = work_dir / "out" / Path(fuzz_target).name
+        for attempt in range(3):
+            container_name = f"hgb-elfuzz-{engine}-{uuid.uuid4().hex[:12]}"
+            create = _run_phase(runner, ["docker", "create", "--pull=never", "--name", container_name, image_tag, "true"], 180, f"create {engine}")
+            if create.exit_code == 0:
+                cp = _run_phase(
+                    runner,
+                    ["docker", "cp", f"{container_name}:/out/{fuzz_target}", str(host_binary)],
+                    300,
+                    f"copy {engine} binary",
+                )
+                if cp.exit_code == 0 and host_binary.is_file():
+                    extracted = True
+                    binary_path = str(host_binary)
+                    binary_sha256 = _sha256_file(host_binary)
+            _run_phase(runner, ["docker", "rm", "-f", container_name], 180, f"cleanup {engine}")
+            if extracted:
+                break
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
     return {
         "engine": engine,
         "sanitizer": sanitizer,

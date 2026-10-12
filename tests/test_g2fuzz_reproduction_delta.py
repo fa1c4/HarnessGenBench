@@ -432,6 +432,25 @@ def test_campaign_requires_cmplog_binary(tmp_path: Path):
     assert "CmpLog" in exc_info.value.reason
 
 
+def test_replay_seed_filter_preserves_usable_generated_inputs(tmp_path: Path):
+    initial = tmp_path / "afl_initial"
+    initial.mkdir()
+    (initial / "good").write_bytes(b"good")
+    (initial / "bad").write_bytes(b"bad")
+    (initial / "hang").write_bytes(b"hang")
+    target = tmp_path / "target.afl"
+    make_executable(target, """#!/usr/bin/env python3
+import pathlib, sys, time
+data = pathlib.Path(sys.argv[1]).read_bytes()
+if data == b'hang': time.sleep(0.2)
+if data == b'bad': raise SystemExit(1)
+""")
+    record = g2.filter_replay_initial_corpus(initial, target, ["@@"], 0.05)
+    assert record["retained"] == 1
+    assert {item["reason"] for item in record["excluded"]} == {"exit_1", "timeout"}
+    assert [path.name for path in initial.iterdir()] == ["good"]
+
+
 # 9. evaluated requires the full closed loop (real evidence) with delta schema
 def test_evaluated_requires_full_closed_loop(tmp_path: Path):
     code, metadata, pipeline, workspace = run_full(tmp_path)

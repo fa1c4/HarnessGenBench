@@ -95,8 +95,8 @@ if func_path.exists():
     # their own outputs between os.listdir and getsize/move; skip them
     # instead of aborting the whole run.
     func_text = func_text.replace(
-        "        # 检查文件大小，如果大于10MB，则删除该文件\n        if os.path.getsize(source_path) > size_limit:\n            os.remove(source_path)\n            print(f\"---- Deleted large file {source_path} (greater than 10MB)\")\n            continue  # 跳过该文件，避免继续移动\n",
-        "        # 检查文件大小，如果大于10MB，则删除该文件\n        try:\n            file_size = os.path.getsize(source_path)\n        except OSError:\n            print(f\"---- Skipped unreadable file {source_path}\")\n            continue\n        if file_size > size_limit:\n            os.remove(source_path)\n            print(f\"---- Deleted large file {source_path} (greater than 10MB)\")\n            continue  # 跳过该文件，避免继续移动\n",
+        "        # \u68c0\u67e5\u6587\u4ef6\u5927\u5c0f，\u5982\u679c\u5927\u4e8e10MB，\u5219\u5220\u9664\u8be5\u6587\u4ef6\n        if os.path.getsize(source_path) > size_limit:\n            os.remove(source_path)\n            print(f\"---- Deleted large file {source_path} (greater than 10MB)\")\n            continue  # \u8df3\u8fc7\u8be5\u6587\u4ef6，\u907f\u514d\u7ee7\u7eed\u79fb\u52a8\n",
+        "        # \u68c0\u67e5\u6587\u4ef6\u5927\u5c0f，\u5982\u679c\u5927\u4e8e10MB，\u5219\u5220\u9664\u8be5\u6587\u4ef6\n        try:\n            file_size = os.path.getsize(source_path)\n        except OSError:\n            print(f\"---- Skipped unreadable file {source_path}\")\n            continue\n        if file_size > size_limit:\n            os.remove(source_path)\n            print(f\"---- Deleted large file {source_path} (greater than 10MB)\")\n            continue  # \u8df3\u8fc7\u8be5\u6587\u4ef6，\u907f\u514d\u7ee7\u7eed\u79fb\u52a8\n",
     )
     func_path.write_text(func_text)
 llm_path = path.parent / "py_utils" / "llm_utils.py"

@@ -1938,6 +1938,7 @@ PY_PROMEFUZZ_INTENDED_APIS
       --build-timeout-seconds "${HGB_PROMEFUZZ_EVAL_BUILD_TIMEOUT:-1800}"
       --strict
     )
+    [[ "${HGB_EVAL_ALL_STOP_AFTER_SUCCESS:-0}" == "1" ]] && evaluator_args+=(--stop-on-first-success)
     [[ -n "$intended_apis_arg" ]] && evaluator_args+=(--intended-apis "$intended_apis_arg")
     # HGB8 blocker fix / eta plan §2: strict reproduction profiles must build
     # a separate coverage-instrumented image so coverage comes from a real

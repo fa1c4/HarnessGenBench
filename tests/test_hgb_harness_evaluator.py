@@ -271,3 +271,78 @@ def test_run_coverage_eta_parses_inputs_replayed_marker(tmp_path: Path) -> None:
     assert cov["copy_out_ok"] is True
     assert cov["coverage_report_path"]
     assert Path(cov["coverage_report_path"]).is_file()
+
+
+def test_phase_b_reuses_verified_candidate_image_and_smoke(tmp_path: Path, monkeypatch) -> None:
+    import hashlib
+
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    candidate = candidates_dir / "cand_001.c"
+    candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    runner = _Runner(candidate_sha=candidate_sha)
+    saved = {
+        "candidate_sha256": candidate_sha,
+        "native_destination": "/src/project/native.c",
+        "sanitizer_smoke": {"any_executed": True, "misuse_crash": False, "timed_out": False},
+        "build": {
+            "image_tag": "phase-a-verified-image", "image_digest": "sha256:fakeimage",
+            "binary_path": "/out/fuzz_target", "binary_sha256": candidate_sha,
+            "binary_verified": True, "overlay_audit": {"matches_candidate": True},
+        },
+    }
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Phase B rebuilt or repeated smoke for a verified Phase A image")
+
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "build_candidate_image", forbidden)
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_smoke", forbidden)
+    result = evaluator.evaluate(
+        generator="promefuzz", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=10,
+        strict=True, runner=runner, intended_apis=["hgb_sample_api"], seeds=[],
+        build_coverage_image=True, preverified_candidate=saved,
+        keep_going_campaign=True,
+    )
+    assert result["status"] == hgb_result.STATUS_EVALUATED
+    assert result["selected_candidate"]["build"]["phase_a_reused"] is True
+    assert result["campaign"]["keep_going"] is True
+
+
+def test_phase_b_reuses_saved_coverage_image(tmp_path: Path, monkeypatch) -> None:
+    import hashlib
+
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    candidate_sha = hashlib.sha256((candidates_dir / "cand_001.c").read_bytes()).hexdigest()
+    saved = {
+        "candidate_sha256": candidate_sha,
+        "native_destination": "/src/project/native.c",
+        "sanitizer_smoke": {"any_executed": True, "misuse_crash": False, "timed_out": False},
+        "build": {"image_tag": "phase-a-address", "image_digest": "sha256:fakeimage",
+                  "binary_path": "/out/fuzz_target", "binary_verified": True},
+    }
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Phase B rebuilt a saved coverage image")
+
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "build_coverage_image", forbidden)
+    result = evaluator.evaluate(
+        generator="promefuzz", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=10,
+        strict=True, runner=_Runner(candidate_sha=candidate_sha),
+        intended_apis=["hgb_sample_api"], seeds=[], build_coverage_image=True,
+        preverified_candidate=saved, keep_going_campaign=True,
+        prebuilt_coverage_image="phase-a-coverage",
+    )
+    assert result["status"] == hgb_result.STATUS_EVALUATED
+    assert result["selected_candidate"]["coverage"]["line_coverage"]["covered"] == 27
+
+
+def test_fork_campaign_parses_progress_even_when_worker_stats_are_zero() -> None:
+    log = (
+        "INFO: -fork=1: fuzzing in separate process(s)\n"
+        "#629: cov: 219 ft: 219 corp: 1 exec/s 314 oom/timeout/crash: 0/0/0 time: 2s\n"
+        "stat::number_of_executed_units: 0\n"
+    )
+    assert evaluator.hgb_fuzzbench_builder._parse_execs_done(log) == 629

@@ -1662,6 +1662,7 @@ run_evaluator() {
       --intended-apis "$selected_functions"
       --strict
     )
+    [[ "${HGB_EVAL_ALL_STOP_AFTER_SUCCESS:-0}" == "1" ]] && ofg_evaluator_args+=(--stop-on-first-success)
     case "$hgb_profile" in
       # Every non-compat profile must build a separate coverage-instrumented
       # image: the campaign image is SANITIZER=address and produces no

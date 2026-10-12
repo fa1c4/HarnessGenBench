@@ -119,10 +119,10 @@ fi
 [[ "$save_mode" == "compact" || "$save_mode" == "debug" ]] || die "--save-mode must be compact or debug"
 
 root="$(repo_root)"
-if [[ "$generator" == "promefuzz" && -z "${HGB_API_KEY_CONFIG:-}" && -f "$root/configs/set_api_key_ds.sh" ]]; then
-  export HGB_API_KEY_CONFIG="$root/configs/set_api_key_ds.sh"
+if [[ "$generator" == "promefuzz" && -z "${HGB_API_KEY_CONFIG:-}" && -f "$HOME/api_keys/HarnessGenBench/set_api_key_ds.sh" ]]; then
+  export HGB_API_KEY_CONFIG="$HOME/api_keys/HarnessGenBench/set_api_key_ds.sh"
 fi
-if [[ "$generator" == "promefuzz" && "${HGB_API_KEY_CONFIG:-}" == "$root/configs/set_api_key_ds.sh" ]]; then
+if [[ "$generator" == "promefuzz" && "${HGB_API_KEY_CONFIG:-}" == "$HOME/api_keys/HarnessGenBench/set_api_key_ds.sh" ]]; then
   # The outer compatibility runner may have already resolved another config
   # into these higher-priority variables. Let the explicitly selected DS file
   # supply all three values before hgb_resolve_llm_provider runs again.
@@ -189,6 +189,9 @@ fuzz_target="$(extract_json_string fuzz_target "$manifest")"
 
 workspace="$(workspace_generator_target_run_dir "$generator" "$target" "$run_id" "$root")"
 ensure_dir "$workspace/logs"
+# Keep relative output from host tools inside this run, even when the caller
+# launched the generator from the repository root.
+cd "$workspace"
 
 record_statistics_on_exit() {
   local exit_code=$?
@@ -245,7 +248,7 @@ fi
   printf 'target_layout=%s\n' "$target_layout"
   printf 'save_mode=%s\n' "$save_mode"
   if [[ "$generator" == "promefuzz" ]]; then
-    printf 'api_key_config=%s\n' "${HGB_API_KEY_CONFIG:-$root/configs/set_api_key.sh}"
+    printf 'api_key_config=%s\n' "${HGB_API_KEY_CONFIG:-$HOME/api_keys/HarnessGenBench/set_api_key.sh}"
   fi
 } >"$workspace/host_command.txt"
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Copy to configs/set_api_key.sh and fill locally. Do not commit that real file.
+# Copy to ~/api_keys/HarnessGenBench/set_api_key.sh and fill locally outside the repository.
+# Never put a real API key in the code directory; store it under ~/api_keys/.
 # The resolver maps these settings to OPENAI_* variables for every compatible generator.
 
 # Select one of: ustc, deepseek, custom, or auto.

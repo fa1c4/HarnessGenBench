@@ -95,7 +95,8 @@ class FakeResult:
 
 
 class FakeRunner:
-    def __init__(self, *, coverage_stdout=None, campaign_execs=500, build_exit=0):
+    def __init__(self, *, coverage_stdout=None, campaign_execs=500, build_exit=0,
+                 campaign_artifact=False):
         self.commands = []
         self.campaign_execs = campaign_execs
         self.coverage_stdout = coverage_stdout if coverage_stdout is not None else json.dumps({
@@ -106,6 +107,7 @@ class FakeRunner:
             "type": "llvm.coverage.json.export", "version": "2.0.1",
         })
         self.build_exit = build_exit
+        self.campaign_artifact = campaign_artifact
         self._containers = {}
 
     def __call__(self, command, timeout):
@@ -157,6 +159,10 @@ class FakeRunner:
                         info = tarfile.TarInfo(name="corpus/seed_0000")
                         info.size = len(data)
                         tf.addfile(info, io.BytesIO(data))
+                        if self.campaign_artifact:
+                            crash = tarfile.TarInfo(name="artifacts/crash-example")
+                            crash.size = len(data)
+                            tf.addfile(crash, io.BytesIO(data))
                 return FakeResult(cmd, 0, "", "")
             if sub == "rm":
                 return FakeResult(cmd, 0, "", "")
@@ -582,7 +588,7 @@ def test_smoke_runner_fails_if_no_sample_executed(tmp_path: Path) -> None:
     assert "copy_in" in source
 
 
-def test_campaign_runner_adds_bounded_runs_to_time_budget(tmp_path: Path) -> None:
+def test_campaign_runner_uses_time_budget_without_run_cap(tmp_path: Path) -> None:
     runner = FakeRunner()
     result = hgb_fuzzbench_builder.run_campaign(
         image_tag="hgb-test",
@@ -595,10 +601,26 @@ def test_campaign_runner_adds_bounded_runs_to_time_budget(tmp_path: Path) -> Non
 
     create_commands = [" ".join(c) for c in runner.commands if c[:2] == ["docker", "create"]]
     assert any("timeout -s INT -k 5s 7s" in c for c in create_commands)
-    assert any("-runs=512" in c and "-max_total_time=2" in c for c in create_commands)
+    assert any("-runs=-1" in c and "-max_total_time=2" in c for c in create_commands)
     assert any("HGB_FUZZER_EXIT_CODE=$fuzzer_rc" in c for c in create_commands)
+    assert any("tail -n 2000 /tmp/campaign.log" in c for c in create_commands)
     assert result["execs_done"] == 500
     assert result["timeouts"] == 0
+
+
+def test_keep_going_campaign_preserves_crash_artifact_outside_corpus(tmp_path: Path) -> None:
+    runner = FakeRunner(campaign_artifact=True)
+    result = hgb_fuzzbench_builder.run_campaign(
+        image_tag="hgb-test", binary_path="/out/fuzz_target",
+        corpus_dir=tmp_path / "seeds", work_dir=tmp_path / "campaign",
+        campaign_seconds=2, runner=runner, keep_going=True,
+    )
+    create = [" ".join(c) for c in runner.commands if c[:2] == ["docker", "create"]]
+    assert any("-fork=1 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1" in c for c in create)
+    assert result["crashes"] == 1
+    assert result["crash_artifacts"] == [str(tmp_path / "campaign/artifacts/crash-example")]
+    assert (tmp_path / "campaign/corpus/seed_0000").is_file()
+    assert not (tmp_path / "campaign/corpus/crash-example").exists()
 
 
 # ---------------------------------------------------------------------------

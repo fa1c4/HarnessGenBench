@@ -21,10 +21,10 @@ openai_key.txt
 !configs/
 !configs/.gitkeep
 !configs/set_api_key.example.sh
-configs/set_api_key.sh
 
 # External projects and generated data
-result.json
+# Do not hide a stray result.json at the repository root. Run results belong
+# under workspace/ or results/ and are ignored by their directories below.
 /external/
 /results/**
 /artifacts/**
