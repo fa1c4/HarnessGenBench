@@ -273,6 +273,31 @@ def test_run_coverage_eta_parses_inputs_replayed_marker(tmp_path: Path) -> None:
     assert Path(cov["coverage_report_path"]).is_file()
 
 
+def test_coverage_replay_limits_each_input_to_one_run(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "seed").write_bytes(b"input")
+
+    class RecordingRunner(_Runner):
+        def __init__(self):
+            super().__init__()
+            self.commands = []
+
+        def __call__(self, command, timeout):
+            self.commands.append(list(command))
+            return super().__call__(command, timeout)
+
+    for strict in (False, True):
+        runner = RecordingRunner()
+        hgb_fuzzbench_builder.run_coverage(
+            image_tag="hgb-test", binary_path="/out/fuzz_target", corpus_dir=corpus,
+            work_dir=tmp_path / f"coverage_{strict}", runner=runner,
+            require_coverage_report=strict,
+        )
+        create = next(cmd for cmd in runner.commands if cmd[:2] == ["docker", "create"])
+        assert '-runs=1 "$f"' in create[-1]
+
+
 def test_phase_b_reuses_verified_candidate_image_and_smoke(tmp_path: Path, monkeypatch) -> None:
     import hashlib
 
@@ -291,11 +316,17 @@ def test_phase_b_reuses_verified_candidate_image_and_smoke(tmp_path: Path, monke
         },
     }
 
-    def forbidden(*_args, **_kwargs):
-        raise AssertionError("Phase B rebuilt or repeated smoke for a verified Phase A image")
+    original_build = evaluator.hgb_fuzzbench_builder.build_candidate_image
 
-    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "build_candidate_image", forbidden)
-    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_smoke", forbidden)
+    def coverage_only_build(*args, **kwargs):
+        assert kwargs.get("sanitizer") == "coverage", "Phase B rebuilt the saved address image"
+        return original_build(*args, **kwargs)
+
+    def forbidden_smoke(*_args, **_kwargs):
+        raise AssertionError("Phase B repeated verified Phase A smoke")
+
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "build_candidate_image", coverage_only_build)
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_smoke", forbidden_smoke)
     result = evaluator.evaluate(
         generator="promefuzz", target_root=gen_root, evaluator_root=evl_root,
         candidates_dir=candidates_dir, work_dir=work_dir, project="project",
@@ -307,6 +338,58 @@ def test_phase_b_reuses_verified_candidate_image_and_smoke(tmp_path: Path, monke
     assert result["status"] == hgb_result.STATUS_EVALUATED
     assert result["selected_candidate"]["build"]["phase_a_reused"] is True
     assert result["campaign"]["keep_going"] is True
+
+
+def test_phase_b_coverage_build_adds_candidate_compile_stage(tmp_path: Path) -> None:
+    import hashlib
+
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    candidate = candidates_dir / "cand_001.c"
+    runner = _Runner(candidate_path=str(candidate))
+    candidate_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    saved = {
+        "candidate_sha256": candidate_sha,
+        "native_destination": "/src/project/native.c",
+        "sanitizer_smoke": {"any_executed": True, "misuse_crash": False, "timed_out": False},
+        "build": {"image_tag": "phase-a-address", "image_digest": "sha256:fakeimage",
+                  "binary_path": "/out/fuzz_target", "binary_verified": True},
+    }
+    result = evaluator.evaluate(
+        generator="promefuzz", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=10,
+        strict=True, runner=runner, intended_apis=["hgb_sample_api"], seeds=[],
+        build_coverage_image=True, preverified_candidate=saved,
+    )
+    assert result["status"] == hgb_result.STATUS_EVALUATED
+    dockerfile = work_dir / "sealed_context/sealed_context/Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+    assert "COPY hgb_candidate_overlay/project/native.c /src/project/native.c" in text
+    assert "# HGB sealed evaluator candidate build." in text
+    assert "SANITIZER=\"$HGB_SANITIZER\"" in text
+
+
+def test_saved_campaign_recovery_requires_full_log_and_matching_corpus(tmp_path: Path) -> None:
+    import io
+    import tarfile
+
+    work = tmp_path / "cand_001"
+    (work / "campaign").mkdir(parents=True)
+    (work / "corpus").mkdir()
+    (work / "corpus/seed").write_bytes(b"input")
+    with tarfile.open(work / "campaign/corpus.tar", "w") as archive:
+        info = tarfile.TarInfo("corpus/seed")
+        info.size = 5
+        archive.addfile(info, io.BytesIO(b"input"))
+    log = work / "campaign/campaign.log"
+    log.write_text("#123: cov: 10 time: 86405s\nINFO: fuzzed for 86405 seconds\n", encoding="utf-8")
+    saved = hgb_fuzzbench_builder.load_saved_campaign(work, 86400)
+    assert saved["reused_saved_campaign"] is True
+    assert saved["campaign_wall_seconds"] >= 86400
+    assert saved["final_corpus_file_count"] == 1
+    log.write_text("#123: cov: 10 time: 85155s\nKilled\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duration"):
+        hgb_fuzzbench_builder.load_saved_campaign(work, 86400)
 
 
 def test_phase_b_reuses_saved_coverage_image(tmp_path: Path, monkeypatch) -> None:
@@ -337,6 +420,44 @@ def test_phase_b_reuses_saved_coverage_image(tmp_path: Path, monkeypatch) -> Non
     )
     assert result["status"] == hgb_result.STATUS_EVALUATED
     assert result["selected_candidate"]["coverage"]["line_coverage"]["covered"] == 27
+
+
+def test_phase_b_rebuilds_stale_coverage_image(tmp_path: Path) -> None:
+    import hashlib
+
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    candidate_sha = hashlib.sha256((candidates_dir / "cand_001.c").read_bytes()).hexdigest()
+
+    class StaleImageRunner(_Runner):
+        def __init__(self):
+            super().__init__(candidate_sha=candidate_sha)
+            self.commands = []
+
+        def __call__(self, command, timeout):
+            self.commands.append(list(command))
+            if command[:2] == ["docker", "run"] and "phase-a-coverage" in command:
+                return FakeResult(command, 0, "0" * 64 + "  /src/project/native.c\n")
+            return super().__call__(command, timeout)
+
+    runner = StaleImageRunner()
+    saved = {
+        "candidate_sha256": candidate_sha,
+        "native_destination": "/src/project/native.c",
+        "sanitizer_smoke": {"any_executed": True, "misuse_crash": False, "timed_out": False},
+        "build": {"image_tag": "phase-a-address", "image_digest": "sha256:fakeimage",
+                  "binary_path": "/out/fuzz_target", "binary_verified": True},
+    }
+    result = evaluator.evaluate(
+        generator="promefuzz", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=10,
+        strict=True, runner=runner, intended_apis=["hgb_sample_api"], seeds=[],
+        build_coverage_image=True, preverified_candidate=saved,
+        prebuilt_coverage_image="phase-a-coverage",
+    )
+    assert result["status"] == hgb_result.STATUS_EVALUATED
+    assert result["selected_candidate"]["coverage"]["phase_a_image_reused"] is False
+    assert any(cmd[:2] == ["docker", "build"] for cmd in runner.commands)
 
 
 def test_fork_campaign_parses_progress_even_when_worker_stats_are_zero() -> None:

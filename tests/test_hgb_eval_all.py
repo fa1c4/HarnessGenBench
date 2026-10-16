@@ -2,6 +2,7 @@ import csv
 import importlib.util
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -39,6 +40,57 @@ def test_csv_contains_na_and_campaign_metrics(tmp_path: Path) -> None:
     assert record["ckgfuzzer_covered_lines"] == "12"
 
 
+def test_default_run_id_uses_phase_date_and_campaign_duration() -> None:
+    assert hgb_eval_all.default_run_id("generate", "2026-10-16", 86400, 300) == (
+        "eval_all_phase_a_20261016_300s")
+    assert hgb_eval_all.default_run_id("fuzz", "2026-10-16", 86400, 300) == (
+        "eval_all_phase_b_20261016_86400s")
+
+
+def test_default_plan_uses_today_workspace_paths_and_saved_manifest(tmp_path: Path, monkeypatch) -> None:
+    class Today:
+        @staticmethod
+        def now():
+            return datetime(2026, 10, 16)
+
+    targets = ["example"]
+    scope = {(baseline, "example"): "pending" for baseline in hgb_eval_all.BASELINES}
+    saved = tmp_path / "results/eval_all/2026-10-12.phase_a.json"
+    saved.parent.mkdir(parents=True)
+    saved.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": "example", "status": "ready", "source_run": "saved-source"}
+        for baseline in hgb_eval_all.BASELINES
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "datetime", Today)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: (targets, scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, raw: (True, raw))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--plan"])
+    assert hgb_eval_all.main() == 0
+    manifest = tmp_path / "workspace/eval_all/2026-10-16.phase_a.json"
+    output = tmp_path / "workspace/eval_all/2026-10-16.csv"
+    assert manifest.read_bytes() == saved.read_bytes()
+    assert output.is_file()
+    assert all(row[f"{baseline}_status"] == "pending" for baseline in hgb_eval_all.BASELINES
+               for row in csv.DictReader(output.open(newline="", encoding="utf-8")))
+
+
+def test_latest_manifest_skips_incomplete_newer_selection(tmp_path: Path) -> None:
+    scope = {("ckgfuzzer", "example"): "pending", ("promefuzz", "example"): "pending"}
+    directory = tmp_path / "results/eval_all"
+    directory.mkdir(parents=True)
+    complete = directory / "2026-10-12.phase_a.json"
+    incomplete = directory / "2026-10-16.phase_a.json"
+    complete.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": "example", "status": "ready", "source_run": "saved-source"}
+        for baseline in ("ckgfuzzer", "promefuzz")
+    ]}), encoding="utf-8")
+    incomplete.write_text(json.dumps({"records": [
+        {"baseline": "ckgfuzzer", "target": "example", "status": "ready", "source_run": "new-source"}
+    ]}), encoding="utf-8")
+    assert hgb_eval_all.latest_complete_manifest(tmp_path, "2026-10-16", scope) == complete
+
+
 def test_resume_keeps_completed_rows_and_requeues_stale_running(tmp_path: Path, monkeypatch) -> None:
     targets, scope = hgb_eval_all.plan(hgb_eval_all.ROOT)
     rows = {(b, t): {"status": scope[b, t]} for t in targets for b in hgb_eval_all.BASELINES}
@@ -47,7 +99,14 @@ def test_resume_keeps_completed_rows_and_requeues_stale_running(tmp_path: Path, 
     rows["promefuzz", first] = {"status": "running"}
     output = tmp_path / "2026-10-10.csv"
     hgb_eval_all.save_csv(output, targets, rows)
-    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--resume", "--plan", "--output", str(output)])
+    manifest = tmp_path / "phase_a.json"
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved-source"}
+        for (baseline, target), status in scope.items() if status == "pending"
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, raw: (True, raw))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--resume", "--plan",
+                                      "--output", str(output), "--manifest", str(manifest)])
     assert hgb_eval_all.main() == 0
     records = list(csv.DictReader(output.open(newline="", encoding="utf-8")))
     assert records[0]["ckgfuzzer_status"] == "evaluated"

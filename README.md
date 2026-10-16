@@ -91,7 +91,13 @@ python3 scripts/hgb_eval_all.py --phase generate --parallel-worker 32
 Phase B starts a fresh 24-hour fuzzing campaign from each saved Phase A artifact. It reuses verified harness images when present, does not repeat successful Phase A smoke checks, and does not call a baseline's generator or LLM. Run it after Phase A succeeds:
 
 ```bash
-python3 scripts/hgb_eval_all.py --phase fuzz --parallel-worker 32
+time python3 scripts/hgb_eval_all.py \
+    --phase fuzz \
+    --parallel-worker 64 \
+    --campaign-seconds 86400 \
+    --memory-per-job-gib 8
 ```
 
-The default is 64 workers. Each replay container is limited to one logical CPU and 8 GiB RAM; `--memory-budget-gib` limits the combined replay-container allocation. Docker image builds also use host memory. Generated harnesses, inputs, fuzzing artifacts, logs, and temporary run files go under `workspace/`; evaluation reports remain under `results/eval_all/`. The scripts do not write generated files directly into the repository root. Phase A writes `results/eval_all/YYYY-MM-DD.phase_a.json` and `.phase_a.csv`. Phase B updates `results/eval_all/YYYY-MM-DD.csv` as jobs finish, with `N/A` for out-of-scope pairs. Use `--plan` with either phase to inspect its jobs without launching Docker, and `--resume` to continue an existing CSV. Saved-input libFuzzer campaigns continue after crash, OOM, and target timeout findings and preserve their artifact files. ELFuzz Phase B labels its method variant `saved-input-libfuzzer`.
+The date defaults to today. Phase A writes `workspace/eval_all/YYYY-MM-DD.phase_a.json` and `.phase_a.csv`; Phase B uses that manifest and updates `workspace/eval_all/YYYY-MM-DD.csv` as jobs finish. If today's manifest is absent, the script copies the latest complete saved Phase A manifest into today's workspace path. The default run ID records the phase, date, and campaign duration, such as `eval_all_phase_b_20261016_86400s`. Supply a new `--output` and `--run-id` for another run on the same day.
+
+The default is 64 workers. Each replay container is limited to one logical CPU and 8 GiB RAM; `--memory-budget-gib` limits the combined replay-container allocation. Docker image builds also use host memory. Generated harnesses, inputs, fuzzing artifacts, logs, and evaluation reports go under `workspace/`. Phase B records `N/A` for out-of-scope pairs. Use `--plan` with either phase to inspect its jobs without launching Docker, and `--resume` to continue an existing CSV. Saved-input libFuzzer campaigns continue after crash, OOM, and target timeout findings and preserve their artifact files. ELFuzz Phase B labels its method variant `saved-input-libfuzzer`.

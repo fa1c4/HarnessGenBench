@@ -94,7 +94,10 @@ def main() -> int:
     if min(args.max_attempts, args.parallel_worker, args.memory_per_job_gib,
            args.campaign_seconds) < 1:
         parser.error("attempts, workers, memory, and campaign duration must be positive")
-    output = ROOT / "results/eval_all" / f"{args.date}.csv"
+    output = ROOT / "workspace/eval_all" / f"{args.date}.csv"
+    legacy_output = ROOT / "results/eval_all" / f"{args.date}.csv"
+    if not output.is_file() and legacy_output.is_file():
+        output = legacy_output
     print(f"Waiting for {args.after_unit} before retrying unfinished pairs", flush=True)
     wait_until_stopped(args.after_unit)
     if not output.is_file():
@@ -113,6 +116,7 @@ def main() -> int:
         run_id = f"{args.run_id_prefix}_{args.date.replace('-', '')}_r{attempt}"
         command = [sys.executable, str(ROOT / "scripts/hgb_eval_all.py"),
                    "--phase", "fuzz", "--resume", "--date", args.date,
+                   "--output", str(output),
                    "--run-id", run_id, "--parallel-worker", str(args.parallel_worker),
                    "--memory-per-job-gib", str(args.memory_per_job_gib),
                    "--campaign-seconds", str(args.campaign_seconds)]

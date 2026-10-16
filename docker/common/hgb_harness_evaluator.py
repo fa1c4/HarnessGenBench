@@ -35,6 +35,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 from dataclasses import dataclass, field
@@ -414,6 +415,7 @@ def evaluate_candidate(
     keep_going_campaign: bool = False,
     coverage_format: str = "auto",
     prebuilt_coverage_image: str = "",
+    reuse_saved_campaign: bool = False,
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
     strict_eta = profile in ETA_PROFILES
@@ -565,19 +567,27 @@ def evaluate_candidate(
 
     # 6.4 Fuzzing campaign (fixed-budget libFuzzer).
     corpus_dir = candidate_work / "corpus"
-    corpus_dir.mkdir(parents=True, exist_ok=True)
-    for seed in seeds:
-        if Path(seed).is_file():
-            shutil.copy2(seed, corpus_dir / Path(seed).name)
-    campaign = hgb_fuzzbench_builder.run_campaign(
-        image_tag=image_tag,
-        binary_path=build.binary_path,
-        corpus_dir=corpus_dir,
-        work_dir=candidate_work,
-        campaign_seconds=campaign_seconds,
-        runner=runner,
-        keep_going=keep_going_campaign,
-    )
+    if reuse_saved_campaign:
+        try:
+            campaign = hgb_fuzzbench_builder.load_saved_campaign(candidate_work, campaign_seconds)
+        except (OSError, ValueError) as exc:
+            hgb_result.mark_stage(rec.stages, "campaign", "failed")
+            rec.error = f"saved campaign invalid: {exc}"
+            return rec
+    else:
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        for seed in seeds:
+            if Path(seed).is_file():
+                shutil.copy2(seed, corpus_dir / Path(seed).name)
+        campaign = hgb_fuzzbench_builder.run_campaign(
+            image_tag=image_tag,
+            binary_path=build.binary_path,
+            corpus_dir=corpus_dir,
+            work_dir=candidate_work,
+            campaign_seconds=campaign_seconds,
+            runner=runner,
+            keep_going=keep_going_campaign,
+        )
     rec.campaign = campaign
     if strict and not keep_going_campaign and int(campaign.get("crashes", 0) or 0) > 0:
         hgb_result.mark_stage(rec.stages, "campaign", "failed")
@@ -615,16 +625,27 @@ def evaluate_candidate(
             return rec
         coverage_corpus_dir = corpus_dir
     cov_image = image_tag
+    reused_cov_image = False
     if build_coverage_image and (coverage_image_tag or prebuilt_coverage_image):
         if preverified is not None and prebuilt_coverage_image:
-            inspect = runner(["docker", "image", "inspect", "-f", "{{.Id}}", prebuilt_coverage_image], 60)
-            verify = runner(["docker", "run", "--rm", "--pull=never", prebuilt_coverage_image,
-                             "sh", "-lc", f"test -x {build.binary_path}"], 120)
+            inspect = hgb_fuzzbench_builder._run_phase(
+                runner, ["docker", "image", "inspect", "-f", "{{.Id}}", prebuilt_coverage_image],
+                300, "inspect saved coverage image")
+            verify = hgb_fuzzbench_builder._run_phase(
+                runner, ["docker", "run", "--rm", "--pull=never", prebuilt_coverage_image,
+                         "sh", "-lc", (f"test -x {shlex.quote(build.binary_path)} && "
+                                      f"sha256sum {shlex.quote(native_destination)}")],
+                600, "verify saved coverage binary and harness")
+            saved_harness_hash = verify.stdout.split()[0].lower() if verify.stdout.split() else ""
+            reused_cov_image = (inspect.exit_code == 0 and verify.exit_code == 0
+                                and saved_harness_hash == rec.candidate_sha256)
+            hgb_fuzzbench_builder._write_log(candidate_work / "coverage_build/prebuilt_verify.log", verify)
+        if reused_cov_image:
             cov_build = hgb_fuzzbench_builder.BuildResult(
                 image_tag=prebuilt_coverage_image, image_digest=inspect.stdout.strip(),
-                binary_path=build.binary_path, binary_sha256="", build_exit_code=0 if not inspect.exit_code and not verify.exit_code else 1,
+                binary_path=build.binary_path, binary_sha256="", build_exit_code=0,
                 log="phase_a_coverage_image_reused", compiler="clang/clang++",
-                sanitizer="coverage", engine="libfuzzer", binary_verified=not inspect.exit_code and not verify.exit_code,
+                sanitizer="coverage", engine="libfuzzer", binary_verified=True,
             )
         else:
             cov_build = hgb_fuzzbench_builder.build_coverage_image(
@@ -635,6 +656,8 @@ def evaluate_candidate(
                 work_dir=candidate_work / "coverage_build",
                 runner=runner,
                 timeout_seconds=build_timeout_seconds,
+                staged_candidate_host=candidate,
+                native_destination=native_destination,
             )
         # If a coverage image was requested but its build failed or the
         # coverage binary was not verified, fail coverage immediately. Do NOT
@@ -652,13 +675,14 @@ def evaluate_candidate(
                 "binary_verified": cov_build.binary_verified,
             }
             return rec
-        cov_image = prebuilt_coverage_image or coverage_image_tag
+        cov_image = prebuilt_coverage_image if reused_cov_image else coverage_image_tag
     cov = hgb_fuzzbench_builder.run_coverage(
         image_tag=cov_image,
         binary_path=build.binary_path,
         corpus_dir=coverage_corpus_dir,
         work_dir=candidate_work,
         runner=runner,
+        timeout_seconds=21600 if build.binary_path.endswith("/php-fuzz-parser") else 600,
         require_coverage_report=strict_eta,
         coverage_format=coverage_format,
     )
@@ -747,7 +771,7 @@ def evaluate_candidate(
     rec.coverage = cov_summary or {}
     rec.coverage["coverage_report_path"] = coverage_report_path
     rec.coverage["image_tag"] = cov_image
-    rec.coverage["phase_a_image_reused"] = bool(preverified is not None and prebuilt_coverage_image)
+    rec.coverage["phase_a_image_reused"] = reused_cov_image
     if cov_summary is None or cov_summary.get("line_coverage", {}).get("covered") is None:
         hgb_result.mark_stage(rec.stages, "coverage", "failed")
         if not rec.error:
@@ -976,6 +1000,7 @@ def evaluate(
     keep_going_campaign: bool = False,
     coverage_format: str = "auto",
     prebuilt_coverage_image: str = "",
+    reuse_saved_campaign: bool = False,
 ) -> dict[str, Any]:
     """Evaluate all candidates and return the run-level result dict.
 
@@ -1123,6 +1148,7 @@ def evaluate(
             keep_going_campaign=keep_going_campaign,
             coverage_format=coverage_format,
             prebuilt_coverage_image=prebuilt_coverage_image,
+            reuse_saved_campaign=reuse_saved_campaign,
         )
         records.append(rec)
         # Flatten key audit/provenance fields onto the candidate dict so the
@@ -1293,6 +1319,8 @@ def main() -> int:
     parser.add_argument("--coverage-format", choices=("auto", "json", "lcov"), default="auto")
     parser.add_argument("--prebuilt-coverage-image", default="",
                         help="reuse the selected Phase A coverage image while measuring the new final corpus")
+    parser.add_argument("--reuse-saved-campaign", action="store_true",
+                        help="validate and reuse the existing work-dir campaign log and corpus.tar")
     args = parser.parse_args()
 
     generator = args.baseline or args.generator
@@ -1367,6 +1395,7 @@ def main() -> int:
             keep_going_campaign=args.keep_going_campaign,
             coverage_format=args.coverage_format,
             prebuilt_coverage_image=args.prebuilt_coverage_image,
+            reuse_saved_campaign=args.reuse_saved_campaign,
         )
     finally:
         if cleanup_dir is not None:

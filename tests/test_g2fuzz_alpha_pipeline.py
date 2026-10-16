@@ -26,6 +26,20 @@ g2 = load_module("g2fuzz_target_pipeline", ROOT / "docker/common/g2fuzz_target_p
 matrix_collector = load_module("hgb_collect_matrix_g2", ROOT / "scripts/hgb_collect_matrix.py")
 
 
+def test_saved_target_pair_preserves_systemd_runtime_library(tmp_path: Path) -> None:
+    source = tmp_path / "phase_a" / "target"
+    runtime = source / "src" / "shared"
+    runtime.mkdir(parents=True)
+    (runtime / "libsystemd-shared-251.so").write_bytes(b"shared library fixture")
+    afl = make_executable(source / "target.afl", "#!/bin/sh\nexit 0\n")
+    cmp = make_executable(source / "target.cmp", "#!/bin/sh\nexit 0\n")
+    pipeline = g2.G2FuzzPipeline.__new__(g2.G2FuzzPipeline)
+    pipeline.target_afl = tmp_path / "phase_b" / "target" / "target.afl"
+    pipeline.target_cmp = tmp_path / "phase_b" / "target" / "target.cmp"
+    pipeline.copy_pair(afl, cmp)
+    assert (pipeline.target_afl.parent / "src/shared/libsystemd-shared-251.so").read_bytes() == b"shared library fixture"
+
+
 def make_executable(path: Path, text: str) -> Path:
     path.write_text(text, encoding="utf-8")
     path.chmod(0o755)

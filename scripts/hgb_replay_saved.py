@@ -111,7 +111,8 @@ def docker_limits(cpu: int, memory_gib: int) -> list[str]:
 
 
 def run_harness(baseline: str, selected: Path, source: Path, run: Path, package: Path,
-                image: str, budget: int, cpu: int, memory_gib: int) -> int:
+                image: str, budget: int, cpu: int, memory_gib: int,
+                recover_existing: bool = False) -> int:
     import hgb_fuzzbench_builder as builder
 
     candidate = selected_harness(selected)
@@ -167,14 +168,21 @@ def run_harness(baseline: str, selected: Path, source: Path, run: Path, package:
     ]
     if manifest.get("target") == "bloaty_fuzz_target":
         cmd.extend(["--coverage-format", "lcov"])
+    if manifest.get("fuzz_target") == "php-fuzz-parser":
+        # LLVM JSON export of PHP's full coverage binary can exceed the
+        # container memory limit. LCOV preserves real line/function counts.
+        cmd.extend(["--coverage-format", "lcov"])
     if docker_image_exists(coverage_image):
         cmd.extend(["--prebuilt-coverage-image", coverage_image])
+    if recover_existing:
+        cmd.append("--reuse-saved-campaign")
     if baseline == "ckgfuzzer" and profile in {"reproduction-eta", "reproduction-zeta"}:
         cmd.append("--run-native-control")
     env = os.environ.copy()
     env.update({"HGB_DOCKER_CPUS": "1", "HGB_DOCKER_CPUSET": str(cpu),
                 "HGB_DOCKER_MEMORY": f"{memory_gib}g", "HGB_PHASE_B_REPLAY": "1"})
-    with (run / "evaluator.log").open("w", encoding="utf-8") as log:
+    log_name = "evaluator.recovery.log" if recover_existing else "evaluator.log"
+    with (run / log_name).open("w", encoding="utf-8") as log:
         code = subprocess.run(cmd, cwd=run, env=env, stdout=log,
                               stderr=subprocess.STDOUT, check=False).returncode
     result = read_json(run / "evaluation/result.json")
@@ -227,7 +235,8 @@ def run_g2(source: Path, run: Path, package: Path, image: str,
 
 
 def run_elfuzz(source: Path, run: Path, package: Path,
-               budget: int, cpu: int, memory_gib: int) -> int:
+               budget: int, cpu: int, memory_gib: int,
+               recover_existing: bool = False) -> int:
     import hgb_coverage
     import hgb_fuzzbench_builder as builder
 
@@ -256,11 +265,12 @@ def run_elfuzz(source: Path, run: Path, package: Path,
     }, indent=2, sort_keys=True) + "\n")
     os.environ.update({"HGB_DOCKER_CPUS": "1", "HGB_DOCKER_CPUSET": str(cpu),
                        "HGB_DOCKER_MEMORY": f"{memory_gib}g"})
-    campaign = builder.run_campaign(
-        image_tag=native_image, binary_path=f"/out/{fuzz_target}",
-        corpus_dir=seed_dir, work_dir=run, campaign_seconds=budget,
-        keep_going=True,
-    )
+    campaign = (builder.load_saved_campaign(run, budget) if recover_existing else
+                builder.run_campaign(
+                    image_tag=native_image, binary_path=f"/out/{fuzz_target}",
+                    corpus_dir=seed_dir, work_dir=run, campaign_seconds=budget,
+                    keep_going=True,
+                ))
     coverage: dict[str, Any] = {"line_coverage": {"covered": None}}
     reason = ""
     final_corpus = Path(str(campaign.get("final_corpus_dir") or ""))
@@ -281,13 +291,18 @@ def run_elfuzz(source: Path, run: Path, package: Path,
             cov = builder.run_coverage(
                 image_tag=cov_tag, binary_path=f"/out/{fuzz_target}",
                 corpus_dir=final_corpus, work_dir=run,
-                timeout_seconds=3600, require_coverage_report=True,
+                timeout_seconds=21600 if fuzz_target == "php-fuzz-parser" else 3600,
+                require_coverage_report=True,
+                coverage_format="lcov" if fuzz_target == "php-fuzz-parser" else "auto",
             )
             report = Path(str(cov.get("coverage_report_path") or ""))
             if cov.get("copy_out_ok") and report.is_file():
-                coverage = hgb_coverage.summarize_coverage_report(report)
-                coverage["coverage_report_path"] = str(report)
-                coverage["inputs_replayed"] = cov.get("inputs_replayed", 0)
+                try:
+                    coverage = hgb_coverage.summarize_coverage_report(report)
+                    coverage["coverage_report_path"] = str(report)
+                    coverage["inputs_replayed"] = cov.get("inputs_replayed", 0)
+                except hgb_coverage.CoverageError as exc:
+                    reason = f"coverage report invalid: {exc}"
             else:
                 reason = "coverage report missing after campaign replay"
     status = "evaluated" if not reason and (coverage.get("line_coverage") or {}).get("covered") is not None else "quality_failure"
@@ -311,6 +326,8 @@ def main() -> int:
     parser.add_argument("--campaign-seconds", type=int, default=86400)
     parser.add_argument("--cpu", type=int, required=True)
     parser.add_argument("--memory-gib", type=int, default=8)
+    parser.add_argument("--recover-existing", action="store_true",
+                        help="reuse a completed campaign in an existing harness Phase B run")
     args = parser.parse_args()
     if args.campaign_seconds < 1 or args.memory_gib < 1 or args.cpu < 0:
         parser.error("campaign, CPU, and memory limits must be positive")
@@ -336,8 +353,28 @@ def main() -> int:
         raise ValueError(f"Phase A baseline image is missing: {image}")
     run = ROOT / "workspace" / args.baseline / args.target / args.run_id
     if run.exists():
-        raise ValueError(f"Phase B run already exists: {run}")
-    run.mkdir(parents=True)
+        if not args.recover_existing or args.baseline not in HARNESS_BASELINES | {"elfuzz"}:
+            raise ValueError(f"Phase B run already exists: {run}")
+        previous = read_json(run / "phase_b_source.json")
+        if (previous.get("baseline") != args.baseline or previous.get("target") != args.target
+                or previous.get("selected_phase_a_run") != str(selected)):
+            raise ValueError("existing Phase B run provenance does not match the requested source")
+        if read_json(run / "evaluation/result.json").get("status") == "evaluated":
+            raise ValueError("existing Phase B run is already evaluated")
+        backup = run / "recovery_before"
+        backup.mkdir(exist_ok=True)
+        for relative in ("metadata.json", "result.json", "evaluation/result.json",
+                         "evaluation/candidates/cand_001.json", "evaluator.log"):
+            prior = run / relative
+            if prior.is_file():
+                dest = backup / relative
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not dest.exists():
+                    shutil.copy2(prior, dest)
+    else:
+        if args.recover_existing:
+            raise ValueError(f"Phase B run does not exist: {run}")
+        run.mkdir(parents=True)
     # Third-party fuzzers may write relative filenames. Keep those files in
     # this pair's workspace even when the user launched Phase B from the root.
     os.chdir(run)
@@ -350,12 +387,14 @@ def main() -> int:
     }, indent=2, sort_keys=True) + "\n")
     if args.baseline in HARNESS_BASELINES:
         return run_harness(args.baseline, selected, source, run, package, image,
-                           args.campaign_seconds, args.cpu, args.memory_gib)
+                           args.campaign_seconds, args.cpu, args.memory_gib,
+                           recover_existing=args.recover_existing)
     if args.baseline == "g2fuzz":
         return run_g2(source, run, package, image, args.target,
                       args.campaign_seconds, args.cpu, args.memory_gib)
     return run_elfuzz(source, run, package, args.campaign_seconds,
-                      args.cpu, args.memory_gib)
+                      args.cpu, args.memory_gib,
+                      recover_existing=args.recover_existing)
 
 
 if __name__ == "__main__":

@@ -1002,6 +1002,13 @@ class G2FuzzPipeline:
             shutil.copy2(src_afl, self.target_afl)
         if src_cmp.resolve() != self.target_cmp.resolve():
             shutil.copy2(src_cmp, self.target_cmp)
+        # Some FuzzBench targets (systemd) link a private library through
+        # RUNPATH=$ORIGIN/src/shared. A saved target pair needs that runtime
+        # layout as well as the two executable files.
+        runtime = src_afl.parent / "src" / "shared"
+        destination = self.target_afl.parent / "src" / "shared"
+        if runtime.is_dir() and runtime.resolve() != destination.resolve():
+            shutil.copytree(runtime, destination, dirs_exist_ok=True)
         if not executable(self.target_afl) or not executable(self.target_cmp):
             raise PipelineError("infra_missing", "copied G2Fuzz target pair is not executable", 127)
 

@@ -14,6 +14,7 @@ import fcntl
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -305,6 +306,28 @@ def host_memory_gib() -> int:
     raise RuntimeError("unable to read host memory")
 
 
+def default_run_id(phase: str, date: str, campaign_seconds: int,
+                   generation_campaign_seconds: int) -> str:
+    phase_letter = "a" if phase == "generate" else "b"
+    duration = generation_campaign_seconds if phase == "generate" else campaign_seconds
+    return f"eval_all_phase_{phase_letter}_{date.replace('-', '')}_{duration}s"
+
+
+def latest_complete_manifest(root: Path, date: str,
+                             scope: dict[tuple[str, str], str]) -> Path | None:
+    """Find the newest saved Phase A selection no later than the output date."""
+    applicable = {pair for pair, status in scope.items() if status == "pending"}
+    candidates = (
+        list((root / "workspace/eval_all").glob("????-??-??.phase_a.json"))
+        + list((root / "results/eval_all").glob("????-??-??.phase_a.json"))
+    )
+    for candidate in sorted(candidates, key=lambda path: (
+            path.name[:10], path.parent == root / "workspace/eval_all"), reverse=True):
+        if candidate.name[:10] <= date and applicable.issubset(manifest_sources(candidate)):
+            return candidate
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--phase", choices=("generate", "fuzz"), default="fuzz",
@@ -319,10 +342,10 @@ def main() -> int:
     parser.add_argument("--memory-budget-gib", type=int, default=0,
                         help="Maximum combined pair RAM; 0 uses 70%% of host RAM")
     parser.add_argument("--source-audit", type=Path, help="Verified Phase A audit JSON; defaults to the latest local audit")
-    parser.add_argument("--manifest", type=Path, help="Phase A artifact manifest; defaults to results/eval_all/<date>.phase_a.json")
+    parser.add_argument("--manifest", type=Path, help="Phase A artifact manifest; defaults to workspace/eval_all/<date>.phase_a.json")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
-    parser.add_argument("--run-id", default=datetime.now().strftime("eval_all_%Y%m%dT%H%M%S"))
-    parser.add_argument("--output", type=Path, help="Override results/eval_all/<date>.csv")
+    parser.add_argument("--run-id", help="Defaults to eval_all_phase_<a/b>_<date>_<campaign-seconds>s")
+    parser.add_argument("--output", type=Path, help="Override workspace/eval_all/<date>.csv")
     parser.add_argument("--plan", action="store_true", help="Write planned/N/A CSV without Docker or target preparation")
     parser.add_argument("--resume", action="store_true", help="Reuse the date CSV, keeping completed rows and retrying all others")
     parser.add_argument("--rebuild-images", action="store_true", help="Rebuild all baseline images before launching jobs")
@@ -331,13 +354,15 @@ def main() -> int:
             or args.generation_timeout_seconds < 1 or args.memory_per_job_gib < 1
             or args.memory_budget_gib < 0):
         parser.error("worker count, memory cap, and time budgets must be positive")
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id):
-        parser.error("--run-id must contain only letters, digits, underscore, or hyphen")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
         parser.error("--date must be YYYY-MM-DD")
+    args.run_id = args.run_id or default_run_id(
+        args.phase, args.date, args.campaign_seconds, args.generation_campaign_seconds)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id):
+        parser.error("--run-id must contain only letters, digits, underscore, or hyphen")
     default_name = f"{args.date}.phase_a.csv" if args.phase == "generate" else f"{args.date}.csv"
-    output = (args.output or ROOT / "results/eval_all" / default_name).resolve()
-    manifest = (args.manifest or ROOT / "results/eval_all" / f"{args.date}.phase_a.json").resolve()
+    output = (args.output or ROOT / "workspace/eval_all" / default_name).resolve()
+    manifest = (args.manifest or ROOT / "workspace/eval_all" / f"{args.date}.phase_a.json").resolve()
     for label, path in (("output", output), ("manifest", manifest)):
         if path.resolve().parent == ROOT:
             parser.error(f"--{label} may not create a file in the repository root: {path}")
@@ -352,6 +377,12 @@ def main() -> int:
     except BlockingIOError:
         parser.error(f"another evaluation coordinator owns {output}")
     targets, scope = plan(ROOT)
+    if not manifest.is_file() and args.manifest is None:
+        previous = latest_complete_manifest(ROOT, args.date, scope)
+        if previous is not None:
+            manifest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(previous, manifest)
+            print(f"Phase A manifest: {manifest} (copied from {previous})", flush=True)
     if manifest.is_file():
         sources = manifest_sources(manifest)
     else:

@@ -34,6 +34,7 @@ def test_retry_waits_for_prior_service_and_keeps_a_csv_snapshot(tmp_path: Path, 
             return SimpleNamespace(returncode=3, stdout="inactive\n")
         assert "--resume" in command
         assert command[command.index("--parallel-worker") + 1] == "32"
+        assert command[command.index("--output") + 1] == str(output)
         write("evaluated")
         return SimpleNamespace(returncode=0)
 

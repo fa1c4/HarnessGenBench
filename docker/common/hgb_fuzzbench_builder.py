@@ -877,6 +877,8 @@ def build_coverage_image(
     runner: Runner = _run,
     timeout_seconds: int = 1800,
     sanitizer: str = "coverage",
+    staged_candidate_host: Path | None = None,
+    native_destination: str = "",
 ) -> BuildResult:
     """Build a separate coverage-instrumented image for source-based coverage.
 
@@ -888,6 +890,22 @@ def build_coverage_image(
     build-variant key is written immediately before ``RUN compile`` so Docker
     can reuse package-install layers without reusing the wrong compiled binary.
     """
+
+    if staged_candidate_host is not None:
+        if not native_destination:
+            raise ValueError("native_destination is required for a candidate coverage build")
+        # A Phase B sealed context has not passed through build_candidate_image.
+        # Add its final candidate COPY and compile stage before building coverage.
+        built = build_candidate_image(
+            context_dir=context_dir, dockerfile=dockerfile,
+            image_tag=image_tag, fuzz_target=fuzz_target,
+            staged_candidate_host=staged_candidate_host,
+            native_destination=native_destination, work_dir=work_dir,
+            runner=runner, timeout_seconds=timeout_seconds,
+            sanitizer=sanitizer, engine="libfuzzer",
+        )
+        built.engine = "coverage"
+        return built
 
     work_dir.mkdir(parents=True, exist_ok=True)
     build_command = [
@@ -1317,7 +1335,7 @@ def run_campaign(
                     pass
         final_corpus_file_count = 0
     fuzzer_timed_out = "HGB_FUZZER_EXIT_CODE=124" in log
-    return {
+    campaign_record = {
         "configured_duration_seconds": budget,
         "campaign_wall_seconds": campaign_wall_seconds,
         "execs_done": execs_done,
@@ -1336,6 +1354,78 @@ def run_campaign(
         "queue_count": final_corpus_file_count,
         "final_corpus_file_count": final_corpus_file_count,
         "copy_out_ok": copy_out_ok,
+    }
+    import json
+    (campaign_work / "campaign.json").write_text(
+        json.dumps(campaign_record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return campaign_record
+
+
+def load_saved_campaign(work_dir: Path, campaign_seconds: int) -> dict:
+    """Validate and reuse a completed Phase B campaign without fuzzing again."""
+    import json
+    import tarfile
+
+    work_dir = Path(work_dir)
+    campaign_dir = work_dir / "campaign"
+    log_path = campaign_dir / "campaign.log"
+    tar_path = campaign_dir / "corpus.tar"
+    corpus_dir = work_dir / "corpus"
+    if not log_path.is_file() or not tar_path.is_file() or not corpus_dir.is_dir():
+        raise ValueError("saved campaign log, corpus tar, or extracted corpus is missing")
+    log = log_path.read_text(encoding="utf-8", errors="replace")
+    durations = [int(value) for value in re.findall(r"INFO: fuzzed for (\d+) seconds", log)]
+    durations.extend(int(value) for value in re.findall(r"\btime:\s*(\d+)s", log))
+    with tarfile.open(tar_path) as archive:
+        corpus_names = {member.name.removeprefix("corpus/") for member in archive.getmembers()
+                        if member.isfile() and member.name.startswith("corpus/")}
+    corpus_files = {str(path.relative_to(corpus_dir)) for path in corpus_dir.rglob("*") if path.is_file()}
+    if not corpus_names or corpus_names != corpus_files:
+        raise ValueError("saved corpus.tar does not match the extracted final corpus")
+    saved_record = campaign_dir / "campaign.json"
+    old_candidate = work_dir.parent / "candidates" / f"{work_dir.name}.json"
+    old = {}
+    if saved_record.is_file():
+        try:
+            old = json.loads(saved_record.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    if old_candidate.is_file():
+        try:
+            old = old or (json.loads(old_candidate.read_text(encoding="utf-8")).get("campaign") or {})
+        except (OSError, ValueError):
+            pass
+    elapsed = max(max(durations, default=0), float(old.get("campaign_wall_seconds") or 0))
+    if elapsed < campaign_seconds - 60:
+        raise ValueError(f"saved campaign duration {elapsed}s is below required {campaign_seconds - 60}s")
+    execs_done = max(int(old.get("execs_done") or 0), _parse_execs_done(log))
+    if execs_done <= 0:
+        raise ValueError("saved campaign has no recorded target executions")
+    artifacts = work_dir / "artifacts"
+    crashes = sorted(str(path) for path in artifacts.glob("crash-*") if path.is_file())
+    ooms = sorted(str(path) for path in artifacts.glob("oom-*") if path.is_file())
+    return {
+        **old,
+        "configured_duration_seconds": campaign_seconds,
+        "campaign_wall_seconds": max(float(old.get("campaign_wall_seconds") or 0), float(elapsed)),
+        "execs_done": execs_done,
+        "new_units": int(old.get("new_units") or _parse_new_units(log)),
+        "crashes": max(int(old.get("crashes") or 0), len(crashes)),
+        "timeouts": int(old.get("timeouts") or 0),
+        "ooms": max(int(old.get("ooms") or 0), len(ooms)),
+        "crash_artifacts": crashes,
+        "oom_artifacts": ooms,
+        "keep_going": True,
+        "peak_rss_mb": int(old.get("peak_rss_mb") or _parse_peak_rss(log)),
+        "log": str(log_path),
+        "corpus_dir": str(corpus_dir),
+        "final_corpus_dir": str(corpus_dir),
+        "queue_count": len(corpus_files),
+        "final_corpus_file_count": len(corpus_files),
+        "copy_out_ok": True,
+        "reused_saved_campaign": True,
+        "corpus_tar_sha256": _sha256_file(tar_path),
     }
 
 
@@ -1399,23 +1489,24 @@ def run_coverage(
     executed (eta plan §2/§6).
     """
     work_dir.mkdir(parents=True, exist_ok=True)
-    # Build copy_in list for corpus files to replay.
+    cov_work = work_dir / "coverage"
+    cov_work.mkdir(parents=True, exist_ok=True)
+    # One Docker copy avoids thousands of daemon calls for large final corpora
+    # such as ELFuzz PHP (18,635 inputs). Archive only regular corpus files.
+    import tarfile
+    seeds = sorted(path for path in corpus_dir.rglob("*") if path.is_file()) if corpus_dir.is_dir() else []
     copy_in: list[tuple[Path, str]] = []
-    seed_index = 0
-    for seed in sorted(corpus_dir.iterdir()) if corpus_dir.is_dir() else []:
-        if seed.is_file():
-            # Stage under /tmp because docker cp cannot create /tmp/corpus in a
-            # stopped container. The replay script moves staged files after it
-            # creates the directory.
-            copy_in.append((seed, f"/tmp/hgb_coverage_seed_{seed_index:04d}"))
-            seed_index += 1
+    if seeds:
+        archive_path = cov_work / "inputs.tar"
+        with tarfile.open(archive_path, "w") as archive:
+            for index, seed in enumerate(seeds):
+                archive.add(seed, arcname=f"cov_{index:06d}", recursive=False)
+        copy_in = [(archive_path, "/tmp/hgb_coverage_inputs.tar")]
     coverage_seed_stage = (
         'mkdir -p /tmp/corpus; '
-        'for f in /tmp/hgb_coverage_seed_*; do '
-        '[ -e "$f" ] || continue; cp "$f" "/tmp/corpus/cov_${f##*_}"; '
-        'done; '
+        'if [ -f /tmp/hgb_coverage_inputs.tar ]; then '
+        'tar -xf /tmp/hgb_coverage_inputs.tar -C /tmp/corpus; fi; '
     )
-    cov_work = work_dir / "coverage"
     # PHP's full binary can make llvm-cov's JSON export consume hundreds of
     # gigabytes. LCOV is a real source-based report with line and per-function
     # execution counts, and streams with much lower memory use.
@@ -1426,6 +1517,9 @@ def run_coverage(
         and not require_coverage_report
     )
     report_name = "coverage.lcov" if use_lcov else "coverage.json"
+    report_path = cov_work / report_name
+    if report_path.exists():
+        report_path.unlink()
     export_command = (f'llvm-cov export -format=lcov {binary_path}' if use_lcov
                       else f'llvm-cov export -format=text {binary_path}')
     if require_coverage_report:
@@ -1439,7 +1533,7 @@ def run_coverage(
             'n=0; '
             'for f in /tmp/corpus/*; do '
             '[ -f "$f" ] || continue; '
-            f'LLVM_PROFILE_FILE=/tmp/cov/coverage-%p.profraw {binary_path} "$f" >/dev/null 2>&1 || true; '
+            f'timeout 60 env LLVM_PROFILE_FILE=/tmp/cov/coverage-%m.profraw {binary_path} -runs=1 "$f" >/dev/null 2>&1 || true; '
             'n=$((n+1)); '
             'done; '
             'printf "HGB_INPUTS_REPLAYED=%s\\n" "$n" >&2; '
@@ -1458,7 +1552,7 @@ def run_coverage(
             'n=0; '
             'for f in /tmp/corpus/*; do '
             '[ -f "$f" ] || continue; '
-            f'timeout 60 env LLVM_PROFILE_FILE=/tmp/cov/coverage-%p.profraw {binary_path} "$f" >/dev/null 2>&1 || true; '
+            f'timeout 60 env LLVM_PROFILE_FILE=/tmp/cov/coverage-%m.profraw {binary_path} -runs=1 "$f" >/dev/null 2>&1 || true; '
             'n=$((n+1)); '
             'done; '
             'printf "HGB_INPUTS_REPLAYED=%s\\n" "$n" >&2; '
@@ -1474,7 +1568,7 @@ def run_coverage(
         image_tag=image_tag,
         work_dir=cov_work,
         runner=runner,
-        timeout_seconds=timeout_seconds,
+        timeout_seconds=max(timeout_seconds, min(21600, 600 + 3 * len(seeds))),
         command=cmd,
         phase="coverage",
         copy_in=copy_in if copy_in else None,
@@ -1486,7 +1580,7 @@ def run_coverage(
     # Parse the executed-file count from the HGB_INPUTS_REPLAYED marker the eta
     # replay loop writes to stderr.  Fall back to the copy_in count for the
     # legacy -runs=0 replay path.
-    inputs_replayed = len(copy_in)
+    inputs_replayed = len(seeds)
     marker_log = (result.stderr or "") + "\n" + (result.stdout or "")
     m = re.search(r"HGB_INPUTS_REPLAYED=(\d+)", marker_log)
     if m:
