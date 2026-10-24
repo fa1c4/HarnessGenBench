@@ -28,6 +28,17 @@ hgb_fuzzbench_builder = _load_module("hgb_fuzzbench_builder_harness_eval", "dock
 evaluator = _load_module("hgb_harness_evaluator_shared", "docker/common/hgb_harness_evaluator.py")
 
 
+def test_freetype_fallback_seed_contains_valid_font_and_consumable_length(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    font = target / "source_input/TRT/fonts/TestGLYFOne.ttf"
+    font.parent.mkdir(parents=True)
+    font.write_bytes(b"F" * 1516)
+    seed = evaluator._fallback_seed(target, tmp_path / "work", "freetype2", "ftfuzzer")
+    assert seed.read_bytes() == font.read_bytes() + len(font.read_bytes()).to_bytes(2, "little")
+    fallback = evaluator._fallback_seed(target, tmp_path / "other", "zlib", "zlib_uncompress_fuzzer")
+    assert fallback.read_bytes() == b"hgb"
+
+
 class FakeResult:
     def __init__(self, command, exit_code=0, stdout="", stderr=""):
         self.command = list(command)
@@ -170,6 +181,21 @@ def test_eta_evaluator_requires_copied_coverage_report(tmp_path: Path) -> None:
     assert result["status"] != hgb_result.STATUS_EVALUATED
     cand = json.loads((work_dir / "candidates" / "cand_001.json").read_text(encoding="utf-8"))
     assert cand["stages"]["coverage"] == "failed"
+
+
+def test_valuable_target_rejects_harness_only_coverage(tmp_path: Path) -> None:
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    runner = _Runner(candidate_path=str(candidates_dir / "cand_001.c"))
+    result = evaluator.evaluate(
+        generator="oss-fuzz-gen", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="re2",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=10,
+        strict=True, runner=runner, intended_apis=["hgb_sample_api"], seeds=[],
+        build_coverage_image=True,
+    )
+    assert result["status"] != hgb_result.STATUS_EVALUATED
+    candidate = json.loads((work_dir / "candidates" / "cand_001.json").read_text(encoding="utf-8"))
+    assert "no covered re2 project source lines" in candidate["error"]
 
 
 def test_eta_evaluator_requires_nonzero_inputs_replayed(tmp_path: Path) -> None:

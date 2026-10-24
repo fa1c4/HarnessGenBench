@@ -51,11 +51,55 @@ def test_introspector_rejects_unlinkable_api_names(name, signature, path, reason
     assert ofg_introspector.reject_reason(record) == reason
 
 
-def test_systemd_explicitly_skips_unsupported_upstream_introspector():
+def test_bloaty_introspector_prefers_project_api_over_generated_protobuf():
+    records = [
+        {"name": "InitDefaultsscc_info_Options_bloaty_2eproto",
+         "signature": "void InitDefaultsscc_info_Options_bloaty_2eproto()",
+         "path": "/work/src/bloaty.pb.cc", "public": True},
+        {"name": "bloaty::BloatyMain", "signature": "bool BloatyMain()",
+         "path": "/src/bloaty/src/bloaty.cc", "public": True},
+    ]
+    assert ofg_introspector.reject_reason(records[1]) == ""
+    result = ofg_introspector.select_functions(
+        records, max_functions=3, project="bloaty", target_name="bloaty_fuzz_target",
+        preferred=["bloaty::BloatyMain"])
+    assert [item["name"] for item in result["selected"]] == ["bloaty::BloatyMain"]
+    assert result["rejected"][0]["_reject_reason"] == "irrelevant_source_path"
+
+
+def test_bloaty_benchmark_recovers_public_header_signature(tmp_path: Path):
+    header = tmp_path / "bloaty" / "src" / "bloaty.h"
+    header.parent.mkdir(parents=True)
+    header.write_text(
+        "bool BloatyMain(const Options& options, const InputFileFactory& factory, "
+        "RollupOutput* output, std::string* error);\n", encoding="utf-8")
+    result = ofg_synthesis.synthesize_benchmark(
+        records=[
+            {"name": "InitDefaultsscc_info_Options_bloaty_2eproto",
+             "signature": "void InitDefaultsscc_info_Options_bloaty_2eproto()",
+             "path": "/work/src/bloaty.pb.cc", "public": True},
+            {"name": "bloaty::BloatyMain", "signature": "N/A BloatyMain()",
+             "path": "/src/bloaty/src/bloaty.cc", "public": True},
+        ],
+        project="bloaty", target_name="bloaty_fuzz_target", source_dir=tmp_path,
+        preferred_apis=["bloaty::BloatyMain"])
+    assert result["selection"]["selected"][0]["name"] == "bloaty::BloatyMain"
+    assert "InputFileFactory&" in result["benchmark"]["functions"][0]["signature"]
+    assert "bloaty::BloatyMain(" in result["benchmark"]["functions"][0]["signature"]
+    assert result["benchmark"]["use_context"] is True
+
+
+def test_bloaty_oss_fuzz_destination_is_compiled_by_cmake():
+    overrides = ofg_profile.load_target_overrides(REPO_ROOT / "metadata")
+    assert overrides["targets"]["bloaty_fuzz_target"]["candidate_destination"] == (
+        "/src/bloaty/tests/fuzz_target.cc")
+
+
+def test_systemd_is_in_scope_with_a_candidate_destination():
     overrides = ofg_profile.load_target_overrides(REPO_ROOT / "metadata")
     systemd = overrides["targets"]["systemd_fuzz-link-parser"]
-    assert systemd["applicability"] == "not_applicable"
-    assert systemd["applicability_reason"] == "upstream_fuzz_introspector_unsupported"
+    assert systemd.get("applicability") != "not_applicable"
+    assert systemd["candidate_destination"] == "/src/systemd/src/udev/net/fuzz-link-parser.c"
     entrypoint = (REPO_ROOT / "docker/oss-fuzz-gen/entrypoint.sh").read_text(encoding="utf-8")
     assert entrypoint.index('if [[ -n "$ofg_scope_reason" ]]') < entrypoint.index('if ! hgb_api_key_present; then')
 
@@ -69,6 +113,7 @@ LLVM_COVERAGE_JSON = json.dumps({
     "data": [{"totals": {"lines": {"count": 100, "covered": 31},
                           "functions": {"count": 10, "covered": 6},
                           "regions": {"count": 50, "covered": 14}},
+              "files": [{"filename": "/src/jsoncpp/src/lib_json/json_reader.cpp", "summary": {"lines": {"count": 100, "covered": 31}}}],
               "functions": [{"name": "jsoncpp_parse", "count": 5},
                             {"name": "LLVMFuzzerTestOneInput", "count": 12}]}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",

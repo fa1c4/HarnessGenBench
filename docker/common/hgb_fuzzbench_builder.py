@@ -510,6 +510,76 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
             return True
         return False
 
+    if fuzz_target == "zlib_uncompress_fuzzer" and dockerfile.is_file():
+        content = dockerfile.read_text(encoding="utf-8", errors="replace")
+        # A shallow branch clone cannot checkout benchmark.yaml's historical
+        # commit. Fetch the complete project history before pinning it.
+        content = content.replace(
+            "git clone --depth 1 -b develop https://github.com/madler/zlib.git",
+            "git clone https://github.com/madler/zlib.git")
+        dockerfile.write_text(content, encoding="utf-8")
+        pin_dockerfile_clone("https://github.com/madler/zlib.git", "")
+
+    if fuzz_target == "fuzz_target":
+        pin_dockerfile_clone("https://github.com/google/bloaty.git", "")
+
+    # Every coverage variant must build the source revision named by the
+    # benchmark, even when its Dockerfile originally cloned moving HEAD.
+    for target_name, clone_url in (
+        ("jsoncpp_fuzzer", "https://github.com/open-source-parsers/jsoncpp"),
+        ("cms_transform_fuzzer", "https://github.com/mm2/Little-CMS.git"),
+        ("fuzz_both", "https://github.com/the-tcpdump-group/libpcap.git"),
+        ("xml", "https://gitlab.gnome.org/GNOME/libxml2.git"),
+        ("decoder_fuzzer", "https://github.com/cisco/openh264.git"),
+        ("x509", "https://github.com/openssl/openssl.git"),
+        ("fuzz-link-parser", "https://github.com/systemd/systemd"),
+    ):
+        if fuzz_target != target_name:
+            continue
+        if target_name in ("x509", "fuzz-link-parser") and dockerfile.is_file():
+            # Their historical Dockerfiles use depth-1 tag clones; the saved
+            # benchmark commit may predate the tag tip.
+            content = dockerfile.read_text(encoding="utf-8", errors="replace")
+            content = content.replace("--depth 1 \\\n", "")
+            dockerfile.write_text(content, encoding="utf-8")
+        pin_dockerfile_clone(clone_url, "")
+
+    if fuzz_target == "libjpeg_turbo_fuzzer" and dockerfile.is_file() and benchmark_commit:
+        # The benchmark clones multiple moving branches of libjpeg-turbo via
+        # fuzz/branches.txt. This target uses the main branch; pin its library
+        # checkout before the in-tree build script compiles it.
+        content = dockerfile.read_text(encoding="utf-8", errors="replace")
+        clone = "git clone https://github.com/libjpeg-turbo/libjpeg-turbo \\\n          -b $branch libjpeg-turbo.$branch; \\"
+        pinned = ("git clone https://github.com/libjpeg-turbo/libjpeg-turbo \\\n"
+                  "          -b $branch libjpeg-turbo.$branch && \\\n"
+                  f"      git -C libjpeg-turbo.$branch checkout {benchmark_commit}; \\")
+        if clone in content:
+            content = content.replace(clone, pinned, 1)
+        content = content.replace("cat fuzz/branches.txt | while read branch; do \\",
+                                  "printf 'main\\n' | while read branch; do \\", 1)
+        dockerfile.write_text(content, encoding="utf-8")
+
+    if fuzz_target == "ftfuzzer":
+        pin_dockerfile_clone("git://git.sv.nongnu.org/freetype/freetype2.git", "")
+
+    if fuzz_target == "hb-shape-fuzzer":
+        pin_dockerfile_clone("https://github.com/harfbuzz/harfbuzz.git", "")
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if build_sh.is_file():
+                content = build_sh.read_text(encoding="utf-8", errors="replace")
+                content = content.replace(
+                    "apt-get install python3 python3-pip -y",
+                    "apt-get install python3 python3-pip ninja-build -y")
+                content = content.replace(
+                    "python3.8 -m pip install ninja meson==0.56.0",
+                    "python3.8 -m pip install meson==0.56.0")
+                build_sh.write_text(content, encoding="utf-8")
+
+    if fuzz_target == "fuzz_dtlsclient":
+        pin_dockerfile_clone(
+            "https://github.com/Mbed-TLS/mbedtls.git",
+            "169d9e6eb4096cb48aa25651f42b276089841087")
+
     # Fix PHP: pin php-src to the benchmark commit. At that commit the original
     # build.sh options (--enable-opcache, --enable-option-checking=fatal,
     # --with-pic) are valid, so only strip them when the clone could not be
@@ -620,6 +690,15 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
                 text = text.replace("\nmake\n", "\n" + marker + "\nmake -k || true\n", 1)
                 build_sh.write_text(text, encoding="utf-8")
 
+    # The unpinned libpng HEAD removed contrib/oss-fuzz/build.sh while this
+    # benchmark Dockerfile still copies it. Use benchmark.yaml's commit when
+    # available, with a verified 1.6.40 tag as the fallback.
+    if fuzz_target == "libpng_read_fuzzer":
+        pin_dockerfile_clone(
+            "https://github.com/glennrp/libpng.git",
+            "f135775ad4e5d4408d2e12ffcc71bb36e6b48551",
+        )
+
     # Fix re2: pin to the benchmark commit that doesn't need abseil.
     if fuzz_target == "fuzzer":
         pin_dockerfile_clone(
@@ -651,6 +730,99 @@ def _patch_single_target_build_context(context_dir: Path, fuzz_target: str) -> N
                     "rake -m 2>/dev/null || (ruby ./minirake 2>/dev/null || true)",
                 )
             build_sh.write_text(text, encoding="utf-8")
+
+    # Static archive linking normally includes only objects referenced by a
+    # particular generated harness. For coverage, include every zlib object
+    # so an uncompress driver and a deflate/gzip driver expose the same SUT
+    # source set. The native fuzzing binary keeps its original link command.
+    if fuzz_target == "zlib_uncompress_fuzzer":
+        marker = "# HGB common zlib coverage object set."
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            content = build_sh.read_text(encoding="utf-8", errors="replace")
+            if marker in content or "$LIB_FUZZING_ENGINE ./libz.a" not in content:
+                continue
+            archive = (
+                marker + "\n"
+                'HGB_ZLIB_ARCHIVE="./libz.a"\n'
+                'if [ "${SANITIZER:-}" = coverage ]; then\n'
+                '  HGB_ZLIB_ARCHIVE="-Wl,--whole-archive ./libz.a -Wl,--no-whole-archive"\n'
+                'fi\n'
+            )
+            content = content.replace("$CXX $CXXFLAGS -std=c++11", archive + "$CXX $CXXFLAGS -std=c++11", 1)
+            content = content.replace("$LIB_FUZZING_ENGINE ./libz.a", "$LIB_FUZZING_ENGINE $HGB_ZLIB_ARCHIVE")
+            build_sh.write_text(content, encoding="utf-8")
+
+    if fuzz_target == "decoder_fuzzer":
+        # Different generated decoders reference different OpenH264 archive
+        # members. Include every member in coverage builds so their target
+        # file:line denominator is the same; native fuzzing keeps its link.
+        marker = "# HGB common OpenH264 coverage object set."
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            content = build_sh.read_text(encoding="utf-8", errors="replace")
+            needle = "$SRC/decoder_fuzzer.cpp libopenh264.a"
+            if marker in content or needle not in content:
+                continue
+            setting = (marker + "\n"
+                       'HGB_OPENH264_ARCHIVE="libopenh264.a"\n'
+                       'if [ "${SANITIZER:-}" = coverage ]; then\n'
+                       '  HGB_OPENH264_ARCHIVE="-Wl,--whole-archive libopenh264.a -Wl,--no-whole-archive"\n'
+                       'fi\n')
+            content = content.replace("$CXX $CXXFLAGS -o $OUT/decoder_fuzzer", setting + "$CXX $CXXFLAGS -o $OUT/decoder_fuzzer", 1)
+            content = content.replace(needle, "$SRC/decoder_fuzzer.cpp $HGB_OPENH264_ARCHIVE", 1)
+            build_sh.write_text(content, encoding="utf-8")
+
+    if fuzz_target == "fuzz_dtlsclient":
+        marker = "# HGB common mbedTLS coverage object set."
+        cmake_extension = (
+            marker + "\n"
+            'if(DEFINED ENV{SANITIZER} AND "$ENV{SANITIZER}" STREQUAL "coverage")\n'
+            '  set(libs "-Wl,--whole-archive" '
+            '${mbedtls_target} ${mbedx509_target} ${mbedcrypto_target} '
+            '"-Wl,--no-whole-archive")\n'
+            'endif()\n'
+        )
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            content = build_sh.read_text(encoding="utf-8", errors="replace")
+            # The target build needs jsonschema for its generated PSA wrapper.
+            # The unpinned requirements select rpds-py, which needs a Rust
+            # toolchain absent from this OSS-Fuzz image.
+            content = content.replace(
+                "pip3 install -r $SRC/mbedtls/scripts/basic.requirements.txt",
+                "pip3 install 'jsonschema==4.17.3' 'Jinja2<3.2'")
+            if marker in content or "mkdir build" not in content:
+                build_sh.write_text(content, encoding="utf-8")
+                continue
+            injection = (
+                "python3 - <<'HGB_MBEDTLS_COVERAGE_CMAKE'\n"
+                "from pathlib import Path\n"
+                "cmake = Path('programs/fuzz/CMakeLists.txt')\n"
+                "content = cmake.read_text()\n"
+                "needle = 'find_library(FUZZINGENGINE_LIB'\n"
+                "if needle not in content:\n"
+                "    raise SystemExit('mbedTLS fuzz CMake link rule changed')\n"
+                f"cmake.write_text(content.replace(needle, {cmake_extension!r} + needle, 1))\n"
+                "HGB_MBEDTLS_COVERAGE_CMAKE\n"
+            )
+            build_sh.write_text(content.replace("mkdir build", injection + "mkdir build", 1), encoding="utf-8")
+
+    if fuzz_target == "x509":
+        # This historical OpenSSL build.sh uses `set -u` and reads FUZZER,
+        # while the pinned FuzzBench base builder only exports FUZZING_ENGINE.
+        for build_sh in (context_dir / "build.sh", context_dir / "fuzzbench_benchmark" / "build.sh"):
+            if not build_sh.is_file():
+                continue
+            content = build_sh.read_text(encoding="utf-8", errors="replace")
+            marker = '# HGB default OpenSSL fuzzer engine.\nexport FUZZER="${FUZZER:-libfuzzer}"\n'
+            if marker not in content and 'if [ "$FUZZER" = "centipede" ]' in content:
+                content = content.replace('if [ "$FUZZER" = "centipede" ]',
+                                          marker + 'if [ "$FUZZER" = "centipede" ]', 1)
+                build_sh.write_text(content, encoding="utf-8")
 
 
 def _sealed_compile_block(fuzz_target: str = "") -> str:
@@ -826,10 +998,10 @@ def build_candidate_image(
         # Section 5.1: verify /out/<fuzz_target> exists and is executable.
         binary_path = f"/out/{Path(fuzz_target).stem}"
         verify_cmd = [
-            "docker", "run", "--rm", "--pull=never", image_tag,
+            "docker", "run", "--rm", "--pull=never", *_eval_all_label_args(), image_tag,
             "sh", "-lc", f"test -x {binary_path} && sha256sum {binary_path}",
         ]
-        verify = _run_phase(runner, verify_cmd, 120, "verify candidate binary")
+        verify = _run_phase(runner, verify_cmd, 300, "verify candidate binary")
         _write_log(work_dir / "binary_verify.log", verify)
         if verify.exit_code == 0:
             binary_verified = True
@@ -841,10 +1013,10 @@ def build_candidate_image(
         # reference) was the final write at the native harness path.
         if rel and candidate_sha256:
             audit_cmd = [
-                "docker", "run", "--rm", "--pull=never", image_tag,
+                "docker", "run", "--rm", "--pull=never", *_eval_all_label_args(), image_tag,
                 "sh", "-lc", f"sha256sum /src/{rel} 2>/dev/null || true",
             ]
-            audit = _run_phase(runner, audit_cmd, 120, "overlay audit")
+            audit = _run_phase(runner, audit_cmd, 300, "overlay audit")
             audit_line = (audit.stdout or "").strip().splitlines()
             container_sha = audit_line[0].split()[0] if audit_line and audit_line[0].split() else ""
             overlay_audit["container_native_sha256"] = container_sha
@@ -933,10 +1105,10 @@ def build_coverage_image(
         image_digest = inspect.stdout.strip()
         binary_path = f"/out/{Path(fuzz_target).stem}"
         verify_cmd = [
-            "docker", "run", "--rm", "--pull=never", image_tag,
+            "docker", "run", "--rm", "--pull=never", *_eval_all_label_args(), image_tag,
             "sh", "-lc", f"test -x {binary_path} && sha256sum {binary_path}",
         ]
-        verify = _run_phase(runner, verify_cmd, 120, "verify coverage binary")
+        verify = _run_phase(runner, verify_cmd, 300, "verify coverage binary")
         _write_log(work_dir / "binary_verify.log", verify)
         if verify.exit_code == 0:
             binary_verified = True
@@ -957,6 +1129,15 @@ def build_coverage_image(
         overlay_audit=None,
         sealed_env_defaults=dict(SEALED_ENV_DEFAULTS),
     )
+
+
+def _eval_all_label_args() -> list[str]:
+    run_id = os.environ.get("HGB_EVAL_ALL_RUN_ID", "")
+    if not run_id:
+        return []
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        raise ValueError("HGB_EVAL_ALL_RUN_ID contains unsupported characters")
+    return ["--label", f"hgb.eval_all_run={run_id}"]
 
 
 def _container_run(
@@ -984,6 +1165,7 @@ def _container_run(
     work_dir.mkdir(parents=True, exist_ok=True)
     container_name = f"hgb-eval-{phase}-{uuid.uuid4().hex[:12]}"
     create = ["docker", "create", "--pull=never", "--name", container_name]
+    create.extend(_eval_all_label_args())
     cpu_limit = os.environ.get("HGB_DOCKER_CPUS", "")
     if cpu_limit:
         if not cpu_limit.isdecimal() or int(cpu_limit) < 1:
@@ -1227,17 +1409,50 @@ def run_campaign(
         'done; '
     )
     asan_prefix = (
-        'ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}symbolize=0" '
+        'export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}symbolize=0"; '
         if binary_path.endswith("/php-fuzz-parser") else ""
     )
+    max_total_time = '"$remaining"' if keep_going else str(budget)
+    fuzzer_args = (
+        f'{binary_path} {continuation_flags}-runs={run_count} '
+        f'-max_total_time={max_total_time} -print_final_stats=1 '
+        '-artifact_prefix=/tmp/artifacts/ /tmp/corpus'
+    )
+    if keep_going:
+        # Fork mode can exit early after a crash with "MERGE: failed to parse
+        # the control file" even when -ignore_crashes=1 is set. Resume from
+        # the same on-container corpus until the fixed campaign deadline.
+        # Repeated immediate failures still stop and fail the duration gate.
+        fuzz_command = (
+            f'campaign_end=$(( $(date +%s) + {budget} )); '
+            'fuzzer_rc=0; attempts=0; rapid_failures=0; '
+            'while [ "$(date +%s)" -lt "$campaign_end" ]; do '
+            'attempt_start=$(date +%s); remaining=$((campaign_end - attempt_start)); '
+            'attempts=$((attempts + 1)); '
+            'echo "HGB_FUZZER_ATTEMPT=$attempts REMAINING=$remaining" >> /tmp/campaign.log; '
+            f'timeout -s INT -k 5s "$((remaining + 5))s" {fuzzer_args} '
+            '>> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
+            'attempt_elapsed=$(( $(date +%s) - attempt_start )); '
+            'if [ "$attempt_elapsed" -lt 10 ]; then '
+            'rapid_failures=$((rapid_failures + 1)); '
+            'else rapid_failures=0; fi; '
+            'if [ "$rapid_failures" -ge 5 ]; then '
+            'echo "HGB_FUZZER_STOPPED_AFTER_RAPID_FAILURES=1" >> /tmp/campaign.log; '
+            'break; fi; '
+            'done; '
+        )
+    else:
+        fuzz_command = (
+            f'remaining={budget}; '
+            f'timeout -s INT -k 5s {fuzzer_timeout}s {fuzzer_args} '
+            '> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
+        )
     cmd = [
         "sh",
         "-lc",
-        f'{seed_stage}{asan_prefix}timeout -s INT -k 5s {fuzzer_timeout}s {binary_path} '
-        f'{continuation_flags}-runs={run_count} -max_total_time={budget} '
-        f'-print_final_stats=1 -artifact_prefix=/tmp/artifacts/ /tmp/corpus '
-        f'> /tmp/campaign.log 2>&1; '
-        f'fuzzer_rc=$?; echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
+        f'{seed_stage}{asan_prefix}{fuzz_command}'
+        f'echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
+        f'echo "HGB_FUZZER_ATTEMPTS=${{attempts:-1}}"; '
         f'echo "---STATS---"; '
         f'ls /tmp/corpus | wc -l; '
         f'ls /tmp/artifacts 2>/dev/null | wc -l; '
@@ -1335,6 +1550,7 @@ def run_campaign(
                     pass
         final_corpus_file_count = 0
     fuzzer_timed_out = "HGB_FUZZER_EXIT_CODE=124" in log
+    attempt_match = re.search(r"HGB_FUZZER_ATTEMPTS=(\d+)", log)
     campaign_record = {
         "configured_duration_seconds": budget,
         "campaign_wall_seconds": campaign_wall_seconds,
@@ -1346,6 +1562,8 @@ def run_campaign(
         "crash_artifacts": crash_artifacts,
         "oom_artifacts": oom_artifacts,
         "keep_going": keep_going,
+        "restart_count": max(0, int(attempt_match.group(1)) - 1)
+        if keep_going and attempt_match else 0,
         "peak_rss_mb": _parse_peak_rss(log),
         "exit_code": result.exit_code,
         "log": str(campaign_work / "campaign.log"),
@@ -1688,7 +1906,7 @@ def verify_g2fuzz_target_pair(afl_binary: Path, cmp_binary: Path) -> dict:
 # -- G2Fuzz triple (.afl/.cmp/.cov) Docker builder -------------------------
 
 G2FUZZ_AFL_ENGINE = "afl"
-G2FUZZ_COVERAGE_ENGINE = "coverage"
+G2FUZZ_COVERAGE_ENGINE = "libfuzzer"
 G2FUZZ_COVERAGE_FLAGS = "-fprofile-instr-generate -fcoverage-mapping"
 G2FUZZ_TRIPLE_VARIANTS = ("afl", "cmp", "cov")
 
@@ -1700,15 +1918,15 @@ def _g2fuzz_variant_build_args(*, variant: str, sanitizer: str) -> list[str]:
     - ``cmp``: AFL++ CmpLog instrumentation (``FUZZING_ENGINE=afl`` plus
       ``AFL_LLVM_CMPLOG=1`` so ``afl-clang-fast`` instruments comparison
       logging).
-    - ``cov``: coverage instrumentation (``FUZZING_ENGINE=coverage`` so the
-      FuzzBench compile script uses clang with
+    - ``cov``: coverage instrumentation (``FUZZING_ENGINE=libfuzzer`` and
+      ``SANITIZER=coverage`` so the FuzzBench compile script uses clang with
       ``-fprofile-instr-generate -fcoverage-mapping``).
     """
 
     if variant == "cov":
         return [
             "--build-arg", f"FUZZING_ENGINE={G2FUZZ_COVERAGE_ENGINE}",
-            "--build-arg", f"SANITIZER={sanitizer}",
+            "--build-arg", "SANITIZER=coverage",
             "--build-arg", "ARCHITECTURE=x86_64",
         ]
     # Both afl and cmp use the AFL engine; cmp additionally passes
@@ -1784,7 +2002,7 @@ def g2fuzz_target_triple_build_commands(
     return {
         "program_id": program_id,
         "build_mode": "fuzzbench_docker_triple",
-        "sanitizer": sanitizer,
+        "sanitizer": "coverage" if variant == "cov" else sanitizer,
         **commands,
     }
 

@@ -53,7 +53,10 @@ matrix_collector = load_module("hgb_collect_matrix_delta", ROOT / "scripts/hgb_c
 
 
 COVERAGE_JSON = json.dumps({
-    "data": [{"totals": {"lines": {"count": 50, "covered": 30},
+    "data": [{"files": [
+                {"filename": "/src/libpng/png.c", "summary": {"lines": {"count": 25, "covered": 15}}},
+                {"filename": "/src/jsoncpp/src/json_reader.cpp", "summary": {"lines": {"count": 25, "covered": 15}}},
+              ], "totals": {"lines": {"count": 50, "covered": 30},
                          "functions": {"count": 10, "covered": 6},
                          "regions": {"count": 40, "covered": 20}}}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",

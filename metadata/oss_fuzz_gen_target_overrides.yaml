@@ -118,6 +118,7 @@ targets:
     preferred_apis: [link_load_one, link_config_ctx_new]
   bloaty_fuzz_target:
     language: c++
-    candidate_destination: /src/bloaty/fuzz_target.cc
+    candidate_destination: /src/bloaty/tests/fuzz_target.cc
     build_timeout: 2400
     fuzz_timeout: 600
+    preferred_apis: ["bloaty::ParseOptions"]

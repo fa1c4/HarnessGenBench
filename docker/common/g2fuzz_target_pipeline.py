@@ -642,6 +642,13 @@ def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, 
             start_new_session=True,
         )
         code = proc.wait(timeout=effective_timeout)
+        if code == -signal.SIGKILL:
+            # The controller can be killed while its forkserver children
+            # remain alive; clear that process group before an AFL resume.
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
     except subprocess.TimeoutExpired:
         timed_out = True
         if proc is not None:
@@ -662,6 +669,42 @@ def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, 
     with log_path.open("a", encoding="utf-8") as log:
         log.write(f"\n[exit={code} timed_out={timed_out}]\n")
     return code, timed_out
+
+
+def run_afl_with_resume(cmd: list[str], log_path: Path, output_dir: Path,
+                        timeout: int, env: dict[str, str]) -> tuple[int, bool, float, int]:
+    """Resume an AFL campaign after a SIGKILL, preserving its output queue."""
+    started = time.monotonic()
+    deadline = started + timeout
+    attempts = 0
+    code, timed_out = 1, False
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("wb"):
+        pass
+    while attempts < 4:
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            code, timed_out = 124, True
+            break
+        attempts += 1
+        attempt_cmd = list(cmd)
+        if attempts > 1:
+            # AFL++ resumes an existing -o output directory with -i -.
+            attempt_cmd[attempt_cmd.index("-i") + 1] = "-"
+        attempt_log = log_path.with_name(f"{log_path.stem}.attempt_{attempts:03d}{log_path.suffix}")
+        code, timed_out = run_subprocess(attempt_cmd, attempt_log, remaining, env=env)
+        with log_path.open("ab") as combined:
+            combined.write(f"\n[HGB_AFL_ATTEMPT={attempts} EXIT={code}]\n".encode())
+            combined.write(attempt_log.read_bytes())
+        if code != -signal.SIGKILL:
+            break
+        stats = parse_fuzzer_stats(output_dir / "default" / "fuzzer_stats")
+        queue = output_dir / "default" / "queue"
+        if (attempts >= 4 or deadline - time.monotonic() <= 60
+                or int(stats.get("execs_done") or 0) <= 0
+                or not queue.is_dir() or not any(queue.iterdir())):
+            break
+    return code, timed_out, round(time.monotonic() - started, 3), attempts
 
 
 def is_generated_input_candidate(path: Path) -> bool:
@@ -2464,7 +2507,8 @@ class G2FuzzPipeline:
             }
         )
         timeout = int(os.environ.get("G2FUZZ_AFL_TIMEOUT_SECONDS", "3600") or "3600")
-        code, timed_out = run_subprocess(cmd, self.workspace / "logs" / "afl.log", timeout, env=env)
+        code, timed_out, campaign_wall_seconds, afl_attempts = run_afl_with_resume(
+            cmd, self.workspace / "logs" / "afl.log", out, timeout, env)
         queue_dir = out / "default" / "queue"
         crashes_dir = out / "default" / "crashes"
         hangs_dir = out / "default" / "hangs"
@@ -2479,6 +2523,8 @@ class G2FuzzPipeline:
         execs_done = int(stats.get("execs_done") or 0)
         metrics = {
             "afl_exit_code": code,
+            "campaign_wall_seconds": campaign_wall_seconds,
+            "afl_attempts": afl_attempts,
             "campaign_timeout_configured": timed_out or code == 124,
             "deadline_reached": timed_out and code == 124,
             "queue_count": queue_count,
@@ -2543,8 +2589,8 @@ class G2FuzzPipeline:
             {
                 "CC": clang,
                 "CXX": clangxx,
-                "FUZZING_ENGINE": "coverage",
-                "SANITIZER": "address",
+                "FUZZING_ENGINE": "libfuzzer",
+                "SANITIZER": "coverage",
                 "ARCHITECTURE": "x86_64",
                 "SRC": str(src),
                 "OUT": str(out_dir),
@@ -2637,6 +2683,7 @@ class G2FuzzPipeline:
                         corpus_dir=corpus,
                         work_dir=self.workspace / "coverage",
                         timeout_seconds=int(os.environ.get("G2FUZZ_COVERAGE_TIMEOUT_SECONDS", "600") or "600"),
+                        coverage_format="lcov" if self.target.startswith("php_") else "json",
                     )
                     if replay.get("report_path") and Path(replay["report_path"]).is_file():
                         report_path = Path(replay["report_path"])
@@ -2658,8 +2705,10 @@ class G2FuzzPipeline:
         }
         if report_path and report_path.is_file() and summarize_coverage_report is not None:
             try:
-                parsed = summarize_coverage_report(report_path)
+                parsed = summarize_coverage_report(
+                    report_path, project=str(self.target_manifest().get("project") or ""))
                 coverage["line_coverage"] = parsed.get("line_coverage")
+                coverage["sut_line_coverage"] = parsed.get("sut_line_coverage")
                 coverage["function_coverage"] = parsed.get("function_coverage")
                 coverage["regions"] = parsed.get("regions")
                 coverage["coverage_mode"] = parsed.get("source", "g2fuzz_campaign")
@@ -2929,6 +2978,8 @@ class G2FuzzPipeline:
             "seed_provenance": seed_provenance,
             "seed_provenance_bytes": seed_provenance_bytes,
             "campaign": {
+                "campaign_wall_seconds": self.metrics.get("campaign_wall_seconds"),
+                "afl_attempts": int(self.metrics.get("afl_attempts") or 0),
                 "execs_done": execs_done,
                 "queue_count": int(self.metrics.get("queue_count") or 0),
                 "crashes": int(self.metrics.get("crash_count") or 0),

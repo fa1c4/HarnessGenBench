@@ -110,9 +110,21 @@ def docker_limits(cpu: int, memory_gib: int) -> list[str]:
             "--memory", f"{memory_gib}g", "--memory-swap", f"{memory_gib}g"]
 
 
+def eval_all_docker_options() -> list[str]:
+    """Identify containers so an interrupted coordinator can stop its own run."""
+    run_id = os.environ.get("HGB_EVAL_ALL_RUN_ID", "")
+    if not run_id:
+        return []
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", run_id):
+        raise ValueError("HGB_EVAL_ALL_RUN_ID contains unsupported characters")
+    return ["--label", f"hgb.eval_all_run={run_id}",
+            "-e", f"HGB_EVAL_ALL_RUN_ID={run_id}"]
+
+
 def run_harness(baseline: str, selected: Path, source: Path, run: Path, package: Path,
                 image: str, budget: int, cpu: int, memory_gib: int,
-                recover_existing: bool = False) -> int:
+                recover_existing: bool = False,
+                canonical_build: bool = False) -> int:
     import hgb_fuzzbench_builder as builder
 
     candidate = selected_harness(selected)
@@ -140,6 +152,7 @@ def run_harness(baseline: str, selected: Path, source: Path, run: Path, package:
     )
     cmd = [
         "docker", "run", "--rm", "--pull=never", "--init", *docker_limits(cpu, memory_gib),
+        *eval_all_docker_options(),
         "-v", f"{run}:/workspace",
         "-v", f"{run}:{run}",
         "-v", f"{selected}:/phase-a:ro",
@@ -156,7 +169,6 @@ def run_harness(baseline: str, selected: Path, source: Path, run: Path, package:
         "/opt/hgb/bin/hgb_harness_evaluator.py",
         "--generator", baseline, "--target-root", "/target", "--evaluator-root", "/evaluator",
         "--candidate", f"/workspace/generated_harnesses/{candidate.name}",
-        "--phase-a-result", "/phase-a/evaluation/result.json",
         "--keep-going-campaign",
         "--work-dir", "/workspace/evaluation",
         "--project", str(manifest.get("project") or ""),
@@ -166,13 +178,12 @@ def run_harness(baseline: str, selected: Path, source: Path, run: Path, package:
         "--strict", "--build-coverage-image", "--stop-on-first-success",
         "--intended-apis", ",".join(intended),
     ]
-    if manifest.get("target") == "bloaty_fuzz_target":
-        cmd.extend(["--coverage-format", "lcov"])
-    if manifest.get("fuzz_target") == "php-fuzz-parser":
-        # LLVM JSON export of PHP's full coverage binary can exceed the
-        # container memory limit. LCOV preserves real line/function counts.
-        cmd.extend(["--coverage-format", "lcov"])
-    if docker_image_exists(coverage_image):
+    if not canonical_build:
+        cmd.extend(["--phase-a-result", "/phase-a/evaluation/result.json"])
+    # Keep executable file:line identities for a common source-set audit.
+    # LCOV also avoids excessive JSON export memory on large targets such as PHP.
+    cmd.extend(["--coverage-format", "lcov"])
+    if not canonical_build and docker_image_exists(coverage_image):
         cmd.extend(["--prebuilt-coverage-image", coverage_image])
     if recover_existing:
         cmd.append("--reuse-saved-campaign")
@@ -208,6 +219,7 @@ def run_g2(source: Path, run: Path, package: Path, image: str,
     meta = read_json(source / "metadata.json")
     cmd = [
         "docker", "run", "--rm", "--pull=never", "--init", *docker_limits(cpu, memory_gib),
+        *eval_all_docker_options(),
         "-v", f"{run}:/workspace", "-v", f"{source}:/source:ro",
         "-v", f"{package}:/target:ro",
         "-v", f"{ROOT / 'docker/common'}:/opt/hgb/bin:ro",
@@ -230,22 +242,122 @@ def run_g2(source: Path, run: Path, package: Path, image: str,
             "-e", "G2FUZZ_AFL_EXEC_TIMEOUT_MS=1000",
         ]
     with (run / "replay.log").open("w", encoding="utf-8") as log:
-        return subprocess.run(cmd, cwd=run, stdout=log,
+        code = subprocess.run(cmd, cwd=run, stdout=log,
                               stderr=subprocess.STDOUT, check=False).returncode
+    return finish_g2_coverage(run, package, target, cpu, memory_gib, code)
+
+
+def finish_g2_coverage(run: Path, package: Path, target: str,
+                       cpu: int, memory_gib: int, code: int) -> int:
+    """Use the saved G2Fuzz corpus with the shared host-built coverage oracle."""
+    import hgb_coverage
+    import hgb_fuzzbench_builder as builder
+
+    result = read_json(run / "result.json")
+    campaign = result.get("campaign") or {}
+    stages = result.get("stages") or {}
+    if (code and (stages.get("coverage") or {}).get("status") != "failed"
+            or int(campaign.get("execs_done") or 0) <= 0
+            or any(isinstance(stage, dict) and stage.get("status") == "failed"
+                   for name, stage in stages.items() if name != "coverage")):
+        return code or 1
+    corpus = run / "coverage/corpus"
+    if not corpus.is_dir() or not any(path.is_file() for path in corpus.iterdir()):
+        return code or 1
+    host_coverage = run / "host_coverage"
+    host_coverage.mkdir(exist_ok=True)
+    manifest = read_json(package / "target_manifest.json")
+    fuzz_target = str(manifest.get("fuzz_target") or target)
+    tag = builder.deterministic_image_tag(run.name, fuzz_target, "coverage", generator="g2fuzz")
+    os.environ.update({"HGB_DOCKER_CPUS": "1", "HGB_DOCKER_CPUSET": str(cpu),
+                       "HGB_DOCKER_MEMORY": f"{memory_gib}g"})
+    reason = ""
+    try:
+        oracle = builder.build_elfuzz_sut(
+            benchmark_dir=package / "fuzzbench_benchmark", image_tag=tag,
+            fuzz_target=fuzz_target, work_dir=host_coverage / "sut",
+            engine=builder.ELFUZZ_COVERAGE_ENGINE,
+            sanitizer=builder.ELFUZZ_COVERAGE_SANITIZER,
+            timeout_seconds=7200)
+        (host_coverage / "oracle.json").write_text(json.dumps(oracle, indent=2, sort_keys=True) + "\n")
+        if not oracle.get("binary_extracted"):
+            raise ValueError("canonical coverage target build failed")
+        readable_corpus = host_coverage / "corpus"
+        readable_corpus.mkdir(exist_ok=True)
+        copy_command = [
+            "docker", "run", "--rm", "--pull=never", *docker_limits(cpu, memory_gib),
+            *eval_all_docker_options(), "-v", f"{corpus}:/hgb_source:ro",
+            "-v", f"{readable_corpus}:/hgb_destination", tag, "sh", "-lc",
+            f"cp -R /hgb_source/. /hgb_destination/ && chown -R {os.getuid()}:{os.getgid()} /hgb_destination",
+        ]
+        copied = subprocess.run(copy_command, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, text=True, timeout=3600, check=False)
+        if copied.returncode:
+            raise ValueError(f"canonical corpus copy failed: {copied.stderr[-500:]}")
+        replay = builder.run_coverage(
+            image_tag=tag, binary_path=f"/out/{fuzz_target}", corpus_dir=readable_corpus,
+            work_dir=host_coverage, timeout_seconds=21600 if fuzz_target == "php-fuzz-parser" else 3600,
+            require_coverage_report=True, coverage_format="lcov")
+        report = Path(str(replay.get("coverage_report_path") or ""))
+        if not replay.get("copy_out_ok") or not report.is_file():
+            raise ValueError("canonical coverage replay produced no copied LCOV report")
+        coverage = hgb_coverage.summarize_coverage_report(
+            report, project=str(manifest.get("project") or target.split("_", 1)[0]))
+        coverage.update({"report_path": str(report), "coverage_report_path": str(report),
+                         "inputs_replayed": replay.get("inputs_replayed", 0),
+                         "coverage_mode": "canonical_fuzzbench_source_coverage"})
+        result["coverage"] = coverage
+        result["coverage_gamma"] = {
+            "line_coverage": (coverage.get("line_coverage") or {}).get("percent", 0),
+            "region_coverage": (coverage.get("regions") or {}).get("percent", 0),
+            "function_coverage": (coverage.get("function_coverage") or {}).get("percent", 0),
+        }
+        stages["coverage"] = {"status": "complete", "reason": "none",
+                              "report_path": str(report),
+                              "inputs_replayed": replay.get("inputs_replayed", 0)}
+        result["stages"] = stages
+        result["status"] = "evaluated"
+        result["reason"] = "none"
+        result["error"] = None
+        result["exit_code"] = 0
+    except (OSError, ValueError, hgb_coverage.CoverageError) as exc:
+        reason = f"canonical G2Fuzz coverage failed: {exc}"
+        result["status"] = "quality_failure"
+        result["reason"] = reason
+        result["exit_code"] = 1
+    for name in ("result.json", "metadata.json"):
+        destination = run / name
+        temporary = run / f".{name}.host_coverage.tmp"
+        temporary.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        temporary.replace(destination)
+    return 0 if not reason else 1
 
 
 def run_elfuzz(source: Path, run: Path, package: Path,
                budget: int, cpu: int, memory_gib: int,
-               recover_existing: bool = False) -> int:
+               recover_existing: bool = False,
+               canonical_build: bool = False) -> int:
     import hgb_coverage
     import hgb_fuzzbench_builder as builder
 
     build = read_json(source / "target/build.json")
     native_image = str(build.get("native_image_tag") or "")
     source_meta = read_json(source / "metadata.json")
+    manifest = read_json(package / "target_manifest.json")
     fuzz_target = str(source_meta.get("fuzz_target") or "")
-    if not native_image or not fuzz_target or not docker_image_exists(native_image):
+    if not fuzz_target or (not canonical_build and (not native_image or not docker_image_exists(native_image))):
         raise ValueError("Phase A ELFuzz native FuzzBench image is missing")
+    if canonical_build:
+        native_image = builder.deterministic_image_tag(
+            run.name, fuzz_target, "native", generator="elfuzz")
+        if not recover_existing:
+            native_build = builder.build_elfuzz_sut(
+                benchmark_dir=package / "fuzzbench_benchmark",
+                image_tag=native_image, fuzz_target=fuzz_target,
+                work_dir=run / "sut/native", engine=builder.ELFUZZ_NATIVE_ENGINE,
+                sanitizer="address", timeout_seconds=7200)
+            if not native_build.get("binary_extracted"):
+                raise ValueError("canonical ELFuzz native target build failed")
     produced = source / "generated_inputs/produced"
     if not produced.is_dir():
         raise ValueError("Phase A ELFuzz produced input directory is missing")
@@ -293,12 +405,13 @@ def run_elfuzz(source: Path, run: Path, package: Path,
                 corpus_dir=final_corpus, work_dir=run,
                 timeout_seconds=21600 if fuzz_target == "php-fuzz-parser" else 3600,
                 require_coverage_report=True,
-                coverage_format="lcov" if fuzz_target == "php-fuzz-parser" else "auto",
+                coverage_format="lcov",
             )
             report = Path(str(cov.get("coverage_report_path") or ""))
             if cov.get("copy_out_ok") and report.is_file():
                 try:
-                    coverage = hgb_coverage.summarize_coverage_report(report)
+                    coverage = hgb_coverage.summarize_coverage_report(
+                        report, project=str(source_meta.get("project") or manifest.get("project") or ""))
                     coverage["coverage_report_path"] = str(report)
                     coverage["inputs_replayed"] = cov.get("inputs_replayed", 0)
                 except hgb_coverage.CoverageError as exc:
@@ -322,6 +435,8 @@ def main() -> int:
     parser.add_argument("--baseline", choices=sorted(BASELINES), required=True)
     parser.add_argument("--target", required=True)
     parser.add_argument("--source-run", required=True)
+    parser.add_argument("--canonical-source-run",
+                        help="G2Fuzz Phase A source whose FuzzBench package is shared by all baselines for this target")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--campaign-seconds", type=int, default=86400)
     parser.add_argument("--cpu", type=int, required=True)
@@ -343,6 +458,15 @@ def main() -> int:
     if host.get("generator") != args.baseline or host.get("target") != args.target:
         raise ValueError("Phase A host command has a different baseline or target")
     package = Path(host.get("target_package", "")).resolve(strict=True)
+    canonical_build = bool(args.canonical_source_run)
+    if canonical_build:
+        canonical_selected, canonical_source = phase_a_source("g2fuzz", args.canonical_source_run)
+        if source_target(canonical_selected, canonical_source) != args.target:
+            raise ValueError("canonical target package source has a different target")
+        canonical_host = host_command(canonical_source)
+        if canonical_host.get("generator") != "g2fuzz":
+            raise ValueError("canonical target package source is not G2Fuzz")
+        package = Path(canonical_host.get("target_package", "")).resolve(strict=True)
     if not package.is_relative_to(ROOT / "workspace"):
         raise ValueError(f"Phase A target package is outside workspace: {package}")
     manifest = read_json(package / "target_manifest.json")
@@ -353,14 +477,15 @@ def main() -> int:
         raise ValueError(f"Phase A baseline image is missing: {image}")
     run = ROOT / "workspace" / args.baseline / args.target / args.run_id
     if run.exists():
-        if not args.recover_existing or args.baseline not in HARNESS_BASELINES | {"elfuzz"}:
+        if not args.recover_existing or args.baseline not in HARNESS_BASELINES | {"elfuzz", "g2fuzz"}:
             raise ValueError(f"Phase B run already exists: {run}")
         previous = read_json(run / "phase_b_source.json")
         if (previous.get("baseline") != args.baseline or previous.get("target") != args.target
                 or previous.get("selected_phase_a_run") != str(selected)):
             raise ValueError("existing Phase B run provenance does not match the requested source")
-        if read_json(run / "evaluation/result.json").get("status") == "evaluated":
-            raise ValueError("existing Phase B run is already evaluated")
+        if (read_json(run / "evaluation/result.json").get("status") == "evaluated"
+                and not canonical_build):
+            raise ValueError("refreshing an evaluated Phase B run requires the shared target package")
         backup = run / "recovery_before"
         backup.mkdir(exist_ok=True)
         for relative in ("metadata.json", "result.json", "evaluation/result.json",
@@ -384,17 +509,22 @@ def main() -> int:
     (run / "phase_b_source.json").write_text(json.dumps({
         "phase": "B", "selected_phase_a_run": str(selected), "source_run": str(source),
         "baseline": args.baseline, "target": args.target,
+        "canonical_target_package": str(package) if canonical_build else "",
     }, indent=2, sort_keys=True) + "\n")
     if args.baseline in HARNESS_BASELINES:
         return run_harness(args.baseline, selected, source, run, package, image,
                            args.campaign_seconds, args.cpu, args.memory_gib,
-                           recover_existing=args.recover_existing)
+                           recover_existing=args.recover_existing,
+                           canonical_build=canonical_build)
     if args.baseline == "g2fuzz":
+        if args.recover_existing:
+            return finish_g2_coverage(run, package, args.target, args.cpu, args.memory_gib, 0)
         return run_g2(source, run, package, image, args.target,
                       args.campaign_seconds, args.cpu, args.memory_gib)
     return run_elfuzz(source, run, package, args.campaign_seconds,
                       args.cpu, args.memory_gib,
-                      recover_existing=args.recover_existing)
+                      recover_existing=args.recover_existing,
+                      canonical_build=canonical_build)
 
 
 if __name__ == "__main__":

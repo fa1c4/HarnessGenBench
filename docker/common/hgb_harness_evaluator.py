@@ -419,6 +419,11 @@ def evaluate_candidate(
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
     strict_eta = profile in ETA_PROFILES
+    # Valuable-target coverage is meaningful only when the selected driver
+    # reaches instrumented code in the benchmark project. A driver testing
+    # its own mock can otherwise report 100% harness coverage.
+    if coverage_parser is None and project in hgb_coverage.VALUABLE_PROJECTS:
+        coverage_parser = lambda path: hgb_coverage.summarize_coverage_report(path, project=project)
 
     rec = CandidateRecord(
         candidate_id=candidate_id,
@@ -632,7 +637,8 @@ def evaluate_candidate(
                 runner, ["docker", "image", "inspect", "-f", "{{.Id}}", prebuilt_coverage_image],
                 300, "inspect saved coverage image")
             verify = hgb_fuzzbench_builder._run_phase(
-                runner, ["docker", "run", "--rm", "--pull=never", prebuilt_coverage_image,
+                runner, ["docker", "run", "--rm", "--pull=never",
+                         *hgb_fuzzbench_builder._eval_all_label_args(), prebuilt_coverage_image,
                          "sh", "-lc", (f"test -x {shlex.quote(build.binary_path)} && "
                                       f"sha256sum {shlex.quote(native_destination)}")],
                 600, "verify saved coverage binary and harness")
@@ -971,6 +977,27 @@ def _run_native_coverage_control(
         return None
 
 
+def _fallback_seed(target_root: Path, work_dir: Path, project: str, fuzz_target: str) -> Path:
+    """Create a deterministic seed when the target package has no corpus."""
+    seed_dir = work_dir / "campaign_seeds"
+    seed_dir.mkdir(parents=True, exist_ok=True)
+    font = target_root / "source_input/TRT/fonts/TestGLYFOne.ttf"
+    if project == "freetype2" and fuzz_target == "ftfuzzer" and font.is_file():
+        # A valid font reaches FT_Load_Glyph in drivers that consume a length
+        # from the end of a FuzzedDataProvider input. Every baseline receives
+        # this same public target-source seed.
+        content = font.read_bytes()
+        seed = seed_dir / "freetype_valid_font"
+        # ConsumeIntegralInRange reads only enough bytes to represent its
+        # range: this 1516-byte font needs two trailing length bytes.
+        seed.write_bytes(content + len(content).to_bytes(2, "little"))
+    else:
+        # libFuzzer skips zero-byte corpus files, so keep a nonempty fallback.
+        seed = seed_dir / "hgb_empty_seed"
+        seed.write_bytes(b"hgb")
+    return seed
+
+
 def evaluate(
     *,
     generator: str,
@@ -1101,11 +1128,7 @@ def evaluate(
         # input so strict profiles have a real final corpus artifact to replay.
         # A NON-empty byte string is used because libFuzzer skips zero-byte
         # corpus files ("0 files found" -> empty-corpus fuzzing).
-        seed_dir = work_dir / "campaign_seeds"
-        seed_dir.mkdir(parents=True, exist_ok=True)
-        empty_seed = seed_dir / "hgb_empty_seed"
-        empty_seed.write_bytes(b"hgb")
-        seeds = [empty_seed]
+        seeds = [_fallback_seed(target_root, work_dir, project, fuzz_target)]
 
     records: list[CandidateRecord] = []
     candidate_dicts: list[dict[str, Any]] = []

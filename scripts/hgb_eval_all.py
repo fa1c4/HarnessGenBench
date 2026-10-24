@@ -14,10 +14,13 @@ import fcntl
 import json
 import os
 import re
+import signal
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
@@ -30,10 +33,79 @@ ROOT = Path(__file__).resolve().parents[1]
 BASELINES = ("ckgfuzzer", "promefuzz", "oss-fuzz-gen", "g2fuzz", "elfuzz")
 METRICS = (
     "status", "campaign_seconds", "campaign_elapsed_seconds", "execs_done",
-    "covered_lines", "crashes", "read_tokens", "write_tokens",
+    "covered_lines", "raw_covered_lines", "sut_covered_lines", "sut_total_lines", "sut_source_files",
+    "coverage_contract",
+    "crashes", "read_tokens", "write_tokens",
     "retry_count", "driver_fix_rounds", "run", "reason",
 )
 FIELDS = ["target", *[f"{b}_{m}" for b in BASELINES for m in METRICS]]
+
+
+class JobProcesses:
+    """Own the replay process groups started by one evaluation coordinator."""
+
+    def __init__(self) -> None:
+        self.interrupted = threading.Event()
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen[Any]] = set()
+
+    def add(self, process: subprocess.Popen[Any]) -> None:
+        with self._lock:
+            self._processes.add(process)
+            if self.interrupted.is_set():
+                self._signal(process, signal.SIGTERM)
+
+    def discard(self, process: subprocess.Popen[Any]) -> None:
+        with self._lock:
+            self._processes.discard(process)
+
+    @staticmethod
+    def _signal(process: subprocess.Popen[Any], signum: int) -> None:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+
+    def stop(self, signum: int = signal.SIGTERM) -> None:
+        self.interrupted.set()
+        with self._lock:
+            processes = list(self._processes)
+        for process in processes:
+            self._signal(process, signum)
+
+
+def stop_eval_containers(run_id: str) -> None:
+    """Stop only containers labelled by this evaluation run."""
+    try:
+        listed = subprocess.run(
+            ["docker", "ps", "-aq", "--filter", f"label=hgb.eval_all_run={run_id}"],
+            capture_output=True, text=True, timeout=15, check=False)
+        if listed.returncode:
+            print(f"Docker container cleanup failed: {listed.stderr.strip()}", file=sys.stderr)
+            return
+        container_ids = listed.stdout.split()
+        if container_ids:
+            subprocess.run(["docker", "rm", "-f", *container_ids],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=min(60, max(30, len(container_ids) * 3)), check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Docker container cleanup failed: {exc}", file=sys.stderr)
+
+
+def run_tracked(cmd: list[str], *, cwd: Path, stdout: Any,
+                env: dict[str, str] | None, processes: JobProcesses | None) -> int:
+    """Keep a long-running child in its own group for prompt signal cleanup."""
+    if processes is None:
+        return subprocess.run(cmd, cwd=cwd, env=env, stdout=stdout,
+                              stderr=subprocess.STDOUT, check=False).returncode
+    process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=stdout,
+                               stderr=subprocess.STDOUT, start_new_session=True)
+    processes.add(process)
+    try:
+        return process.wait()
+    finally:
+        processes.discard(process)
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -62,20 +134,101 @@ def plan(root: Path) -> tuple[list[str], dict[tuple[str, str], str]]:
     return targets, scope
 
 
-def save_csv(path: Path, targets: list[str], rows: dict[tuple[str, str], dict[str, Any]]) -> None:
+def job_key(trial: int, baseline: str, target: str, trials: int) -> tuple[Any, ...]:
+    return (baseline, target) if trials == 1 else (trial, baseline, target)
+
+
+def save_csv(path: Path, targets: list[str], rows: dict[tuple[Any, ...], dict[str, Any]],
+             trials: int = 1) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8", dir=path.parent, delete=False) as handle:
         temp = Path(handle.name)
-        writer = csv.DictWriter(handle, fieldnames=FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=(["trial", *FIELDS] if trials > 1 else FIELDS))
+        writer.writeheader()
+        for trial in range(1, trials + 1):
+            for target in targets:
+                row = {"target": target}
+                if trials > 1:
+                    row["trial"] = trial
+                for baseline in BASELINES:
+                    data = rows[job_key(trial, baseline, target, trials)]
+                    for metric in METRICS:
+                        row[f"{baseline}_{metric}"] = data.get(metric, "")
+                writer.writerow(row)
+    temp.replace(path)
+
+
+def save_trial_summary(path: Path, targets: list[str],
+                       rows: dict[tuple[Any, ...], dict[str, Any]], trials: int) -> None:
+    """Keep raw trial rows and a separate aggregate that exposes failures."""
+    fields = ("baseline", "target", "status", "evaluated_trials", "total_trials",
+              "mean_covered_lines", "stdev_covered_lines", "trial_statuses")
+    with tempfile.NamedTemporaryFile("w", newline="", encoding="utf-8",
+                                     dir=path.parent, delete=False) as handle:
+        temp = Path(handle.name)
+        writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for target in targets:
-            row = {"target": target}
             for baseline in BASELINES:
-                data = rows[baseline, target]
-                for metric in METRICS:
-                    row[f"{baseline}_{metric}"] = data.get(metric, "")
-            writer.writerow(row)
+                entries = [rows[job_key(trial, baseline, target, trials)]
+                           for trial in range(1, trials + 1)]
+                statuses = [str(entry.get("status") or "pending") for entry in entries]
+                covered = [int(entry["covered_lines"]) for entry in entries
+                           if entry.get("status") == "evaluated" and
+                           str(entry.get("covered_lines", "")).isdigit()]
+                status = ("N/A" if all(value == "N/A" for value in statuses) else
+                          "evaluated" if all(value == "evaluated" for value in statuses) else
+                          "partial" if covered else "failed")
+                writer.writerow({
+                    "baseline": baseline, "target": target, "status": status,
+                    "evaluated_trials": len(covered), "total_trials": trials,
+                    "mean_covered_lines": round(statistics.mean(covered), 3) if covered else "",
+                    "stdev_covered_lines": round(statistics.stdev(covered), 3) if len(covered) > 1 else "",
+                    "trial_statuses": ";".join(statuses),
+                })
     temp.replace(path)
+
+
+def minimum_campaign_elapsed(budget: int) -> int:
+    """Allow only timer granularity and bounded shutdown overhead."""
+    return max(0, budget - min(60, max(2, round(budget * 0.01))))
+
+
+def completed_csv_trial(record: dict[str, str], baseline: str, budget: int) -> bool:
+    if (record.get(f"{baseline}_status") != "evaluated"
+            or record.get(f"{baseline}_campaign_seconds") != str(budget)
+            or record.get(f"{baseline}_coverage_contract") != "canonical-g2-lcov-v1"):
+        return False
+    try:
+        return float(record.get(f"{baseline}_campaign_elapsed_seconds") or 0) >= minimum_campaign_elapsed(budget)
+    except (TypeError, ValueError):
+        return False
+
+
+def recovered_csv_trial(root: Path, record: dict[str, str], baseline: str,
+                        target: str, budget: int, selected_source: str) -> dict[str, Any] | None:
+    """Reuse a failed CSV row whose saved Phase B run was repaired in place."""
+    raw = record.get(f"{baseline}_run") or ""
+    if not raw or raw == "N/A":
+        return None
+    try:
+        run = (root / raw).resolve(strict=True)
+        if not run.is_relative_to(root / "workspace" / baseline / target):
+            return None
+        provenance = read_json(run / "phase_b_source.json")
+        if (provenance.get("baseline") != baseline or provenance.get("target") != target
+                or provenance.get("selected_phase_a_run") != selected_source
+                or not provenance.get("canonical_target_package")):
+            return None
+        result = read_json(run / ("evaluation/result.json" if baseline in BASELINES[:3] else "result.json"))
+        campaign = result.get("campaign") or (result.get("metrics") or {}).get("campaign") or {}
+        configured = campaign.get("configured_duration_seconds")
+        if configured is not None and int(configured) != budget:
+            return None
+        row = result_row(root, baseline, target, run, budget, 0)
+        return row if row["status"] == "evaluated" and row["coverage_contract"] == "canonical-g2-lcov-v1" else None
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def campaign_elapsed(baseline: str, run: Path, campaign: dict[str, Any]) -> float | None:
@@ -121,8 +274,11 @@ def result_row(root: Path, baseline: str, target: str, run: Path, budget: int, e
     meta = read_json(run / "metadata.json")
     result = read_json(run / ("evaluation/result.json" if baseline in BASELINES[:3] else "result.json"))
     statistics = read_json(run / "statistics.json")
+    provenance = read_json(run / "phase_b_source.json")
     campaign = result.get("campaign") or (result.get("metrics") or {}).get("campaign") or {}
     coverage = result.get("coverage") or (result.get("metrics") or {}).get("coverage") or {}
+    sut = coverage.get("sut_line_coverage") or {}
+    raw_covered = (coverage.get("line_coverage") or {}).get("covered", "")
     elapsed = campaign_elapsed(baseline, run, campaign)
     status = str(meta.get("status") or result.get("status") or f"failed_exit_{exit_code}")
     reason = str(meta.get("reason") or result.get("reason") or "")
@@ -131,14 +287,22 @@ def result_row(root: Path, baseline: str, target: str, run: Path, budget: int, e
             status, reason = "incomplete", "missing evaluated result"
         elif elapsed is None:
             status, reason = "duration_unverified", "no measured campaign duration"
-        elif elapsed < budget - 60:
+        elif elapsed < minimum_campaign_elapsed(budget):
             status, reason = "short_campaign", f"measured {elapsed:.0f}s; required {budget}s"
     return {
         "status": status,
         "campaign_seconds": budget,
         "campaign_elapsed_seconds": "" if elapsed is None else round(elapsed, 3),
         "execs_done": campaign.get("execs_done", ""),
-        "covered_lines": (coverage.get("line_coverage") or {}).get("covered", ""),
+        "covered_lines": sut.get("covered", raw_covered),
+        "raw_covered_lines": raw_covered,
+        "sut_covered_lines": sut.get("covered", ""),
+        "sut_total_lines": sut.get("total", ""),
+        "sut_source_files": sut.get("source_files", ""),
+        "coverage_contract": ("canonical-g2-lcov-v1"
+                              if provenance.get("canonical_target_package") and
+                              str(coverage.get("coverage_report_path") or coverage.get("report_path") or "").endswith(".lcov")
+                              else ""),
         "crashes": campaign.get("crashes", ""),
         "read_tokens": statistics.get("read_tokens", ""),
         "write_tokens": statistics.get("write_tokens", ""),
@@ -150,7 +314,8 @@ def result_row(root: Path, baseline: str, target: str, run: Path, budget: int, e
 
 
 def run_job(root: Path, baseline: str, target: str, package: Path, run_id: str, budget: int,
-            generation_timeout: int, log_dir: Path, cpu: int, memory_gib: int = 8) -> dict[str, Any]:
+            generation_timeout: int, log_dir: Path, cpu: int, memory_gib: int = 8,
+            processes: JobProcesses | None = None) -> dict[str, Any]:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", f"{baseline}_{target}")
     pair_id = f"{run_id}_{safe}"
     run = root / "workspace" / baseline / target / pair_id
@@ -174,6 +339,7 @@ def run_job(root: Path, baseline: str, target: str, package: Path, run_id: str, 
         "TOKENIZERS_PARALLELISM": "false", "AFL_NO_AFFINITY": "1",
         "HGB_SKIP_IMAGE_PREFLIGHT": "1",
         "HGB_TARGET_REQUIRE_SPLIT": "1",
+        "HGB_EVAL_ALL_RUN_ID": run_id,
         "DOCKER_NAME": f"hgb-tgi-{pair_id}",
     })
     protocol = "paper-native" if baseline in ("g2fuzz", "elfuzz") else "blind-project"
@@ -187,9 +353,9 @@ def run_job(root: Path, baseline: str, target: str, package: Path, run_id: str, 
     with log_path.open("w", encoding="utf-8") as log:
         log.write("command=" + " ".join(cmd) + "\n")
         log.flush()
-        completed = subprocess.run(cmd, cwd=log_dir, env=env, stdout=log, stderr=subprocess.STDOUT, check=False)
-    row = result_row(root, baseline, target, run, budget, completed.returncode)
-    row["reason"] = row["reason"] or (f"exit {completed.returncode}; see {log_path.relative_to(root)}" if completed.returncode else "")
+        exit_code = run_tracked(cmd, cwd=log_dir, env=env, stdout=log, processes=processes)
+    row = result_row(root, baseline, target, run, budget, exit_code)
+    row["reason"] = row["reason"] or (f"exit {exit_code}; see {log_path.relative_to(root)}" if exit_code else "")
     row["job_wall_seconds"] = round(time.time() - started, 3)
     return row
 
@@ -278,23 +444,44 @@ def manifest_sources(path: Path) -> dict[tuple[str, str], str]:
 
 def run_replay_job(root: Path, baseline: str, target: str, source: str,
                    run_id: str, budget: int, log_dir: Path,
-                   cpu: int, memory_gib: int) -> dict[str, Any]:
+                   cpu: int, memory_gib: int, trial: int = 1, trials: int = 1,
+                   processes: JobProcesses | None = None,
+                   canonical_source: str = "") -> dict[str, Any]:
     safe = re.sub(r"[^A-Za-z0-9_]+", "_", f"{baseline}_{target}")
-    pair_id = f"{run_id}_{safe}"
+    trial_prefix = f"trial_{trial:03d}_" if trials > 1 else ""
+    pair_id = f"{run_id}_{trial_prefix}{safe}"
     run = root / "workspace" / baseline / target / pair_id
     cmd = [sys.executable, str(root / "scripts/hgb_replay_saved.py"),
            "--baseline", baseline, "--target", target, "--source-run", source,
            "--run-id", pair_id, "--campaign-seconds", str(budget),
            "--cpu", str(cpu), "--memory-gib", str(memory_gib)]
-    log_path = log_dir / f"{safe}.log"
+    if canonical_source:
+        cmd.extend(["--canonical-source-run", canonical_source])
+    log_path = log_dir / f"{safe}{f'.trial_{trial:03d}' if trials > 1 else ''}.log"
     started = time.time()
     with log_path.open("w", encoding="utf-8") as log:
         log.write("command=" + " ".join(cmd) + "\n")
         log.flush()
-        completed = subprocess.run(cmd, cwd=log_dir, stdout=log, stderr=subprocess.STDOUT, check=False)
-    row = result_row(root, baseline, target, run, budget, completed.returncode)
+        if processes is None:
+            exit_code = subprocess.run(cmd, cwd=log_dir, stdout=log,
+                                       stderr=subprocess.STDOUT, check=False).returncode
+        else:
+            env = os.environ.copy()
+            env["HGB_EVAL_ALL_RUN_ID"] = run_id
+            process = subprocess.Popen(cmd, cwd=log_dir, env=env, stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            processes.add(process)
+            try:
+                exit_code = process.wait()
+            finally:
+                processes.discard(process)
+    row = result_row(root, baseline, target, run, budget, exit_code)
+    if processes is not None and processes.interrupted.is_set():
+        row["status"] = "interrupted"
+        row["reason"] = "evaluation stopped by signal"
+        return row
     row["reason"] = row["reason"] or (
-        f"exit {completed.returncode}; see {log_path.relative_to(root)}" if completed.returncode else "")
+        f"exit {exit_code}; see {log_path.relative_to(root)}" if exit_code else "")
     row["job_wall_seconds"] = round(time.time() - started, 3)
     return row
 
@@ -311,6 +498,32 @@ def default_run_id(phase: str, date: str, campaign_seconds: int,
     phase_letter = "a" if phase == "generate" else "b"
     duration = generation_campaign_seconds if phase == "generate" else campaign_seconds
     return f"eval_all_phase_{phase_letter}_{date.replace('-', '')}_{duration}s"
+
+
+def write_coverage_products(output: Path) -> bool:
+    """Recount saved LCOV on target code and the shared executable line set."""
+    audit_dir = output.parent if output.is_relative_to(ROOT / "workspace") else ROOT / "workspace/eval_all"
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    stem = output.stem
+    artifacts = {
+        "--output": audit_dir / f"{stem}.coverage_audit.csv",
+        "--corrected-output": audit_dir / f"{stem}.coverage_corrected.csv",
+        "--source-sets-output": audit_dir / f"{stem}.coverage_source_sets.csv",
+        "--common-source-output": audit_dir / f"{stem}.coverage_common.csv",
+    }
+    cmd = [sys.executable, str(ROOT / "scripts/hgb_audit_coverage_integrity.py"),
+           "--input", str(output)]
+    for flag, destination in artifacts.items():
+        cmd.extend([flag, str(destination)])
+    log = audit_dir / f"{stem}.audit.log"
+    with log.open("w", encoding="utf-8") as handle:
+        code = subprocess.run(cmd, cwd=ROOT, stdout=handle,
+                              stderr=subprocess.STDOUT, check=False).returncode
+    if code:
+        print(f"coverage audit failed (exit {code}); see {log}", file=sys.stderr, flush=True)
+        return False
+    print(f"Common-source coverage: {artifacts['--common-source-output']}", flush=True)
+    return True
 
 
 def latest_complete_manifest(root: Path, date: str,
@@ -333,6 +546,8 @@ def main() -> int:
     parser.add_argument("--phase", choices=("generate", "fuzz"), default="fuzz",
                         help="generate/check Phase A artifacts or fuzz saved Phase A artifacts (default: fuzz)")
     parser.add_argument("--parallel-worker", type=int, default=64, help="Maximum concurrent baseline/target jobs (default: 64)")
+    parser.add_argument("--trials", type=int, default=1,
+                        help="Independent Phase B campaigns per applicable artifact (default: 1)")
     parser.add_argument("--campaign-seconds", type=int, default=86400, help="Per-job fuzz campaign budget (default: 86400)")
     parser.add_argument("--generation-campaign-seconds", type=int, default=300,
                         help="Short verification campaign for newly generated Phase A artifacts (default: 300)")
@@ -350,17 +565,23 @@ def main() -> int:
     parser.add_argument("--resume", action="store_true", help="Reuse the date CSV, keeping completed rows and retrying all others")
     parser.add_argument("--rebuild-images", action="store_true", help="Rebuild all baseline images before launching jobs")
     args = parser.parse_args()
-    if (args.parallel_worker < 1 or args.campaign_seconds < 1 or args.generation_campaign_seconds < 1
+    if (args.parallel_worker < 1 or args.trials < 1 or args.campaign_seconds < 1 or args.generation_campaign_seconds < 1
             or args.generation_timeout_seconds < 1 or args.memory_per_job_gib < 1
             or args.memory_budget_gib < 0):
         parser.error("worker count, memory cap, and time budgets must be positive")
+    if args.phase != "fuzz" and args.trials != 1:
+        parser.error("--trials applies only to --phase fuzz")
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
         parser.error("--date must be YYYY-MM-DD")
     args.run_id = args.run_id or default_run_id(
         args.phase, args.date, args.campaign_seconds, args.generation_campaign_seconds)
+    if args.trials > 1 and args.run_id == default_run_id(
+            args.phase, args.date, args.campaign_seconds, args.generation_campaign_seconds):
+        args.run_id += f"_trials{args.trials}"
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id):
         parser.error("--run-id must contain only letters, digits, underscore, or hyphen")
-    default_name = f"{args.date}.phase_a.csv" if args.phase == "generate" else f"{args.date}.csv"
+    default_name = (f"{args.date}.phase_a.csv" if args.phase == "generate" else
+                    f"{args.date}.trials{args.trials}.csv" if args.trials > 1 else f"{args.date}.csv")
     output = (args.output or ROOT / "workspace/eval_all" / default_name).resolve()
     manifest = (args.manifest or ROOT / "workspace/eval_all" / f"{args.date}.phase_a.json").resolve()
     for label, path in (("output", output), ("manifest", manifest)):
@@ -370,6 +591,10 @@ def main() -> int:
         parser.error(f"output already exists: {output}; pass --resume or --output")
     if args.resume and not output.exists():
         parser.error(f"--resume requires an existing CSV: {output}")
+    if args.resume and not args.plan:
+        # Failed or interrupted trials need fresh run directories. Preserve
+        # completed rows in the CSV while keeping each retry auditable.
+        args.run_id += "_resume_" + datetime.now().strftime("%Y%m%dT%H%M%S%f")
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_handle = (output.parent / f"{output.name}.lock").open("w")
     try:
@@ -390,42 +615,86 @@ def main() -> int:
         sources = audited_sources(ROOT, audit)
         save_manifest(manifest, sources, targets, scope)
         sources = manifest_sources(manifest)
-    rows = {(b, t): {"status": "N/A" if scope[b, t] == "N/A" else "pending",
-                     **({m: "N/A" for m in METRICS if m != "status"} if scope[b, t] == "N/A" else {})}
-            for t in targets for b in BASELINES}
+    rows = {job_key(trial, b, t, args.trials):
+            {"status": "N/A" if scope[b, t] == "N/A" else "pending",
+             **({m: "N/A" for m in METRICS if m != "status"} if scope[b, t] == "N/A" else {})}
+            for trial in range(1, args.trials + 1) for t in targets for b in BASELINES}
+    ready_pairs: set[tuple[str, str]] = set()
     for target in targets:
         for baseline in BASELINES:
             if scope[baseline, target] == "N/A":
                 continue
             ready, detail = source_ready(baseline, target, sources.get((baseline, target), "")) \
                 if (baseline, target) in sources else (False, "no verified Phase A artifact")
+            if ready:
+                ready_pairs.add((baseline, target))
             if args.phase == "generate" and ready:
                 rows[baseline, target] = {"status": "generated", "run": detail}
             elif args.phase == "fuzz" and not ready:
-                rows[baseline, target] = {"status": "missing_artifact", "reason": detail}
+                for trial in range(1, args.trials + 1):
+                    rows[job_key(trial, baseline, target, args.trials)] = {
+                        "status": "missing_artifact", "reason": detail}
+    if args.phase == "fuzz":
+        for target in targets:
+            if ("g2fuzz", target) in ready_pairs:
+                continue
+            for baseline in BASELINES:
+                if scope[baseline, target] == "pending":
+                    for trial in range(1, args.trials + 1):
+                        rows[job_key(trial, baseline, target, args.trials)] = {
+                            "status": "missing_artifact",
+                            "reason": "G2Fuzz Phase A target package is required as the shared coverage build source"}
     if args.resume:
         with output.open(newline="", encoding="utf-8") as existing:
-            old_rows = {record["target"]: record for record in csv.DictReader(existing)}
-        for target in targets:
-            record = old_rows.get(target, {})
-            for baseline in BASELINES:
-                if (scope[baseline, target] == "pending" and args.phase == "fuzz"
-                        and record.get(f"{baseline}_status") == "evaluated"):
-                    rows[baseline, target] = {metric: record.get(f"{baseline}_{metric}", "") for metric in METRICS}
-    save_csv(output, targets, rows)
-    jobs = [(b, t) for t in targets for b in BASELINES if scope[b, t] == "pending"]
-    remaining = sum(rows[b, t]["status"] == "pending" for b, t in jobs)
-    print(f"phase={args.phase}; planned {len(jobs)} applicable pairs ({remaining} jobs); "
-          f"{len(targets) * len(BASELINES) - len(jobs)} N/A; requested_workers={args.parallel_worker}; "
+            reader = csv.DictReader(existing)
+            if ("trial" in (reader.fieldnames or [])) != (args.trials > 1):
+                parser.error("--resume CSV trial schema does not match --trials")
+            old_rows = {(int(record.get("trial") or 1), record["target"]): record
+                        for record in reader}
+        if args.trials > 1 and {trial for trial, _ in old_rows} != set(range(1, args.trials + 1)):
+            parser.error("--resume CSV has a different number of trials")
+        for trial in range(1, args.trials + 1):
+            for target in targets:
+                record = old_rows.get((trial, target), {})
+                for baseline in BASELINES:
+                    if (scope[baseline, target] == "pending" and args.phase == "fuzz"
+                            and (baseline, target) in ready_pairs
+                            and completed_csv_trial(record, baseline, args.campaign_seconds)):
+                        _, selected = source_ready(baseline, target, sources[baseline, target])
+                        refreshed = recovered_csv_trial(ROOT, record, baseline, target,
+                                                       args.campaign_seconds, selected)
+                        rows[job_key(trial, baseline, target, args.trials)] = refreshed or {
+                            metric: record.get(f"{baseline}_{metric}", "") for metric in METRICS}
+                    elif (scope[baseline, target] == "pending" and args.phase == "fuzz"
+                          and (baseline, target) in ready_pairs):
+                        _, selected = source_ready(baseline, target, sources[baseline, target])
+                        recovered = recovered_csv_trial(ROOT, record, baseline, target,
+                                                        args.campaign_seconds, selected)
+                        if recovered is not None:
+                            rows[job_key(trial, baseline, target, args.trials)] = recovered
+    save_csv(output, targets, rows, args.trials)
+    jobs = [(trial, b, t) for trial in range(1, args.trials + 1)
+            for t in targets for b in BASELINES if scope[b, t] == "pending"]
+    remaining = sum(rows[job_key(trial, b, t, args.trials)]["status"] == "pending"
+                    for trial, b, t in jobs)
+    print(f"phase={args.phase}; planned {len(jobs)} applicable jobs ({remaining} pending); "
+          f"{args.trials * len(targets) * len(BASELINES) - len(jobs)} N/A; "
+          f"trials={args.trials}; requested_workers={args.parallel_worker}; "
           f"campaign={args.campaign_seconds}s", flush=True)
     print(output, flush=True)
     if args.plan:
         return 0
     if not remaining:
-        failures = [(b, t) for b, t in jobs
-                    if rows[b, t]["status"] not in (("generated",) if args.phase == "generate" else ("evaluated",))]
+        failures = [(trial, b, t) for trial, b, t in jobs
+                    if rows[job_key(trial, b, t, args.trials)]["status"] not in
+                    (("generated",) if args.phase == "generate" else ("evaluated",))]
+        if args.phase == "fuzz" and args.trials > 1:
+            summary = output.with_name(output.stem + ".summary.csv")
+            save_trial_summary(summary, targets, rows, args.trials)
+            print(f"Trial summary: {summary}", flush=True)
         print(f"phase={args.phase}: {len(jobs) - len(failures)}/{len(jobs)} ready; manifest={manifest}", flush=True)
-        return 1 if failures else 0
+        audited = write_coverage_products(output) if args.phase == "fuzz" else True
+        return 1 if failures or not audited else 0
     if subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode:
         print("Docker is unavailable; no jobs started", file=sys.stderr)
         return 2
@@ -442,39 +711,99 @@ def main() -> int:
     print(f"effective_workers={effective_workers}; per_job_memory={args.memory_per_job_gib}GiB; "
           f"aggregate_cap={effective_workers * args.memory_per_job_gib}GiB", flush=True)
     if args.phase == "fuzz":
-        pending = [(b, t) for b, t in jobs if rows[b, t]["status"] == "pending"]
+        pending = [(trial, b, t) for trial, b, t in jobs
+                   if rows[job_key(trial, b, t, args.trials)]["status"] == "pending"]
         active = {}
-        with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            while pending or active:
-                while pending and len(active) < effective_workers:
-                    baseline, target = pending.pop(0)
-                    used_cpus = {item[2] for item in active.values()}
-                    cpu = next((value for value in cpus if value not in used_cpus), cpus[len(active) % len(cpus)])
-                    rows[baseline, target]["status"] = "running"
-                    future = executor.submit(
-                        run_replay_job, ROOT, baseline, target, sources[baseline, target],
-                        args.run_id, args.campaign_seconds, log_dir, cpu, args.memory_per_job_gib)
-                    active[future] = (baseline, target, cpu)
-                save_csv(output, targets, rows)
-                if not active:
-                    break
-                done, _ = wait(active, return_when=FIRST_COMPLETED)
-                for future in done:
-                    baseline, target, _ = active.pop(future)
-                    try:
-                        rows[baseline, target] = future.result()
-                    except Exception as exc:
-                        rows[baseline, target] = {"status": "runner_failed", "reason": str(exc)}
-                    print(f"{baseline} {target}: {rows[baseline, target]['status']}", flush=True)
-                save_csv(output, targets, rows)
-        failures = [(b, t) for b, t in jobs if rows[b, t]["status"] != "evaluated"]
+        processes = JobProcesses()
+        prior_sigint = signal.getsignal(signal.SIGINT)
+        prior_sigterm = signal.getsignal(signal.SIGTERM)
+        def interrupt(_signum: int, _frame: Any) -> None:
+            processes.interrupted.set()
+        signal.signal(signal.SIGINT, interrupt)
+        signal.signal(signal.SIGTERM, interrupt)
+        try:
+            with ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                stopped = False
+                stop_started = 0.0
+                forced = False
+                while pending or active:
+                    if processes.interrupted.is_set() and not stopped:
+                        stopped = True
+                        stop_started = time.monotonic()
+                        print("Interrupt received; stopping evaluation jobs and containers", flush=True)
+                        processes.stop()
+                        stop_eval_containers(args.run_id)
+                        pending.clear()
+                    if stopped and active and not forced and time.monotonic() - stop_started >= 3:
+                        forced = True
+                        processes.stop(signal.SIGKILL)
+                        stop_eval_containers(args.run_id)
+                    while not stopped and pending and len(active) < effective_workers:
+                        active_pairs = {(item[1], item[2]) for item in active.values()}
+                        next_index = next((index for index, (_, b, t) in enumerate(pending)
+                                           if (b, t) not in active_pairs), None)
+                        if next_index is None:
+                            break
+                        trial, baseline, target = pending.pop(next_index)
+                        used_cpus = {item[3] for item in active.values()}
+                        cpu = next((value for value in cpus if value not in used_cpus), cpus[len(active) % len(cpus)])
+                        rows[job_key(trial, baseline, target, args.trials)]["status"] = "running"
+                        future = executor.submit(
+                            run_replay_job, ROOT, baseline, target, sources[baseline, target],
+                            args.run_id, args.campaign_seconds, log_dir, cpu,
+                            args.memory_per_job_gib, trial, args.trials, processes,
+                            sources.get(("g2fuzz", target), ""))
+                        active[future] = (trial, baseline, target, cpu)
+                    save_csv(output, targets, rows, args.trials)
+                    if not active:
+                        break
+                    done, _ = wait(active, timeout=1, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        trial, baseline, target, _ = active.pop(future)
+                        key = job_key(trial, baseline, target, args.trials)
+                        try:
+                            rows[key] = future.result()
+                        except Exception as exc:
+                            rows[key] = {"status": "runner_failed", "reason": str(exc)}
+                        print(f"trial {trial}/{args.trials} {baseline} {target}: {rows[key]['status']}", flush=True)
+                    save_csv(output, targets, rows, args.trials)
+                if stopped:
+                    for trial, baseline, target, _ in active.values():
+                        rows[job_key(trial, baseline, target, args.trials)] = {
+                            "status": "interrupted", "reason": "evaluation stopped by signal"}
+                    save_csv(output, targets, rows, args.trials)
+        finally:
+            signal.signal(signal.SIGINT, prior_sigint)
+            signal.signal(signal.SIGTERM, prior_sigterm)
+        if processes.interrupted.is_set():
+            if args.trials > 1:
+                save_trial_summary(output.with_name(output.stem + ".summary.csv"),
+                                   targets, rows, args.trials)
+            return 130
+        failures = [(trial, b, t) for trial, b, t in jobs
+                    if rows[job_key(trial, b, t, args.trials)]["status"] != "evaluated"]
+        if args.trials > 1:
+            summary = output.with_name(output.stem + ".summary.csv")
+            save_trial_summary(summary, targets, rows, args.trials)
+            print(f"Trial summary: {summary}", flush=True)
         print(f"Phase B: {len(jobs) - len(failures)}/{len(jobs)} evaluated for >= "
-              f"{args.campaign_seconds - 60}s; CSV: {output}", flush=True)
-        return 1 if failures else 0
+              f"{minimum_campaign_elapsed(args.campaign_seconds)}s; CSV: {output}", flush=True)
+        audited = write_coverage_products(output)
+        return 1 if failures or not audited else 0
     # Phase A prepares only pairs that lack a verified saved artifact. Its
     # short evaluator campaign verifies generation; Phase B owns the long run.
+    phase_a_processes = JobProcesses()
+    prior_sigint = signal.getsignal(signal.SIGINT)
+    prior_sigterm = signal.getsignal(signal.SIGTERM)
+    def phase_a_interrupt(_signum: int, _frame: Any) -> None:
+        print("Interrupt received; stopping generation jobs and containers", flush=True)
+        phase_a_processes.stop(signal.SIGKILL)
+        stop_eval_containers(args.run_id)
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGINT, phase_a_interrupt)
+    signal.signal(signal.SIGTERM, phase_a_interrupt)
     for baseline in BASELINES:
-        if not any(rows[b, t]["status"] == "pending" and b == baseline for b, t in jobs):
+        if not any(rows[b, t]["status"] == "pending" and b == baseline for _, b, t in jobs):
             continue
         image_log = log_dir / f"image_{baseline}.log"
         shell = ('source "$1/scripts/lib/common.sh"; load_hgb_config; '
@@ -482,11 +811,11 @@ def main() -> int:
                  'if [[ "$3" == 1 ]] || ! docker image inspect "$image" >/dev/null 2>&1; '
                  'then hgb_build_image "$2" "$2" "$1"; else printf "reusing %s\\n" "$image"; fi')
         with image_log.open("w", encoding="utf-8") as log:
-            code = subprocess.run(["bash", "-c", shell, "bash", str(ROOT), baseline,
-                                   "1" if args.rebuild_images else "0"], cwd=log_dir,
-                                  stdout=log, stderr=subprocess.STDOUT, check=False).returncode
+            code = run_tracked(["bash", "-c", shell, "bash", str(ROOT), baseline,
+                                "1" if args.rebuild_images else "0"], cwd=log_dir,
+                               env=None, stdout=log, processes=phase_a_processes)
         if code:
-            for b, t in jobs:
+            for _, b, t in jobs:
                 if b == baseline:
                     rows[b, t] = {"status": "image_build_failed", "reason": str(image_log.relative_to(ROOT))}
             save_csv(output, targets, rows)
@@ -501,9 +830,9 @@ def main() -> int:
         env.update({"HGB_TARGET_REQUIRE_SPLIT": "1", "HGB_BASELINE_PROFILE": "alpha", "HGB_BASELINE_PROTOCOL": "blind-project"})
         prep_log = log_dir / f"package_{target}.log"
         with prep_log.open("w", encoding="utf-8") as log:
-            code = subprocess.run(["bash", str(ROOT / "scripts/hgb_prepare_target.sh"), "--target", target,
-                                   "--run-id", args.run_id, "--output", str(package)], cwd=log_dir, env=env,
-                                  stdout=log, stderr=subprocess.STDOUT, check=False).returncode
+            code = run_tracked(["bash", str(ROOT / "scripts/hgb_prepare_target.sh"), "--target", target,
+                                "--run-id", args.run_id, "--output", str(package)], cwd=log_dir,
+                               env=env, stdout=log, processes=phase_a_processes)
         if code or not (package / "generator_input/target_manifest.json").is_file():
             for baseline in BASELINES:
                 if rows[baseline, target]["status"] == "pending":
@@ -511,7 +840,7 @@ def main() -> int:
             save_csv(output, targets, rows)
         else:
             packages[target] = package
-    pending = [(b, t) for b, t in jobs if rows[b, t]["status"] == "pending"]
+    pending = [(b, t) for _, b, t in jobs if rows[b, t]["status"] == "pending"]
     active = {}
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
         while pending or active:
@@ -522,7 +851,7 @@ def main() -> int:
                 rows[baseline, target]["status"] = "running"
                 future = executor.submit(run_job, ROOT, baseline, target, packages[target], args.run_id,
                                          args.generation_campaign_seconds, args.generation_timeout_seconds, log_dir,
-                                         cpu, args.memory_per_job_gib)
+                                         cpu, args.memory_per_job_gib, phase_a_processes)
                 active[future] = (baseline, target, cpu)
             save_csv(output, targets, rows)
             if not active:
@@ -541,11 +870,16 @@ def main() -> int:
                     rows[baseline, target] = {"status": "runner_failed", "reason": str(exc)}
                 print(f"{baseline} {target}: {rows[baseline, target]['status']}", flush=True)
             save_csv(output, targets, rows)
-    failures = [(b, t) for b, t in jobs if rows[b, t]["status"] != "generated"]
+    failures = [(b, t) for _, b, t in jobs if rows[b, t]["status"] != "generated"]
+    signal.signal(signal.SIGINT, prior_sigint)
+    signal.signal(signal.SIGTERM, prior_sigterm)
     print(f"Phase A: {len(jobs) - len(failures)}/{len(jobs)} generated and verified; "
           f"manifest={manifest}; CSV={output}", flush=True)
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)

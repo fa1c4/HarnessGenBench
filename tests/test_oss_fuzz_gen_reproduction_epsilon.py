@@ -73,7 +73,8 @@ LLVM_COVERAGE_JSON = json.dumps({
     "data": [{"totals": {"lines": {"count": 100, "covered": 31},
                           "functions": {"count": 10, "covered": 6},
                           "regions": {"count": 50, "covered": 14}},
-               "functions": [{"name": "jsoncpp_parse", "count": 5},
+               "files": [{"filename": "/src/jsoncpp/src/lib_json/json_reader.cpp", "summary": {"lines": {"count": 100, "covered": 31}}}],
+              "functions": [{"name": "jsoncpp_parse", "count": 5},
                              {"name": "LLVMFuzzerTestOneInput", "count": 12}]}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",
 })

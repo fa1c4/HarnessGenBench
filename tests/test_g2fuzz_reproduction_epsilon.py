@@ -59,7 +59,10 @@ matrix_collector = load_module("hgb_collect_matrix_epsilon", ROOT / "scripts/hgb
 
 
 COVERAGE_JSON = json.dumps({
-    "data": [{"totals": {"lines": {"count": 50, "covered": 30},
+    "data": [{"files": [
+                {"filename": "/src/libpng/png.c", "summary": {"lines": {"count": 25, "covered": 15}}},
+                {"filename": "/src/jsoncpp/src/json_reader.cpp", "summary": {"lines": {"count": 25, "covered": 15}}},
+              ], "totals": {"lines": {"count": 50, "covered": 30},
                          "functions": {"count": 10, "covered": 6},
                          "regions": {"count": 40, "covered": 20}}}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",
@@ -469,6 +472,48 @@ def test_campaign_requires_cmplog_binary(tmp_path: Path):
         pipeline.run_campaign()
     assert exc_info.value.status == "infra_missing"
     assert "CmpLog" in exc_info.value.reason
+
+
+def test_afl_sigkill_resumes_existing_queue_and_records_both_attempts(tmp_path: Path, monkeypatch):
+    output = tmp_path / "output"
+    queue = output / "default" / "queue"
+    queue.mkdir(parents=True)
+    (queue / "id:000000").write_bytes(b"seed")
+    (output / "default" / "fuzzer_stats").write_text("execs_done : 12\n")
+    commands = []
+
+    def fake_run(cmd, log_path, _timeout, env=None):
+        commands.append(cmd)
+        log_path.write_text(f"attempt {len(commands)}\n")
+        return (-9, False) if len(commands) == 1 else (124, True)
+
+    monkeypatch.setattr(g2, "run_subprocess", fake_run)
+    code, timed_out, elapsed, attempts = g2.run_afl_with_resume(
+        ["afl-fuzz", "-i", "seeds", "-o", str(output)],
+        tmp_path / "afl.log", output, 100, {})
+    assert (code, timed_out, attempts) == (124, True, 2)
+    assert elapsed >= 0
+    assert commands[0][2] == "seeds"
+    assert commands[1][2] == "-"
+    assert "attempt 1" in (tmp_path / "afl.log").read_text()
+    assert "attempt 2" in (tmp_path / "afl.log").read_text()
+
+
+def test_afl_sigkill_without_saved_progress_does_not_retry(tmp_path: Path, monkeypatch):
+    commands = []
+
+    def fake_run(cmd, log_path, _timeout, env=None):
+        commands.append(cmd)
+        log_path.write_text("killed\n")
+        return -9, False
+
+    monkeypatch.setattr(g2, "run_subprocess", fake_run)
+    code, _timed_out, _elapsed, attempts = g2.run_afl_with_resume(
+        ["afl-fuzz", "-i", "seeds", "-o", str(tmp_path / "output")],
+        tmp_path / "afl.log", tmp_path / "output", 100, {})
+    assert code == -9
+    assert attempts == 1
+    assert len(commands) == 1
 
 
 def test_try_num_one_forbidden_under_epsilon():

@@ -498,6 +498,10 @@ run_hgb_container() {
   ensure_dir "$workspace"
   hgb_add_host_gateway_for_url extra_docker_args "${CKGFUZZER_EMBEDDING_BASE_URL:-}"
   hgb_add_host_gateway_for_url extra_docker_args "${PROME_FUZZ_EMBEDDING_BASE_URL:-}"
+  if [[ -n "${HGB_EVAL_ALL_RUN_ID:-}" ]]; then
+    [[ "$HGB_EVAL_ALL_RUN_ID" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid HGB_EVAL_ALL_RUN_ID"
+    extra_docker_args+=(--label "hgb.eval_all_run=$HGB_EVAL_ALL_RUN_ID" -e HGB_EVAL_ALL_RUN_ID)
+  fi
   docker run --rm --pull=never --init \
     "${extra_docker_args[@]}" \
     -e API_KEY \
@@ -816,6 +820,10 @@ run_hgb_target_container() {
   # matrix pair hanging forever. The generation stage timeout is enforced inside
   # the entrypoint; this is a coarser outer guard with a safety margin.
   local hgb_docker_run_timeout="${HGB_DOCKER_RUN_TIMEOUT_SECONDS:-$(( ${HGB_GENERATION_TIMEOUT_SECONDS:-10800} + 10800 ))}"
+  if [[ -n "${HGB_EVAL_ALL_RUN_ID:-}" ]]; then
+    [[ "$HGB_EVAL_ALL_RUN_ID" =~ ^[A-Za-z0-9_-]+$ ]] || die "invalid HGB_EVAL_ALL_RUN_ID"
+    extra_docker_args+=(--label "hgb.eval_all_run=$HGB_EVAL_ALL_RUN_ID" -e HGB_EVAL_ALL_RUN_ID)
+  fi
   if [[ -n "${HGB_DOCKER_CPUS:-}" ]]; then
     [[ "$HGB_DOCKER_CPUS" =~ ^[1-9][0-9]*$ ]] || die "HGB_DOCKER_CPUS must be a positive integer"
     extra_docker_args+=(--cpus "$HGB_DOCKER_CPUS")

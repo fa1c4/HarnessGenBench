@@ -43,7 +43,10 @@ matrix_collector = load_module("hgb_collect_matrix_gamma", ROOT / "scripts/hgb_c
 
 
 COVERAGE_JSON = json.dumps({
-    "data": [{"totals": {"lines": {"count": 50, "covered": 30},
+    "data": [{"files": [
+                {"filename": "/src/libpng/png.c", "summary": {"lines": {"count": 25, "covered": 15}}},
+                {"filename": "/src/jsoncpp/src/json_reader.cpp", "summary": {"lines": {"count": 25, "covered": 15}}},
+              ], "totals": {"lines": {"count": 50, "covered": 30},
                          "functions": {"count": 10, "covered": 6},
                          "regions": {"count": 40, "covered": 20}}}],
     "type": "llvm.coverage.json.export", "version": "2.0.1",
@@ -303,9 +306,10 @@ def test_coverage_build_includes_coverage_flags() -> None:
     assert "-fcoverage-mapping" in cov_env["CFLAGS"]
     assert "-fprofile-instr-generate" in cov_env["CXXFLAGS"]
     assert "-fcoverage-mapping" in cov_env["CXXFLAGS"]
-    # cov uses the coverage engine, not afl
+    # cov uses the same libFuzzer/coverage variant as other baselines.
     cov_args = commands["cov"]["build_args"]
-    assert "FUZZING_ENGINE=coverage" in cov_args
+    assert "FUZZING_ENGINE=libfuzzer" in cov_args
+    assert "SANITIZER=coverage" in cov_args
     assert "FUZZING_ENGINE=afl" not in cov_args
 
 

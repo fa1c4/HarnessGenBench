@@ -291,6 +291,7 @@ def run_coverage_replay(
     work_dir: Path,
     runner: Runner = _run,
     timeout_seconds: int = 600,
+    coverage_format: str = "json",
 ) -> dict[str, Any]:
     """Replay the final corpus under a coverage-instrumented target binary.
 
@@ -306,15 +307,19 @@ def run_coverage_replay(
     corpus_dir = Path(corpus_dir)
     if not Path(target_binary).is_file():
         return {"exit_code": 127, "report_path": None, "log": str(work_dir / "coverage.log")}
+    if coverage_format not in {"json", "lcov"}:
+        raise ValueError("coverage_format must be json or lcov")
+    report_name = "coverage.lcov" if coverage_format == "lcov" else "coverage.json"
+    export_format = "lcov" if coverage_format == "lcov" else "text"
     cmd = [
         "sh",
         "-lc",
         f"mkdir -p /tmp/cov /tmp/corpus && cp -r {corpus_dir}/. /tmp/corpus/ && "
         f"LLVM_PROFILE_FILE=/tmp/cov/coverage.profraw {target_binary} -runs=0 /tmp/corpus && "
         f"llvm-profdata merge -o /tmp/cov/merged.profdata /tmp/cov/*.profraw && "
-        f"llvm-cov export -format=text -summary-only {target_binary} "
-        f"-instr-profile=/tmp/cov/merged.profdata > {cov_dir}/coverage.json 2>{cov_dir}/cov.err; "
-        f"cat {cov_dir}/coverage.json",
+        f"llvm-cov export -format={export_format} {target_binary} "
+        f"-instr-profile=/tmp/cov/merged.profdata > {cov_dir}/{report_name} 2>{cov_dir}/cov.err; "
+        f"cat {cov_dir}/{report_name}",
     ]
     try:
         result = runner(cmd, timeout_seconds)
@@ -324,7 +329,7 @@ def run_coverage_replay(
         f"$ {' '.join(cmd)}\n[stdout]\n{result.stdout}\n[stderr]\n{result.stderr}\n[exit]\n{result.exit_code}\n",
         encoding="utf-8",
     )
-    report = cov_dir / "coverage.json"
+    report = cov_dir / report_name
     return {
         "exit_code": result.exit_code,
         "report_path": str(report) if report.is_file() else None,

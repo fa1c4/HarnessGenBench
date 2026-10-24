@@ -247,6 +247,42 @@ patch_oss_fuzz_projects() {
   local oss_fuzz_dir="$1"
   local patch_log="$workspace/logs/oss_fuzz_project_patches.log"
   mkdir -p "$(dirname "$patch_log")"
+  # The OSS-Fuzz Bloaty Dockerfile clones HEAD without submodules. Its CMake
+  # build then blocks on `git submodule update` for protobuf and other
+  # dependencies. The split target package already contains the pinned source
+  # with populated submodules and excludes the reference fuzz driver.
+  if [[ "${HGB_TARGET_PROJECT:-}" == "bloaty" ]]; then
+    local bloaty_source="${HGB_TARGET_SOURCE_DIR:-/target/source_input}/bloaty"
+    local bloaty_project="$oss_fuzz_dir/projects/bloaty"
+    local bloaty_dockerfile="$bloaty_project/Dockerfile"
+    if [[ ! -f "$bloaty_source/src/bloaty.h" ||
+          ! -f "$bloaty_source/third_party/protobuf/cmake/CMakeLists.txt" ||
+          -f "$bloaty_source/tests/fuzz_target.cc" ||
+          ! -f "$bloaty_dockerfile" ]]; then
+      printf 'ofg_project_patch: Bloaty split source is incomplete or contains the reference driver\n' >>"$patch_log"
+      return 1
+    fi
+    rsync -a --delete "$bloaty_source/" "$bloaty_project/hgb_target_source/"
+    # CMake runs `git submodule update` whenever this file exists, even when
+    # every submodule is already populated. The split source has no Git
+    # metadata, so this update would block on the network.
+    rm -f "$bloaty_project/hgb_target_source/.gitmodules"
+    if ! grep -qF 'HGB local split Bloaty source' "$bloaty_dockerfile"; then
+      "$python" - "$bloaty_dockerfile" <<'PY_OFG_BLOATY_SOURCE'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+source = p.read_text(encoding="utf-8")
+old = "RUN git clone --depth 1 https://github.com/google/bloaty.git bloaty"
+if source.count(old) != 1:
+    raise SystemExit("Bloaty Dockerfile clone command changed unexpectedly")
+p.write_text(source.replace(old,
+    "COPY hgb_target_source/ $SRC/bloaty/\n# HGB local split Bloaty source", 1),
+    encoding="utf-8")
+PY_OFG_BLOATY_SOURCE
+      printf 'ofg_project_patch: Bloaty image uses local split source and populated submodules\n' >>"$patch_log"
+    fi
+  fi
   # lcms: the upstream Dockerfile seeds the corpus with ``cd seeds`` relative
   # to WORKDIR lcms (the dir does not exist there) and copies testbed/*.icc
   # files that current lcms master no longer ships; the RUN always fails and
@@ -1884,6 +1920,41 @@ PY_OFG_SCOPE
      hgb_write_common_metadata failed "$reason" 65 harness_generator
      hgb_write_common_summary failed "$reason" harness_generator
      exit 65
+   fi
+   if [[ "$project" == "bloaty" ]]; then
+     # This checkout is freshly materialized for this run. Upstream's git
+     # clean would delete the staged, untracked hgb_target_source/ Docker
+     # context before its COPY step, so retain it through the repair loop.
+     export OFG_CLEAN_UP_OSS_FUZZ=0
+     # Upstream discards compiler stdout, where Bloaty's CMake/Ninja errors
+     # appear. Feed that output to the repair loop as stderr while preserving
+     # the compile command's exit status.
+     "$python" - /opt/hgb/artifacts/oss-fuzz-gen/tool/container_tool.py <<'PY_OFG_BLOATY_COMPILE_FEEDBACK'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+old = "command = 'compile > /dev/null' + extra_commands"
+new = "command = 'compile 1>&2' + extra_commands"
+if source.count(old) != 1:
+    raise SystemExit("Bloaty compile feedback hook no longer matches OSS-Fuzz-Gen")
+path.write_text(source.replace(old, new, 1), encoding="utf-8")
+prototype = Path("/opt/hgb/artifacts/oss-fuzz-gen/agent/one_prompt_prototyper.py")
+source = prototype.read_text(encoding="utf-8")
+old = ("    function_referenced = self._validate_fuzz_target_references_function(\n"
+       "        compilation_tool, benchmark, cur_round, build_result.trial)")
+new = ("    if benchmark.project == 'bloaty':\n"
+       "      # C++ objdump prints mangled calls, so use the compiled source's\n"
+       "      # explicit project API call here; HGB verifies runtime coverage.\n"
+       "      function_referenced = (binary_exists and\n"
+       "          benchmark.function_name + '(' in build_result.fuzz_target_source)\n"
+       "    else:\n"
+       "      function_referenced = self._validate_fuzz_target_references_function(\n"
+       "          compilation_tool, benchmark, cur_round, build_result.trial)")
+if source.count(old) != 1:
+    raise SystemExit("Bloaty C++ reference hook no longer matches OSS-Fuzz-Gen")
+prototype.write_text(source.replace(old, new, 1), encoding="utf-8")
+PY_OFG_BLOATY_COMPILE_FEEDBACK
    fi
 
    # --- LLM preflight (before any paid request) ---

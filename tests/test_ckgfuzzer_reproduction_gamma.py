@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -615,8 +616,11 @@ def test_keep_going_campaign_preserves_crash_artifact_outside_corpus(tmp_path: P
         corpus_dir=tmp_path / "seeds", work_dir=tmp_path / "campaign",
         campaign_seconds=2, runner=runner, keep_going=True,
     )
-    create = [" ".join(c) for c in runner.commands if c[:2] == ["docker", "create"]]
+    create_commands = [c for c in runner.commands if c[:2] == ["docker", "create"]]
+    create = [" ".join(c) for c in create_commands]
     assert any("-fork=1 -ignore_crashes=1 -ignore_ooms=1 -ignore_timeouts=1" in c for c in create)
+    assert any("HGB_FUZZER_ATTEMPT=" in c and "rapid_failures" in c for c in create)
+    assert subprocess.run(["sh", "-n", "-c", create_commands[0][-1]], check=False).returncode == 0
     assert result["crashes"] == 1
     assert result["crash_artifacts"] == [str(tmp_path / "campaign/artifacts/crash-example")]
     assert (tmp_path / "campaign/corpus/seed_0000").is_file()

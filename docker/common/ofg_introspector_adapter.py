@@ -150,7 +150,12 @@ def reject_reason(record: dict[str, Any]) -> str:
         return "macro_like_name"
     # Some reports carry a display name that differs from the declaration.
     # Such a name gives the generator a symbol that does not exist.
-    if sig and re.search(r"\b" + re.escape(name) + r"\s*\(", sig) is None:
+    # Introspector often stores a qualified C++ display name alongside an
+    # unqualified declaration (for example ``bloaty::BloatyMain`` and
+    # ``bool BloatyMain(...)``). Match the callable's final component while
+    # still rejecting genuinely different declaration names.
+    declared_name = name.rsplit("::", 1)[-1]
+    if sig and re.search(r"\b" + re.escape(declared_name) + r"\s*\(", sig) is None:
         return "signature_name_mismatch"
     if name.endswith("::") or name.endswith(":") or "(anonymous" in name:
         return "malformed_name"
@@ -341,6 +346,13 @@ def filter_functions(
     selected: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for record in records:
+        # Bloaty's generated protobuf object lives under /work/src and has
+        # names containing "bloaty", but it is not a Bloaty parser API.
+        # Keep this benchmark on the primary project's source tree.
+        path_l = (record.get("path") or "").replace("\\", "/").lower()
+        if project == "bloaty" and not path_l.startswith("/src/bloaty/src/"):
+            rejected.append({**record, "_reject_reason": "irrelevant_source_path"})
+            continue
         reason = reject_reason(record)
         if reason:
             rejected.append({**record, "_reject_reason": reason})

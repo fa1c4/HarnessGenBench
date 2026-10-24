@@ -21,6 +21,39 @@ CPP_EXTS = {".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx"}
 C_EXTS = {".c", ".h"}
 
 
+def enrich_bloaty_public_apis(records: list[dict[str, Any]], source_dir: str | Path) -> list[dict[str, Any]]:
+    """Recover declarations that Introspector shortened to ``N/A Name()``.
+
+    Use only the generator-visible public project header. The report still
+    supplies candidate names and reachability; this fills in real argument
+    types so generated drivers can call the selected Bloaty API.
+    """
+    from extract_api_list import DECL_RE, public_header_records
+
+    declarations = {
+        f"bloaty::{item['name']}": item
+        for item in public_header_records(
+            Path(source_dir), ("bloaty/src/bloaty.h",), (DECL_RE,))
+    }
+    enriched = []
+    for record in records:
+        declaration = declarations.get(str(record.get("name") or ""))
+        if declaration:
+            signature = str(declaration["signature"])
+            short_name = str(record["name"]).rsplit("::", 1)[-1]
+            signature = signature.replace(
+                f" {short_name}(", f" bloaty::{short_name}(", 1)
+            enriched.append({**record,
+                             "signature": signature,
+                             "return_type": declaration["return_type"],
+                             "params": declaration["params"],
+                             "path": "/src/bloaty/src/bloaty.h",
+                             "public": True})
+        else:
+            enriched.append(record)
+    return enriched
+
+
 def detect_language(source_dir: str | Path) -> str:
     """Detect ``c`` or ``c++`` from the project source tree."""
     source = Path(source_dir)
@@ -101,6 +134,8 @@ def synthesize_benchmark(
     preferred_apis: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build the benchmark dict and selection metadata."""
+    if project == "bloaty" and source_dir:
+        records = enrich_bloaty_public_apis(records, source_dir)
     selection = select_functions(
         records,
         max_functions=max_functions,
@@ -131,6 +166,7 @@ def synthesize_benchmark(
         "target_name": fuzz_target or target_name,
         "target_path": target_path,
         "use_project_examples": False,
+        "use_context": project == "bloaty",
     }
     leak = benchmark_leak_audit(benchmark)
     return {
