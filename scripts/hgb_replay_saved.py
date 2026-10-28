@@ -386,8 +386,14 @@ def run_elfuzz(source: Path, run: Path, package: Path,
     coverage: dict[str, Any] = {"line_coverage": {"covered": None}}
     reason = ""
     final_corpus = Path(str(campaign.get("final_corpus_dir") or ""))
-    if int(campaign.get("execs_done") or 0) <= 0 or not campaign.get("copy_out_ok") or not final_corpus.is_dir():
-        reason = "campaign did not produce a verified final corpus"
+    if (int(campaign.get("execs_done") or 0) <= 0
+            or not campaign.get("copy_out_ok")
+            or not final_corpus.is_dir()
+            or int(campaign.get("final_corpus_file_count") or 0) <= 0
+            or campaign.get("corpus_archive_error")):
+        archive_error = str(campaign.get("corpus_archive_error") or "")
+        reason = (f"campaign corpus archive invalid: {archive_error}" if archive_error
+                  else "campaign did not produce a verified final corpus")
     else:
         cov_tag = builder.deterministic_image_tag(run.name, fuzz_target, "coverage", generator="elfuzz")
         cov_build = builder.build_elfuzz_sut(

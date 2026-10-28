@@ -1466,7 +1466,7 @@ def run_campaign(
     # ``docker start -a`` time for fuzzer shutdown, corpus archiving, and log
     # draining under concurrent image builds; a client timeout loses
     # the final libFuzzer statistics even after the fixed budget has ended.
-    timeout = timeout_seconds or (budget + 240)
+    timeout = timeout_seconds or (budget + 1800)
     campaign_work = work_dir / "campaign"
     final_corpus_dir = work_dir / "corpus"
     final_corpus_dir.mkdir(parents=True, exist_ok=True)
@@ -1481,6 +1481,11 @@ def run_campaign(
         copy_in=copy_in if copy_in else None,
         copy_out=("/tmp/corpus.tar", campaign_work / "corpus.tar"),
     )
+    # _container_run writes a phased Docker audit here. Keep it before the
+    # caller-facing campaign.log below is replaced with the fuzzer output.
+    container_log = campaign_work / "campaign.log"
+    if container_log.is_file():
+        container_log.replace(campaign_work / "container.log")
     campaign_wall_seconds = round(
         result.run_wall_seconds if result.run_wall_seconds is not None
         else time.monotonic() - campaign_start, 3,
@@ -1490,6 +1495,7 @@ def run_campaign(
     # artifact files into the corpus used for coverage replay.
     import tarfile
     corpus_tar = campaign_work / "corpus.tar"
+    corpus_archive_error = ""
     if corpus_tar.is_file():
         try:
             # The host-side seed copies staged into final_corpus_dir must not
@@ -1515,8 +1521,8 @@ def run_campaign(
                         tf.extract(stripped, destination, filter="data")
                     except TypeError:
                         tf.extract(stripped, destination)
-        except (OSError, tarfile.TarError):
-            pass
+        except (OSError, tarfile.TarError) as exc:
+            corpus_archive_error = str(exc)
     (campaign_work / "campaign.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
     log = result.stdout + "\n" + result.stderr
     execs_done = _parse_execs_done(log)
@@ -1553,6 +1559,7 @@ def run_campaign(
     attempt_match = re.search(r"HGB_FUZZER_ATTEMPTS=(\d+)", log)
     campaign_record = {
         "configured_duration_seconds": budget,
+        "corpus_archive_error": corpus_archive_error,
         "campaign_wall_seconds": campaign_wall_seconds,
         "execs_done": execs_done,
         "new_units": new_units,

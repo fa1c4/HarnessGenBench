@@ -677,11 +677,13 @@ def run_afl_with_resume(cmd: list[str], log_path: Path, output_dir: Path,
     started = time.monotonic()
     deadline = started + timeout
     attempts = 0
+    sigkill_retries = 0
+    lock_retries = 0
     code, timed_out = 1, False
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("wb"):
         pass
-    while attempts < 4:
+    while attempts < 16:
         remaining = int(deadline - time.monotonic())
         if remaining <= 0:
             code, timed_out = 124, True
@@ -696,11 +698,22 @@ def run_afl_with_resume(cmd: list[str], log_path: Path, output_dir: Path,
         with log_path.open("ab") as combined:
             combined.write(f"\n[HGB_AFL_ATTEMPT={attempts} EXIT={code}]\n".encode())
             combined.write(attempt_log.read_bytes())
+        # A killed AFL controller can leave its forkserver holding the output
+        # lock briefly. Never start a second fuzzer in that directory; wait
+        # for the lock to be released and retry the same -i - resume.
+        if (attempts > 1 and code == 1 and sigkill_retries > 0
+                and "is in use" in attempt_log.read_text(encoding="utf-8", errors="replace")):
+            if lock_retries >= 12 or deadline - time.monotonic() <= 60:
+                break
+            lock_retries += 1
+            time.sleep(5)
+            continue
         if code != -signal.SIGKILL:
             break
+        sigkill_retries += 1
         stats = parse_fuzzer_stats(output_dir / "default" / "fuzzer_stats")
         queue = output_dir / "default" / "queue"
-        if (attempts >= 4 or deadline - time.monotonic() <= 60
+        if (sigkill_retries >= 4 or deadline - time.monotonic() <= 60
                 or int(stats.get("execs_done") or 0) <= 0
                 or not queue.is_dir() or not any(queue.iterdir())):
             break

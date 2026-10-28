@@ -499,6 +499,37 @@ def test_afl_sigkill_resumes_existing_queue_and_records_both_attempts(tmp_path: 
     assert "attempt 2" in (tmp_path / "afl.log").read_text()
 
 
+def test_afl_sigkill_waits_for_output_lock_before_resuming(tmp_path: Path, monkeypatch):
+    output = tmp_path / "output"
+    queue = output / "default" / "queue"
+    queue.mkdir(parents=True)
+    (queue / "id:000000").write_bytes(b"seed")
+    (output / "default" / "fuzzer_stats").write_text("execs_done : 12\n")
+    commands = []
+    sleeps = []
+
+    def fake_run(cmd, log_path, _timeout, env=None):
+        commands.append(cmd)
+        if len(commands) == 1:
+            log_path.write_text("killed\n")
+            return -9, False
+        if len(commands) == 2:
+            log_path.write_text("Directory '/workspace/campaign/output/default' is in use\n")
+            return 1, False
+        log_path.write_text("resumed until deadline\n")
+        return 124, True
+
+    monkeypatch.setattr(g2, "run_subprocess", fake_run)
+    monkeypatch.setattr(g2.time, "sleep", lambda seconds: sleeps.append(seconds))
+    code, timed_out, _elapsed, attempts = g2.run_afl_with_resume(
+        ["afl-fuzz", "-i", "seeds", "-o", str(output)],
+        tmp_path / "afl.log", output, 100, {})
+    assert (code, timed_out, attempts) == (124, True, 3)
+    assert sleeps == [5]
+    assert commands[1][2] == commands[2][2] == "-"
+    assert "is in use" in (tmp_path / "afl.log").read_text()
+
+
 def test_afl_sigkill_without_saved_progress_does_not_retry(tmp_path: Path, monkeypatch):
     commands = []
 

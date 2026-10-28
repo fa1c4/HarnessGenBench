@@ -418,6 +418,29 @@ def test_saved_campaign_recovery_requires_full_log_and_matching_corpus(tmp_path:
         hgb_fuzzbench_builder.load_saved_campaign(work, 86400)
 
 
+def test_campaign_reports_truncated_corpus_archive(tmp_path: Path) -> None:
+    class TruncatedCorpusRunner(_Runner):
+        def __call__(self, command, timeout):
+            result = super().__call__(command, timeout)
+            if len(command) > 3 and command[:2] == ["docker", "cp"] and "corpus.tar" in command[2]:
+                path = Path(command[3])
+                path.write_bytes(path.read_bytes()[:600])
+            return result
+
+    seeds = tmp_path / "seeds"
+    seeds.mkdir()
+    (seeds / "seed").write_bytes(b"input")
+    work = tmp_path / "work"
+    campaign = hgb_fuzzbench_builder.run_campaign(
+        image_tag="test-image", binary_path="/out/php-fuzz-parser",
+        corpus_dir=seeds, work_dir=work, campaign_seconds=10,
+        runner=TruncatedCorpusRunner(), keep_going=True,
+    )
+    assert campaign["corpus_archive_error"]
+    assert campaign["final_corpus_file_count"] == 0
+    assert (work / "campaign/container.log").is_file()
+
+
 def test_phase_b_reuses_saved_coverage_image(tmp_path: Path, monkeypatch) -> None:
     import hashlib
 
