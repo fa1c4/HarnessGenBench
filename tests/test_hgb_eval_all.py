@@ -49,6 +49,66 @@ def test_default_run_id_uses_phase_date_and_campaign_duration() -> None:
         "eval_all_phase_b_20261016_86400s")
 
 
+def test_trials_for_each_pair_are_scheduled_together() -> None:
+    targets, scope = hgb_eval_all.plan(hgb_eval_all.ROOT)
+    jobs = hgb_eval_all.scheduled_jobs(targets, scope, 5)
+    assert len(jobs) == 445
+    for start in range(0, len(jobs), 5):
+        group = jobs[start:start + 5]
+        assert [trial for trial, _, _ in group] == [1, 2, 3, 4, 5]
+        assert len({(baseline, target) for _, baseline, target in group}) == 1
+
+
+def test_adaptive_capacity_uses_measured_memory_instead_of_docker_cap() -> None:
+    capacity, estimate = hgb_eval_all.adaptive_worker_capacity(
+        requested=128, cpus=256, active=38, memory_budget_gib=305,
+        container_cap_gib=8, eval_usage_gib=45, available_gib=366,
+        host_total_gib=436)
+    assert capacity == 128
+    assert 2 < estimate < 3
+
+    capacity, _ = hgb_eval_all.adaptive_worker_capacity(
+        requested=128, cpus=256, active=38, memory_budget_gib=305,
+        container_cap_gib=8, eval_usage_gib=180, available_gib=366,
+        host_total_gib=436)
+    assert capacity < 38  # Existing jobs keep running; no more are admitted.
+
+    capacity, _ = hgb_eval_all.adaptive_worker_capacity(
+        requested=128, cpus=256, active=38, memory_budget_gib=305,
+        container_cap_gib=8, eval_usage_gib=45, available_gib=80,
+        host_total_gib=436)
+    assert capacity == 38  # Host reserve blocks new jobs.
+
+
+def test_eval_memory_sums_outer_and_nested_campaign_cgroups(monkeypatch) -> None:
+    commands = []
+    outer = "a" * 64
+    campaign = "b" * 64
+    exited = "c" * 64
+
+    def fake_check_output(cmd, **_kwargs):
+        commands.append(cmd)
+        return f"{outer}\n{campaign}\n{exited}\n"
+
+    files = {
+        f"/sys/fs/cgroup/system.slice/docker-{outer}.scope/memory.current": str(2 * 1024 ** 3),
+        f"/sys/fs/cgroup/system.slice/docker-{campaign}.scope/memory.current": str(1024 ** 3),
+    }
+    original_read_text = Path.read_text
+
+    def fake_read_text(path, *args, **kwargs):
+        if str(path) in files:
+            return files[str(path)]
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(hgb_eval_all.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    assert hgb_eval_all.eval_container_memory_gib("test_run") == 3
+    assert commands[0][-1] == "label=hgb.eval_all_run=test_run"
+    assert "--no-trunc" in commands[0]
+    assert len(commands) == 1
+
+
 def test_default_plan_uses_today_workspace_paths_and_saved_manifest(tmp_path: Path, monkeypatch) -> None:
     class Today:
         @staticmethod
@@ -252,14 +312,42 @@ def test_job_processes_stop_entire_replay_process_group() -> None:
 
 def test_interrupt_cleanup_filters_containers_by_run_id(monkeypatch) -> None:
     commands = []
+    remaining = {"container_one", "container_two"}
     def fake_run(cmd, **_kwargs):
         commands.append(cmd)
-        return SimpleNamespace(returncode=0, stdout="container_one\ncontainer_two\n", stderr="")
+        if cmd[1] == "ps":
+            return SimpleNamespace(returncode=0, stdout="\n".join(sorted(remaining)), stderr="")
+        remaining.difference_update(cmd[3:])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
     monkeypatch.setattr(hgb_eval_all.subprocess, "run", fake_run)
     hgb_eval_all.stop_eval_containers("eval_all_phase_b_test")
     assert commands[0][-1] == "label=hgb.eval_all_run=eval_all_phase_b_test"
     assert commands[1][:3] == ["docker", "rm", "-f"]
     assert commands[1][3:] == ["container_one", "container_two"]
+    assert not remaining
+
+
+def test_interrupt_cleanup_continues_after_one_batch_times_out(monkeypatch) -> None:
+    remaining = {f"container_{index:02d}" for index in range(25)}
+    batches = []
+    timed_out = False
+
+    def fake_run(cmd, **_kwargs):
+        nonlocal timed_out
+        if cmd[1] == "ps":
+            return SimpleNamespace(returncode=0, stdout="\n".join(sorted(remaining)), stderr="")
+        batches.append(cmd[3:])
+        if not timed_out:
+            timed_out = True
+            raise subprocess.TimeoutExpired(cmd, 45)
+        remaining.difference_update(cmd[3:])
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", fake_run)
+    hgb_eval_all.stop_eval_containers("eval_all_phase_b_test")
+    assert len(batches) == 4
+    assert max(map(len, batches)) == 12
+    assert not remaining
 
 
 def test_ten_minute_campaign_requires_nearly_full_elapsed_time() -> None:
@@ -480,6 +568,46 @@ def test_replay_trials_use_distinct_run_ids_and_logs(tmp_path: Path, monkeypatch
     assert seen == ["batch_trial_001_promefuzz_example", "batch_trial_002_promefuzz_example"]
     assert (logs / "promefuzz_example.trial_001.log").is_file()
     assert (logs / "promefuzz_example.trial_002.log").is_file()
+
+
+def test_phase_b_dispatches_trials_of_one_pair_together(tmp_path: Path, monkeypatch) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"ckgfuzzer", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    manifest = tmp_path / "inputs/manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved-source"}
+        for baseline in ("ckgfuzzer", "g2fuzz")
+    ]}), encoding="utf-8")
+    output = tmp_path / "outputs/trials.csv"
+    seen_active = []
+
+    def fake_wait(active, **_kwargs):
+        seen_active.append({(trial, baseline, name) for trial, baseline, name, _cpu in active.values()})
+        return set(active), set()
+
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "eval_container_memory_gib", lambda _run_id: 0.0)
+    monkeypatch.setattr(hgb_eval_all, "host_available_memory_gib", lambda: 90.0)
+    monkeypatch.setattr(hgb_eval_all, "host_memory_gib", lambda: 100)
+    monkeypatch.setattr(hgb_eval_all, "run_replay_job", lambda *_args: {"status": "evaluated"})
+    monkeypatch.setattr(hgb_eval_all, "wait", fake_wait)
+    monkeypatch.setattr(hgb_eval_all, "write_coverage_products", lambda _output: True)
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--trials", "2",
+                                      "--parallel-worker", "4", "--campaign-seconds", "60",
+                                      "--run-id", "concurrent_trials", "--manifest", str(manifest),
+                                      "--output", str(output)])
+    original_cwd = Path.cwd()
+    try:
+        assert hgb_eval_all.main() == 0
+    finally:
+        monkeypatch.chdir(original_cwd)
+    assert any({(1, "ckgfuzzer", target), (2, "ckgfuzzer", target)} <= active
+               for active in seen_active)
 
 
 def test_elfuzz_binary_extraction_retries_transient_docker_failure(tmp_path: Path, monkeypatch) -> None:

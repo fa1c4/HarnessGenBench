@@ -12,6 +12,7 @@ import argparse
 import csv
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -39,6 +40,9 @@ METRICS = (
     "retry_count", "driver_fix_rounds", "run", "reason",
 )
 FIELDS = ["target", *[f"{b}_{m}" for b in BASELINES for m in METRICS]]
+# Limit Docker API traffic and stagger starts on a busy shared daemon.
+MEMORY_SAMPLE_INTERVAL_SECONDS = 15
+MEMORY_LAUNCH_BATCH = 4
 
 
 class JobProcesses:
@@ -78,18 +82,33 @@ class JobProcesses:
 def stop_eval_containers(run_id: str) -> None:
     """Stop only containers labelled by this evaluation run."""
     try:
-        listed = subprocess.run(
-            ["docker", "ps", "-aq", "--filter", f"label=hgb.eval_all_run={run_id}"],
-            capture_output=True, text=True, timeout=15, check=False)
-        if listed.returncode:
-            print(f"Docker container cleanup failed: {listed.stderr.strip()}", file=sys.stderr)
-            return
-        container_ids = listed.stdout.split()
-        if container_ids:
-            subprocess.run(["docker", "rm", "-f", *container_ids],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=min(60, max(30, len(container_ids) * 3)), check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        def listed_ids() -> list[str]:
+            result = subprocess.run(
+                ["docker", "ps", "-aq", "--filter", f"label=hgb.eval_all_run={run_id}"],
+                capture_output=True, text=True, timeout=15, check=False)
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "docker ps failed")
+            return result.stdout.split()
+
+        for _ in range(2):
+            container_ids = listed_ids()
+            if not container_ids:
+                return
+            # A single docker rm with dozens of IDs can time out before it
+            # reaches the last container. Continue with later batches even if
+            # one batch is slow or a --rm container disappears meanwhile.
+            for start in range(0, len(container_ids), 12):
+                try:
+                    subprocess.run(["docker", "rm", "-f", *container_ids[start:start + 12]],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=45, check=False)
+                except subprocess.TimeoutExpired:
+                    continue
+        remaining = listed_ids()
+        if remaining:
+            print(f"Docker container cleanup incomplete: {len(remaining)} containers remain "
+                  f"for {run_id}", file=sys.stderr)
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
         print(f"Docker container cleanup failed: {exc}", file=sys.stderr)
 
 
@@ -136,6 +155,15 @@ def plan(root: Path) -> tuple[list[str], dict[tuple[str, str], str]]:
 
 def job_key(trial: int, baseline: str, target: str, trials: int) -> tuple[Any, ...]:
     return (baseline, target) if trials == 1 else (trial, baseline, target)
+
+
+def scheduled_jobs(targets: list[str], scope: dict[tuple[str, str], str],
+                   trials: int) -> list[tuple[int, str, str]]:
+    """Place a pair's trials together so they can occupy workers concurrently."""
+    return [(trial, baseline, target)
+            for target in targets for baseline in BASELINES
+            if scope[baseline, target] == "pending"
+            for trial in range(1, trials + 1)]
 
 
 def save_csv(path: Path, targets: list[str], rows: dict[tuple[Any, ...], dict[str, Any]],
@@ -493,6 +521,56 @@ def host_memory_gib() -> int:
     raise RuntimeError("unable to read host memory")
 
 
+def host_available_memory_gib() -> float:
+    for line in Path("/proc/meminfo").read_text(encoding="utf-8").splitlines():
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) / (1024 * 1024)
+    raise RuntimeError("unable to read available host memory")
+
+
+def eval_container_memory_gib(run_id: str) -> float:
+    """Sum current cgroup charges of this run's outer and campaign containers."""
+    ids = subprocess.check_output(
+        ["docker", "ps", "-q", "--no-trunc", "--filter", f"label=hgb.eval_all_run={run_id}"],
+        text=True, timeout=15).split()
+    if not ids:
+        return 0.0
+    usage = 0
+    sampled = 0
+    for container_id in ids:
+        if not re.fullmatch(r"[0-9a-f]{64}", container_id):
+            raise RuntimeError("docker ps did not return full container IDs")
+        paths = (Path("/sys/fs/cgroup/system.slice") / f"docker-{container_id}.scope/memory.current",
+                 Path("/sys/fs/cgroup/docker") / container_id / "memory.current")
+        for path in paths:
+            try:
+                usage += int(path.read_text(encoding="utf-8"))
+                sampled += 1
+                break
+            except FileNotFoundError:
+                continue  # The container may have exited after docker ps.
+    if not sampled:
+        raise RuntimeError("Docker cgroup v2 memory counters are unavailable")
+    return usage / (1024 ** 3)
+
+
+def adaptive_worker_capacity(requested: int, cpus: int, active: int,
+                             memory_budget_gib: float, container_cap_gib: int,
+                             eval_usage_gib: float, available_gib: float,
+                             host_total_gib: float) -> tuple[int, float]:
+    """Admit jobs using measured RAM with room for unobserved startup growth."""
+    # The initial allowance covers builds before Docker creates a container.
+    # Double the observed mean to allow running jobs to grow after admission.
+    estimated_job_gib = max(1.0, container_cap_gib / 4,
+                            2 * eval_usage_gib / max(1, active))
+    host_reserve_gib = max(32.0, host_total_gib * 0.20)
+    active_growth_gib = max(0.0, active * estimated_job_gib - eval_usage_gib)
+    new_job_headroom_gib = max(0.0, available_gib - host_reserve_gib - active_growth_gib)
+    budget_capacity = max(1, math.floor(memory_budget_gib / estimated_job_gib))
+    host_capacity = active + math.floor(new_job_headroom_gib / estimated_job_gib)
+    return min(requested, cpus, budget_capacity, host_capacity), estimated_job_gib
+
+
 def default_run_id(phase: str, date: str, campaign_seconds: int,
                    generation_campaign_seconds: int) -> str:
     phase_letter = "a" if phase == "generate" else "b"
@@ -553,9 +631,9 @@ def main() -> int:
                         help="Short verification campaign for newly generated Phase A artifacts (default: 300)")
     parser.add_argument("--generation-timeout-seconds", type=int, default=21600)
     parser.add_argument("--memory-per-job-gib", type=int, default=8,
-                        help="Docker RAM cap for each active pair (default: 8 GiB)")
+                        help="Docker RAM cap for each container (default: 8 GiB)")
     parser.add_argument("--memory-budget-gib", type=int, default=0,
-                        help="Maximum combined pair RAM; 0 uses 70%% of host RAM")
+                        help="Phase B measured RAM budget; 0 uses 70%% of host RAM")
     parser.add_argument("--source-audit", type=Path, help="Verified Phase A audit JSON; defaults to the latest local audit")
     parser.add_argument("--manifest", type=Path, help="Phase A artifact manifest; defaults to workspace/eval_all/<date>.phase_a.json")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
@@ -673,8 +751,7 @@ def main() -> int:
                         if recovered is not None:
                             rows[job_key(trial, baseline, target, args.trials)] = recovered
     save_csv(output, targets, rows, args.trials)
-    jobs = [(trial, b, t) for trial in range(1, args.trials + 1)
-            for t in targets for b in BASELINES if scope[b, t] == "pending"]
+    jobs = scheduled_jobs(targets, scope, args.trials)
     remaining = sum(rows[job_key(trial, b, t, args.trials)]["status"] == "pending"
                     for trial, b, t in jobs)
     print(f"phase={args.phase}; planned {len(jobs)} applicable jobs ({remaining} pending); "
@@ -695,8 +772,14 @@ def main() -> int:
         print(f"phase={args.phase}: {len(jobs) - len(failures)}/{len(jobs)} ready; manifest={manifest}", flush=True)
         audited = write_coverage_products(output) if args.phase == "fuzz" else True
         return 1 if failures or not audited else 0
-    if subprocess.run(["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False).returncode:
-        print("Docker is unavailable; no jobs started", file=sys.stderr)
+    try:
+        docker_ready = subprocess.run(
+            ["docker", "info"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=15, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        docker_ready = False
+    if not docker_ready:
+        print("Docker is unavailable or unresponsive; no jobs started", file=sys.stderr)
         return 2
     log_dir = ROOT / "workspace/eval_all" / args.run_id
     log_dir.mkdir(parents=True, exist_ok=False)
@@ -706,10 +789,12 @@ def main() -> int:
         print("No usable CPUs in process affinity mask", file=sys.stderr)
         return 2
     memory_budget = args.memory_budget_gib or max(args.memory_per_job_gib, int(host_memory_gib() * 0.70))
-    effective_workers = min(args.parallel_worker, len(cpus),
-                            max(1, memory_budget // args.memory_per_job_gib))
-    print(f"effective_workers={effective_workers}; per_job_memory={args.memory_per_job_gib}GiB; "
-          f"aggregate_cap={effective_workers * args.memory_per_job_gib}GiB", flush=True)
+    worker_ceiling = min(args.parallel_worker, len(cpus))
+    effective_workers = (worker_ceiling if args.phase == "fuzz" else
+                         min(worker_ceiling, max(1, memory_budget // args.memory_per_job_gib)))
+    print(f"worker_ceiling={effective_workers}; container_memory_cap={args.memory_per_job_gib}GiB; "
+          f"memory_budget={memory_budget}GiB; "
+          f"admission={'measured' if args.phase == 'fuzz' else 'fixed'}", flush=True)
     if args.phase == "fuzz":
         pending = [(trial, b, t) for trial, b, t in jobs
                    if rows[job_key(trial, b, t, args.trials)]["status"] == "pending"]
@@ -726,7 +811,11 @@ def main() -> int:
                 stopped = False
                 stop_started = 0.0
                 forced = False
+                next_memory_sample = 0.0
+                admission_capacity = 0
+                last_reported_capacity = None
                 while pending or active:
+                    admission_open = False
                     if processes.interrupted.is_set() and not stopped:
                         stopped = True
                         stop_started = time.monotonic()
@@ -738,13 +827,33 @@ def main() -> int:
                         forced = True
                         processes.stop(signal.SIGKILL)
                         stop_eval_containers(args.run_id)
-                    while not stopped and pending and len(active) < effective_workers:
-                        active_pairs = {(item[1], item[2]) for item in active.values()}
-                        next_index = next((index for index, (_, b, t) in enumerate(pending)
-                                           if (b, t) not in active_pairs), None)
-                        if next_index is None:
-                            break
-                        trial, baseline, target = pending.pop(next_index)
+                    if not stopped and pending and time.monotonic() >= next_memory_sample:
+                        try:
+                            eval_usage = eval_container_memory_gib(args.run_id)
+                            available = host_available_memory_gib()
+                            admission_capacity, estimate = adaptive_worker_capacity(
+                                effective_workers, len(cpus), len(active), memory_budget,
+                                args.memory_per_job_gib, eval_usage, available, host_memory_gib())
+                            if admission_capacity != last_reported_capacity:
+                                print(f"memory admission: capacity={admission_capacity}; "
+                                      f"active={len(active)}; eval={eval_usage:.1f}GiB; "
+                                      f"available={available:.1f}GiB; "
+                                      f"estimated_job={estimate:.1f}GiB", flush=True)
+                                last_reported_capacity = admission_capacity
+                        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                            admission_capacity = min(
+                                effective_workers, max(1, memory_budget // args.memory_per_job_gib))
+                            if admission_capacity != last_reported_capacity:
+                                print(f"memory sampling failed; using fixed capacity "
+                                      f"{admission_capacity}: {exc}", file=sys.stderr, flush=True)
+                                last_reported_capacity = admission_capacity
+                        next_memory_sample = time.monotonic() + MEMORY_SAMPLE_INTERVAL_SECONDS
+                        admission_open = True
+                    launched = 0
+                    changed = False
+                    while (admission_open and not stopped and pending and len(active) < admission_capacity
+                           and launched < MEMORY_LAUNCH_BATCH):
+                        trial, baseline, target = pending.pop(0)
                         used_cpus = {item[3] for item in active.values()}
                         cpu = next((value for value in cpus if value not in used_cpus), cpus[len(active) % len(cpus)])
                         rows[job_key(trial, baseline, target, args.trials)]["status"] = "running"
@@ -754,10 +863,16 @@ def main() -> int:
                             args.memory_per_job_gib, trial, args.trials, processes,
                             sources.get(("g2fuzz", target), ""))
                         active[future] = (trial, baseline, target, cpu)
-                    save_csv(output, targets, rows, args.trials)
-                    if not active:
-                        break
-                    done, _ = wait(active, timeout=1, return_when=FIRST_COMPLETED)
+                        launched += 1
+                        changed = True
+                    if changed:
+                        save_csv(output, targets, rows, args.trials)
+                    if active:
+                        done, _ = wait(active, timeout=1, return_when=FIRST_COMPLETED)
+                    else:
+                        done = set()
+                        if pending and not stopped:
+                            time.sleep(1)
                     for future in done:
                         trial, baseline, target, _ = active.pop(future)
                         key = job_key(trial, baseline, target, args.trials)
@@ -766,7 +881,8 @@ def main() -> int:
                         except Exception as exc:
                             rows[key] = {"status": "runner_failed", "reason": str(exc)}
                         print(f"trial {trial}/{args.trials} {baseline} {target}: {rows[key]['status']}", flush=True)
-                    save_csv(output, targets, rows, args.trials)
+                    if done:
+                        save_csv(output, targets, rows, args.trials)
                 if stopped:
                     for trial, baseline, target, _ in active.values():
                         rows[job_key(trial, baseline, target, args.trials)] = {
