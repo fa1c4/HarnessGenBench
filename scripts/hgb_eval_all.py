@@ -112,6 +112,19 @@ def stop_eval_containers(run_id: str) -> None:
         print(f"Docker container cleanup failed: {exc}", file=sys.stderr)
 
 
+def reap_embedding_service(root: Path) -> None:
+    """Close an auto-started service after killed Phase A workers release or die."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(root / "scripts/hgb_embedding_service.py"), "reap"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=130, check=False)
+        if result.returncode:
+            print("Embedding service cleanup failed; inspect its lease state", file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Embedding service cleanup failed: {exc}", file=sys.stderr)
+
+
 def run_tracked(cmd: list[str], *, cwd: Path, stdout: Any,
                 env: dict[str, str] | None, processes: JobProcesses | None) -> int:
     """Keep a long-running child in its own group for prompt signal cleanup."""
@@ -915,6 +928,7 @@ def main() -> int:
         print("Interrupt received; stopping generation jobs and containers", flush=True)
         phase_a_processes.stop(signal.SIGKILL)
         stop_eval_containers(args.run_id)
+        reap_embedding_service(ROOT)
         raise KeyboardInterrupt
     signal.signal(signal.SIGINT, phase_a_interrupt)
     signal.signal(signal.SIGTERM, phase_a_interrupt)
@@ -987,6 +1001,7 @@ def main() -> int:
                 print(f"{baseline} {target}: {rows[baseline, target]['status']}", flush=True)
             save_csv(output, targets, rows)
     failures = [(b, t) for _, b, t in jobs if rows[b, t]["status"] != "generated"]
+    reap_embedding_service(ROOT)
     signal.signal(signal.SIGINT, prior_sigint)
     signal.signal(signal.SIGTERM, prior_sigterm)
     print(f"Phase A: {len(jobs) - len(failures)}/{len(jobs)} generated and verified; "

@@ -47,6 +47,24 @@ class FakeResult:
         self.stderr = stderr
 
 
+@pytest.mark.parametrize("start_exit", [0, 124])
+def test_smoke_docker_operations_have_ten_minute_timeout(tmp_path: Path, start_exit: int) -> None:
+    calls = []
+
+    def runner(command, timeout):
+        calls.append((command[1], timeout))
+        if command[1] == "start":
+            return FakeResult(command, start_exit, "HGB_TARGET_START\n" if not start_exit else "")
+        return FakeResult(command)
+
+    evaluator.hgb_fuzzbench_builder.run_smoke(
+        image_tag="smoke-image", binary_path="/out/fuzzer", seeds=[],
+        work_dir=tmp_path, runner=runner)
+    assert calls == ([('create', 600), ('cp', 600), ('start', 600)]
+                     + ([('kill', 600)] if start_exit else [])
+                     + [('rm', 600)])
+
+
 class _Runner:
     """Fake runner that materializes a copied coverage.json for eta and a
     corpus.tar for the campaign, and emits the HGB_INPUTS_REPLAYED marker.

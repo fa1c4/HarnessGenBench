@@ -15,7 +15,6 @@ export PROME_FUZZ_EVAL_MAX_CANDIDATES=4
 
 TARGETS="${HGB_RETRY_TARGETS:-freetype2_ftfuzzer,libxml2_xml,openssl_x509,php_php-fuzz-parser_0dbedb,systemd_fuzz-link-parser}"
 image="hgb-promefuzz:655d2d98fc30"
-embedding_container="hgb-local-embedding"
 log="${HGB_PROME_RETRY_LOG:-workspace/promefuzz_final.log}"
 lock="workspace/promefuzz/.retry_runner.lock"
 
@@ -23,6 +22,15 @@ exec 8>"$lock"
 flock -n 8 || { echo "another retry runner is active" >>"$log"; exit 0; }
 
 log_line() { printf '[%s] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$log"; }
+embedding_lease=0
+release_embedding_on_exit() {
+  if [[ "$embedding_lease" == "1" ]]; then
+    python3 scripts/hgb_embedding_service.py release --pid "$$" || true
+  fi
+}
+trap release_embedding_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 unresolved_targets() {
   python3 - "$TARGETS" <<'PY'
@@ -60,7 +68,7 @@ wait_services() {
   while :; do
     attempt=$((attempt + 1))
     if ! embedding_ok; then
-      timeout 60 docker start "$embedding_container" >/dev/null 2>&1 || true
+      python3 scripts/hgb_embedding_service.py acquire --pid "$$" >/dev/null 2>&1 || true
     fi
     if embedding_ok && docker_ok; then
       log_line "services healthy (poll $attempt)"
@@ -74,6 +82,14 @@ wait_services() {
 round=0
 remaining="$(unresolved_targets)"
 log_line "runner started; unresolved=$remaining"
+if [[ -n "$remaining" ]]; then
+  if python3 scripts/hgb_embedding_service.py acquire --pid "$$"; then
+    embedding_lease=1
+  else
+    log_line "local embedding service failed to start"
+    exit 1
+  fi
+fi
 while [[ -n "$remaining" ]]; do
   round=$((round + 1))
   log_line "round $round: waiting for services; targets=$remaining"

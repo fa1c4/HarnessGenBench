@@ -1,6 +1,7 @@
 import csv
 import importlib.util
 import json
+import os
 import signal
 import subprocess
 import sys
@@ -9,6 +10,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def restore_working_directory():
+    original = Path.cwd()
+    yield
+    os.chdir(original)
 
 SPEC = importlib.util.spec_from_file_location("hgb_eval_all", Path(__file__).resolve().parents[1] / "scripts/hgb_eval_all.py")
 assert SPEC and SPEC.loader

@@ -1151,6 +1151,7 @@ def _container_run(
     copy_out: tuple[str, Path] | None = None,
     copy_in: list[tuple[Path, str]] | None = None,
     env: list[str] | None = None,
+    cleanup_timeout_seconds: int = 60,
 ) -> CommandResult:
     """Run a one-shot container with the candidate image and capture logs.
 
@@ -1230,7 +1231,8 @@ def _container_run(
                 # (e.g. a half-written corpus.tar or coverage.json). Kill the
                 # container so copied artifacts are final, never mid-write.
                 if start_exit_code == 124:
-                    _run_phase(runner, ["docker", "kill", container_name], 60, f"kill timed-out {phase}")
+                    _run_phase(runner, ["docker", "kill", container_name],
+                               cleanup_timeout_seconds, f"kill timed-out {phase}")
             else:
                 start_result = CommandResult(list(command), 1, "", f"copy_in failed for {phase}; target not started")
                 phases.append(("run", start_result))
@@ -1245,7 +1247,8 @@ def _container_run(
                 if cp.exit_code != 0:
                     copy_out_ok = False
     finally:
-        rm = _run_phase(runner, ["docker", "rm", "-f", container_name], 60, f"cleanup {phase}")
+        rm = _run_phase(runner, ["docker", "rm", "-f", container_name],
+                        cleanup_timeout_seconds, f"cleanup {phase}")
         phases.append(("cleanup", rm))
     log_path = work_dir / f"{phase}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1276,7 +1279,7 @@ def run_smoke(
     seeds: list[Path],
     work_dir: Path,
     runner: Runner = _run,
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 600,
 ) -> dict:
     """Run the built binary on empty input and available seeds (sanitizer smoke).
 
@@ -1315,6 +1318,7 @@ def run_smoke(
                      f"{php_asan_prefix}exec {binary_path} {container_input}"],
             phase=f"smoke_{label}",
             copy_in=[(host_input, container_input)],
+            cleanup_timeout_seconds=timeout_seconds,
         )
         copy_in_ok = bool(getattr(result, "copy_in_ok", True))
         combined_log = (result.stderr or "") + (result.stdout or "")

@@ -127,6 +127,9 @@ done
 [[ "$save_mode" == "compact" || "$save_mode" == "debug" ]] || die "--save-mode must be compact or debug"
 
 root="$(repo_root)"
+trap 'hgb_release_embedding_service || true' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ "$generators" == "all" ]]; then
   generator_list=(oss-fuzz-gen ckgfuzzer promefuzz elfuzz g2fuzz)

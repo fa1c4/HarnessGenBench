@@ -354,22 +354,19 @@ hgb_embedding_probe_ok() {
 
 hgb_ensure_embedding_service() {
   hgb_embedding_base_url_in_use || return 0
-  hgb_embedding_probe_ok && return 0
-  local container="hgb-local-embedding" deadline
-  if docker inspect "$container" >/dev/null 2>&1; then
-    log "starting local embedding service container: $container"
-    timeout 60 docker start "$container" >/dev/null 2>&1 || true
-  else
-    log "starting local embedding service via scripts/local_embedding_server.sh"
-    timeout 300 bash "$(repo_root)/scripts/local_embedding_server.sh" start >/dev/null 2>&1 || true
+  [[ "${HGB_EMBEDDING_LEASED:-0}" == "1" ]] && return 0
+  if python3 "$(repo_root)/scripts/hgb_embedding_service.py" acquire --pid "$$"; then
+    HGB_EMBEDDING_LEASED=1
+    return 0
   fi
-  deadline=$((SECONDS + 180))
-  while (( SECONDS < deadline )); do
-    hgb_embedding_probe_ok && { log "local embedding service is ready"; return 0; }
-    sleep 3
-  done
   log "WARNING: local embedding service is not ready; embedding-backed generators will fail closed"
   return 1
+}
+
+hgb_release_embedding_service() {
+  [[ "${HGB_EMBEDDING_LEASED:-0}" == "1" ]] || return 0
+  HGB_EMBEDDING_LEASED=0
+  python3 "$(repo_root)/scripts/hgb_embedding_service.py" release --pid "$$"
 }
 
 hgb_build_image() {

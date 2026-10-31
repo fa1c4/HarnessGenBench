@@ -204,8 +204,11 @@ record_statistics_on_exit() {
   if ! python3 "$root/docker/common/hgb_record_statistics.py" --workspace "$workspace" --baseline "$generator" --target "$target" --run-id "$run_id" --exit-code "$exit_code"; then
     log "statistics collection failed for $generator/$target/$run_id"
   fi
+  hgb_release_embedding_service || log "embedding service release failed for $generator/$target/$run_id"
 }
 trap record_statistics_on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if ! python3 "$root/docker/common/hgb_record_statistics.py" --workspace "$workspace" --baseline "$generator" --target "$target" --run-id "$run_id" --status running; then
   log "statistics initialization failed for $generator/$target/$run_id"
 fi
