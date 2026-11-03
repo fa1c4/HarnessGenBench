@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -161,7 +162,7 @@ def test_latest_manifest_skips_incomplete_newer_selection(tmp_path: Path) -> Non
     assert hgb_eval_all.latest_complete_manifest(tmp_path, "2026-10-16", scope) == complete
 
 
-def test_resume_keeps_completed_rows_and_requeues_stale_running(tmp_path: Path, monkeypatch) -> None:
+def test_resume_requeues_rows_without_saved_coverage(tmp_path: Path, monkeypatch) -> None:
     targets, scope = hgb_eval_all.plan(hgb_eval_all.ROOT)
     rows = {(b, t): {"status": scope[b, t]} for t in targets for b in hgb_eval_all.BASELINES}
     first = targets[0]
@@ -183,8 +184,7 @@ def test_resume_keeps_completed_rows_and_requeues_stale_running(tmp_path: Path, 
                                       "--output", str(output), "--manifest", str(manifest)])
     assert hgb_eval_all.main() == 0
     records = list(csv.DictReader(output.open(newline="", encoding="utf-8")))
-    assert records[0]["ckgfuzzer_status"] == "evaluated"
-    assert records[0]["ckgfuzzer_execs_done"] == "12"
+    assert records[0]["ckgfuzzer_status"] == "pending"
     assert records[0]["promefuzz_status"] == "pending"
     assert records[0]["oss-fuzz-gen_status"] == "pending"
 
@@ -318,6 +318,17 @@ def test_job_processes_stop_entire_replay_process_group() -> None:
         processes.discard(process)
 
 
+def test_phase_b_drain_does_not_signal_child_started_during_interrupt(monkeypatch) -> None:
+    processes = hgb_eval_all.JobProcesses(drain_on_interrupt=True)
+    signalled = []
+    monkeypatch.setattr(processes, "_signal", lambda process, signum: signalled.append(signum))
+    processes.interrupted.set()
+    child = object()
+    processes.add(child)
+    assert not signalled
+    processes.discard(child)
+
+
 def test_interrupt_cleanup_filters_containers_by_run_id(monkeypatch) -> None:
     commands = []
     remaining = {"container_one", "container_two"}
@@ -367,6 +378,9 @@ def test_resume_reuses_in_place_coverage_recovery_without_restarting_fuzzing(tmp
     selected = str(tmp_path / "workspace/g2fuzz/zlib_zlib_uncompress_fuzzer/phase_a")
     run = tmp_path / "workspace/g2fuzz/zlib_zlib_uncompress_fuzzer/phase_b"
     run.mkdir(parents=True)
+    report = run / "host_coverage/coverage.lcov"
+    report.parent.mkdir()
+    report.write_text("TN:\nSF:src/zlib.c\nDA:1,1\nend_of_record\n")
     (run / "metadata.json").write_text('{"status":"evaluated"}')
     (run / "result.json").write_text(json.dumps({
         "status": "evaluated",
@@ -389,6 +403,9 @@ def test_resume_reuses_in_place_coverage_recovery_without_restarting_fuzzing(tmp
     assert recovered["covered_lines"] == 90
     assert hgb_eval_all.recovered_csv_trial(
         tmp_path, record, "g2fuzz", "zlib_zlib_uncompress_fuzzer", 600, "different source") is None
+    report.unlink()
+    assert hgb_eval_all.recovered_csv_trial(
+        tmp_path, record, "g2fuzz", "zlib_zlib_uncompress_fuzzer", 600, selected) is None
 
 
 def test_benchmark_context_pins_libpng_and_defaults_openssl_fuzzer(tmp_path: Path) -> None:
@@ -578,6 +595,322 @@ def test_replay_trials_use_distinct_run_ids_and_logs(tmp_path: Path, monkeypatch
     assert (logs / "promefuzz_example.trial_002.log").is_file()
 
 
+def test_replay_measurer_uses_exact_saved_run_and_never_starts_fuzz(tmp_path: Path, monkeypatch) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    run = tmp_path / "workspace/promefuzz/example/old_trial"
+    (run / "evaluation").mkdir(parents=True)
+    seen = []
+
+    def fake_run(cmd, **_kwargs):
+        seen.append(cmd)
+        (run / "metadata.json").write_text('{"status":"evaluated"}')
+        (run / "evaluation/result.json").write_text(json.dumps({
+            "status": "evaluated", "campaign": {"campaign_wall_seconds": 60},
+            "coverage": {"line_coverage": {"covered": 2}},
+        }))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", fake_run)
+    row = hgb_eval_all.run_replay_job(
+        tmp_path, "promefuzz", "example", "saved", "new_batch", 60, logs,
+        1, 8, stage="measurer", existing_run="workspace/promefuzz/example/old_trial")
+    cmd = seen[0]
+    assert cmd[cmd.index("--run-id") + 1] == "old_trial"
+    assert cmd[cmd.index("--stage") + 1] == "measurer"
+    assert "--recover-existing" in cmd
+    assert row["run"] == "workspace/promefuzz/example/old_trial"
+    assert (logs / "promefuzz_example.measurer.log").is_file()
+
+
+def test_harness_runner_result_exposes_campaign_before_coverage(tmp_path: Path) -> None:
+    run = tmp_path / "workspace/promefuzz/example/trial"
+    (run / "evaluation").mkdir(parents=True)
+    (run / "metadata.json").write_text('{"status":"corpus_ready"}')
+    (run / "evaluation/runner_result.json").write_text(json.dumps({
+        "status": "corpus_ready", "campaign": {"campaign_wall_seconds": 14400,
+                                               "execs_done": 1234},
+    }))
+    row = hgb_eval_all.result_row(tmp_path, "promefuzz", "example", run, 14400, 0)
+    assert row["status"] == "corpus_ready"
+    assert row["campaign_elapsed_seconds"] == 14400
+    assert row["execs_done"] == 1234
+
+
+def test_measure_phase_resumes_saved_corpus_without_runner(tmp_path: Path, monkeypatch) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"promefuzz", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    manifest = tmp_path / "inputs/manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved-source"}
+        for baseline in ("promefuzz", "g2fuzz")
+    ]}), encoding="utf-8")
+    output = tmp_path / "workspace/eval_all/trials.csv"
+    rows = {(baseline, target): {"status": scope[baseline, target]}
+            for baseline in hgb_eval_all.BASELINES}
+    rows["promefuzz", target] = {
+        "status": "quality_failure", "run": "workspace/promefuzz/example/old_trial",
+        "campaign_seconds": 60, "reason": "old coverage failed"}
+    rows["g2fuzz", target] = {"status": "evaluated", "run": "workspace/g2fuzz/example/old_trial"}
+    hgb_eval_all.save_csv(output, [target], rows)
+    seen = []
+
+    def fake_replay(*args):
+        seen.append(args)
+        assert args[-2] == "measurer"
+        assert args[-1] == "workspace/promefuzz/example/old_trial"
+        return {"status": "evaluated", "run": args[-1], "coverage_contract": "canonical-g2-lcov-v1"}
+
+    def fake_evaluated(_root, record, baseline, _target, _budget, _selected):
+        return ({"status": "evaluated", "run": record[f"{baseline}_run"],
+                 "coverage_contract": "canonical-g2-lcov-v1"}
+                if baseline == "g2fuzz" or seen else None)
+
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "recovered_csv_trial", fake_evaluated)
+    monkeypatch.setattr(hgb_eval_all, "recovered_corpus_trial", lambda _root, record, *_args: (
+        {"status": "corpus_ready", "run": record.get("promefuzz_run", "")}
+        if record.get("promefuzz_run") else None))
+    monkeypatch.setattr(hgb_eval_all, "active_phase_b_state", lambda: (set(), set()))
+    monkeypatch.setattr(hgb_eval_all, "run_replay_job", fake_replay)
+    monkeypatch.setattr(hgb_eval_all, "eval_container_memory_gib", lambda _run_id: 0.0)
+    monkeypatch.setattr(hgb_eval_all, "host_available_memory_gib", lambda: 90.0)
+    monkeypatch.setattr(hgb_eval_all, "host_memory_gib", lambda: 100)
+    monkeypatch.setattr(hgb_eval_all, "write_coverage_products", lambda _output: True)
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "measure", "--baseline", "promefuzz",
+                                      "--target", target, "--campaign-seconds", "60", "--parallel-worker", "1",
+                                      "--manifest", str(manifest), "--output", str(output)])
+    assert hgb_eval_all.main() == 0
+    assert len(seen) == 1
+    saved = next(csv.DictReader(output.open(newline="", encoding="utf-8")))
+    assert saved["promefuzz_status"] == "evaluated"
+    assert saved["g2fuzz_status"] == "evaluated"
+
+
+def test_measure_uses_manifest_from_existing_csv_date(tmp_path: Path, monkeypatch) -> None:
+    class Today:
+        @staticmethod
+        def now():
+            return datetime(2026, 11, 3)
+
+    target = "example"
+    scope = {(baseline, target): "pending" for baseline in hgb_eval_all.BASELINES}
+    output = tmp_path / "workspace/eval_all/2026-11-02.csv"
+    hgb_eval_all.save_csv(output, [target], {
+        (baseline, target): {"status": "pending"} for baseline in hgb_eval_all.BASELINES})
+    manifest = output.with_name("2026-11-02.phase_a.json")
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in hgb_eval_all.BASELINES
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "datetime", Today)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "measure", "--plan",
+                                      "--output", str(output)])
+    assert hgb_eval_all.main() == 0
+    assert manifest.is_file()
+    assert not output.with_name("2026-11-03.phase_a.json").exists()
+
+
+@pytest.mark.parametrize("mount_state, expected", [
+    ("active", "running"), ("stopped", "pending"), ("unknown", "running")])
+def test_resume_running_trial_uses_docker_activity(tmp_path: Path, monkeypatch,
+                                                  mount_state: str, expected: str) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"promefuzz", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    output = tmp_path / "workspace/eval_all/2026-11-02.csv"
+    old_run = "workspace/promefuzz/example/old_trial"
+    rows = {(baseline, target): {"status": scope[baseline, target]}
+            for baseline in hgb_eval_all.BASELINES}
+    rows["promefuzz", target] = {"status": "running", "run": old_run}
+    hgb_eval_all.save_csv(output, [target], rows)
+    (tmp_path / old_run).mkdir(parents=True)
+    manifest = output.with_name("2026-11-02.phase_a.json")
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("promefuzz", "g2fuzz")
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "recovered_csv_trial", lambda *_args: None)
+    monkeypatch.setattr(hgb_eval_all, "recovered_corpus_trial", lambda *_args: None)
+    mounts = ({tmp_path / old_run} if mount_state == "active" else
+              None if mount_state == "unknown" else set())
+    monkeypatch.setattr(hgb_eval_all, "active_phase_b_state", lambda: (set(), mounts))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--resume", "--plan",
+                                      "--baseline", "promefuzz", "--target", target,
+                                      "--output", str(output)])
+    assert hgb_eval_all.main() == 0
+    row = next(csv.DictReader(output.open(newline="", encoding="utf-8")))
+    assert row["promefuzz_status"] == expected
+    if expected == "running":
+        assert row["promefuzz_run"] == old_run
+        assert "may still be active" in row["promefuzz_reason"]
+    else:
+        assert row["promefuzz_run"] == ""
+
+
+def test_resume_retries_when_recorded_runner_never_created_run(tmp_path: Path, monkeypatch) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"promefuzz", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    output = tmp_path / "workspace/eval_all/2026-11-02.csv"
+    rows = {(baseline, target): {"status": scope[baseline, target]}
+            for baseline in hgb_eval_all.BASELINES}
+    rows["promefuzz", target] = {
+        "status": "running", "run": "workspace/promefuzz/example/never_started"}
+    hgb_eval_all.save_csv(output, [target], rows)
+    manifest = output.with_name("2026-11-02.phase_a.json")
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("promefuzz", "g2fuzz")
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "recovered_csv_trial", lambda *_args: None)
+    monkeypatch.setattr(hgb_eval_all, "recovered_corpus_trial", lambda *_args: None)
+    monkeypatch.setattr(hgb_eval_all, "active_phase_b_state", lambda: (set(), set()))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--resume", "--plan",
+                                      "--baseline", "promefuzz", "--target", target,
+                                      "--output", str(output)])
+    assert hgb_eval_all.main() == 0
+    row = next(csv.DictReader(output.open(newline="", encoding="utf-8")))
+    assert row["promefuzz_status"] == "pending"
+    assert row["promefuzz_run"] == ""
+
+
+def test_saved_run_activity_matches_nested_live_corpus_mount(tmp_path: Path) -> None:
+    run = tmp_path / "workspace/promefuzz/example/trial"
+    assert hgb_eval_all.saved_run_activity(run, (set(), {run / "evaluation/cand_001/campaign/live_corpus"})) is True
+    assert hgb_eval_all.saved_run_activity(run, ({"trial"}, set())) is True
+    assert hgb_eval_all.saved_run_activity(run, (set(), set())) is False
+    assert hgb_eval_all.saved_run_activity(run, (set(), None)) is None
+
+
+def test_all_phase_checkpoints_corpus_before_separate_measurer(tmp_path: Path, monkeypatch) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"promefuzz", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    manifest = tmp_path / "inputs/manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("promefuzz", "g2fuzz")
+    ]}), encoding="utf-8")
+    output = tmp_path / "workspace/eval_all/single.csv"
+    run = "workspace/promefuzz/example/trial"
+    stages = []
+    checkpoints = []
+    original_save_csv = hgb_eval_all.save_csv
+
+    def fake_replay(*args):
+        stage = args[-2]
+        stages.append(stage)
+        if stage == "measurer":
+            assert args[-1] == run
+            assert ("corpus_ready", run) in checkpoints
+            return {"status": "evaluated", "run": run, "coverage_contract": "canonical-g2-lcov-v1"}
+        assert stage == "runner"
+        saved = next(csv.DictReader(output.open(newline="", encoding="utf-8")))
+        assert saved["promefuzz_status"] == "running"
+        assert saved["promefuzz_run"] == "workspace/promefuzz/example/stage_test_promefuzz_example"
+        return {"status": "corpus_ready", "run": run}
+
+    def record_save(path, targets, rows, trials=1):
+        row = rows["promefuzz", target]
+        checkpoints.append((row["status"], row.get("run", "")))
+        original_save_csv(path, targets, rows, trials)
+
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "run_replay_job", fake_replay)
+    monkeypatch.setattr(hgb_eval_all, "recovered_corpus_trial", lambda *_args: {
+        "status": "corpus_ready", "run": run})
+    monkeypatch.setattr(hgb_eval_all, "recovered_csv_trial", lambda *_args: {
+        "status": "evaluated", "run": run, "coverage_contract": "canonical-g2-lcov-v1"})
+    monkeypatch.setattr(hgb_eval_all, "save_csv", record_save)
+    monkeypatch.setattr(hgb_eval_all, "eval_container_memory_gib", lambda _run_id: 0.0)
+    monkeypatch.setattr(hgb_eval_all, "host_available_memory_gib", lambda: 90.0)
+    monkeypatch.setattr(hgb_eval_all, "host_memory_gib", lambda: 100)
+    monkeypatch.setattr(hgb_eval_all, "write_coverage_products", lambda _output: True)
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "all", "--baseline", "promefuzz",
+                                      "--target", target, "--campaign-seconds", "60", "--parallel-worker", "1",
+                                      "--manifest", str(manifest), "--output", str(output), "--run-id", "stage_test"])
+    assert hgb_eval_all.main() == 0
+    assert stages == ["runner", "measurer"]
+    planned_run = "workspace/promefuzz/example/stage_test_promefuzz_example"
+    assert ("running", planned_run) in checkpoints
+    assert checkpoints.index(("running", planned_run)) < checkpoints.index(("corpus_ready", run))
+    assert checkpoints.index(("corpus_ready", run)) < checkpoints.index(("measuring", run))
+    assert next(csv.DictReader(output.open(newline="", encoding="utf-8")))["promefuzz_status"] == "evaluated"
+
+
+def test_all_phase_measures_finished_corpus_while_another_runner_continues(tmp_path: Path, monkeypatch) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"promefuzz", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    manifest = tmp_path / "inputs/manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("promefuzz", "g2fuzz")
+    ]}), encoding="utf-8")
+    output = tmp_path / "workspace/eval_all/two.trials2.csv"
+    second_runner_started = threading.Event()
+    first_measurer_started = threading.Event()
+    stages = []
+
+    def fake_replay(*args):
+        trial, stage, existing_run = args[9], args[-2], args[-1]
+        stages.append((trial, stage))
+        run = f"workspace/promefuzz/example/pipeline_trial_{trial:03d}_promefuzz_example"
+        if stage == "runner":
+            if trial == 2:
+                second_runner_started.set()
+                assert first_measurer_started.wait(5), "measurer did not overlap second runner"
+            return {"status": "corpus_ready", "run": run}
+        assert existing_run == run
+        if trial == 1:
+            assert second_runner_started.wait(5)
+            first_measurer_started.set()
+        return {"status": "evaluated", "run": run, "coverage_contract": "canonical-g2-lcov-v1"}
+
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "run_replay_job", fake_replay)
+    monkeypatch.setattr(hgb_eval_all, "recovered_corpus_trial", lambda _root, record, baseline, *_args: {
+        "status": "corpus_ready", "run": record[f"{baseline}_run"]})
+    monkeypatch.setattr(hgb_eval_all, "recovered_csv_trial", lambda _root, record, baseline, *_args: {
+        "status": "evaluated", "run": record[f"{baseline}_run"],
+        "coverage_contract": "canonical-g2-lcov-v1"})
+    monkeypatch.setattr(hgb_eval_all, "eval_container_memory_gib", lambda _run_id: 0.0)
+    monkeypatch.setattr(hgb_eval_all, "host_available_memory_gib", lambda: 90.0)
+    monkeypatch.setattr(hgb_eval_all, "host_memory_gib", lambda: 100)
+    monkeypatch.setattr(hgb_eval_all, "write_coverage_products", lambda _output: True)
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "all", "--baseline", "promefuzz",
+                                      "--target", target, "--trials", "2", "--campaign-seconds", "60",
+                                      "--parallel-worker", "2", "--measurer-worker", "1",
+                                      "--manifest", str(manifest), "--output", str(output),
+                                      "--run-id", "pipeline"])
+    assert hgb_eval_all.main() == 0
+    assert first_measurer_started.is_set()
+    assert stages.index((1, "measurer")) < stages.index((2, "measurer"))
+
+
 def test_phase_b_dispatches_trials_of_one_pair_together(tmp_path: Path, monkeypatch) -> None:
     target = "example"
     scope = {(baseline, target): "pending" if baseline in {"ckgfuzzer", "g2fuzz"} else "N/A"
@@ -592,7 +925,7 @@ def test_phase_b_dispatches_trials_of_one_pair_together(tmp_path: Path, monkeypa
     seen_active = []
 
     def fake_wait(active, **_kwargs):
-        seen_active.append({(trial, baseline, name) for trial, baseline, name, _cpu in active.values()})
+        seen_active.append({(trial, baseline, name) for trial, baseline, name, _cpu, _stage in active.values()})
         return set(active), set()
 
     monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)

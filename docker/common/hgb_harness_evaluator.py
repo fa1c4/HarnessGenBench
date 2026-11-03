@@ -302,6 +302,32 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _target_manifest_sha256(target_root: Path) -> str:
+    """Bind a saved campaign to the small canonical target manifest."""
+    for name in ("target_manifest.json", "target_manifest.generator.json"):
+        manifest = target_root / name
+        if manifest.is_file():
+            return _sha256_file(manifest)
+    return ""
+
+
+def _write_json_durable(path: Path, value: dict[str, Any]) -> None:
+    """Publish a runner marker only after its JSON bytes reach stable storage."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as output:
+        json.dump(value, output, indent=2, sort_keys=True)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
 def _resolve_native_harness(
     evaluator_root: Path,
     target_root: Path,
@@ -416,6 +442,8 @@ def evaluate_candidate(
     coverage_format: str = "auto",
     prebuilt_coverage_image: str = "",
     reuse_saved_campaign: bool = False,
+    stage: str = "all",
+    runner_evidence: dict[str, Any] | None = None,
 ) -> CandidateRecord:
     """Evaluate a single candidate end-to-end."""
     strict_eta = profile in ETA_PROFILES
@@ -477,7 +505,31 @@ def evaluate_candidate(
         hgb_result.mark_stage(rec.stages, "copy_audit", "completed")
 
     # 6.2 Exact FuzzBench build with the deterministic image tag.
-    if preverified is not None:
+    if stage == "measurer":
+        # The address build and sanitizer smoke belong to the runner. The
+        # measurer only needs their recorded evidence and builds a separate
+        # coverage image from this same, hash-checked candidate source.
+        saved = (runner_evidence or {}).get("build") or {}
+        if (not saved.get("binary_verified") or not saved.get("binary_path")
+                or not saved.get("image_tag") or not saved.get("image_digest")):
+            hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
+            rec.error = "saved runner candidate build evidence is incomplete"
+            return rec
+        image_tag = str(saved["image_tag"])
+        build = hgb_fuzzbench_builder.BuildResult(
+            image_tag=image_tag, image_digest=str(saved["image_digest"]),
+            binary_path=str(saved["binary_path"]),
+            binary_sha256=str(saved.get("binary_sha256") or ""),
+            build_exit_code=int(saved.get("build_exit_code") or 0),
+            log=str(saved.get("log") or ""),
+            compiler=str(saved.get("compiler") or "clang/clang++"),
+            sanitizer=str(saved.get("sanitizer") or "address"),
+            engine=str(saved.get("engine") or "libfuzzer"),
+            binary_verified=True,
+            overlay_audit=saved.get("overlay_audit") or {},
+            sealed_env_defaults=saved.get("sealed_env_defaults") or {},
+        )
+    elif preverified is not None:
         saved = preverified.get("build") or {}
         if (preverified.get("candidate_sha256") != rec.candidate_sha256
                 or preverified.get("native_destination") != native_destination
@@ -486,7 +538,9 @@ def evaluate_candidate(
             rec.error = "Phase A selected harness/build provenance mismatch"
             return rec
         image_tag = str(saved["image_tag"])
-        inspect = runner(["docker", "image", "inspect", "-f", "{{.Id}}", image_tag], 60)
+        inspect = hgb_fuzzbench_builder._run_phase(
+            runner, ["docker", "image", "inspect", "-f", "{{.Id}}", image_tag],
+            60, "inspect Phase A candidate image")
         if inspect.exit_code or inspect.stdout.strip() != saved.get("image_digest"):
             hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
             rec.error = "Phase A selected image digest is missing or changed"
@@ -526,7 +580,8 @@ def evaluate_candidate(
         "log": build.log,
         "overlay_audit": build.overlay_audit or {},
         "sealed_env_defaults": build.sealed_env_defaults or sealed_context.get("sealed_env_defaults", {}),
-        "phase_a_reused": preverified is not None,
+        "phase_a_reused": (bool(saved.get("phase_a_reused")) if stage == "measurer"
+                           else preverified is not None),
     }
     if build.build_exit_code != 0:
         hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
@@ -536,6 +591,10 @@ def evaluate_candidate(
     if not build.binary_verified:
         hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
         rec.error = "candidate_build: /out/<fuzz_target> is missing or not executable in the built image"
+        return rec
+    if stage == "runner" and not build.image_digest:
+        hgb_result.mark_stage(rec.stages, "candidate_build", "failed")
+        rec.error = "candidate_build: address image digest is missing from runner evidence"
         return rec
     hgb_result.mark_stage(rec.stages, "candidate_build", "completed")
     # Section 3.5: if the source compiled at the native path does not match the
@@ -547,7 +606,8 @@ def evaluate_candidate(
         return rec
 
     # 6.3 Sanitizer smoke.
-    smoke = (dict(preverified.get("sanitizer_smoke") or {}) if preverified is not None
+    smoke = (dict((runner_evidence or {}).get("sanitizer_smoke") or {}) if stage == "measurer"
+             else dict(preverified.get("sanitizer_smoke") or {}) if preverified is not None
              else hgb_fuzzbench_builder.run_smoke(
                  image_tag=image_tag,
                  binary_path=build.binary_path,
@@ -572,7 +632,7 @@ def evaluate_candidate(
 
     # 6.4 Fuzzing campaign (fixed-budget libFuzzer).
     corpus_dir = candidate_work / "corpus"
-    if reuse_saved_campaign:
+    if stage == "measurer" or reuse_saved_campaign:
         try:
             campaign = hgb_fuzzbench_builder.load_saved_campaign(candidate_work, campaign_seconds)
         except (OSError, ValueError) as exc:
@@ -592,6 +652,7 @@ def evaluate_candidate(
             campaign_seconds=campaign_seconds,
             runner=runner,
             keep_going=keep_going_campaign,
+            durable=stage == "runner",
         )
     rec.campaign = campaign
     if strict and not keep_going_campaign and int(campaign.get("crashes", 0) or 0) > 0:
@@ -614,6 +675,27 @@ def evaluate_candidate(
         rec.error = "campaign final corpus is empty; strict profiles never fall back to the seed corpus"
         return rec
     hgb_result.mark_stage(rec.stages, "campaign", "completed")
+
+    if stage == "runner":
+        # A runner result is a durable, reusable corpus. Validate the saved
+        # archive against the extracted corpus and require a complete in-
+        # container campaign interval before publishing corpus_ready.
+        try:
+            hgb_fuzzbench_builder.load_saved_campaign(
+                candidate_work, campaign_seconds, include_archive_sha256=False)
+        except (OSError, ValueError) as exc:
+            hgb_result.mark_stage(rec.stages, "campaign", "failed")
+            rec.error = f"saved campaign invalid after runner: {exc}"
+            return rec
+        active = campaign.get("campaign_active_seconds")
+        if active is None or int(active) < campaign_seconds - 60:
+            hgb_result.mark_stage(rec.stages, "campaign", "failed")
+            rec.error = ("runner has no complete in-container campaign duration evidence"
+                         if active is None else
+                         f"runner campaign duration {active}s is below required {campaign_seconds - 60}s")
+            return rec
+        rec.campaign["saved_campaign_verified"] = True
+        return rec
 
     # 6.5 Coverage (real LLVM source-based coverage with function detail).
     # Replay the final campaign corpus (not only the seed corpus) so coverage
@@ -1028,6 +1110,7 @@ def evaluate(
     coverage_format: str = "auto",
     prebuilt_coverage_image: str = "",
     reuse_saved_campaign: bool = False,
+    stage: str = "all",
 ) -> dict[str, Any]:
     """Evaluate all candidates and return the run-level result dict.
 
@@ -1040,6 +1123,8 @@ def evaluate(
     auditable outputs at a stable path.
     """
 
+    if stage not in {"all", "runner", "measurer"}:
+        raise ValueError(f"unsupported evaluation stage: {stage}")
     work_dir.mkdir(parents=True, exist_ok=True)
     runner = runner or hgb_fuzzbench_builder._run
     candidates = _candidate_files(candidates_dir)
@@ -1049,10 +1134,74 @@ def evaluate(
     candidates_json_dir.mkdir(parents=True, exist_ok=True)
 
     def _emit(result: dict[str, Any]) -> dict[str, Any]:
-        hgb_result.write_result(result, work_dir / "result.json")
+        result_name = "runner_result.json" if stage == "runner" else "result.json"
+        if stage == "runner":
+            _write_json_durable(work_dir / result_name, result)
+        else:
+            hgb_result.write_result(result, work_dir / result_name)
         if result_dir is not None:
-            hgb_result.write_result(result, Path(result_dir) / "result.json")
+            if stage == "runner":
+                _write_json_durable(Path(result_dir) / result_name, result)
+            else:
+                hgb_result.write_result(result, Path(result_dir) / result_name)
         return result
+
+    runner_evidence: dict[str, Any] | None = None
+    if stage in {"runner", "measurer"} and len(candidates) != 1:
+        stages = hgb_result.default_stages()
+        hgb_result.mark_stage(stages, "generation", "failed")
+        return _emit(hgb_result.build_result(
+            generator=generator, profile=profile, protocol=protocol,
+            target=fuzz_target, status=hgb_result.STATUS_QUALITY_FAILURE,
+            stages=stages, reason=f"{stage} requires exactly one selected candidate",
+            candidate_count=len(candidates),
+        ))
+    if stage == "measurer":
+        saved_path = work_dir / "runner_result.json"
+        try:
+            legacy_saved = not saved_path.is_file() and reuse_saved_campaign
+            if legacy_saved:
+                # Historical Phase B quality failures already have a full
+                # saved campaign but predate the runner_result marker. Their
+                # per-candidate report retains the address build/smoke proof.
+                candidate_report = work_dir / "candidates" / "cand_001.json"
+                runner_evidence = json.loads(candidate_report.read_text(encoding="utf-8"))
+                campaign_evidence = hgb_fuzzbench_builder.load_saved_campaign(
+                    work_dir / "cand_001", campaign_seconds, include_archive_sha256=False)
+                checks = (
+                    runner_evidence.get("candidate_id") == "cand_001",
+                    runner_evidence.get("candidate_sha256") == _sha256_file(candidates[0]),
+                    bool((runner_evidence.get("build") or {}).get("binary_verified")),
+                    bool((runner_evidence.get("sanitizer_smoke") or {}).get("any_executed")),
+                )
+            else:
+                saved_result = json.loads(saved_path.read_text(encoding="utf-8"))
+                runner_evidence = saved_result.get("selected_candidate") or {}
+                campaign_evidence = saved_result.get("campaign") or {}
+                identity = (saved_result.get("artifacts") or {}).get("target_manifest_sha256", "")
+                checks = (
+                    saved_result.get("status") == "corpus_ready",
+                    saved_result.get("generator") == generator,
+                    saved_result.get("profile") == profile,
+                    saved_result.get("target") == fuzz_target,
+                    saved_result.get("candidate_count") == 1,
+                    runner_evidence.get("candidate_id") == "cand_001",
+                    runner_evidence.get("candidate_sha256") == _sha256_file(candidates[0]),
+                    identity == _target_manifest_sha256(target_root),
+                    int(campaign_evidence.get("configured_duration_seconds") or 0) == campaign_seconds,
+                    bool(campaign_evidence.get("saved_campaign_verified")),
+                )
+            if not all(checks):
+                raise ValueError("runner marker, selected candidate, target manifest or campaign budget differs")
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            stages = hgb_result.default_stages()
+            hgb_result.mark_stage(stages, "campaign", "failed")
+            return _emit(hgb_result.build_result(
+                generator=generator, profile=profile, protocol=protocol,
+                target=fuzz_target, status=hgb_result.STATUS_QUALITY_FAILURE,
+                stages=stages, reason=f"saved runner evidence invalid: {exc}",
+                candidate_count=len(candidates),
+            ))
 
     if not candidates:
         stages = hgb_result.default_stages()
@@ -1172,6 +1321,8 @@ def evaluate(
             coverage_format=coverage_format,
             prebuilt_coverage_image=prebuilt_coverage_image,
             reuse_saved_campaign=reuse_saved_campaign,
+            stage=stage,
+            runner_evidence=runner_evidence,
         )
         records.append(rec)
         # Flatten key audit/provenance fields onto the candidate dict so the
@@ -1209,6 +1360,8 @@ def evaluate(
         (candidates_json_dir / f"{candidate_id}.json").write_text(
             json.dumps(cand_dict, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        if stage == "runner":
+            break
         if stop_on_first_success and hgb_result.result_status_from_stages(
             rec.stages,
             has_candidate_json=True,
@@ -1217,6 +1370,31 @@ def evaluate(
             candidate_overlaid=bool(rec.overlaid),
         ) == hgb_result.STATUS_EVALUATED:
             break
+
+    if stage == "runner":
+        selected = candidate_dicts[0]
+        campaign_ready = (
+            selected["stages"].get("campaign") == "completed"
+            and selected["campaign"].get("saved_campaign_verified") is True
+            and not selected.get("error")
+        )
+        status = "corpus_ready" if campaign_ready else hgb_result.STATUS_QUALITY_FAILURE
+        if not campaign_ready and hgb_result.classify_infra_failure(str(selected.get("error") or "")):
+            status = hgb_result.STATUS_INFRA_FAILURE
+        result = hgb_result.build_result(
+            generator=generator, profile=profile, protocol=protocol,
+            target=fuzz_target, status=status, stages=selected["stages"],
+            reason="" if campaign_ready else str(selected.get("error") or "campaign not ready"),
+            candidate_count=1,
+            metrics={"campaign": selected["campaign"], "build": selected["build"]},
+            artifacts={
+                "candidate_reports_dir": str(candidates_json_dir),
+                "sealed_context_dir": str(work_dir / "sealed_context"),
+                "target_manifest_sha256": _target_manifest_sha256(target_root),
+            },
+            selected_candidate=selected,
+        )
+        return _emit(result)
 
     # 6.7 Candidate selection.
     selected = hgb_result.select_best_candidate(candidate_dicts)
@@ -1344,6 +1522,8 @@ def main() -> int:
                         help="reuse the selected Phase A coverage image while measuring the new final corpus")
     parser.add_argument("--reuse-saved-campaign", action="store_true",
                         help="validate and reuse the existing work-dir campaign log and corpus.tar")
+    parser.add_argument("--stage", choices=("all", "runner", "measurer"), default="all",
+                        help="run the full evaluator, save a campaign corpus, or measure a saved corpus")
     args = parser.parse_args()
 
     generator = args.baseline or args.generator
@@ -1419,6 +1599,7 @@ def main() -> int:
             coverage_format=args.coverage_format,
             prebuilt_coverage_image=args.prebuilt_coverage_image,
             reuse_saved_campaign=args.reuse_saved_campaign,
+            stage=args.stage,
         )
     finally:
         if cleanup_dir is not None:

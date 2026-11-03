@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -47,8 +49,15 @@ class FakeResult:
         self.stderr = stderr
 
 
+@pytest.mark.parametrize("phase_b", [False, True])
 @pytest.mark.parametrize("start_exit", [0, 124])
-def test_smoke_docker_operations_have_ten_minute_timeout(tmp_path: Path, start_exit: int) -> None:
+def test_smoke_docker_waits_are_unbounded_only_for_phase_b(
+    tmp_path: Path, monkeypatch, phase_b: bool, start_exit: int,
+) -> None:
+    if phase_b:
+        monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    else:
+        monkeypatch.delenv("HGB_PHASE_B_REPLAY", raising=False)
     calls = []
 
     def runner(command, timeout):
@@ -60,9 +69,71 @@ def test_smoke_docker_operations_have_ten_minute_timeout(tmp_path: Path, start_e
     evaluator.hgb_fuzzbench_builder.run_smoke(
         image_tag="smoke-image", binary_path="/out/fuzzer", seeds=[],
         work_dir=tmp_path, runner=runner)
-    assert calls == ([('create', 600), ('cp', 600), ('start', 600)]
-                     + ([('kill', 600)] if start_exit else [])
-                     + [('rm', 600)])
+    timeout = None if phase_b else 600
+    assert calls == ([('create', timeout), ('cp', timeout), ('start', timeout)]
+                     + ([('kill', timeout)] if start_exit and not phase_b else [])
+                     + [('rm', timeout)])
+
+
+def test_phase_b_binary_verification_docker_wait_has_no_timeout(monkeypatch) -> None:
+    calls = []
+
+    def runner(command, timeout):
+        calls.append((list(command), timeout))
+        return FakeResult(command)
+
+    command = ["docker", "run", "--rm", "test-image", "sh", "-lc", "test -x /out/fuzzer"]
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    evaluator.hgb_fuzzbench_builder._run_phase(runner, command, 300, "verify candidate binary")
+    assert calls == [(command, None)]
+
+    monkeypatch.delenv("HGB_PHASE_B_REPLAY")
+    evaluator.hgb_fuzzbench_builder._run_phase(runner, command, 300, "verify candidate binary")
+    assert calls[-1] == (command, 300)
+
+
+def test_phase_b_failed_attach_waits_for_container_before_copy_out(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    commands = []
+    output = tmp_path / "saved-corpus.tar"
+
+    def runner(command, timeout):
+        command = list(command)
+        commands.append((command, timeout))
+        action = command[1]
+        if action == "start":
+            return FakeResult(command, 125, "", "Docker attach failed")
+        if action == "inspect":
+            return FakeResult(command, 0, "true\n")
+        if action == "wait":
+            return FakeResult(command, 0, "0\n")
+        if action == "cp":
+            with tarfile.open(command[-1], "w") as archive:
+                payload = b"saved after container exit"
+                member = tarfile.TarInfo("corpus/sample")
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+        return FakeResult(command)
+
+    result = evaluator.hgb_fuzzbench_builder._container_run(
+        image_tag="test-image", work_dir=tmp_path / "container",
+        runner=runner, timeout_seconds=123,
+        command=["sh", "-lc", "true"], phase="campaign",
+        copy_out=("/tmp/corpus.tar", output),
+    )
+
+    assert [command[1] for command, _ in commands] == [
+        "create", "start", "inspect", "wait", "cp", "rm",
+    ]
+    assert all(timeout is None for _, timeout in commands)
+    assert all(command[:2] != ["docker", "kill"] for command, _ in commands)
+    assert commands[-1][0][:3] == ["docker", "rm", commands[1][0][-1]]
+    with tarfile.open(output) as archive:
+        assert archive.extractfile("corpus/sample").read() == b"saved after container exit"
+    assert result.copy_out_ok is True
+    assert result.exit_code == 0
 
 
 class _Runner:
@@ -431,6 +502,11 @@ def test_saved_campaign_recovery_requires_full_log_and_matching_corpus(tmp_path:
     assert saved["reused_saved_campaign"] is True
     assert saved["campaign_wall_seconds"] >= 86400
     assert saved["final_corpus_file_count"] == 1
+    (work / "campaign/fuzzer.log").write_text(
+        "HGB_CAMPAIGN_START_EPOCH=1000\nHGB_CAMPAIGN_END_EPOCH=1100\n")
+    with pytest.raises(ValueError, match="active duration"):
+        hgb_fuzzbench_builder.load_saved_campaign(work, 86400)
+    (work / "campaign/fuzzer.log").unlink()
     log.write_text("#123: cov: 10 time: 85155s\nKilled\n", encoding="utf-8")
     with pytest.raises(ValueError, match="duration"):
         hgb_fuzzbench_builder.load_saved_campaign(work, 86400)
@@ -534,3 +610,171 @@ def test_fork_campaign_parses_progress_even_when_worker_stats_are_zero() -> None
         "stat::number_of_executed_units: 0\n"
     )
     assert evaluator.hgb_fuzzbench_builder._parse_execs_done(log) == 629
+
+
+def test_runner_then_measurer_replays_saved_harness_corpus_only(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    calls = {"campaign": 0, "coverage": 0}
+    real_coverage = evaluator.hgb_fuzzbench_builder.run_coverage
+    real_build_candidate = evaluator.hgb_fuzzbench_builder.build_candidate_image
+
+    def saved_campaign(**kwargs):
+        calls["campaign"] += 1
+        assert kwargs["durable"] is True
+        work = kwargs["work_dir"]
+        campaign_dir = work / "campaign"
+        corpus_dir = work / "corpus"
+        campaign_dir.mkdir(parents=True, exist_ok=True)
+        corpus_dir.mkdir(parents=True, exist_ok=True)
+        for staged in corpus_dir.iterdir():
+            if staged.is_file():
+                staged.unlink()
+        payload = b"saved final corpus input"
+        (corpus_dir / "final_input").write_bytes(payload)
+        fuzzer_log = (
+            "HGB_CAMPAIGN_START_EPOCH=1000\n"
+            "#500: cov: 8 time: 120s\n"
+            "INFO: fuzzed for 120 seconds\n"
+            "HGB_CAMPAIGN_END_EPOCH=1120\n"
+        )
+        (campaign_dir / "fuzzer.log").write_text(fuzzer_log)
+        (campaign_dir / "campaign.log").write_text(fuzzer_log)
+        with tarfile.open(campaign_dir / "corpus.tar", "w") as archive:
+            item = tarfile.TarInfo("corpus/final_input")
+            item.size = len(payload)
+            archive.addfile(item, io.BytesIO(payload))
+        record = {
+            "configured_duration_seconds": 120,
+            "campaign_wall_seconds": 120,
+            "campaign_active_seconds": 120,
+            "execs_done": 500,
+            "copy_out_ok": True,
+            "final_corpus_file_count": 1,
+            "final_corpus_dir": str(corpus_dir),
+            "corpus_dir": str(corpus_dir),
+            "log": str(campaign_dir / "campaign.log"),
+            "corpus_archive_error": "",
+        }
+        (campaign_dir / "campaign.json").write_text(json.dumps(record))
+        return record
+
+    def forbidden_coverage(**kwargs):
+        raise AssertionError("runner must not measure coverage")
+
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_campaign", saved_campaign)
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_coverage", forbidden_coverage)
+    runner_result = evaluator.evaluate(
+        generator="ckgfuzzer", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=120,
+        strict=True, runner=_Runner(candidate_path=str(candidates_dir / "cand_001.c")),
+        intended_apis=["hgb_sample_api"], seeds=[], build_coverage_image=True,
+        keep_going_campaign=True, coverage_format="json", stage="runner",
+    )
+    assert runner_result["status"] == "corpus_ready"
+    assert (work_dir / "runner_result.json").is_file()
+    assert not (work_dir / "result.json").exists()
+    assert runner_result["campaign"]["saved_campaign_verified"] is True
+    assert calls["campaign"] == 1
+
+    def forbidden_campaign(**kwargs):
+        raise AssertionError("measurer must not fuzz again")
+
+    def counted_coverage(**kwargs):
+        calls["coverage"] += 1
+        return real_coverage(**kwargs)
+
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_campaign", forbidden_campaign)
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_coverage", counted_coverage)
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_smoke", forbidden_campaign)
+    def coverage_build_only(**kwargs):
+        assert kwargs.get("sanitizer") == "coverage"
+        return real_build_candidate(**kwargs)
+
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "build_candidate_image", coverage_build_only)
+    measured = evaluator.evaluate(
+        generator="ckgfuzzer", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=120,
+        strict=True, runner=_Runner(candidate_path=str(candidates_dir / "cand_001.c")),
+        intended_apis=["hgb_sample_api"], seeds=[], build_coverage_image=True,
+        keep_going_campaign=True, coverage_format="json", stage="measurer",
+    )
+    assert measured["status"] == "evaluated"
+    assert calls == {"campaign": 1, "coverage": 1}
+    assert measured["campaign"]["reused_saved_campaign"] is True
+    assert (work_dir / "result.json").is_file()
+
+    # Pre-split saved campaigns have a candidate report but no runner marker.
+    (work_dir / "runner_result.json").unlink()
+    legacy_measured = evaluator.evaluate(
+        generator="ckgfuzzer", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=120,
+        strict=True, runner=_Runner(candidate_path=str(candidates_dir / "cand_001.c")),
+        intended_apis=["hgb_sample_api"], seeds=[], build_coverage_image=True,
+        keep_going_campaign=True, coverage_format="json", stage="measurer",
+        reuse_saved_campaign=True,
+    )
+    assert legacy_measured["status"] == "evaluated"
+    assert calls == {"campaign": 1, "coverage": 2}
+
+
+def test_measurer_rejects_changed_candidate_without_fuzzing(tmp_path: Path, monkeypatch) -> None:
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    work_dir.mkdir()
+    candidate = candidates_dir / "cand_001.c"
+    marker = {
+        "status": "corpus_ready", "generator": "ckgfuzzer", "profile": "alpha",
+        "target": "fuzz_target", "candidate_count": 1,
+        "artifacts": {"target_manifest_sha256": ""},
+        "campaign": {"configured_duration_seconds": 120, "saved_campaign_verified": True},
+        "selected_candidate": {"candidate_id": "cand_001", "candidate_sha256": "wrong"},
+    }
+    (work_dir / "runner_result.json").write_text(json.dumps(marker))
+    monkeypatch.setattr(evaluator.hgb_fuzzbench_builder, "run_campaign",
+                        lambda **kwargs: pytest.fail("measurer must not fuzz"))
+    result = evaluator.evaluate(
+        generator="ckgfuzzer", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="alpha", campaign_seconds=120,
+        stage="measurer",
+    )
+    assert result["status"] == "quality_failure"
+    assert "saved runner evidence invalid" in result["reason"]
+
+
+def test_phase_b_live_corpus_maps_outer_and_host_workspaces(tmp_path: Path) -> None:
+    builder = evaluator.hgb_fuzzbench_builder
+    outer = Path("/workspace/evaluation/cand_001/campaign/live_corpus")
+    assert builder._phase_b_live_host_path(outer, str(tmp_path / "host-run")) == (
+        tmp_path / "host-run/evaluation/cand_001/campaign/live_corpus")
+    host_workspace = tmp_path / "repo/workspace"
+    host_live = host_workspace / "phase_b/try_001/campaign/live_corpus"
+    assert builder._phase_b_live_host_path(
+        host_live, repo_workspace=host_workspace) == host_live
+    with pytest.raises(ValueError, match="workspace"):
+        builder._phase_b_live_host_path(tmp_path / "unrelated/live_corpus",
+                                        repo_workspace=host_workspace)
+
+
+def test_inner_campaign_docker_create_binds_live_corpus(tmp_path: Path) -> None:
+    calls = []
+
+    def runner(command, timeout):
+        calls.append(list(command))
+        return FakeResult(command)
+
+    host_live = tmp_path / "run/evaluation/cand_001/campaign/live_corpus"
+    host_live.mkdir(parents=True)
+    evaluator.hgb_fuzzbench_builder._container_run(
+        image_tag="address-image", work_dir=tmp_path / "container",
+        runner=runner, timeout_seconds=100,
+        command=["sh", "-lc", "true"], phase="campaign",
+        mounts=[(host_live, "/tmp/corpus")],
+    )
+    create = calls[0]
+    assert create[:2] == ["docker", "create"]
+    assert create[create.index("-v") + 1] == f"{host_live}:/tmp/corpus"

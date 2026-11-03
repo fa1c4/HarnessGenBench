@@ -15,14 +15,16 @@ import hashlib
 import os
 import re
 import shlex
+import shutil
 import subprocess
+import tarfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-Runner = Callable[[Sequence[str], int], "CommandResult"]
+Runner = Callable[[Sequence[str], int | None], "CommandResult"]
 
 # Container-side marker emitted to stderr before the target binary execs. A
 # smoke/campaign/coverage phase is only considered to have executed the target
@@ -48,7 +50,7 @@ class CommandResult:
     run_wall_seconds: float | None = None
 
 
-def _run(command: Sequence[str], timeout_seconds: int) -> CommandResult:
+def _run(command: Sequence[str], timeout_seconds: int | None) -> CommandResult:
     completed = subprocess.run(
         list(command),
         stdout=subprocess.PIPE,
@@ -109,8 +111,13 @@ class BuildResult:
     sealed_env_defaults: dict = None
 
 
-def _run_phase(runner: Runner, command: Sequence[str], timeout_seconds: int, phase: str) -> CommandResult:
+def _run_phase(runner: Runner, command: Sequence[str], timeout_seconds: int | None, phase: str) -> CommandResult:
     try:
+        # Phase B must wait for Docker to finish its own operation. A timeout
+        # here can discard a completed campaign before its statistics or
+        # coverage artifact has been copied out.
+        if command and command[0] == "docker" and os.environ.get("HGB_PHASE_B_REPLAY") == "1":
+            timeout_seconds = None
         return runner(command, timeout_seconds)
     except subprocess.TimeoutExpired as exc:
         return CommandResult(list(command), 124, "", f"{phase} timed out: {exc}")
@@ -126,6 +133,55 @@ def _write_log(path: Path, result: CommandResult) -> None:
         + f"\n[exit]\n{result.exit_code}\n",
         encoding="utf-8",
     )
+
+
+def _verify_corpus_tar(path: Path) -> None:
+    """Read every archived file once, with bounded memory, before publishing it."""
+    corpus_files = 0
+    try:
+        with tarfile.open(path, mode="r|", bufsize=1024 * 1024) as archive:
+            for member in archive:
+                if not member.isfile():
+                    continue
+                source = archive.extractfile(member)
+                if source is None:
+                    raise tarfile.ReadError(f"could not read {member.name}")
+                if member.name.startswith("corpus/"):
+                    corpus_files += 1
+                with source:
+                    while source.read(1024 * 1024):
+                        pass
+    except (tarfile.TarError, EOFError) as exc:
+        raise ValueError(f"invalid corpus.tar: {exc}") from exc
+    if corpus_files == 0:
+        raise ValueError("invalid corpus.tar: archive contains no corpus files")
+
+
+def _phase_b_host_path(path: Path, host_workspace: str | Path,
+                       container_workspace: Path = Path("/workspace")) -> Path:
+    """Map an outer-container workspace path to its Docker-host bind path."""
+    host_root = Path(host_workspace)
+    if not host_root.is_absolute() or ":" in str(host_root):
+        raise ValueError("HGB_WORKSPACE_HOST must be an absolute Docker host path")
+    try:
+        relative = Path(path).resolve().relative_to(container_workspace.resolve())
+    except ValueError as exc:
+        raise ValueError("Phase B runner work directory must be under /workspace") from exc
+    return host_root / relative
+
+
+def _phase_b_live_host_path(path: Path, host_workspace: str = "",
+                            repo_workspace: Path | None = None) -> Path:
+    """Resolve the live corpus bind path for outer-container or host runners."""
+    resolved = Path(path).resolve()
+    if resolved.is_relative_to(Path("/workspace").resolve()):
+        if not host_workspace:
+            raise ValueError("outer-container Phase B runner needs HGB_WORKSPACE_HOST")
+        return _phase_b_host_path(resolved, host_workspace)
+    workspace = (repo_workspace or Path(__file__).resolve().parents[2] / "workspace").resolve()
+    if resolved.is_relative_to(workspace):
+        return resolved
+    raise ValueError("Phase B runner work directory must be inside the HGB workspace")
 
 
 def _normalize_candidate_for_native_path(candidate: Path, native_destination: str, work_dir: Path) -> Path:
@@ -1145,11 +1201,12 @@ def _container_run(
     image_tag: str,
     work_dir: Path,
     runner: Runner,
-    timeout_seconds: int,
+    timeout_seconds: int | None,
     command: list[str],
     phase: str,
     copy_out: tuple[str, Path] | None = None,
     copy_in: list[tuple[Path, str]] | None = None,
+    mounts: list[tuple[Path, str]] | None = None,
     env: list[str] | None = None,
     cleanup_timeout_seconds: int = 60,
 ) -> CommandResult:
@@ -1185,6 +1242,12 @@ def _container_run(
     if env:
         for pair in env:
             create.extend(["-e", pair])
+    if mounts:
+        for host_path, container_path in mounts:
+            host = Path(host_path)
+            if not host.is_absolute() or ":" in str(host) or not container_path.startswith("/"):
+                raise ValueError("Docker bind mount requires safe absolute host and container paths")
+            create.extend(["-v", f"{host}:{container_path}"])
     create.append(image_tag)
     create.extend(command)
     phases: list[tuple[str, CommandResult]] = []
@@ -1197,6 +1260,7 @@ def _container_run(
     copy_in_ok = True
     start_exit_code: int | None = None
     copy_out_ok = True
+    phase_b = os.environ.get("HGB_PHASE_B_REPLAY") == "1"
     try:
         if create_result.exit_code == 0:
             for host_path, container_path in (copy_in or []):
@@ -1225,14 +1289,31 @@ def _container_run(
                 phases.append(("run", start_result))
                 result = start_result
                 start_exit_code = start_result.exit_code
-                # A client-side timeout of ``docker start -a`` kills only the
-                # docker client: the container keeps running and a subsequent
-                # ``docker cp`` would race the in-container artifact writes
-                # (e.g. a half-written corpus.tar or coverage.json). Kill the
-                # container so copied artifacts are final, never mid-write.
-                if start_exit_code == 124:
+                # Phase A retains its bounded cleanup. Phase B waits without
+                # a Docker client timeout, so exit 124 may be the container's
+                # own graceful deadline status and must not trigger a kill.
+                if start_exit_code == 124 and os.environ.get("HGB_PHASE_B_REPLAY") != "1":
                     _run_phase(runner, ["docker", "kill", container_name],
                                cleanup_timeout_seconds, f"kill timed-out {phase}")
+                elif start_exit_code not in (0, 124) and os.environ.get("HGB_PHASE_B_REPLAY") == "1":
+                    # A failed attach can leave the container running. Wait
+                    # for its own exit before copying results; never read a
+                    # partially written corpus archive or force removal.
+                    state = _run_phase(
+                        runner, ["docker", "inspect", "-f", "{{.State.Running}}", container_name],
+                        None, f"inspect {phase} after attach error")
+                    phases.append(("inspect_after_attach_error", state))
+                    if state.exit_code == 0 and state.stdout.strip() == "true":
+                        finished = _run_phase(
+                            runner, ["docker", "wait", container_name], None,
+                            f"wait for {phase} after attach error")
+                        phases.append(("wait_after_attach_error", finished))
+                        start_result.run_wall_seconds = round(time.monotonic() - run_started, 3)
+                        if finished.exit_code == 0:
+                            try:
+                                start_result.exit_code = int(finished.stdout.strip())
+                            except ValueError:
+                                pass
             else:
                 start_result = CommandResult(list(command), 1, "", f"copy_in failed for {phase}; target not started")
                 phases.append(("run", start_result))
@@ -1242,14 +1323,55 @@ def _container_run(
                 container_src, dst = copy_out
                 docker_cp_src = f"{container_name}:{container_src}"
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                cp = _run_phase(runner, ["docker", "cp", docker_cp_src, str(dst)], timeout_seconds, f"copy {phase}")
+                # Docker may leave a partial destination when its copy fails.
+                # In Phase B, publish only a complete, synced copy so the
+                # evaluator never mistakes a half-written report for coverage.
+                staged = (dst.with_name(f".{dst.name}.hgb-copy-{uuid.uuid4().hex}")
+                          if phase_b else dst)
+                cp = _run_phase(runner, ["docker", "cp", docker_cp_src, str(staged)],
+                                timeout_seconds, f"copy {phase}")
                 phases.append(("copy", cp))
                 if cp.exit_code != 0:
                     copy_out_ok = False
+                if phase_b:
+                    try:
+                        if not copy_out_ok:
+                            raise ValueError(f"docker cp exited {cp.exit_code}")
+                        if staged.is_symlink() or not staged.is_file() or staged.stat().st_size == 0:
+                            raise ValueError("copied artifact is missing, empty, or not a regular file")
+                        if Path(container_src).name == "corpus.tar" or dst.name == "corpus.tar":
+                            _verify_corpus_tar(staged)
+                        with staged.open("rb") as copied:
+                            os.fsync(copied.fileno())
+                        os.replace(staged, dst)
+                        directory_fd = os.open(dst.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                        try:
+                            os.fsync(directory_fd)
+                        finally:
+                            os.close(directory_fd)
+                    except (OSError, ValueError) as exc:
+                        copy_out_ok = False
+                        phases.append(("copy_verify", CommandResult(
+                            ["verify", str(staged), str(dst)], 1, "", str(exc))))
+                    finally:
+                        try:
+                            staged.unlink(missing_ok=True)
+                        except OSError:
+                            pass
     finally:
-        rm = _run_phase(runner, ["docker", "rm", "-f", container_name],
-                        cleanup_timeout_seconds, f"cleanup {phase}")
-        phases.append(("cleanup", rm))
+        if phase_b and copy_out and not copy_out_ok:
+            # The stopped container still contains the raw artifact, allowing
+            # a later copy/recovery attempt after a failed transfer.
+            phases.append(("cleanup_skipped", CommandResult(
+                ["docker", "rm", container_name], 1, "",
+                f"{phase} copy-out failed; container retained for recovery")))
+        else:
+            rm_command = ["docker", "rm", container_name]
+            if not phase_b:
+                rm_command.insert(2, "-f")
+            rm = _run_phase(runner, rm_command,
+                            cleanup_timeout_seconds, f"cleanup {phase}")
+            phases.append(("cleanup", rm))
     log_path = work_dir / f"{phase}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
     chunks = []
@@ -1373,6 +1495,7 @@ def run_campaign(
     runner: Runner = _run,
     timeout_seconds: int | None = None,
     keep_going: bool = False,
+    durable: bool = False,
 ) -> dict:
     """Run a fixed-budget libFuzzer campaign and parse execs_done from the log.
 
@@ -1396,6 +1519,11 @@ def run_campaign(
         if keep_going else ""
     )
     fuzzer_timeout = budget + 5
+    # Give libFuzzer a graceful interrupt if its own -max_total_time has not
+    # returned. GNU timeout then waits for shutdown; there is no -k escalation
+    # in Phase B and the Docker client has no deadline.
+    timeout_prefix = ("timeout -s INT " if os.environ.get("HGB_PHASE_B_REPLAY") == "1"
+                      else "timeout -s INT -k 5s ")
     # Build copy_in list for seed corpus files.
     copy_in: list[tuple[Path, str]] = []
     seed_index = 0
@@ -1428,13 +1556,15 @@ def run_campaign(
         # the same on-container corpus until the fixed campaign deadline.
         # Repeated immediate failures still stop and fail the duration gate.
         fuzz_command = (
-            f'campaign_end=$(( $(date +%s) + {budget} )); '
+            'campaign_start_epoch=$(date +%s); '
+            'echo "HGB_CAMPAIGN_START_EPOCH=$campaign_start_epoch" >> /tmp/campaign.log; '
+            f'campaign_end=$((campaign_start_epoch + {budget} )); '
             'fuzzer_rc=0; attempts=0; rapid_failures=0; '
             'while [ "$(date +%s)" -lt "$campaign_end" ]; do '
             'attempt_start=$(date +%s); remaining=$((campaign_end - attempt_start)); '
             'attempts=$((attempts + 1)); '
             'echo "HGB_FUZZER_ATTEMPT=$attempts REMAINING=$remaining" >> /tmp/campaign.log; '
-            f'timeout -s INT -k 5s "$((remaining + 5))s" {fuzzer_args} '
+            f'{timeout_prefix}"$((remaining + 5))s" {fuzzer_args} '
             '>> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
             'attempt_elapsed=$(( $(date +%s) - attempt_start )); '
             'if [ "$attempt_elapsed" -lt 10 ]; then '
@@ -1444,12 +1574,16 @@ def run_campaign(
             'echo "HGB_FUZZER_STOPPED_AFTER_RAPID_FAILURES=1" >> /tmp/campaign.log; '
             'break; fi; '
             'done; '
+            'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/campaign.log; '
         )
     else:
         fuzz_command = (
+            'campaign_start_epoch=$(date +%s); '
+            'echo "HGB_CAMPAIGN_START_EPOCH=$campaign_start_epoch" >> /tmp/campaign.log; '
             f'remaining={budget}; '
-            f'timeout -s INT -k 5s {fuzzer_timeout}s {fuzzer_args} '
-            '> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
+            f'{timeout_prefix}{fuzzer_timeout}s {fuzzer_args} '
+            '>> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
+            'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/campaign.log; '
         )
     cmd = [
         "sh",
@@ -1464,16 +1598,37 @@ def run_campaign(
         # when the Docker client captures stdout. The final statistics and
         # recent findings are retained without copying the whole log.
         f'tail -n 2000 /tmp/campaign.log; '
-        f'cd /tmp && tar -cf /tmp/corpus.tar corpus artifacts 2>/dev/null || true',
+        f'cd /tmp && tar -cf /tmp/corpus.tar corpus artifacts campaign.log 2>/dev/null || true',
     ]
     # The in-container ``timeout`` above enforces the fuzzing budget. Give
     # ``docker start -a`` time for fuzzer shutdown, corpus archiving, and log
     # draining under concurrent image builds; a client timeout loses
     # the final libFuzzer statistics even after the fixed budget has ended.
-    timeout = timeout_seconds or (budget + 1800)
+    timeout = (None if os.environ.get("HGB_PHASE_B_REPLAY") == "1"
+               else timeout_seconds or (budget + 1800))
     campaign_work = work_dir / "campaign"
+    saved_fuzzer_log = campaign_work / "fuzzer.log"
+    saved_fuzzer_log.unlink(missing_ok=True)
     final_corpus_dir = work_dir / "corpus"
     final_corpus_dir.mkdir(parents=True, exist_ok=True)
+    mounts: list[tuple[Path, str]] | None = None
+    live_corpus_dir: Path | None = None
+    if durable and os.environ.get("HGB_PHASE_B_REPLAY") == "1":
+        # The evaluator itself runs in an outer Docker container at
+        # /workspace. The inner campaign container receives the *host* path
+        # for a separate live corpus, so each new libFuzzer input is visible
+        # on the host throughout the 24-hour run. Its final corpus.tar remains
+        # the only authoritative source for coverage measurement.
+        host_workspace = os.environ.get("HGB_WORKSPACE_HOST", "")
+        live_corpus_dir = campaign_work / "live_corpus"
+        if live_corpus_dir.is_dir() and any(live_corpus_dir.iterdir()):
+            # Keep an interrupted attempt's host-visible inputs instead of
+            # silently blending them into a fresh timed campaign.
+            previous = campaign_work / f"live_corpus.previous.{uuid.uuid4().hex[:12]}"
+            os.replace(live_corpus_dir, previous)
+        live_corpus_dir.mkdir(parents=True, exist_ok=True)
+        host_live_corpus = _phase_b_live_host_path(live_corpus_dir, host_workspace)
+        mounts = [(host_live_corpus, "/tmp/corpus")]
     campaign_start = time.monotonic()
     result = _container_run(
         image_tag=image_tag,
@@ -1483,6 +1638,7 @@ def run_campaign(
         command=cmd,
         phase="campaign",
         copy_in=copy_in if copy_in else None,
+        mounts=mounts,
         copy_out=("/tmp/corpus.tar", campaign_work / "corpus.tar"),
     )
     # _container_run writes a phased Docker audit here. Keep it before the
@@ -1514,6 +1670,12 @@ def run_campaign(
                         stale.unlink()
             with tarfile.open(corpus_tar) as tf:
                 for member in tf.getmembers():
+                    if member.name == "campaign.log" and member.isfile():
+                        archived_log = tf.extractfile(member)
+                        if archived_log is not None:
+                            with archived_log, saved_fuzzer_log.open("wb") as output:
+                                shutil.copyfileobj(archived_log, output)
+                        continue
                     top, _, name = member.name.partition("/")
                     destination = final_corpus_dir if top == "corpus" else artifact_dir if top == "artifacts" else None
                     if destination is None:
@@ -1527,8 +1689,37 @@ def run_campaign(
                         tf.extract(stripped, destination)
         except (OSError, tarfile.TarError) as exc:
             corpus_archive_error = str(exc)
-    (campaign_work / "campaign.log").write_text(result.stdout + "\n" + result.stderr, encoding="utf-8")
-    log = result.stdout + "\n" + result.stderr
+    if durable and not corpus_archive_error and corpus_tar.is_file():
+        try:
+            # corpus.tar was already verified, fsynced and atomically copied
+            # by _container_run. Flush the extracted replay inputs as well so
+            # the corpus_ready marker never precedes their persistence.
+            for path in final_corpus_dir.rglob("*"):
+                if path.is_file():
+                    with path.open("rb") as extracted:
+                        os.fsync(extracted.fileno())
+            if saved_fuzzer_log.is_file():
+                with saved_fuzzer_log.open("rb") as full_log:
+                    os.fsync(full_log.fileno())
+            for directory in (final_corpus_dir, artifact_dir):
+                directory_fd = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except OSError as exc:
+            corpus_archive_error = f"could not persist extracted corpus: {exc}"
+    saved_log_tail = ""
+    if saved_fuzzer_log.is_file():
+        with saved_fuzzer_log.open("rb") as saved:
+            saved.seek(0, os.SEEK_END)
+            saved.seek(max(0, saved.tell() - 4 * 1024 * 1024))
+            saved_log_tail = saved.read().decode("utf-8", errors="replace")
+    log = result.stdout + "\n" + saved_log_tail + "\n" + result.stderr
+    (campaign_work / "campaign.log").write_text(log, encoding="utf-8")
+    if durable:
+        with (campaign_work / "campaign.log").open("rb") as summary_log:
+            os.fsync(summary_log.fileno())
     execs_done = _parse_execs_done(log)
     new_units = _parse_new_units(log)
     crash_marker_seen = any(marker in log for marker in (
@@ -1560,11 +1751,13 @@ def run_campaign(
                     pass
         final_corpus_file_count = 0
     fuzzer_timed_out = "HGB_FUZZER_EXIT_CODE=124" in log
+    campaign_active_seconds = _campaign_active_seconds(saved_fuzzer_log)
     attempt_match = re.search(r"HGB_FUZZER_ATTEMPTS=(\d+)", log)
     campaign_record = {
         "configured_duration_seconds": budget,
         "corpus_archive_error": corpus_archive_error,
         "campaign_wall_seconds": campaign_wall_seconds,
+        "campaign_active_seconds": campaign_active_seconds,
         "execs_done": execs_done,
         "new_units": new_units,
         "crashes": crashes,
@@ -1580,18 +1773,50 @@ def run_campaign(
         "log": str(campaign_work / "campaign.log"),
         "corpus_dir": str(final_corpus_dir),
         "final_corpus_dir": str(final_corpus_dir),
+        "live_corpus_dir": str(live_corpus_dir) if live_corpus_dir else "",
         "queue_count": final_corpus_file_count,
         "final_corpus_file_count": final_corpus_file_count,
         "copy_out_ok": copy_out_ok,
     }
     import json
-    (campaign_work / "campaign.json").write_text(
-        json.dumps(campaign_record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    record_path = campaign_work / "campaign.json"
+    payload = json.dumps(campaign_record, indent=2, sort_keys=True) + "\n"
+    if durable:
+        temporary = record_path.with_name(f".{record_path.name}.{uuid.uuid4().hex}.tmp")
+        with temporary.open("w", encoding="utf-8") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, record_path)
+        directory_fd = os.open(campaign_work, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    else:
+        record_path.write_text(payload, encoding="utf-8")
     return campaign_record
 
 
-def load_saved_campaign(work_dir: Path, campaign_seconds: int) -> dict:
+def _campaign_active_seconds(log_path: Path) -> int | None:
+    """Read the bounded start/end markers from the complete in-container log."""
+    if not log_path.is_file():
+        return None
+    with log_path.open("rb") as saved:
+        beginning = saved.read(8192).decode("utf-8", errors="replace")
+        saved.seek(0, os.SEEK_END)
+        saved.seek(max(0, saved.tell() - 8192))
+        ending = saved.read().decode("utf-8", errors="replace")
+    start = re.search(r"HGB_CAMPAIGN_START_EPOCH=(\d+)", beginning)
+    end = re.search(r"HGB_CAMPAIGN_END_EPOCH=(\d+)", ending)
+    if not start or not end:
+        return None
+    seconds = int(end.group(1)) - int(start.group(1))
+    return seconds if seconds >= 0 else None
+
+
+def load_saved_campaign(work_dir: Path, campaign_seconds: int,
+                        *, include_archive_sha256: bool = True) -> dict:
     """Validate and reuse a completed Phase B campaign without fuzzing again."""
     import json
     import tarfile
@@ -1625,7 +1850,10 @@ def load_saved_campaign(work_dir: Path, campaign_seconds: int) -> dict:
             old = old or (json.loads(old_candidate.read_text(encoding="utf-8")).get("campaign") or {})
         except (OSError, ValueError):
             pass
+    active_seconds = _campaign_active_seconds(campaign_dir / "fuzzer.log")
     elapsed = max(max(durations, default=0), float(old.get("campaign_wall_seconds") or 0))
+    if active_seconds is not None and active_seconds < campaign_seconds - 60:
+        raise ValueError(f"saved campaign active duration {active_seconds}s is below required {campaign_seconds - 60}s")
     if elapsed < campaign_seconds - 60:
         raise ValueError(f"saved campaign duration {elapsed}s is below required {campaign_seconds - 60}s")
     execs_done = max(int(old.get("execs_done") or 0), _parse_execs_done(log))
@@ -1638,6 +1866,7 @@ def load_saved_campaign(work_dir: Path, campaign_seconds: int) -> dict:
         **old,
         "configured_duration_seconds": campaign_seconds,
         "campaign_wall_seconds": max(float(old.get("campaign_wall_seconds") or 0), float(elapsed)),
+        "campaign_active_seconds": active_seconds if active_seconds is not None else old.get("campaign_active_seconds"),
         "execs_done": execs_done,
         "new_units": int(old.get("new_units") or _parse_new_units(log)),
         "crashes": max(int(old.get("crashes") or 0), len(crashes)),
@@ -1654,7 +1883,7 @@ def load_saved_campaign(work_dir: Path, campaign_seconds: int) -> dict:
         "final_corpus_file_count": len(corpus_files),
         "copy_out_ok": True,
         "reused_saved_campaign": True,
-        "corpus_tar_sha256": _sha256_file(tar_path),
+        "corpus_tar_sha256": _sha256_file(tar_path) if include_archive_sha256 else "",
     }
 
 

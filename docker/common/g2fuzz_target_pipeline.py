@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -672,8 +673,14 @@ def run_subprocess(cmd: list[str], log_path: Path, timeout: int, env: dict[str, 
 
 
 def run_afl_with_resume(cmd: list[str], log_path: Path, output_dir: Path,
-                        timeout: int, env: dict[str, str]) -> tuple[int, bool, float, int]:
-    """Resume an AFL campaign after a SIGKILL, preserving its output queue."""
+                        timeout: int, env: dict[str, str], *,
+                        self_terminating: bool = False) -> tuple[int, bool, float, int]:
+    """Resume an AFL campaign after a SIGKILL, preserving its output queue.
+
+    In Phase B, AFL's native -V timer ends each attempt and flushes its own
+    stats. The host waits without a deadline so it cannot kill AFL while it
+    writes the final queue and statistics.
+    """
     started = time.monotonic()
     deadline = started + timeout
     attempts = 0
@@ -684,7 +691,7 @@ def run_afl_with_resume(cmd: list[str], log_path: Path, output_dir: Path,
     with log_path.open("wb"):
         pass
     while attempts < 16:
-        remaining = int(deadline - time.monotonic())
+        remaining = math.ceil(deadline - time.monotonic())
         if remaining <= 0:
             code, timed_out = 124, True
             break
@@ -693,8 +700,11 @@ def run_afl_with_resume(cmd: list[str], log_path: Path, output_dir: Path,
         if attempts > 1:
             # AFL++ resumes an existing -o output directory with -i -.
             attempt_cmd[attempt_cmd.index("-i") + 1] = "-"
+        if self_terminating:
+            attempt_cmd[attempt_cmd.index("--"):attempt_cmd.index("--")] = ["-V", str(remaining)]
         attempt_log = log_path.with_name(f"{log_path.stem}.attempt_{attempts:03d}{log_path.suffix}")
-        code, timed_out = run_subprocess(attempt_cmd, attempt_log, remaining, env=env)
+        code, timed_out = run_subprocess(
+            attempt_cmd, attempt_log, 0 if self_terminating else remaining, env=env)
         with log_path.open("ab") as combined:
             combined.write(f"\n[HGB_AFL_ATTEMPT={attempts} EXIT={code}]\n".encode())
             combined.write(attempt_log.read_bytes())
@@ -2520,8 +2530,10 @@ class G2FuzzPipeline:
             }
         )
         timeout = int(os.environ.get("G2FUZZ_AFL_TIMEOUT_SECONDS", "3600") or "3600")
+        self_terminating = os.environ.get("HGB_PHASE_B_REPLAY") == "1"
         code, timed_out, campaign_wall_seconds, afl_attempts = run_afl_with_resume(
-            cmd, self.workspace / "logs" / "afl.log", out, timeout, env)
+            cmd, self.workspace / "logs" / "afl.log", out, timeout, env,
+            self_terminating=self_terminating)
         queue_dir = out / "default" / "queue"
         crashes_dir = out / "default" / "crashes"
         hangs_dir = out / "default" / "hangs"
@@ -2538,8 +2550,11 @@ class G2FuzzPipeline:
             "afl_exit_code": code,
             "campaign_wall_seconds": campaign_wall_seconds,
             "afl_attempts": afl_attempts,
-            "campaign_timeout_configured": timed_out or code == 124,
-            "deadline_reached": timed_out and code == 124,
+            "campaign_timeout_configured": self_terminating or timed_out or code == 124,
+            "deadline_reached": ((self_terminating and code == 0 and
+                                  campaign_wall_seconds >= timeout - 60)
+                                 or (timed_out and code == 124)),
+            "duration_mode": "afl-native-V" if self_terminating else "host-timeout",
             "queue_count": queue_count,
             "crash_count": crash_count,
             "hang_count": hang_count,
@@ -2995,6 +3010,7 @@ class G2FuzzPipeline:
                 "afl_attempts": int(self.metrics.get("afl_attempts") or 0),
                 "execs_done": execs_done,
                 "queue_count": int(self.metrics.get("queue_count") or 0),
+                "persisted_corpus_file_count": int(self.metrics.get("persisted_corpus_file_count") or 0),
                 "crashes": int(self.metrics.get("crash_count") or 0),
                 "hangs": int(self.metrics.get("hang_count") or 0),
             },
@@ -3026,8 +3042,26 @@ class G2FuzzPipeline:
     def write_outputs(self, status: str, reason: str, exit_code: int) -> None:
         self.write_seed_provenance()
         payload = self.result_payload(status, reason, exit_code)
-        json_dump(self.workspace / "result.json", payload)
-        json_dump(self.workspace / "metadata.json", payload)
+        if status == "corpus_ready":
+            # The runner's handoff marker must survive a host crash after the
+            # corpus was fsynced. Publish it atomically after all inputs exist.
+            for name in ("result.json", "metadata.json"):
+                destination = self.workspace / name
+                temporary = destination.with_name(f".{name}.runner.tmp")
+                with temporary.open("w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, indent=2, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary, destination)
+                parent_fd = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+        else:
+            json_dump(self.workspace / "result.json", payload)
+            json_dump(self.workspace / "metadata.json", payload)
         self.write_summary(payload)
 
     def write_summary(self, payload: dict[str, Any]) -> None:
@@ -3060,7 +3094,53 @@ class G2FuzzPipeline:
                 lines.append(f"- `{path.relative_to(self.workspace)}`")
         (self.workspace / "HGB_SUMMARY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    def replay_saved(self, source_run: Path) -> int:
+    def persist_replay_corpus(self) -> None:
+        """Save the campaign inputs on the mounted host workspace before measuring.
+
+        The AFL queue is already written to the host throughout the campaign.
+        This immutable, deduplicated copy also includes the generated inputs
+        and is the only input the separate coverage measurer needs.
+        """
+        corpus = self.workspace / "coverage" / "corpus"
+        temporary = corpus.with_name(".corpus.runner.tmp")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir(parents=True)
+        seen: set[str] = set()
+        try:
+            for source_class in ("afl_queue", "g2_generated"):
+                base = self.workspace / "seeds" / source_class
+                if not base.is_dir():
+                    continue
+                for path in sorted(p for p in base.rglob("*") if p.is_file()):
+                    if source_class == "g2_generated" and not is_generated_input_candidate(path):
+                        continue
+                    digest = sha256_file(path)
+                    if digest in seen:
+                        continue
+                    seen.add(digest)
+                    destination = unique_dest(temporary, path.name)
+                    shutil.copy2(path, destination)
+                    with destination.open("rb") as handle:
+                        os.fsync(handle.fileno())
+            if not seen:
+                raise PipelineError("quality_failure", "G2Fuzz saved campaign corpus is empty", 65)
+            temporary_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(temporary_fd)
+            finally:
+                os.close(temporary_fd)
+            os.replace(temporary, corpus)
+            parent_fd = os.open(corpus.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
+        except OSError as exc:
+            raise PipelineError("quality_failure", f"G2Fuzz corpus save failed: {exc}", 65) from exc
+        self.metrics["persisted_corpus_file_count"] = len(seen)
+
+    def replay_saved(self, source_run: Path, *, runner_only: bool = False) -> int:
         """Run the native G2Fuzz campaign from Phase A artifacts, without program_gen."""
         try:
             source_run = source_run.resolve(strict=True)
@@ -3109,6 +3189,10 @@ class G2FuzzPipeline:
             })
             self.validate_generated_inputs()
             self.run_campaign()
+            if runner_only:
+                self.persist_replay_corpus()
+                self.write_outputs("corpus_ready", "none", 0)
+                return 0
             self.collect_coverage()
             if self._evaluated_ok():
                 self.write_outputs("evaluated", "none", 0)
@@ -3182,6 +3266,8 @@ def main(argv: list[str] | None = None) -> int:
         add_common_args(p)
         if name == "replay":
             p.add_argument("--source-run", required=True, type=Path)
+            p.add_argument("--runner-only", action="store_true",
+                           help="save the campaign corpus without computing coverage")
     validate_parser = sub.add_parser("validate-adapters")
     validate_parser.add_argument("--metadata-root", default=str(default_metadata_root()))
     dump_parser = sub.add_parser("dump-adapter")
@@ -3200,7 +3286,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "full":
             return pipeline.full()
         if args.command == "replay":
-            return pipeline.replay_saved(args.source_run)
+            return pipeline.replay_saved(args.source_run, runner_only=args.runner_only)
         pipeline.preflight()
         if args.command == "preflight":
             pipeline.write_outputs("dry_run_ok", "preflight completed", 0)

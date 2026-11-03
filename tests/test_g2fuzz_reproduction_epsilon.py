@@ -56,6 +56,7 @@ g2 = load_module("g2fuzz_target_pipeline_epsilon", ROOT / "docker/common/g2fuzz_
 builder = load_module("hgb_fuzzbench_builder_epsilon", ROOT / "docker/common/hgb_fuzzbench_builder.py")
 contract_mod = load_module("g2fuzz_contract_epsilon", ROOT / "docker/common/g2fuzz_contract.py")
 matrix_collector = load_module("hgb_collect_matrix_epsilon", ROOT / "scripts/hgb_collect_matrix.py")
+saved_replay = load_module("hgb_replay_saved_g2_epsilon", ROOT / "scripts/hgb_replay_saved.py")
 
 
 COVERAGE_JSON = json.dumps({
@@ -497,6 +498,124 @@ def test_afl_sigkill_resumes_existing_queue_and_records_both_attempts(tmp_path: 
     assert commands[1][2] == "-"
     assert "attempt 1" in (tmp_path / "afl.log").read_text()
     assert "attempt 2" in (tmp_path / "afl.log").read_text()
+
+
+def test_phase_b_afl_uses_native_duration_and_waits_for_its_own_exit(tmp_path: Path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, log_path, timeout, env=None):
+        calls.append((list(cmd), timeout))
+        log_path.write_text("AFL exited after its own duration\n", encoding="utf-8")
+        return 0, False
+
+    monkeypatch.setattr(g2, "run_subprocess", fake_run)
+    command = ["afl-fuzz", "-i", "seeds", "-o", str(tmp_path / "output"),
+               "-c", "target.cmp", "--", "target.afl", "@@"]
+    code, timed_out, _elapsed, attempts = g2.run_afl_with_resume(
+        command, tmp_path / "afl.log", tmp_path / "output", 100, {},
+        self_terminating=True,
+    )
+
+    assert (code, timed_out, attempts) == (0, False, 1)
+    assert len(calls) == 1
+    argv, host_timeout = calls[0]
+    assert host_timeout == 0
+    assert argv[argv.index("-V") + 1].isdecimal()
+    assert 0 < int(argv[argv.index("-V") + 1]) <= 100
+    assert argv.index("-V") < argv.index("--")
+    assert argv[argv.index("-c") + 1] == "target.cmp"
+
+
+def test_phase_a_afl_keeps_host_timeout_without_native_duration(tmp_path: Path, monkeypatch):
+    calls = []
+
+    def fake_run(cmd, log_path, timeout, env=None):
+        calls.append((list(cmd), timeout))
+        log_path.write_text("AFL completed\n", encoding="utf-8")
+        return 0, False
+
+    monkeypatch.setattr(g2, "run_subprocess", fake_run)
+    command = ["afl-fuzz", "-i", "seeds", "-o", str(tmp_path / "output"),
+               "-c", "target.cmp", "--", "target.afl", "@@"]
+    code, timed_out, _elapsed, attempts = g2.run_afl_with_resume(
+        command, tmp_path / "afl.log", tmp_path / "output", 100, {},
+    )
+
+    assert (code, timed_out, attempts) == (0, False, 1)
+    assert len(calls) == 1
+    argv, host_timeout = calls[0]
+    assert "-V" not in argv
+    assert 0 < host_timeout <= 100
+
+
+@pytest.mark.parametrize("phase_b", [False, True])
+def test_campaign_selects_native_duration_only_for_phase_b_replay(
+    tmp_path: Path, monkeypatch, phase_b: bool,
+):
+    pipeline = make_pipeline(tmp_path, runner=FakeDockerRunner())
+    pipeline.artifact_dir.mkdir(parents=True)
+    make_executable(pipeline.artifact_dir / "afl-fuzz", "#!/usr/bin/env bash\nexit 0\n")
+    pipeline.target_afl.parent.mkdir(parents=True, exist_ok=True)
+    make_executable(pipeline.target_afl, "#!/usr/bin/env bash\nexit 0\n")
+    make_executable(pipeline.target_cmp, "#!/usr/bin/env bash\nexit 0\n")
+    pipeline.invocation = g2.resolved_invocation(pipeline.adapter, pipeline.target_afl)
+    (pipeline.workspace / "campaign").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("G2FUZZ_AFL_TIMEOUT_SECONDS", "100")
+    if phase_b:
+        monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    else:
+        monkeypatch.delenv("HGB_PHASE_B_REPLAY", raising=False)
+    calls = []
+
+    def fake_campaign(cmd, log_path, output_dir, timeout, env,
+                      *, self_terminating=False):
+        calls.append((list(cmd), timeout, self_terminating))
+        queue = output_dir / "default" / "queue"
+        queue.mkdir(parents=True)
+        (queue / "id:000000").write_bytes(b"input")
+        (output_dir / "default" / "fuzzer_stats").write_text(
+            "execs_done : 12\n", encoding="utf-8",
+        )
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("AFL exited normally\n", encoding="utf-8")
+        return 0, False, 100.0, 1
+
+    monkeypatch.setattr(g2, "run_afl_with_resume", fake_campaign)
+    pipeline.run_campaign()
+
+    assert len(calls) == 1
+    argv, budget, self_terminating = calls[0]
+    assert budget == 100
+    assert self_terminating is phase_b
+    assert argv[argv.index("-c") + 1] == str(pipeline.target_cmp)
+
+
+def test_saved_g2_replay_passes_phase_b_marker_into_container(tmp_path: Path, monkeypatch):
+    source = tmp_path / "source"
+    (source / "target").mkdir(parents=True)
+    (source / "target" / "target.afl").write_bytes(b"afl")
+    (source / "target" / "target.cmp").write_bytes(b"cmp")
+    (source / "seeds" / "g2_generated").mkdir(parents=True)
+    (source / "metadata.json").write_text("{}\n", encoding="utf-8")
+    run = tmp_path / "run"
+    run.mkdir()
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(saved_replay.subprocess, "run", fake_run)
+    monkeypatch.setattr(saved_replay, "finish_g2_coverage", lambda *args: 0)
+    result = saved_replay.run_g2(
+        source, run, tmp_path / "package", "g2-image", "libpng_libpng_read_fuzzer",
+        86400, 0, 8,
+    )
+
+    assert result == 0
+    assert len(commands) == 1
+    assert "HGB_PHASE_B_REPLAY=1" in commands[0]
+    assert "G2FUZZ_AFL_TIMEOUT_SECONDS=86400" in commands[0]
 
 
 def test_afl_sigkill_waits_for_output_lock_before_resuming(tmp_path: Path, monkeypatch):

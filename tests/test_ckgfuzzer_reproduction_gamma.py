@@ -110,9 +110,11 @@ class FakeRunner:
         self.build_exit = build_exit
         self.campaign_artifact = campaign_artifact
         self._containers = {}
+        self.calls = []
 
     def __call__(self, command, timeout):
         self.commands.append(list(command))
+        self.calls.append((list(command), timeout))
         cmd = list(command)
         if not cmd:
             return FakeResult(cmd, 1)
@@ -605,8 +607,212 @@ def test_campaign_runner_uses_time_budget_without_run_cap(tmp_path: Path) -> Non
     assert any("-runs=-1" in c and "-max_total_time=2" in c for c in create_commands)
     assert any("HGB_FUZZER_EXIT_CODE=$fuzzer_rc" in c for c in create_commands)
     assert any("tail -n 2000 /tmp/campaign.log" in c for c in create_commands)
+    assert any("tar -cf /tmp/corpus.tar corpus artifacts campaign.log" in c for c in create_commands)
     assert result["execs_done"] == 500
     assert result["timeouts"] == 0
+
+
+def test_phase_b_campaign_waits_for_docker_and_saves_results(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    runner = FakeRunner()
+    result = hgb_fuzzbench_builder.run_campaign(
+        image_tag="hgb-test", binary_path="/out/fuzz_target",
+        corpus_dir=tmp_path / "seeds", work_dir=tmp_path / "campaign",
+        campaign_seconds=86400, runner=runner, keep_going=True,
+    )
+
+    docker_calls = [(command[1], timeout) for command, timeout in runner.calls
+                    if command[:1] == ["docker"]]
+    assert docker_calls == [
+        ("create", None), ("start", None), ("cp", None), ("rm", None),
+    ]
+    create = next(command for command in runner.commands if command[:2] == ["docker", "create"])
+    shell = create[-1]
+    assert "campaign_start_epoch=$(date +%s)" in shell
+    assert "campaign_end=$((campaign_start_epoch + 86400 ))" in shell
+    assert "HGB_CAMPAIGN_END_EPOCH" in shell
+    assert "-max_total_time=\"$remaining\"" in shell
+    assert "timeout -s INT" in shell
+    assert " -k " not in shell and "SIGKILL" not in shell
+    assert "tail -n 2000 /tmp/campaign.log" in shell
+    assert "tar -cf /tmp/corpus.tar corpus artifacts campaign.log" in shell
+    assert not any(command[:2] == ["docker", "kill"] for command in runner.commands)
+    assert result["execs_done"] == 500
+    assert result["copy_out_ok"] is True
+    assert result["final_corpus_file_count"] == 1
+    assert (tmp_path / "campaign/campaign/corpus.tar").is_file()
+    assert (tmp_path / "campaign/campaign/campaign.log").is_file()
+
+
+def test_phase_b_campaign_recovers_stats_from_archived_log(tmp_path: Path, monkeypatch) -> None:
+    import io
+    import tarfile
+
+    class ArchivedLogRunner(FakeRunner):
+        def __call__(self, command, timeout):
+            result = super().__call__(command, timeout)
+            if command[:2] == ["docker", "start"]:
+                return FakeResult(command, 0, "", "")
+            if command[:2] == ["docker", "cp"] and "corpus.tar" in command[2]:
+                data = b"#987654: cov: 27 time: 86401s\nINFO: fuzzed for 86401 seconds\n"
+                with tarfile.open(command[3], "a") as archive:
+                    info = tarfile.TarInfo("campaign.log")
+                    info.size = len(data)
+                    archive.addfile(info, io.BytesIO(data))
+            return result
+
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    work = tmp_path / "campaign"
+    campaign = hgb_fuzzbench_builder.run_campaign(
+        image_tag="hgb-test", binary_path="/out/fuzz_target",
+        corpus_dir=tmp_path / "seeds", work_dir=work,
+        campaign_seconds=86400, runner=ArchivedLogRunner(), keep_going=True,
+    )
+
+    assert campaign["execs_done"] == 987654
+    assert (work / "campaign/fuzzer.log").read_bytes().startswith(b"#987654:")
+    assert "#987654:" in (work / "campaign/campaign.log").read_text(encoding="utf-8")
+    assert campaign["final_corpus_file_count"] == 1
+
+
+def test_phase_b_coverage_copy_is_synced_before_container_cleanup(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import os
+    import stat
+
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    report = tmp_path / "coverage" / "coverage.lcov"
+    payload = b"TN:\nSF:/src/example.c\nDA:1,1\nend_of_record\n"
+    events: list[str] = []
+    original_fsync = os.fsync
+
+    def observed_fsync(fd: int) -> None:
+        mode = os.fstat(fd).st_mode
+        events.append("dir_fsync" if stat.S_ISDIR(mode) else "file_fsync")
+        original_fsync(fd)
+
+    monkeypatch.setattr(hgb_fuzzbench_builder.os, "fsync", observed_fsync)
+
+    def runner(command, timeout):
+        cmd = list(command)
+        if cmd[:2] == ["docker", "cp"]:
+            assert Path(cmd[3]) != report
+            Path(cmd[3]).write_bytes(payload)
+        if cmd[:2] == ["docker", "rm"]:
+            events.append("rm")
+            assert len(cmd) == 3
+            assert report.read_bytes() == payload
+        return hgb_fuzzbench_builder.CommandResult(cmd, 0, "", "")
+
+    result = hgb_fuzzbench_builder._container_run(
+        image_tag="hgb-test", work_dir=report.parent, runner=runner,
+        timeout_seconds=10, command=["true"], phase="coverage",
+        copy_out=("/tmp/cov/coverage.lcov", report),
+    )
+
+    assert result.copy_out_ok is True
+    assert events == ["file_fsync", "dir_fsync", "rm"]
+    assert list(report.parent.glob(".coverage.lcov.hgb-copy-*")) == []
+
+
+@pytest.mark.parametrize("copy_exit,payload", [(1, b"partial"), (0, b"")])
+def test_phase_b_failed_coverage_copy_keeps_container_and_no_report(
+    tmp_path: Path, monkeypatch, copy_exit: int, payload: bytes,
+) -> None:
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    report = tmp_path / "coverage" / "coverage.lcov"
+    calls: list[list[str]] = []
+
+    def runner(command, timeout):
+        cmd = list(command)
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "cp"]:
+            Path(cmd[3]).write_bytes(payload)
+            return hgb_fuzzbench_builder.CommandResult(cmd, copy_exit, "", "copy failed")
+        return hgb_fuzzbench_builder.CommandResult(cmd, 0, "", "")
+
+    result = hgb_fuzzbench_builder._container_run(
+        image_tag="hgb-test", work_dir=report.parent, runner=runner,
+        timeout_seconds=10, command=["true"], phase="coverage",
+        copy_out=("/tmp/cov/coverage.lcov", report),
+    )
+
+    assert result.copy_out_ok is False
+    assert not report.exists()
+    assert list(report.parent.glob(".coverage.lcov.hgb-copy-*")) == []
+    assert not any(cmd[:2] in (["docker", "rm"], ["docker", "kill"]) for cmd in calls)
+    assert "coverage copy-out failed; container retained" in (report.parent / "coverage.log").read_text()
+
+
+def test_phase_b_coverage_fsync_failure_keeps_container(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    report = tmp_path / "coverage" / "coverage.lcov"
+    calls: list[list[str]] = []
+
+    def failed_fsync(_fd: int) -> None:
+        raise OSError("sync failed")
+
+    monkeypatch.setattr(hgb_fuzzbench_builder.os, "fsync", failed_fsync)
+
+    def runner(command, timeout):
+        cmd = list(command)
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "cp"]:
+            Path(cmd[3]).write_bytes(b"TN:\nSF:/src/example.c\nDA:1,1\nend_of_record\n")
+        return hgb_fuzzbench_builder.CommandResult(cmd, 0, "", "")
+
+    result = hgb_fuzzbench_builder._container_run(
+        image_tag="hgb-test", work_dir=report.parent, runner=runner,
+        timeout_seconds=10, command=["true"], phase="coverage",
+        copy_out=("/tmp/cov/coverage.lcov", report),
+    )
+
+    assert result.copy_out_ok is False
+    assert not report.exists()
+    assert list(report.parent.glob(".coverage.lcov.hgb-copy-*")) == []
+    assert not any(cmd[:2] == ["docker", "rm"] for cmd in calls)
+
+
+def test_phase_b_truncated_corpus_tar_keeps_campaign_container(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    import io
+    import tarfile
+
+    monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    archive_path = tmp_path / "campaign" / "corpus.tar"
+    calls: list[list[str]] = []
+
+    def runner(command, timeout):
+        cmd = list(command)
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "cp"]:
+            staged = Path(cmd[3])
+            data = b"x" * 4096
+            with tarfile.open(staged, "w") as archive:
+                entry = tarfile.TarInfo("corpus/seed")
+                entry.size = len(data)
+                archive.addfile(entry, io.BytesIO(data))
+            with staged.open("r+b") as output:
+                output.truncate(512 + 100)
+        return hgb_fuzzbench_builder.CommandResult(cmd, 0, "", "")
+
+    result = hgb_fuzzbench_builder._container_run(
+        image_tag="hgb-test", work_dir=archive_path.parent, runner=runner,
+        timeout_seconds=10, command=["true"], phase="campaign",
+        copy_out=("/tmp/corpus.tar", archive_path),
+    )
+
+    assert result.copy_out_ok is False
+    assert not archive_path.exists()
+    assert list(archive_path.parent.glob(".corpus.tar.hgb-copy-*")) == []
+    assert not any(cmd[:2] == ["docker", "rm"] for cmd in calls)
+    audit = (archive_path.parent / "campaign.log").read_text(encoding="utf-8")
+    assert "unexpected end of data" in audit
+    assert "campaign copy-out failed; container retained" in audit
 
 
 def test_keep_going_campaign_preserves_crash_artifact_outside_corpus(tmp_path: Path) -> None:
