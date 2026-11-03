@@ -90,6 +90,8 @@ python3 scripts/hgb_eval_all.py --phase generate --parallel-worker 32
 
 Phase B starts a fresh 24-hour fuzzing campaign from each saved Phase A artifact. The runner saves the complete corpus and campaign evidence, then records `corpus_ready` in the CSV. A separate measurer process reads that saved corpus and writes the canonical LCOV report. Neither stage calls a baseline's generator or LLM. Run the stages after Phase A succeeds:
 
+Pressing Ctrl-C stops active Phase B jobs and containers, then leaves unfinished trials in the CSV for inspection or `--resume`.
+
 ```bash
 time python3 scripts/hgb_eval_all.py \
     --phase fuzz \

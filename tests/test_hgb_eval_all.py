@@ -318,14 +318,14 @@ def test_job_processes_stop_entire_replay_process_group() -> None:
         processes.discard(process)
 
 
-def test_phase_b_drain_does_not_signal_child_started_during_interrupt(monkeypatch) -> None:
-    processes = hgb_eval_all.JobProcesses(drain_on_interrupt=True)
+def test_phase_b_interrupt_signals_child_started_during_interrupt(monkeypatch) -> None:
+    processes = hgb_eval_all.JobProcesses()
     signalled = []
     monkeypatch.setattr(processes, "_signal", lambda process, signum: signalled.append(signum))
     processes.interrupted.set()
     child = object()
     processes.add(child)
-    assert not signalled
+    assert signalled == [signal.SIGTERM]
     processes.discard(child)
 
 

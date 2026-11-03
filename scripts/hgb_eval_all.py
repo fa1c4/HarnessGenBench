@@ -47,18 +47,17 @@ MEMORY_LAUNCH_BATCH = 4
 
 
 class JobProcesses:
-    """Own child process groups; Phase B may drain them after an interrupt."""
+    """Own child process groups and stop late arrivals after an interrupt."""
 
-    def __init__(self, *, drain_on_interrupt: bool = False) -> None:
+    def __init__(self) -> None:
         self.interrupted = threading.Event()
-        self.drain_on_interrupt = drain_on_interrupt
         self._lock = threading.Lock()
         self._processes: set[subprocess.Popen[Any]] = set()
 
     def add(self, process: subprocess.Popen[Any]) -> None:
         with self._lock:
             self._processes.add(process)
-            if self.interrupted.is_set() and not self.drain_on_interrupt:
+            if self.interrupted.is_set():
                 self._signal(process, signal.SIGTERM)
 
     def discard(self, process: subprocess.Popen[Any]) -> None:
@@ -81,13 +80,17 @@ class JobProcesses:
             self._signal(process, signum)
 
 
-def stop_eval_containers(run_id: str) -> None:
+def stop_eval_containers(run_id: str, *, deadline_seconds: float = 60) -> None:
     """Stop only containers labelled by this evaluation run."""
+    deadline = time.monotonic() + deadline_seconds
     try:
         def listed_ids() -> list[str]:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(["docker", "ps"], deadline_seconds)
             result = subprocess.run(
                 ["docker", "ps", "-aq", "--filter", f"label=hgb.eval_all_run={run_id}"],
-                capture_output=True, text=True, timeout=15, check=False)
+                capture_output=True, text=True, timeout=min(15, remaining), check=False)
             if result.returncode:
                 raise RuntimeError(result.stderr.strip() or "docker ps failed")
             return result.stdout.split()
@@ -100,10 +103,13 @@ def stop_eval_containers(run_id: str) -> None:
             # reaches the last container. Continue with later batches even if
             # one batch is slow or a --rm container disappears meanwhile.
             for start in range(0, len(container_ids), 12):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(["docker", "rm"], deadline_seconds)
                 try:
                     subprocess.run(["docker", "rm", "-f", *container_ids[start:start + 12]],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=45, check=False)
+                                   timeout=min(15, remaining), check=False)
                 except subprocess.TimeoutExpired:
                     continue
         remaining = listed_ids()
@@ -995,7 +1001,7 @@ def main() -> int:
           f"admission={'measured' if args.phase != 'generate' else 'fixed'}; "
           f"runners={runner_ceiling}; measurers={measurer_ceiling}", flush=True)
     if args.phase != "generate":
-        processes = JobProcesses(drain_on_interrupt=True)
+        processes = JobProcesses()
         prior_sigint = signal.getsignal(signal.SIGINT)
         prior_sigterm = signal.getsignal(signal.SIGTERM)
         def interrupt(_signum: int, _frame: Any) -> None:
@@ -1012,6 +1018,8 @@ def main() -> int:
             with (ThreadPoolExecutor(max_workers=max(1, runner_ceiling)) as runner_pool,
                   ThreadPoolExecutor(max_workers=max(1, measurer_ceiling)) as measurer_pool):
                 stopped = False
+                stopped_at = 0.0
+                children_killed = False
                 next_memory_sample = 0.0
                 admission_capacity = 0
                 last_reported_capacity = None
@@ -1019,9 +1027,15 @@ def main() -> int:
                     admission_open = False
                     if processes.interrupted.is_set() and not stopped:
                         stopped = True
-                        print("Interrupt received; waiting for active Phase B jobs to finish", flush=True)
+                        stopped_at = time.monotonic()
+                        print("Interrupt received; stopping active Phase B jobs", flush=True)
                         runner_pending.clear()
                         measurer_pending.clear()
+                        processes.stop(signal.SIGTERM)
+                    if (stopped and active and not children_killed
+                            and time.monotonic() - stopped_at >= 5):
+                        processes.stop(signal.SIGKILL)
+                        children_killed = True
                     if (not stopped and (runner_pending or measurer_pending)
                             and time.monotonic() >= next_memory_sample):
                         try:
@@ -1126,6 +1140,7 @@ def main() -> int:
             signal.signal(signal.SIGINT, prior_sigint)
             signal.signal(signal.SIGTERM, prior_sigterm)
         if processes.interrupted.is_set():
+            stop_eval_containers(args.run_id)
             if args.trials > 1:
                 save_trial_summary(output.with_name(output.stem + ".summary.csv"),
                                    targets, rows, args.trials)
