@@ -56,6 +56,7 @@ def test_default_run_id_uses_phase_date_and_campaign_duration() -> None:
         "eval_all_phase_a_20261016_300s")
     assert hgb_eval_all.default_run_id("fuzz", "2026-10-16", 86400, 300) == (
         "eval_all_phase_b_20261016_86400s")
+    assert hgb_eval_all.batch_id_for_start(datetime(2026, 11, 3, 21, 10)) == "20261103-2110"
 
 
 def test_trials_for_each_pair_are_scheduled_together() -> None:
@@ -139,11 +140,113 @@ def test_default_plan_uses_today_workspace_paths_and_saved_manifest(tmp_path: Pa
     monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--plan"])
     assert hgb_eval_all.main() == 0
     manifest = tmp_path / "workspace/eval_all/2026-10-16.phase_a.json"
-    output = tmp_path / "workspace/eval_all/2026-10-16.csv"
+    batch = tmp_path / "workspace/eval_all/20261016-0000"
+    output = batch / "results.csv"
     assert manifest.read_bytes() == saved.read_bytes()
+    assert (batch / "phase_a.json").read_bytes() == saved.read_bytes()
     assert output.is_file()
     assert all(row[f"{baseline}_status"] == "pending" for baseline in hgb_eval_all.BASELINES
                for row in csv.DictReader(output.open(newline="", encoding="utf-8")))
+
+
+def test_batches_on_same_day_use_start_minute_and_resume_by_id(tmp_path: Path, monkeypatch) -> None:
+    class StartClock:
+        current = datetime(2026, 11, 3, 20, 48)
+
+        @classmethod
+        def now(cls):
+            return cls.current
+
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"ckgfuzzer", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    base = tmp_path / "workspace/eval_all"
+    base.mkdir(parents=True)
+    manifest = base / "2026-11-03.phase_a.json"
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("ckgfuzzer", "g2fuzz")
+    ]}), encoding="utf-8")
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "datetime", StartClock)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    fresh = ["hgb_eval_all.py", "--phase", "fuzz", "--plan",
+             "--trials", "5", "--campaign-seconds", "60",
+             "--baseline", "ckgfuzzer", "--target", target]
+    monkeypatch.setattr(sys, "argv", fresh)
+    assert hgb_eval_all.main() == 0
+    first = base / "20261103-2048"
+    assert (first / "results.csv").is_file()
+    assert (first / "phase_a.json").read_bytes() == manifest.read_bytes()
+    assert json.loads((first / "batch.json").read_text())["trials"] == 5
+    with pytest.raises(SystemExit, match="2"):
+        hgb_eval_all.main()
+
+    StartClock.current = datetime(2026, 11, 3, 20, 49)
+    assert hgb_eval_all.main() == 0
+    second = base / "20261103-2049"
+    assert (second / "results.csv").is_file()
+    assert (second / "phase_a.json").is_file()
+
+    second_before = (second / "results.csv").read_bytes()
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--resume",
+                                      "--plan", "--batch-id", first.name,
+                                      "--baseline", "ckgfuzzer", "--target", target])
+    assert hgb_eval_all.main() == 0
+    assert (second / "results.csv").read_bytes() == second_before
+    assert len(list(csv.DictReader((first / "results.csv").open(newline="")))) == 5
+
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz", "--resume",
+                                      "--plan", "--batch-id", first.name,
+                                      "--trials", "1", "--baseline", "ckgfuzzer",
+                                      "--target", target])
+    with pytest.raises(SystemExit, match="2"):
+        hgb_eval_all.main()
+
+
+def test_new_batch_keeps_csv_and_logs_together(tmp_path: Path, monkeypatch) -> None:
+    class StartClock:
+        @staticmethod
+        def now():
+            return datetime(2026, 11, 3, 21, 10)
+
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"ckgfuzzer", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    manifest = tmp_path / "workspace/eval_all/2026-11-03.phase_a.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("ckgfuzzer", "g2fuzz")
+    ]}), encoding="utf-8")
+    log_dirs = []
+
+    def fake_replay(*args):
+        log_dirs.append(args[6])
+        return {"status": "quality_failure", "reason": "synthetic failure"}
+
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "datetime", StartClock)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(hgb_eval_all, "run_replay_job", fake_replay)
+    monkeypatch.setattr(hgb_eval_all, "eval_container_memory_gib", lambda _run_id: 0.0)
+    monkeypatch.setattr(hgb_eval_all, "host_available_memory_gib", lambda: 90.0)
+    monkeypatch.setattr(hgb_eval_all, "host_memory_gib", lambda: 100)
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run",
+                        lambda *_args, **_kwargs: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz",
+                                      "--baseline", "ckgfuzzer", "--target", target,
+                                      "--parallel-worker", "1"])
+    original_cwd = Path.cwd()
+    try:
+        assert hgb_eval_all.main() == 1
+    finally:
+        monkeypatch.chdir(original_cwd)
+    batch = tmp_path / "workspace/eval_all/20261103-2110"
+    assert (batch / "results.csv").is_file()
+    assert log_dirs == [batch / "logs"]
 
 
 def test_latest_manifest_skips_incomplete_newer_selection(tmp_path: Path) -> None:
@@ -522,7 +625,9 @@ def test_trials_plan_has_independent_rows_and_default_paths(tmp_path: Path, monk
     monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz",
                                       "--date", "2026-10-20", "--trials", "5", "--plan"])
     assert hgb_eval_all.main() == 0
-    output = tmp_path / "workspace/eval_all/2026-10-20.trials5.csv"
+    batches = list((tmp_path / "workspace/eval_all").glob("*/results.csv"))
+    assert len(batches) == 1
+    output = batches[0]
     records = list(csv.DictReader(output.open(newline="", encoding="utf-8")))
     assert len(records) == 5
     assert [row["trial"] for row in records] == ["1", "2", "3", "4", "5"]
@@ -593,6 +698,50 @@ def test_replay_trials_use_distinct_run_ids_and_logs(tmp_path: Path, monkeypatch
     assert seen == ["batch_trial_001_promefuzz_example", "batch_trial_002_promefuzz_example"]
     assert (logs / "promefuzz_example.trial_001.log").is_file()
     assert (logs / "promefuzz_example.trial_002.log").is_file()
+
+
+def test_replay_refuses_existing_run_before_reading_stale_result(tmp_path: Path, monkeypatch) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    run = tmp_path / "workspace/ckgfuzzer/example/batch_ckgfuzzer_example"
+    run.mkdir(parents=True)
+    (run / "metadata.json").write_text('{"status":"infra_failure","reason":"old failure"}')
+
+    def unexpected_run(*_args, **_kwargs):
+        pytest.fail("replay child must not start for an existing run")
+
+    monkeypatch.setattr(hgb_eval_all.subprocess, "run", unexpected_run)
+    with pytest.raises(FileExistsError, match="Phase B run already exists"):
+        hgb_eval_all.run_replay_job(tmp_path, "ckgfuzzer", "example", "saved",
+                                    "batch", 60, logs, 1, 8)
+
+
+def test_phase_b_rejects_run_collision_before_writing_csv(tmp_path: Path, monkeypatch,
+                                                          capsys) -> None:
+    target = "example"
+    scope = {(baseline, target): "pending" if baseline in {"ckgfuzzer", "g2fuzz"} else "N/A"
+             for baseline in hgb_eval_all.BASELINES}
+    manifest = tmp_path / "inputs/manifest.json"
+    manifest.parent.mkdir()
+    manifest.write_text(json.dumps({"records": [
+        {"baseline": baseline, "target": target, "status": "ready", "source_run": "saved"}
+        for baseline in ("ckgfuzzer", "g2fuzz")
+    ]}), encoding="utf-8")
+    output = tmp_path / "outputs/trials.csv"
+    run = tmp_path / "workspace/ckgfuzzer/example/batch_ckgfuzzer_example"
+    run.mkdir(parents=True)
+    monkeypatch.setattr(hgb_eval_all, "ROOT", tmp_path)
+    monkeypatch.setattr(hgb_eval_all, "plan", lambda _root: ([target], scope))
+    monkeypatch.setattr(hgb_eval_all, "source_ready", lambda _b, _t, source: (True, source))
+    monkeypatch.setattr(sys, "argv", ["hgb_eval_all.py", "--phase", "fuzz",
+                                      "--baseline", "ckgfuzzer", "--target", target,
+                                      "--run-id", "batch", "--manifest", str(manifest),
+                                      "--output", str(output)])
+    with pytest.raises(SystemExit) as error:
+        hgb_eval_all.main()
+    assert error.value.code == 2
+    assert "Phase B run directories already exist" in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_replay_measurer_uses_exact_saved_run_and_never_starts_fuzz(tmp_path: Path, monkeypatch) -> None:

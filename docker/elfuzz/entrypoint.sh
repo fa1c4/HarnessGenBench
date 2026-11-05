@@ -29,6 +29,28 @@ find_elfuzz_project_root() {
 ELFUZZ_PROJECT_ROOT="$(find_elfuzz_project_root || true)"
 export ELFUZZ_PROJECT_ROOT
 
+patch_elfuzz_campaign_archive() {
+  local rq1="$ELFUZZ_PROJECT_ROOT/cli/rq1.py"
+  if [[ ! -f "$rq1" ]]; then
+    [[ -z "${HGB_CAMPAIGN_TMP_ROOT:-}" ]] && return 0
+    echo "ELFuzz rq1.py missing; cannot redirect campaign archive to workspace" >&2
+    return 70
+  fi
+  python3 - "$rq1" <<'PY_ELFUZZ_ARCHIVE_PATCH'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = 'os.path.join(PROJECT_ROOT, "extradata", "rq1", "afl_results")'
+new = 'os.environ.get("ELFUZZ_CAMPAIGN_OUTPUT_DIR", os.path.join(PROJECT_ROOT, "extradata", "rq1", "afl_results"))'
+if old not in text and new not in text:
+    raise SystemExit("ELFuzz rq1 archive path changed; refusing disk fallback")
+if new not in text:
+    path.write_text(text.replace(old, new))
+PY_ELFUZZ_ARCHIVE_PATCH
+}
+
 patch_elfuzz_trace() {
   local py="$ELFUZZ_PROJECT_ROOT/genvariants_parallel.py"
   [[ -f "$py" ]] || return 0
@@ -443,6 +465,7 @@ if [[ "$mode" == "generate-target" ]]; then
   patch_elfuzz_cleanup
   patch_elfuzz_trace
   patch_elfuzz_sibling_paths
+  patch_elfuzz_campaign_archive
   setup_elfuzz_tgi_proxy
   patch_elfuzz_hgb_flags
   ensure_elfuzz_deps

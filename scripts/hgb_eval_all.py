@@ -623,6 +623,8 @@ def run_replay_job(root: Path, baseline: str, target: str, source: str,
         pair_id = run.name
     else:
         run = root / planned_run
+        if run.exists():
+            raise FileExistsError(f"Phase B run already exists: {run}")
     cmd = [sys.executable, str(root / "scripts/hgb_replay_saved.py"),
            "--baseline", baseline, "--target", target, "--source-run", source,
            "--run-id", pair_id, "--campaign-seconds", str(budget),
@@ -728,6 +730,30 @@ def default_run_id(phase: str, date: str, campaign_seconds: int,
     return f"eval_all_phase_{phase_letter}_{date.replace('-', '')}_{duration}s"
 
 
+def batch_id_for_start(started: datetime) -> str:
+    """Use the coordinator start minute as the batch directory and run ID."""
+    return f"{started:%Y%m%d-%H%M}"
+
+
+def save_batch_config(path: Path, *, started: datetime, phase: str, date: str,
+                      trials: int, campaign_seconds: int,
+                      generation_campaign_seconds: int) -> None:
+    payload = {
+        "schema_version": 1, "batch_id": path.parent.name,
+        "started_at": started.isoformat(), "phase": phase, "date": date,
+        "trials": trials, "campaign_seconds": campaign_seconds,
+        "generation_campaign_seconds": generation_campaign_seconds,
+    }
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        temp = Path(handle.name)
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    temp.replace(path)
+    _fsync_directory(path.parent)
+
+
 def write_coverage_products(output: Path) -> bool:
     """Recount saved LCOV on target code and the shared executable line set."""
     audit_dir = output.parent if output.is_relative_to(ROOT / "workspace") else ROOT / "workspace/eval_all"
@@ -792,12 +818,15 @@ def main() -> int:
     parser.add_argument("--memory-budget-gib", type=int, default=0,
                         help="Phase B measured RAM budget; 0 uses 70%% of host RAM")
     parser.add_argument("--source-audit", type=Path, help="Verified Phase A audit JSON; defaults to the latest local audit")
-    parser.add_argument("--manifest", type=Path, help="Phase A artifact manifest; defaults to workspace/eval_all/<date>.phase_a.json")
+    parser.add_argument("--manifest", type=Path,
+                        help="Phase A artifact manifest for a new run; each batch saves a snapshot")
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"))
-    parser.add_argument("--run-id", help="Defaults to eval_all_phase_<a/b>_<date>_<campaign-seconds>s")
-    parser.add_argument("--output", type=Path, help="Override workspace/eval_all/<date>.csv")
+    parser.add_argument("--run-id", help="Legacy run ID override; timestamped batches use YYYYMMDD-HHMM")
+    parser.add_argument("--output", type=Path, help="Legacy CSV path override; new batches use a timestamped directory")
     parser.add_argument("--plan", action="store_true", help="Write planned/N/A CSV without Docker or target preparation")
-    parser.add_argument("--resume", action="store_true", help="Reuse saved corpus and coverage in the existing CSV")
+    parser.add_argument("--resume", action="store_true",
+                        help="Reuse a batch's saved corpus and coverage; pass --batch-id")
+    parser.add_argument("--batch-id", help="Exact workspace/eval_all batch directory to resume")
     parser.add_argument("--rebuild-images", action="store_true", help="Rebuild all baseline images before launching jobs")
     args = parser.parse_args()
     if (args.parallel_worker < 1 or args.measurer_worker < 1 or args.trials < 1
@@ -805,44 +834,97 @@ def main() -> int:
             or args.generation_timeout_seconds < 1 or args.memory_per_job_gib < 1
             or args.memory_budget_gib < 0):
         parser.error("worker count, memory cap, and time budgets must be positive")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
+        parser.error("--date must be YYYY-MM-DD")
+    if args.phase == "measure":
+        args.resume = True
+    if args.batch_id and not args.resume:
+        parser.error("--batch-id requires --resume or --phase measure")
+    if args.batch_id and (args.output or args.run_id or args.manifest):
+        parser.error("--batch-id cannot be combined with --output, --run-id, or --manifest")
+    if args.run_id and not args.output:
+        parser.error("--run-id requires --output; new batches use the start minute as their ID")
+    if args.resume and not args.batch_id and not args.output:
+        parser.error("--resume requires --batch-id (or --output for a legacy CSV)")
+    if args.batch_id and not re.fullmatch(r"\d{8}-\d{4}", args.batch_id):
+        parser.error("--batch-id must have YYYYMMDD-HHMM form")
+    if args.batch_id:
+        batch_config = read_json(ROOT / "workspace/eval_all" / args.batch_id / "batch.json")
+        if batch_config.get("schema_version") != 1 or batch_config.get("batch_id") != args.batch_id:
+            parser.error(f"batch configuration is missing or invalid: {args.batch_id}")
+        if batch_config.get("phase") not in {"generate", "fuzz", "all"}:
+            parser.error(f"batch configuration has an invalid phase: {args.batch_id}")
+        if "--phase" not in sys.argv[1:]:
+            args.phase = batch_config["phase"]
+        for option, field in (("--date", "date"), ("--trials", "trials"),
+                              ("--campaign-seconds", "campaign_seconds")):
+            saved = batch_config.get(field)
+            if ((field == "date" and (not isinstance(saved, str) or
+                                      not re.fullmatch(r"\d{4}-\d{2}-\d{2}", saved))) or
+                    (field != "date" and (type(saved) is not int or saved < 1))):
+                parser.error(f"batch configuration has invalid {field}: {args.batch_id}")
+            if option in sys.argv[1:] and getattr(args, field) != saved:
+                parser.error(f"{option} disagrees with batch {args.batch_id}: {saved}")
+            setattr(args, field, saved)
+        if args.phase == "generate":
+            args.generation_campaign_seconds = batch_config.get(
+                "generation_campaign_seconds", args.generation_campaign_seconds)
     if args.phase == "generate" and args.trials != 1:
         parser.error("--trials applies only to Phase B")
     if args.phase == "generate" and (args.baseline or args.target):
         parser.error("--baseline and --target currently apply only to Phase B")
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
-        parser.error("--date must be YYYY-MM-DD")
-    args.run_id = args.run_id or default_run_id(
+    base_run_id = args.run_id or default_run_id(
         args.phase, args.date, args.campaign_seconds, args.generation_campaign_seconds)
-    if args.trials > 1 and args.run_id == default_run_id(
+    if args.trials > 1 and base_run_id == default_run_id(
             args.phase, args.date, args.campaign_seconds, args.generation_campaign_seconds):
-        args.run_id += f"_trials{args.trials}"
+        base_run_id += f"_trials{args.trials}"
+    started = datetime.now()
+    batch_dir: Path | None = None
+    manifest_date = args.date
+    if args.batch_id:
+        batch_dir = ROOT / "workspace/eval_all" / args.batch_id
+        args.run_id = f"{args.batch_id}_resume_{started:%Y%m%dT%H%M%S%f}"
+        output = batch_dir / "results.csv"
+        manifest = (batch_dir / "phase_a.json").resolve()
+    elif args.output:
+        args.run_id = base_run_id if args.run_id or args.resume else batch_id_for_start(started)
+        output = args.output.resolve()
+        output_date = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.|$)", output.name)
+        manifest_date = output_date.group(1) if args.resume and output_date else args.date
+        manifest = (args.manifest or ROOT / "workspace/eval_all" /
+                    f"{manifest_date}.phase_a.json").resolve()
+        if args.resume and not args.plan:
+            args.run_id += f"_resume_{started:%Y%m%dT%H%M%S%f}"
+    else:
+        args.run_id = batch_id_for_start(started)
+        batch_dir = ROOT / "workspace/eval_all" / args.run_id
+        output = batch_dir / "results.csv"
+        manifest = (args.manifest or ROOT / "workspace/eval_all" /
+                    f"{args.date}.phase_a.json").resolve()
     if not re.fullmatch(r"[A-Za-z0-9_-]+", args.run_id):
         parser.error("--run-id must contain only letters, digits, underscore, or hyphen")
-    default_name = (f"{args.date}.phase_a.csv" if args.phase == "generate" else
-                    f"{args.date}.trials{args.trials}.csv" if args.trials > 1 else f"{args.date}.csv")
-    output = (args.output or ROOT / "workspace/eval_all" / default_name).resolve()
-    if args.phase == "measure":
-        args.resume = True
-    output_date = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.|$)", output.name)
-    manifest_date = output_date.group(1) if args.resume and output_date else args.date
-    manifest = (args.manifest or ROOT / "workspace/eval_all" / f"{manifest_date}.phase_a.json").resolve()
     for label, path in (("output", output), ("manifest", manifest)):
         if path.resolve().parent == ROOT:
             parser.error(f"--{label} may not create a file in the repository root: {path}")
+    if batch_dir and not args.resume and batch_dir.exists():
+        parser.error(f"batch directory already exists: {batch_dir}; retry in another minute")
     if output.exists() and not args.resume:
         parser.error(f"output already exists: {output}; pass --resume or --output")
     if args.resume and not output.exists():
         parser.error(f"--resume requires an existing CSV: {output}")
-    if args.resume and not args.plan:
-        # Failed or interrupted trials need fresh run directories. Preserve
-        # completed rows in the CSV while keeping each retry auditable.
-        args.run_id += "_resume_" + datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    if args.batch_id and not manifest.is_file():
+        parser.error(f"batch manifest is missing: {manifest}")
     output.parent.mkdir(parents=True, exist_ok=True)
     lock_handle = (output.parent / f"{output.name}.lock").open("w")
     try:
         fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         parser.error(f"another evaluation coordinator owns {output}")
+    if batch_dir and not args.resume:
+        save_batch_config(batch_dir / "batch.json", started=started, phase=args.phase,
+                          date=args.date, trials=args.trials,
+                          campaign_seconds=args.campaign_seconds,
+                          generation_campaign_seconds=args.generation_campaign_seconds)
     targets, scope = plan(ROOT)
     selected_baselines = set(args.baseline or BASELINES)
     selected_targets = set(args.target or targets)
@@ -864,6 +946,8 @@ def main() -> int:
         sources = audited_sources(ROOT, audit)
         save_manifest(manifest, sources, targets, scope)
         sources = manifest_sources(manifest)
+    if batch_dir and manifest != batch_dir / "phase_a.json":
+        shutil.copy2(manifest, batch_dir / "phase_a.json")
     rows = {job_key(trial, b, t, args.trials):
             {"status": ("N/A" if scope[b, t] == "N/A" else
                         "pending" if args.phase == "generate" or (b, t) in selected_pairs else "not_selected"),
@@ -946,10 +1030,21 @@ def main() -> int:
                         rows[key] = old
                     else:
                         rows[key] = {"status": "pending"}
-    save_csv(output, targets, rows, args.trials)
     jobs = [(trial, baseline, target) for trial, baseline, target in
             scheduled_jobs(targets, scope, args.trials)
             if (baseline, target) in selected_pairs or args.phase == "generate"]
+    if args.phase in ("fuzz", "all") and not args.plan:
+        collisions = [ROOT / replay_run_relative(b, t, args.run_id, trial, args.trials)
+                      for trial, b, t in jobs
+                      if rows[job_key(trial, b, t, args.trials)]["status"] == "pending"
+                      and (ROOT / replay_run_relative(b, t, args.run_id, trial, args.trials)).exists()]
+        if collisions:
+            examples = ", ".join(str(path) for path in collisions[:3])
+            suffix = f" (and {len(collisions) - 3} more)" if len(collisions) > 3 else ""
+            parser.error(f"{len(collisions)} Phase B run directories already exist: "
+                         f"{examples}{suffix}; use --resume with the existing CSV "
+                         "or choose a new --run-id")
+    save_csv(output, targets, rows, args.trials)
     needed_statuses = ({"pending", "corpus_ready"} if args.phase == "all" else
                        {"corpus_ready"} if args.phase == "measure" else {"pending"})
     remaining = sum(rows[job_key(trial, b, t, args.trials)]["status"] in needed_statuses
@@ -958,6 +1053,8 @@ def main() -> int:
           f"{args.trials * len(targets) * len(BASELINES) - len(jobs)} unselected or N/A; "
           f"trials={args.trials}; requested_workers={args.parallel_worker}; "
           f"campaign={args.campaign_seconds}s", flush=True)
+    if batch_dir:
+        print(f"batch_id={batch_dir.name}; batch_dir={batch_dir}", flush=True)
     print(output, flush=True)
     if args.plan:
         return 0
@@ -982,7 +1079,8 @@ def main() -> int:
     if not docker_ready:
         print("Docker is unavailable or unresponsive; no jobs started", file=sys.stderr)
         return 2
-    log_dir = ROOT / "workspace/eval_all" / args.run_id
+    log_dir = (batch_dir / (f"resume_{started:%Y%m%dT%H%M%S%f}" if args.resume else "logs")
+               if batch_dir else ROOT / "workspace/eval_all" / args.run_id)
     log_dir.mkdir(parents=True, exist_ok=False)
     os.chdir(log_dir)
     cpus = sorted(os.sched_getaffinity(0))
@@ -1233,6 +1331,8 @@ def main() -> int:
                         sources[baseline, target] = result["run"]
                         result["status"] = "generated"
                         save_manifest(manifest, sources, targets, scope)
+                        if batch_dir and manifest != batch_dir / "phase_a.json":
+                            shutil.copy2(manifest, batch_dir / "phase_a.json")
                     rows[baseline, target] = result
                 except Exception as exc:
                     rows[baseline, target] = {"status": "runner_failed", "reason": str(exc)}

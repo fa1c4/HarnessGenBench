@@ -36,6 +36,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hgb_campaign_storage import AflTreeCheckpoint, require_tmpfs
+
 
 STAGE_NAMES = (
     "target_classification",
@@ -2056,11 +2059,11 @@ class ELFuzzPipeline:
     def collect_campaign(self) -> None:
         benchmark = str(self.adapter["upstream_benchmark"])
         sources = []
-        if self.project_root:
-            sources.append(self.project_root / "extradata" / "rq1" / "afl_results")
         env_src = os.environ.get("ELFUZZ_CAMPAIGN_OUTPUT_DIR")
         if env_src:
             sources.append(Path(env_src))
+        elif self.project_root:
+            sources.append(self.project_root / "extradata" / "rq1" / "afl_results")
         queue_dir = self.workspace / "campaign" / "queue"
         crashes_dir = self.workspace / "campaign" / "crashes"
         hangs_dir = self.workspace / "campaign" / "hangs"
@@ -2113,10 +2116,36 @@ class ELFuzzPipeline:
         (self.workspace / "campaign" / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
         campaign_deadline = int(self.budget["campaign_seconds"])
         stage_cap = int(os.environ.get("ELFUZZ_STAGE_TIMEOUT_SECONDS", "0") or "0")
-        # The campaign runs until its configured deadline. A stage cap smaller
-        # than the deadline is a premature timeout (failure), not completion.
-        subprocess_timeout = min(campaign_deadline, stage_cap) if stage_cap > 0 else campaign_deadline
-        code, timed_out = run_subprocess(cmd, self.workspace / "logs" / "campaign.log", subprocess_timeout)
+        # Upstream archives AFL output after its own --time budget expires.
+        # Give that final write time to finish before enforcing our process cap.
+        default_grace = "0" if self.profile in {"compat-smoke", "ci-smoke"} else "300"
+        archive_grace = max(0, int(os.environ.get("ELFUZZ_ARCHIVE_GRACE_SECONDS", default_grace)))
+        subprocess_timeout = min(campaign_deadline + archive_grace, stage_cap) if stage_cap > 0 else campaign_deadline + archive_grace
+        tmp_root = os.environ.get("HGB_CAMPAIGN_TMP_ROOT")
+        if tmp_root:
+            try:
+                require_tmpfs(Path(tmp_root))
+            except ValueError as exc:
+                raise PipelineError("infra_missing", str(exc), 70) from exc
+            hot_root = Path(tempfile.mkdtemp(prefix="hgb-campaign-", dir=tmp_root))
+            (hot_root / "owner.pid").write_text(f"{os.getpid()}\n", encoding="ascii")
+            env = os.environ.copy()
+            env["TMPDIR"] = str(hot_root)
+            archive_dir = self.workspace / "campaign" / "afl_results"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            env["ELFUZZ_CAMPAIGN_OUTPUT_DIR"] = str(archive_dir)
+            interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "300"))
+            try:
+                with AflTreeCheckpoint(hot_root, self.workspace / "campaign" / "live_checkpoint", interval):
+                    code, timed_out = run_subprocess(cmd, hot_root / "campaign.log", subprocess_timeout, env=env)
+                (self.workspace / "logs").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(hot_root / "campaign.log", self.workspace / "logs" / "campaign.log")
+            finally:
+                shutil.rmtree(hot_root, ignore_errors=True)
+        else:
+            code, timed_out = run_subprocess(cmd, self.workspace / "logs" / "campaign.log", subprocess_timeout)
+        if tmp_root:
+            os.environ["ELFUZZ_CAMPAIGN_OUTPUT_DIR"] = str(self.workspace / "campaign" / "afl_results")
         self.collect_campaign()
         if code not in (0, 124) and self.queue_count == 0 and not self.budget.get("reject_prebuilt_binary"):
             self._run_fallback_campaign()

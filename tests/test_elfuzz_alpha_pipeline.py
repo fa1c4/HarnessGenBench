@@ -127,6 +127,31 @@ def fake_target_binary(path: Path) -> Path:
     return make_executable(path, "#!/usr/bin/env bash\nexit 0\n")
 
 
+def test_campaign_uses_tmpfs_and_workspace_archive(tmp_path: Path, monkeypatch) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    cli = fake_elfuzz_cli(tmp_path / "elfuzz", project)
+    package = make_target_package(tmp_path)
+    workspace = tmp_path / "workspace"
+    hot_mount = tmp_path / "fake-tmpfs"
+    hot_mount.mkdir()
+    monkeypatch.setenv("ELFUZZ_CLI", str(cli))
+    monkeypatch.setenv("ELFUZZ_PROJECT_ROOT", str(project))
+    monkeypatch.setenv("HGB_CAMPAIGN_TMP_ROOT", str(hot_mount))
+    monkeypatch.setattr(elf, "require_tmpfs", lambda _path: None)
+    pipeline = elf.ELFuzzPipeline(
+        workspace=workspace, target="jsoncpp_jsoncpp_fuzzer",
+        target_package=package, artifact_dir=project,
+        metadata_root=ROOT / "metadata", profile="compat-smoke", protocol="paper-native",
+    )
+    pipeline.ensure_layout()
+    pipeline.campaign()
+    assert pipeline.queue_count == 2
+    assert (workspace / "campaign/afl_results/jsoncpp_elfuzz_1/default/queue").is_dir()
+    assert (workspace / "logs/campaign.log").is_file()
+    assert not list(hot_mount.iterdir())
+
+
 def base_env(tmp_path: Path, cli: Path, binary: Path, project_root: Path) -> dict[str, str]:
     env = os.environ.copy()
     env.update(

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Finish Phase B coverage from verified saved campaigns without fuzzing again.
 
-The same-date Phase A manifest supplies the shared G2Fuzz target package for
+The batch's Phase A manifest supplies the shared G2Fuzz target package for
 every baseline. Campaign duration and execution evidence are checked before
 recovery; incomplete corpora remain failed. The CSV is updated after each job.
 """
@@ -33,6 +33,15 @@ BASELINES = hgb_eval_all.BASELINES
 
 
 def manifest_for_csv(csv_path: Path, requested: Path | None) -> Path:
+    if csv_path.name == "results.csv":
+        batch = hgb_eval_all.read_json(csv_path.parent / "batch.json")
+        if batch.get("schema_version") != 1 or batch.get("batch_id") != csv_path.parent.name:
+            raise ValueError("batch CSV has no matching batch configuration")
+        expected = (csv_path.parent / "phase_a.json").resolve(strict=True)
+        manifest = (requested or expected).resolve(strict=True)
+        if manifest != expected:
+            raise ValueError("Phase A manifest must be the batch's saved snapshot")
+        return manifest
     match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.|$)", csv_path.name)
     if match is None:
         raise ValueError("CSV name must begin with its YYYY-MM-DD evaluation date")
@@ -76,7 +85,7 @@ def checked_run(record: dict[str, str], baseline: str,
     if not run.is_relative_to(ROOT / "workspace" / baseline / target):
         raise ValueError(f"run path escapes pair workspace: {run}")
     if target not in canonical:
-        raise ValueError("same-date manifest has no verified G2Fuzz source")
+        raise ValueError("saved manifest has no verified G2Fuzz source")
     canonical_source, canonical_package = canonical[target]
     provenance = json.loads((run / "phase_b_source.json").read_text(encoding="utf-8"))
     if provenance.get("baseline") != baseline or provenance.get("target") != target:
@@ -86,7 +95,7 @@ def checked_run(record: dict[str, str], baseline: str,
         raise ValueError("Phase B provenance has no selected Phase A run")
     raw_package = str(provenance.get("canonical_target_package") or "")
     if not raw_package or Path(raw_package).resolve(strict=True) != canonical_package:
-        raise ValueError("Phase B target package differs from same-date canonical G2Fuzz package")
+        raise ValueError("Phase B target package differs from the saved canonical G2Fuzz package")
     return run, source, canonical_source
 
 
@@ -210,7 +219,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, default=ROOT / "workspace/eval_all/2026-10-12.csv")
     parser.add_argument("--manifest", type=Path,
-                        help="same-date Phase A manifest; defaults to <CSV date>.phase_a.json")
+                        help="Phase A manifest; defaults to the batch snapshot or <CSV date>.phase_a.json")
     parser.add_argument("--parallel-worker", type=int, default=4)
     parser.add_argument("--campaign-seconds", type=int, default=86400)
     parser.add_argument("--memory-per-job-gib", type=int, default=8)
@@ -229,7 +238,7 @@ def main() -> int:
         manifest = manifest_for_csv(csv_path, args.manifest)
         canonical = canonical_sources(manifest)
     except (OSError, KeyError, TypeError, ValueError) as exc:
-        parser.error(f"cannot validate same-date Phase A manifest: {exc}")
+        parser.error(f"cannot validate saved Phase A manifest: {exc}")
     if args.dry_run:
         return recover_csv(args, csv_path, manifest, canonical)
     lock_path = csv_path.parent / f"{csv_path.name}.lock"

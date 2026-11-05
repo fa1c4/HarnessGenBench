@@ -808,6 +808,11 @@ run_hgb_target_container() {
     # pipeline relative to /opt/hgb (the metadata mount parent).
     extra_docker_args+=(-v "$root/repro:/opt/hgb/repro:ro")
   fi
+  if [[ "$generator" == "g2fuzz" || "$generator" == "elfuzz" ]]; then
+    local hgb_campaign_tmpfs_size="${HGB_CAMPAIGN_TMPFS_SIZE:-4g}"
+    [[ "$hgb_campaign_tmpfs_size" =~ ^[1-9][0-9]*[kKmMgG]$ ]] || die "HGB_CAMPAIGN_TMPFS_SIZE must be a positive Docker size (for example 4g)"
+    extra_docker_args+=(--tmpfs "/tmp:size=$hgb_campaign_tmpfs_size" -e HGB_CAMPAIGN_TMP_ROOT=/tmp)
+  fi
   # Record the generator image digest (beta plan section 4) so each result
   # carries reproducible docker image provenance.
   local hgb_docker_image_digest=""
@@ -1016,6 +1021,8 @@ run_hgb_target_container() {
     -e HGB_BASELINE_PROTOCOL \
     -e HGB_STRICT \
     -e HGB_CAMPAIGN_SECONDS \
+    -e HGB_CAMPAIGN_TMPFS_SIZE \
+    -e HGB_CAMPAIGN_CHECKPOINT_SECONDS \
     -e HGB_DOCKER_CPUS \
     -e HGB_DOCKER_CPUSET \
     -e HGB_DOCKER_MEMORY \

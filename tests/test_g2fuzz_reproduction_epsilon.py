@@ -590,6 +590,40 @@ def test_campaign_selects_native_duration_only_for_phase_b_replay(
     assert argv[argv.index("-c") + 1] == str(pipeline.target_cmp)
 
 
+def test_campaign_checkpoints_tmpfs_queue_and_removes_hot_directory(tmp_path: Path, monkeypatch):
+    pipeline = make_pipeline(tmp_path, runner=FakeDockerRunner())
+    pipeline.artifact_dir.mkdir(parents=True)
+    make_executable(pipeline.artifact_dir / "afl-fuzz", "#!/usr/bin/env bash\nexit 0\n")
+    pipeline.target_afl.parent.mkdir(parents=True, exist_ok=True)
+    make_executable(pipeline.target_afl, "#!/usr/bin/env bash\nexit 0\n")
+    make_executable(pipeline.target_cmp, "#!/usr/bin/env bash\nexit 0\n")
+    pipeline.invocation = g2.resolved_invocation(pipeline.adapter, pipeline.target_afl)
+    (pipeline.workspace / "campaign").mkdir(parents=True, exist_ok=True)
+    hot_mount = tmp_path / "fake-tmpfs"
+    hot_mount.mkdir()
+    monkeypatch.setenv("HGB_CAMPAIGN_TMP_ROOT", str(hot_mount))
+    monkeypatch.setattr(g2, "require_tmpfs", lambda _path: None)
+    seen = {}
+
+    def fake_campaign(cmd, log_path, output_dir, timeout, env, *, self_terminating=False):
+        seen["output"] = output_dir
+        seen["cmd"] = cmd
+        queue = output_dir / "default" / "queue"
+        queue.mkdir(parents=True)
+        (queue / "id:000000").write_bytes(b"finding")
+        (output_dir / "default" / "fuzzer_stats").write_text("execs_done : 12\n")
+        log_path.write_text("AFL exited normally\n")
+        return 0, False, 100.0, 1
+
+    monkeypatch.setattr(g2, "run_afl_with_resume", fake_campaign)
+    pipeline.run_campaign()
+    assert seen["cmd"][seen["cmd"].index("-o") + 1] == str(seen["output"])
+    assert seen["output"].is_relative_to(hot_mount)
+    assert (pipeline.workspace / "campaign/output/default/queue/id:000000").read_bytes() == b"finding"
+    assert (pipeline.workspace / "seeds/afl_queue/id:000000").read_bytes() == b"finding"
+    assert not list(hot_mount.iterdir())
+
+
 def test_saved_g2_replay_passes_phase_b_marker_into_container(tmp_path: Path, monkeypatch):
     source = tmp_path / "source"
     (source / "target").mkdir(parents=True)

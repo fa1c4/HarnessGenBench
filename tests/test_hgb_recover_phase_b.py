@@ -21,6 +21,23 @@ sys.modules[SPEC.name] = recovery
 SPEC.loader.exec_module(recovery)
 
 
+def test_recovery_uses_batch_manifest_snapshot(tmp_path: Path) -> None:
+    batch = tmp_path / "20261103-2110"
+    batch.mkdir()
+    (batch / "batch.json").write_text(json.dumps({
+        "schema_version": 1, "batch_id": batch.name,
+    }), encoding="utf-8")
+    csv_path = batch / "results.csv"
+    csv_path.write_text("target\n", encoding="utf-8")
+    manifest = batch / "phase_a.json"
+    manifest.write_text('{"records": []}\n', encoding="utf-8")
+    assert recovery.manifest_for_csv(csv_path, None) == manifest
+    other = tmp_path / "other.phase_a.json"
+    other.write_text('{"records": []}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="saved snapshot"):
+        recovery.manifest_for_csv(csv_path, other)
+
+
 def test_recovery_command_preserves_canonical_g2_source(tmp_path: Path) -> None:
     run = tmp_path / "existing-run"
     command = recovery.recovery_command(

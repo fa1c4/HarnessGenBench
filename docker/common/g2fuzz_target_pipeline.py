@@ -36,6 +36,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from hgb_campaign_storage import AflCheckpoint, require_tmpfs
+
 
 STAGE_NAMES = (
     "target_prepared",
@@ -2498,7 +2501,24 @@ class G2FuzzPipeline:
         # A missing -c CmpLog argument must fail.
         if not self.target_cmp.is_file():
             raise PipelineError("infra_missing", "G2Fuzz campaign requires a CmpLog target.cmp binary", 127)
-        out = self.workspace / "campaign" / "output"
+        persisted_output = self.workspace / "campaign" / "output"
+        hot_root: Path | None = None
+        tmp_root = os.environ.get("HGB_CAMPAIGN_TMP_ROOT")
+        if tmp_root:
+            try:
+                require_tmpfs(Path(tmp_root))
+            except ValueError as exc:
+                raise PipelineError("infra_missing", str(exc), 70) from exc
+            hot_root = Path(tempfile.mkdtemp(prefix="hgb-campaign-", dir=tmp_root))
+            (hot_root / "owner.pid").write_text(f"{os.getpid()}\n", encoding="ascii")
+            out = hot_root / "output"
+            active_log = hot_root / "afl.log"
+            hot_initial = hot_root / "initial"
+            shutil.copytree(initial, hot_initial)
+            initial = hot_initial
+        else:
+            out = persisted_output
+            active_log = self.workspace / "logs" / "afl.log"
         cmd = [
             str(afl_fuzz),
             "-i",
@@ -2531,9 +2551,23 @@ class G2FuzzPipeline:
         )
         timeout = int(os.environ.get("G2FUZZ_AFL_TIMEOUT_SECONDS", "3600") or "3600")
         self_terminating = os.environ.get("HGB_PHASE_B_REPLAY") == "1"
-        code, timed_out, campaign_wall_seconds, afl_attempts = run_afl_with_resume(
-            cmd, self.workspace / "logs" / "afl.log", out, timeout, env,
-            self_terminating=self_terminating)
+        if hot_root:
+            env["TMPDIR"] = str(hot_root)
+            interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "300"))
+            try:
+                with AflCheckpoint(out, persisted_output, interval):
+                    code, timed_out, campaign_wall_seconds, afl_attempts = run_afl_with_resume(
+                        cmd, active_log, out, timeout, env,
+                        self_terminating=self_terminating)
+                (self.workspace / "logs").mkdir(parents=True, exist_ok=True)
+                shutil.copy2(active_log, self.workspace / "logs" / "afl.log")
+            except BaseException:
+                shutil.rmtree(hot_root, ignore_errors=True)
+                raise
+        else:
+            code, timed_out, campaign_wall_seconds, afl_attempts = run_afl_with_resume(
+                cmd, active_log, out, timeout, env,
+                self_terminating=self_terminating)
         queue_dir = out / "default" / "queue"
         crashes_dir = out / "default" / "crashes"
         hangs_dir = out / "default" / "hangs"
@@ -2567,6 +2601,8 @@ class G2FuzzPipeline:
         self.seed_counts["afl_queue"] = count_files(afl_queue)
         self.seed_bytes["afl_queue"] = dir_bytes(afl_queue)
         json_dump(self.workspace / "campaign" / "metrics.json", metrics)
+        if hot_root:
+            shutil.rmtree(hot_root)
         if code not in {0, 124}:
             raise PipelineError("failed", f"afl-fuzz exited {code}", code)
         # Campaign success requires real progress: fuzzer_stats, execs_done>0,

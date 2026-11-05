@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "docker/common"))
 import hgb_coverage
 import hgb_fuzzbench_builder as builder
+from hgb_recover_phase_b import manifest_for_csv
 
 BASELINES = ("ckgfuzzer", "promefuzz", "oss-fuzz-gen")
 ZERO_EXEC_REASON = "campaign recorded execs_done <= 0"
@@ -117,9 +118,7 @@ def scan_archive(path: Path) -> ArchiveScan:
 
 
 def canonical_sources(csv_path: Path, manifest_path: Path) -> dict[tuple[str, str], Path]:
-    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.|$)", csv_path.name)
-    if not match or manifest_path.name != f"{match.group(1)}.phase_a.json":
-        raise ValueError("Phase A manifest must match the CSV date")
+    manifest_for_csv(csv_path, manifest_path)
     sources: dict[tuple[str, str], Path] = {}
     for record in read_json(manifest_path).get("records", []):
         if record.get("status") != "ready":
@@ -201,10 +200,10 @@ def validate_job(record: dict[str, str], baseline: str,
         raise ValueError("Phase B provenance baseline/target mismatch")
     selected = Path(str(phase_b.get("selected_phase_a_run") or "")).resolve(strict=True)
     if selected != sources.get((baseline, target)):
-        raise ValueError("selected Phase A source differs from same-date manifest")
+        raise ValueError("selected Phase A source differs from saved manifest")
     g2_source = sources.get(("g2fuzz", target))
     if g2_source is None:
-        raise ValueError("same-date manifest has no canonical G2 source")
+        raise ValueError("saved manifest has no canonical G2 source")
     package = Path(str(phase_b.get("canonical_target_package") or "")).resolve(strict=True)
     if package != canonical_package(g2_source):
         raise ValueError("Phase B package differs from canonical G2 package")
@@ -361,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--csv", type=Path,
                         default=ROOT / "workspace/eval_all/2026-11-02.trials5.csv")
     parser.add_argument("--manifest", type=Path,
-                        help="same-date Phase A manifest; defaults to <CSV date>.phase_a.json")
+                        help="Phase A manifest; defaults to the batch snapshot or <CSV date>.phase_a.json")
     parser.add_argument("--run", action="store_true",
                         help="explicitly build coverage images and replay intact saved corpora")
     parser.add_argument("--max-jobs", type=int, default=0,
@@ -372,11 +371,8 @@ def main(argv: list[str] | None = None) -> int:
     csv_path = args.csv.resolve(strict=True)
     if not csv_path.is_relative_to(ROOT / "workspace"):
         parser.error("CSV must be under workspace")
-    match = re.match(r"^(\d{4}-\d{2}-\d{2})(?:\.|$)", csv_path.name)
-    if not match:
-        parser.error("CSV name must start with YYYY-MM-DD")
-    manifest = (args.manifest or csv_path.with_name(f"{match.group(1)}.phase_a.json")).resolve(strict=True)
     try:
+        manifest = manifest_for_csv(csv_path, args.manifest)
         sources = canonical_sources(csv_path, manifest)
     except (KeyError, OSError, TypeError, ValueError) as exc:
         parser.error(f"cannot validate Phase A sources: {exc}")

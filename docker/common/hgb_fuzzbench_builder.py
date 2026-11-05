@@ -1224,6 +1224,12 @@ def _container_run(
     container_name = f"hgb-eval-{phase}-{uuid.uuid4().hex[:12]}"
     create = ["docker", "create", "--pull=never", "--name", container_name]
     create.extend(_eval_all_label_args())
+    if phase == "campaign":
+        tmpfs_size = os.environ.get("HGB_CAMPAIGN_TMPFS_SIZE", "4g")
+        if not re.fullmatch(r"[1-9][0-9]*[kKmMgG]", tmpfs_size):
+            raise ValueError("HGB_CAMPAIGN_TMPFS_SIZE must be a positive Docker size")
+        create.extend(["--tmpfs", f"/tmp/hgb-campaign:size={tmpfs_size}",
+                       "-e", "TMPDIR=/tmp/hgb-campaign"])
     cpu_limit = os.environ.get("HGB_DOCKER_CPUS", "")
     if cpu_limit:
         if not cpu_limit.isdecimal() or int(cpu_limit) < 1:
@@ -1529,16 +1535,15 @@ def run_campaign(
     seed_index = 0
     for seed in sorted(corpus_dir.iterdir()) if corpus_dir.is_dir() else []:
         if seed.is_file():
-            # docker cp cannot create missing parent directories inside a
-            # stopped container. Stage seeds under /tmp, then move them into
-            # /tmp/corpus after the campaign command creates the directory.
+            # docker cp runs before Docker mounts tmpfs at container start.
+            # Stage a few seeds outside the hot mount, then move them to RAM.
             copy_in.append((seed, f"/tmp/hgb_campaign_seed_{seed_index:04d}"))
             seed_index += 1
     seed_stage = (
-        'mkdir -p /tmp/corpus /tmp/artifacts; '
+        'mkdir -p /tmp/hgb-campaign/corpus /tmp/hgb-campaign/artifacts; '
         'for f in /tmp/hgb_campaign_seed_*; do '
-        '[ -e "$f" ] || continue; cp "$f" "/tmp/corpus/$(basename "$f")"; '
-        'done; '
+        '[ -e "$f" ] || continue; cp "$f" "/tmp/hgb-campaign/corpus/$(basename "$f")"; '
+        'done; rm -f /tmp/hgb_campaign_seed_*; '
     )
     asan_prefix = (
         'export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}symbolize=0"; '
@@ -1548,7 +1553,7 @@ def run_campaign(
     fuzzer_args = (
         f'{binary_path} {continuation_flags}-runs={run_count} '
         f'-max_total_time={max_total_time} -print_final_stats=1 '
-        '-artifact_prefix=/tmp/artifacts/ /tmp/corpus'
+        '-artifact_prefix=/tmp/hgb-campaign/artifacts/ /tmp/hgb-campaign/corpus'
     )
     if keep_going:
         # Fork mode can exit early after a crash with "MERGE: failed to parse
@@ -1557,48 +1562,72 @@ def run_campaign(
         # Repeated immediate failures still stop and fail the duration gate.
         fuzz_command = (
             'campaign_start_epoch=$(date +%s); '
-            'echo "HGB_CAMPAIGN_START_EPOCH=$campaign_start_epoch" >> /tmp/campaign.log; '
+            'echo "HGB_CAMPAIGN_START_EPOCH=$campaign_start_epoch" >> /tmp/hgb-campaign/campaign.log; '
             f'campaign_end=$((campaign_start_epoch + {budget} )); '
             'fuzzer_rc=0; attempts=0; rapid_failures=0; '
             'while [ "$(date +%s)" -lt "$campaign_end" ]; do '
             'attempt_start=$(date +%s); remaining=$((campaign_end - attempt_start)); '
             'attempts=$((attempts + 1)); '
-            'echo "HGB_FUZZER_ATTEMPT=$attempts REMAINING=$remaining" >> /tmp/campaign.log; '
+            'echo "HGB_FUZZER_ATTEMPT=$attempts REMAINING=$remaining" >> /tmp/hgb-campaign/campaign.log; '
             f'{timeout_prefix}"$((remaining + 5))s" {fuzzer_args} '
-            '>> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
+            '>> /tmp/hgb-campaign/campaign.log 2>&1; fuzzer_rc=$?; '
             'attempt_elapsed=$(( $(date +%s) - attempt_start )); '
             'if [ "$attempt_elapsed" -lt 10 ]; then '
             'rapid_failures=$((rapid_failures + 1)); '
             'else rapid_failures=0; fi; '
             'if [ "$rapid_failures" -ge 5 ]; then '
-            'echo "HGB_FUZZER_STOPPED_AFTER_RAPID_FAILURES=1" >> /tmp/campaign.log; '
+            'echo "HGB_FUZZER_STOPPED_AFTER_RAPID_FAILURES=1" >> /tmp/hgb-campaign/campaign.log; '
             'break; fi; '
             'done; '
-            'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/campaign.log; '
+            'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/hgb-campaign/campaign.log; '
         )
     else:
         fuzz_command = (
             'campaign_start_epoch=$(date +%s); '
-            'echo "HGB_CAMPAIGN_START_EPOCH=$campaign_start_epoch" >> /tmp/campaign.log; '
+            'echo "HGB_CAMPAIGN_START_EPOCH=$campaign_start_epoch" >> /tmp/hgb-campaign/campaign.log; '
             f'remaining={budget}; '
             f'{timeout_prefix}{fuzzer_timeout}s {fuzzer_args} '
-            '>> /tmp/campaign.log 2>&1; fuzzer_rc=$?; '
-            'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/campaign.log; '
+            '>> /tmp/hgb-campaign/campaign.log 2>&1; fuzzer_rc=$?; '
+            'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/hgb-campaign/campaign.log; '
         )
+    checkpoint_interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "300"))
+    if checkpoint_interval < 1:
+        raise ValueError("HGB_CAMPAIGN_CHECKPOINT_SECONDS must be positive")
+    checkpoint_start = (
+        'if [ -d /tmp/hgb-persist/live_corpus ]; then '
+        'hgb_checkpoint() { '
+        'mkdir -p /tmp/hgb-persist/live_corpus /tmp/hgb-persist/live_artifacts; '
+        'cp -au /tmp/hgb-campaign/corpus/. /tmp/hgb-persist/live_corpus/ 2>/dev/null '
+        '|| echo HGB_CHECKPOINT_CORPUS_FAILED >> /tmp/hgb-campaign/campaign.log; '
+        'cp -au /tmp/hgb-campaign/artifacts/. /tmp/hgb-persist/live_artifacts/ 2>/dev/null '
+        '|| echo HGB_CHECKPOINT_ARTIFACTS_FAILED >> /tmp/hgb-campaign/campaign.log; '
+        'tail -n 2000 /tmp/hgb-campaign/campaign.log > /tmp/hgb-persist/.live_fuzzer.log.tmp 2>/dev/null '
+        '&& mv -f /tmp/hgb-persist/.live_fuzzer.log.tmp /tmp/hgb-persist/live_fuzzer.log || :; '
+        '}; '
+        f'(while sleep {checkpoint_interval}; do hgb_checkpoint; done) >/dev/null 2>&1 & '
+        'checkpoint_pid=$!; fi; '
+    )
+    checkpoint_end = (
+        'if [ -n "${checkpoint_pid:-}" ]; then '
+        'kill "$checkpoint_pid" 2>/dev/null || :; wait "$checkpoint_pid" 2>/dev/null || :; '
+        'hgb_checkpoint; fi; '
+    )
     cmd = [
         "sh",
         "-lc",
-        f'{seed_stage}{asan_prefix}{fuzz_command}'
+        f'{seed_stage}{asan_prefix}{checkpoint_start}{fuzz_command}{checkpoint_end}'
         f'echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
         f'echo "HGB_FUZZER_ATTEMPTS=${{attempts:-1}}"; '
         f'echo "---STATS---"; '
-        f'ls /tmp/corpus | wc -l; '
-        f'ls /tmp/artifacts 2>/dev/null | wc -l; '
+        f'ls /tmp/hgb-campaign/corpus | wc -l; '
+        f'ls /tmp/hgb-campaign/artifacts 2>/dev/null | wc -l; '
         # A full 24-hour libFuzzer log can exhaust the evaluator's memory
         # when the Docker client captures stdout. The final statistics and
         # recent findings are retained without copying the whole log.
-        f'tail -n 2000 /tmp/campaign.log; '
-        f'cd /tmp && tar -cf /tmp/corpus.tar corpus artifacts campaign.log 2>/dev/null || true',
+        f'tail -n 2000 /tmp/hgb-campaign/campaign.log; '
+        f'tar -cf /tmp/corpus.tar -C /tmp/hgb-campaign corpus artifacts campaign.log 2>/dev/null; '
+        f'archive_rc=$?; if [ "$archive_rc" -eq 0 ]; then rm -rf /tmp/hgb-campaign/*; '
+        f'else echo "HGB_ARCHIVE_FAILED=$archive_rc" >&2; exit "$archive_rc"; fi',
     ]
     # The in-container ``timeout`` above enforces the fuzzing budget. Give
     # ``docker start -a`` time for fuzzer shutdown, corpus archiving, and log
@@ -1613,13 +1642,12 @@ def run_campaign(
     final_corpus_dir.mkdir(parents=True, exist_ok=True)
     mounts: list[tuple[Path, str]] | None = None
     live_corpus_dir: Path | None = None
-    if durable and os.environ.get("HGB_PHASE_B_REPLAY") == "1":
+    host_workspace = os.environ.get("HGB_WORKSPACE_HOST", "")
+    if host_workspace or (durable and os.environ.get("HGB_PHASE_B_REPLAY") == "1"):
         # The evaluator itself runs in an outer Docker container at
         # /workspace. The inner campaign container receives the *host* path
-        # for a separate live corpus, so each new libFuzzer input is visible
-        # on the host throughout the 24-hour run. Its final corpus.tar remains
-        # the only authoritative source for coverage measurement.
-        host_workspace = os.environ.get("HGB_WORKSPACE_HOST", "")
+        # for periodic checkpoints in both Phase A and Phase B. The hot
+        # corpus stays on tmpfs; final corpus.tar remains authoritative.
         live_corpus_dir = campaign_work / "live_corpus"
         if live_corpus_dir.is_dir() and any(live_corpus_dir.iterdir()):
             # Keep an interrupted attempt's host-visible inputs instead of
@@ -1627,8 +1655,8 @@ def run_campaign(
             previous = campaign_work / f"live_corpus.previous.{uuid.uuid4().hex[:12]}"
             os.replace(live_corpus_dir, previous)
         live_corpus_dir.mkdir(parents=True, exist_ok=True)
-        host_live_corpus = _phase_b_live_host_path(live_corpus_dir, host_workspace)
-        mounts = [(host_live_corpus, "/tmp/corpus")]
+        host_campaign_work = _phase_b_live_host_path(campaign_work, host_workspace)
+        mounts = [(host_campaign_work, "/tmp/hgb-persist")]
     campaign_start = time.monotonic()
     result = _container_run(
         image_tag=image_tag,

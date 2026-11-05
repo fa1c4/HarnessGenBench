@@ -185,6 +185,7 @@ def run_harness(baseline: str, selected: Path, source: Path, run: Path, package:
         "-e", f"HGB_WORKSPACE_HOST={run}", "-e", f"HGB_TARGET_PACKAGE_HOST={package}",
         "-e", "HGB_DOCKER_CPUS=1", "-e", f"HGB_DOCKER_CPUSET={cpu}",
         "-e", f"HGB_DOCKER_MEMORY={memory_gib}g",
+        "-e", "HGB_CAMPAIGN_TMPFS_SIZE", "-e", "HGB_CAMPAIGN_CHECKPOINT_SECONDS",
         "-e", "HGB_PHASE_B_REPLAY=1",
         "--entrypoint", "/opt/hgb/venv/bin/python", image,
         "/opt/hgb/bin/hgb_harness_evaluator.py",
@@ -245,15 +246,20 @@ def run_g2(source: Path, run: Path, package: Path, image: str,
     if not (source / "seeds/g2_generated").is_dir():
         raise ValueError("Phase A G2Fuzz generated inputs are missing")
     meta = read_json(source / "metadata.json")
+    tmpfs_size = os.environ.get("HGB_CAMPAIGN_TMPFS_SIZE", "4g")
+    if not re.fullmatch(r"[1-9][0-9]*[kKmMgG]", tmpfs_size):
+        raise ValueError("HGB_CAMPAIGN_TMPFS_SIZE must be a positive Docker size")
     cmd = [
         "docker", "run", "--rm", "--pull=never", "--init", *docker_limits(cpu, memory_gib),
         *eval_all_docker_options(),
+        "--tmpfs", f"/tmp:size={tmpfs_size}",
         "-v", f"{run}:/workspace", "-v", f"{source}:/source:ro",
         "-v", f"{package}:/target:ro",
         "-v", f"{ROOT / 'docker/common'}:/opt/hgb/bin:ro",
         "-v", "/var/run/docker.sock:/var/run/docker.sock",
         "-e", f"G2FUZZ_AFL_TIMEOUT_SECONDS={budget}", "-e", "AFL_NO_AFFINITY=1",
         "-e", "HGB_PHASE_B_REPLAY=1",
+        "-e", "HGB_CAMPAIGN_TMP_ROOT=/tmp", "-e", "HGB_CAMPAIGN_CHECKPOINT_SECONDS",
         "-e", "OMP_NUM_THREADS=1", "-e", f"HGB_DOCKER_MEMORY={memory_gib}g",
         "--entrypoint", "/opt/hgb/venv/bin/python", image,
         "/opt/hgb/bin/g2fuzz_target_pipeline.py", "replay",

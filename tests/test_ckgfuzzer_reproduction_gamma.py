@@ -606,8 +606,11 @@ def test_campaign_runner_uses_time_budget_without_run_cap(tmp_path: Path) -> Non
     assert any("timeout -s INT -k 5s 7s" in c for c in create_commands)
     assert any("-runs=-1" in c and "-max_total_time=2" in c for c in create_commands)
     assert any("HGB_FUZZER_EXIT_CODE=$fuzzer_rc" in c for c in create_commands)
-    assert any("tail -n 2000 /tmp/campaign.log" in c for c in create_commands)
-    assert any("tar -cf /tmp/corpus.tar corpus artifacts campaign.log" in c for c in create_commands)
+    assert any("tail -n 2000 /tmp/hgb-campaign/campaign.log" in c for c in create_commands)
+    assert any("tar -cf /tmp/corpus.tar -C /tmp/hgb-campaign corpus artifacts campaign.log" in c for c in create_commands)
+    assert any("--tmpfs /tmp/hgb-campaign:size=4g" in c for c in create_commands)
+    shell = next(c[-1] for c in runner.commands if c[:2] == ["docker", "create"])
+    subprocess.run(["sh", "-n"], input=shell, text=True, check=True)
     assert result["execs_done"] == 500
     assert result["timeouts"] == 0
 
@@ -634,8 +637,8 @@ def test_phase_b_campaign_waits_for_docker_and_saves_results(tmp_path: Path, mon
     assert "-max_total_time=\"$remaining\"" in shell
     assert "timeout -s INT" in shell
     assert " -k " not in shell and "SIGKILL" not in shell
-    assert "tail -n 2000 /tmp/campaign.log" in shell
-    assert "tar -cf /tmp/corpus.tar corpus artifacts campaign.log" in shell
+    assert "tail -n 2000 /tmp/hgb-campaign/campaign.log" in shell
+    assert "tar -cf /tmp/corpus.tar -C /tmp/hgb-campaign corpus artifacts campaign.log" in shell
     assert not any(command[:2] == ["docker", "kill"] for command in runner.commands)
     assert result["execs_done"] == 500
     assert result["copy_out_ok"] is True

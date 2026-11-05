@@ -17,7 +17,7 @@ RUN if command -v apt-get >/dev/null 2>&1; then \
 RUN mkdir -p /opt/hgb/bin /opt/hgb/metadata /opt/hgb/scripts
 COPY metadata /opt/hgb/metadata
 COPY repro /opt/hgb/repro
-COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh docker/common/elfuzz_target_pipeline.py /opt/hgb/bin/
+COPY docker/common/target_contract.sh docker/common/extract_api_list.py docker/common/ofg_api_rank.py docker/common/hgb_llm_trace.py docker/common/llm_provider.sh docker/common/elfuzz_target_pipeline.py docker/common/hgb_campaign_storage.py /opt/hgb/bin/
 RUN chmod +x /opt/hgb/bin/target_contract.sh /opt/hgb/bin/llm_provider.sh /opt/hgb/bin/extract_api_list.py /opt/hgb/bin/elfuzz_target_pipeline.py
 COPY docker/elfuzz/entrypoint.sh /opt/hgb/entrypoint.sh
 RUN chmod +x /opt/hgb/entrypoint.sh
