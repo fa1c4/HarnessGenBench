@@ -615,6 +615,24 @@ def test_campaign_runner_uses_time_budget_without_run_cap(tmp_path: Path) -> Non
     assert result["timeouts"] == 0
 
 
+def test_elfuzz_campaign_stages_image_workdir_on_tmpfs(tmp_path: Path) -> None:
+    runner = FakeRunner()
+    hgb_fuzzbench_builder.run_campaign(
+        image_tag="hgb-elfuzz-test",
+        binary_path="/out/fuzz_target",
+        corpus_dir=tmp_path / "seeds",
+        work_dir=tmp_path / "campaign",
+        campaign_seconds=2,
+        runner=runner,
+        tmpfs_workdir=True,
+    )
+    shell = next(c[-1] for c in runner.commands if c[:2] == ["docker", "create"])
+    assert 'cp -a "$hgb_image_workdir"/. /tmp/hgb-campaign/workdir/' in shell
+    assert 'cd /tmp/hgb-campaign/workdir || exit 1' in shell
+    assert shell.index('cd /tmp/hgb-campaign/workdir') < shell.index('campaign_start_epoch=')
+    subprocess.run(["sh", "-n"], input=shell, text=True, check=True)
+
+
 def test_phase_b_campaign_waits_for_docker_and_saves_results(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
     runner = FakeRunner()

@@ -1502,6 +1502,7 @@ def run_campaign(
     timeout_seconds: int | None = None,
     keep_going: bool = False,
     durable: bool = False,
+    tmpfs_workdir: bool = False,
 ) -> dict:
     """Run a fixed-budget libFuzzer campaign and parse execs_done from the log.
 
@@ -1544,6 +1545,20 @@ def run_campaign(
         'for f in /tmp/hgb_campaign_seed_*; do '
         '[ -e "$f" ] || continue; cp "$f" "/tmp/hgb-campaign/corpus/$(basename "$f")"; '
         'done; rm -f /tmp/hgb_campaign_seed_*; '
+    )
+    # ELFuzz targets can create per-execution files relative to the image's
+    # working directory. That directory is normally Docker overlay storage,
+    # so stage its original resources once and run from the campaign tmpfs.
+    # Never recursively copy / or the tmpfs itself into its own workdir.
+    workdir_stage = (
+        'hgb_image_workdir=$PWD; '
+        'mkdir -p /tmp/hgb-campaign/workdir || exit 1; '
+        'case "$hgb_image_workdir" in '
+        '/|/tmp|/tmp/hgb-campaign|/tmp/hgb-campaign/*) ;; '
+        '*) cp -a "$hgb_image_workdir"/. /tmp/hgb-campaign/workdir/ || exit 1;; '
+        'esac; '
+        'cd /tmp/hgb-campaign/workdir || exit 1; '
+        if tmpfs_workdir else ''
     )
     asan_prefix = (
         'export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}symbolize=0"; '
@@ -1615,7 +1630,7 @@ def run_campaign(
     cmd = [
         "sh",
         "-lc",
-        f'{seed_stage}{asan_prefix}{checkpoint_start}{fuzz_command}{checkpoint_end}'
+        f'{seed_stage}{workdir_stage}{asan_prefix}{checkpoint_start}{fuzz_command}{checkpoint_end}'
         f'echo "HGB_FUZZER_EXIT_CODE=$fuzzer_rc"; '
         f'echo "HGB_FUZZER_ATTEMPTS=${{attempts:-1}}"; '
         f'echo "---STATS---"; '

@@ -137,6 +137,7 @@ def test_elf_runner_saves_campaign_without_coverage_build(tmp_path: Path, monkey
     assert code == 0
     assert json.loads((run / "result.json").read_text())["status"] == "corpus_ready"
     assert campaign_calls[0]["durable"] is True
+    assert campaign_calls[0]["tmpfs_workdir"] is True
     assert validated == [(run, 86400)]
 
 

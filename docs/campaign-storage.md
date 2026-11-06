@@ -12,6 +12,7 @@ an AFL output or libFuzzer corpus directory.
 |---|---|---|
 | AFL working input, queue, crashes, hangs, `fuzzer_stats` | container `/tmp` tmpfs | incremental checkpoint under `workspace/campaign/` |
 | libFuzzer corpus, artifact prefix, fork-mode temporary files, active log | container `/tmp/hgb-campaign` tmpfs (`TMPDIR` points there) | `workspace/.../campaign/live_corpus`, `live_artifacts`, recent log checkpoint |
+| ELFuzz shared-runner image working directory and target-created scratch files | container `/tmp/hgb-campaign/workdir` tmpfs; original image working files are copied there once at campaign start | none unless promoted to the corpus or artifact directory |
 | Final corpus, crash artifacts, full log, metrics, coverage inputs | tmpfs until campaign exit | `workspace/`, with the existing Phase B archive verification and fsync |
 | Docker copy-in seed staging and final archive transport | container `/tmp` overlay | copied to `workspace/` once; these are bounded setup/finalization writes |
 
@@ -45,10 +46,18 @@ successful checkpoint.
 | PromeFuzz | same shared evaluator | same | same |
 | OSS-Fuzz-Gen | same shared evaluator | same | same |
 | G2Fuzz | modified AFL++ `-o` | `/workspace/campaign/output` bind mounted on `/data` | outer container `/tmp` tmpfs; `-o` and active log are in a per-campaign directory |
-| ELFuzz | upstream `elfuzz run rq1.afl`, then saved-input libFuzzer replay in Phase B | upstream `tempfile.TemporaryDirectory()` on Docker overlay; Phase B shared runner | outer `/tmp` tmpfs with AFL checkpoints; Phase B shared tmpfs runner |
+| ELFuzz | upstream `elfuzz run rq1.afl`, then saved-input libFuzzer replay in Phase B | upstream `tempfile.TemporaryDirectory()` and the image's working directory on Docker overlay | outer `/tmp` tmpfs with AFL checkpoints; Phase B shared runner stages the image working files once and runs from `/tmp/hgb-campaign/workdir` |
 
 The shared runner sets `TMPDIR` to its tmpfs mount because [libFuzzer reads
 that environment variable for temporary files](https://github.com/llvm/llvm-project/blob/main/compiler-rt/lib/fuzzer/FuzzerIOPosix.cpp).
+For every ELFuzz shared-runner campaign, it changes to a work directory inside
+that mount before starting the target. Ordinary image working directories are
+copied there once so relative input resources remain available; `/`, `/tmp`,
+and the campaign tmpfs itself are not recursively copied. This catches targets
+such as `curl_curl_fuzzer_http` that create small files relative to their
+working directory. The copy must succeed; a full tmpfs fails the campaign
+rather than sending those writes back to Docker overlay.
+Targets that write to absolute image paths still require a separate path audit.
 
 CKGFuzzer's CodeQL database, PromeFuzz and OSS-Fuzz-Gen's generated sources,
 target builds, and ELFuzz's selected generated inputs remain durable evidence

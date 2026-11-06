@@ -466,6 +466,7 @@ def run_elfuzz(source: Path, run: Path, package: Path,
                     corpus_dir=seed_dir, work_dir=run, campaign_seconds=budget,
                     keep_going=True,
                     durable=not measure,
+                    tmpfs_workdir=True,
                 ))
     coverage: dict[str, Any] = {"line_coverage": {"covered": None}}
     reason = ""

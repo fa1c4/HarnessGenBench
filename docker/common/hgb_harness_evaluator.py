@@ -439,6 +439,7 @@ def evaluate_candidate(
     profile: str = "",
     preverified: dict[str, Any] | None = None,
     keep_going_campaign: bool = False,
+    campaign_tmpfs_workdir: bool = False,
     coverage_format: str = "auto",
     prebuilt_coverage_image: str = "",
     reuse_saved_campaign: bool = False,
@@ -653,6 +654,7 @@ def evaluate_candidate(
             runner=runner,
             keep_going=keep_going_campaign,
             durable=stage == "runner",
+            tmpfs_workdir=campaign_tmpfs_workdir,
         )
     rec.campaign = campaign
     if strict and not keep_going_campaign and int(campaign.get("crashes", 0) or 0) > 0:
@@ -1318,6 +1320,7 @@ def evaluate(
             profile=profile,
             preverified=preverified_candidate,
             keep_going_campaign=keep_going_campaign,
+            campaign_tmpfs_workdir=generator.lower() == "elfuzz",
             coverage_format=coverage_format,
             prebuilt_coverage_image=prebuilt_coverage_image,
             reuse_saved_campaign=reuse_saved_campaign,

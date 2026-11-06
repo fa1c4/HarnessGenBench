@@ -320,6 +320,31 @@ def test_eta_evaluator_full_loop_with_native_control(tmp_path: Path) -> None:
     assert Path(cand_json["coverage"]["coverage_report_path"]).is_file()
 
 
+def test_elfuzz_evaluator_uses_tmpfs_campaign_workdir(tmp_path: Path) -> None:
+    class RecordingRunner(_Runner):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.commands = []
+
+        def __call__(self, command, timeout):
+            self.commands.append(list(command))
+            return super().__call__(command, timeout)
+
+    gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
+    runner = RecordingRunner(candidate_path=str(candidates_dir / "cand_001.c"))
+    evaluator.evaluate(
+        generator="elfuzz", target_root=gen_root, evaluator_root=evl_root,
+        candidates_dir=candidates_dir, work_dir=work_dir, project="project",
+        fuzz_target="fuzz_target", profile="reproduction-zeta", campaign_seconds=10,
+        strict=True, runner=runner, intended_apis=["hgb_sample_api"], seeds=[],
+    )
+    campaign_shells = [command[-1] for command in runner.commands
+                       if command[:2] == ["docker", "create"]
+                       and "hgb-campaign/corpus" in command[-1]]
+    assert len(campaign_shells) == 1
+    assert 'cd /tmp/hgb-campaign/workdir || exit 1' in campaign_shells[0]
+
+
 def test_evaluator_can_stop_after_first_fully_verified_candidate(tmp_path: Path) -> None:
     gen_root, evl_root, candidates_dir, work_dir = _setup(tmp_path)
     (candidates_dir / "cand_002.c").write_text(
