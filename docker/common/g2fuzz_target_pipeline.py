@@ -37,7 +37,10 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hgb_campaign_storage import AflCheckpoint, require_tmpfs
+from hgb_campaign_storage import (
+    AflCheckpoint, DEFAULT_CHECKPOINT_SECONDS, iter_afl_files_without_queue_state,
+    require_tmpfs,
+)
 
 
 STAGE_NAMES = (
@@ -2553,7 +2556,7 @@ class G2FuzzPipeline:
         self_terminating = os.environ.get("HGB_PHASE_B_REPLAY") == "1"
         if hot_root:
             env["TMPDIR"] = str(hot_root)
-            interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "300"))
+            interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", str(DEFAULT_CHECKPOINT_SECONDS)))
             try:
                 with AflCheckpoint(out, persisted_output, interval):
                     code, timed_out, campaign_wall_seconds, afl_attempts = run_afl_with_resume(
@@ -2572,11 +2575,12 @@ class G2FuzzPipeline:
         crashes_dir = out / "default" / "crashes"
         hangs_dir = out / "default" / "hangs"
         afl_queue = self.workspace / "seeds" / "afl_queue"
-        if queue_dir.exists():
-            for path in sorted(p for p in queue_dir.rglob("*") if p.is_file()):
-                shutil.copy2(path, unique_dest(afl_queue, path.name))
+        queue_files = (sorted(p for p in iter_afl_files_without_queue_state(queue_dir)
+                              if p.is_file()) if queue_dir.exists() else [])
+        for path in queue_files:
+            shutil.copy2(path, unique_dest(afl_queue, path.name))
         stats = parse_fuzzer_stats(out / "default" / "fuzzer_stats")
-        queue_count = count_files(queue_dir, exclude_readme=False)
+        queue_count = len(queue_files)
         crash_count = count_files(crashes_dir, exclude_readme=True)
         hang_count = count_files(hangs_dir, exclude_readme=True)
         execs_done = int(stats.get("execs_done") or 0)

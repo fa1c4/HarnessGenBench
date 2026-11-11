@@ -24,8 +24,13 @@ campaign failure instead of silently spilling the hot workload to `/data`.
 Choose the size with the target's memory demand and concurrent job count in
 mind.
 
-`HGB_CAMPAIGN_CHECKPOINT_SECONDS` defaults to **300 seconds**. G2Fuzz copies
-only new or changed queue, crash, hang, and statistics files to
+`HGB_CAMPAIGN_CHECKPOINT_SECONDS` defaults to **86400 seconds (24 hours)** for
+the shared libFuzzer runner and the G2Fuzz and ELFuzz AFL pipelines. Every
+campaign also checkpoints on normal exit, so a shorter campaign still saves
+its final findings. An unexpected container or machine stop can lose up to
+24 hours of uncheckpointed findings. The interval remains configurable with
+`HGB_CAMPAIGN_CHECKPOINT_SECONDS`.
+G2Fuzz copies only new or changed queue, crash, hang, and statistics files to
 `workspace/campaign/output/`, using an atomic replacement for each file. The
 ELFuzz upstream AFL run uses Python temporary directories; its AFL findings
 are copied to `workspace/campaign/live_checkpoint/` while running. Its final
@@ -33,10 +38,14 @@ compressed result archive goes directly to `workspace/campaign/afl_results/`. Th
 libFuzzer runner copies new or changed corpus and artifact files plus a recent
 log tail to its mounted workspace. These live checkpoints are recovery
 material; the final verified corpus archive is authoritative for measurement.
+Both AFL checkpoints skip `queue/.state`, including AFL's auto-generated
+dictionary entries; those internal files are not corpus seeds or crash samples.
+G2Fuzz's final queue export and ELFuzz's collected replay queue skip the same
+state directory.
 Phase A and Phase B shared-runner campaigns both checkpoint when the outer
 container supplies `HGB_WORKSPACE_HOST`.
 The worst-case loss on an unexpected stop is the work since the last
-successful checkpoint.
+successful checkpoint for that campaign type.
 
 ## Baseline IO audit
 

@@ -635,6 +635,7 @@ def test_elfuzz_campaign_stages_image_workdir_on_tmpfs(tmp_path: Path) -> None:
 
 def test_phase_b_campaign_waits_for_docker_and_saves_results(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("HGB_PHASE_B_REPLAY", "1")
+    monkeypatch.delenv("HGB_CAMPAIGN_CHECKPOINT_SECONDS", raising=False)
     runner = FakeRunner()
     result = hgb_fuzzbench_builder.run_campaign(
         image_tag="hgb-test", binary_path="/out/fuzz_target",
@@ -655,6 +656,8 @@ def test_phase_b_campaign_waits_for_docker_and_saves_results(tmp_path: Path, mon
     assert "-max_total_time=\"$remaining\"" in shell
     assert "timeout -s INT" in shell
     assert " -k " not in shell and "SIGKILL" not in shell
+    assert '(while sleep 86400; do hgb_checkpoint; done)' in shell
+    assert 'kill "$checkpoint_pid" 2>/dev/null || :; wait "$checkpoint_pid" 2>/dev/null || :; hgb_checkpoint; fi' in shell
     assert "tail -n 2000 /tmp/hgb-campaign/campaign.log" in shell
     assert "tar -cf /tmp/corpus.tar -C /tmp/hgb-campaign corpus artifacts campaign.log" in shell
     assert not any(command[:2] == ["docker", "kill"] for command in runner.commands)

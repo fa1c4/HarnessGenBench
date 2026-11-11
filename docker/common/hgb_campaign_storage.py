@@ -6,7 +6,19 @@ import os
 import shutil
 import tempfile
 import threading
+from collections.abc import Iterator
 from pathlib import Path
+
+DEFAULT_CHECKPOINT_SECONDS = 24 * 60 * 60
+
+
+def iter_afl_files_without_queue_state(root: Path) -> Iterator[Path]:
+    """Walk AFL findings without visiting its transient queue state."""
+    for directory, subdirectories, filenames in os.walk(root):
+        if Path(directory).name == "queue":
+            subdirectories[:] = [name for name in subdirectories if name != ".state"]
+        for filename in filenames:
+            yield Path(directory) / filename
 
 
 def require_tmpfs(path: Path) -> None:
@@ -60,7 +72,8 @@ def _copy_atomic(source: Path, destination: Path) -> bool:
 class AflCheckpoint:
     """Save AFL findings every interval; the active AFL output stays on tmpfs."""
 
-    def __init__(self, output: Path, workspace_output: Path, interval_seconds: int = 300):
+    def __init__(self, output: Path, workspace_output: Path,
+                 interval_seconds: int = DEFAULT_CHECKPOINT_SECONDS):
         if interval_seconds < 1:
             raise ValueError("checkpoint interval must be positive")
         self.output = output
@@ -76,7 +89,7 @@ class AflCheckpoint:
         for name in ("queue", "crashes", "hangs"):
             source_dir = default / name
             if source_dir.is_dir():
-                for source in source_dir.rglob("*"):
+                for source in iter_afl_files_without_queue_state(source_dir):
                     if source.is_file() and not source.is_symlink():
                         destination = self.workspace_output / "default" / name / source.relative_to(source_dir)
                         if not destination.parent.resolve().is_relative_to(self.workspace_output.resolve()):
@@ -117,7 +130,7 @@ class AflTreeCheckpoint(AflCheckpoint):
 
     def sync(self) -> int:
         copied = 0
-        for source in self.output.rglob("*"):
+        for source in iter_afl_files_without_queue_state(self.output):
             if source.is_symlink() or not source.is_file():
                 continue
             relative = source.relative_to(self.output)

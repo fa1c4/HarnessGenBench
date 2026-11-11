@@ -37,7 +37,10 @@ from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from hgb_campaign_storage import AflTreeCheckpoint, require_tmpfs
+from hgb_campaign_storage import (
+    AflTreeCheckpoint, DEFAULT_CHECKPOINT_SECONDS, iter_afl_files_without_queue_state,
+    require_tmpfs,
+)
 
 
 STAGE_NAMES = (
@@ -2078,7 +2081,7 @@ class ELFuzzPipeline:
                     for sub in ("queue", "default/queue"):
                         qd = entry / sub
                         if qd.exists():
-                            for path in sorted(qd.rglob("*")):
+                            for path in sorted(iter_afl_files_without_queue_state(qd)):
                                 if path.is_file() and path.name != "README.txt":
                                     shutil.copy2(path, unique_dest(queue_dir, path.name))
                     for sub in ("crashes", "default/crashes"):
@@ -2134,7 +2137,7 @@ class ELFuzzPipeline:
             archive_dir = self.workspace / "campaign" / "afl_results"
             archive_dir.mkdir(parents=True, exist_ok=True)
             env["ELFUZZ_CAMPAIGN_OUTPUT_DIR"] = str(archive_dir)
-            interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "300"))
+            interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", str(DEFAULT_CHECKPOINT_SECONDS)))
             try:
                 with AflTreeCheckpoint(hot_root, self.workspace / "campaign" / "live_checkpoint", interval):
                     code, timed_out = run_subprocess(cmd, hot_root / "campaign.log", subprocess_timeout, env=env)

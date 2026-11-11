@@ -602,8 +602,16 @@ def test_campaign_checkpoints_tmpfs_queue_and_removes_hot_directory(tmp_path: Pa
     hot_mount = tmp_path / "fake-tmpfs"
     hot_mount.mkdir()
     monkeypatch.setenv("HGB_CAMPAIGN_TMP_ROOT", str(hot_mount))
+    monkeypatch.delenv("HGB_CAMPAIGN_CHECKPOINT_SECONDS", raising=False)
     monkeypatch.setattr(g2, "require_tmpfs", lambda _path: None)
     seen = {}
+    checkpoint_class = g2.AflCheckpoint
+
+    def capture_checkpoint(output, workspace_output, interval):
+        seen["checkpoint_interval"] = interval
+        return checkpoint_class(output, workspace_output, interval)
+
+    monkeypatch.setattr(g2, "AflCheckpoint", capture_checkpoint)
 
     def fake_campaign(cmd, log_path, output_dir, timeout, env, *, self_terminating=False):
         seen["output"] = output_dir
@@ -611,12 +619,19 @@ def test_campaign_checkpoints_tmpfs_queue_and_removes_hot_directory(tmp_path: Pa
         queue = output_dir / "default" / "queue"
         queue.mkdir(parents=True)
         (queue / "id:000000").write_bytes(b"finding")
+        internal = queue / ".state" / "auto_extras"
+        internal.mkdir(parents=True)
+        (internal / "auto_000001").write_bytes(b"internal state")
         (output_dir / "default" / "fuzzer_stats").write_text("execs_done : 12\n")
         log_path.write_text("AFL exited normally\n")
         return 0, False, 100.0, 1
 
     monkeypatch.setattr(g2, "run_afl_with_resume", fake_campaign)
     pipeline.run_campaign()
+    assert seen["checkpoint_interval"] == 86400
+    assert pipeline.metrics["queue_count"] == 1
+    assert not (pipeline.workspace / "campaign/output/default/queue/.state").exists()
+    assert not (pipeline.workspace / "seeds/afl_queue/auto_000001").exists()
     assert seen["cmd"][seen["cmd"].index("-o") + 1] == str(seen["output"])
     assert seen["output"].is_relative_to(hot_mount)
     assert (pipeline.workspace / "campaign/output/default/queue/id:000000").read_bytes() == b"finding"

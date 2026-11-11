@@ -1605,7 +1605,7 @@ def run_campaign(
             '>> /tmp/hgb-campaign/campaign.log 2>&1; fuzzer_rc=$?; '
             'echo "HGB_CAMPAIGN_END_EPOCH=$(date +%s)" >> /tmp/hgb-campaign/campaign.log; '
         )
-    checkpoint_interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "300"))
+    checkpoint_interval = int(os.environ.get("HGB_CAMPAIGN_CHECKPOINT_SECONDS", "86400"))
     if checkpoint_interval < 1:
         raise ValueError("HGB_CAMPAIGN_CHECKPOINT_SECONDS must be positive")
     checkpoint_start = (

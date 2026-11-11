@@ -112,10 +112,12 @@ if cmd == "produce":
 if cmd == "run":
     out = campaign_dir / f"{benchmark}_elfuzz_1"
     (out / "default" / "queue").mkdir(parents=True, exist_ok=True)
+    (out / "default" / "queue" / ".state" / "auto_extras").mkdir(parents=True)
     (out / "default" / "crashes").mkdir(parents=True, exist_ok=True)
     (out / "default" / "hangs").mkdir(parents=True, exist_ok=True)
     (out / "default" / "queue" / "id:000000,orig:seed").write_bytes(b'{"k": 0}')
     (out / "default" / "queue" / "id:000001,orig:seed").write_bytes(b'{"k": 1}')
+    (out / "default" / "queue" / ".state" / "auto_extras" / "auto_000001").write_bytes(b"internal state")
     (out / "default" / "fuzzer_stats").write_text("execs_done : 100\\npaths_total : 2\\n", encoding="utf-8")
     sys.exit(0)
 sys.exit(0)
@@ -138,7 +140,16 @@ def test_campaign_uses_tmpfs_and_workspace_archive(tmp_path: Path, monkeypatch) 
     monkeypatch.setenv("ELFUZZ_CLI", str(cli))
     monkeypatch.setenv("ELFUZZ_PROJECT_ROOT", str(project))
     monkeypatch.setenv("HGB_CAMPAIGN_TMP_ROOT", str(hot_mount))
+    monkeypatch.delenv("HGB_CAMPAIGN_CHECKPOINT_SECONDS", raising=False)
     monkeypatch.setattr(elf, "require_tmpfs", lambda _path: None)
+    checkpoint_class = elf.AflTreeCheckpoint
+    intervals = []
+
+    def capture_checkpoint(output, workspace_output, interval):
+        intervals.append(interval)
+        return checkpoint_class(output, workspace_output, interval)
+
+    monkeypatch.setattr(elf, "AflTreeCheckpoint", capture_checkpoint)
     pipeline = elf.ELFuzzPipeline(
         workspace=workspace, target="jsoncpp_jsoncpp_fuzzer",
         target_package=package, artifact_dir=project,
@@ -146,7 +157,9 @@ def test_campaign_uses_tmpfs_and_workspace_archive(tmp_path: Path, monkeypatch) 
     )
     pipeline.ensure_layout()
     pipeline.campaign()
+    assert intervals == [86400]
     assert pipeline.queue_count == 2
+    assert not (workspace / "campaign/queue/auto_000001").exists()
     assert (workspace / "campaign/afl_results/jsoncpp_elfuzz_1/default/queue").is_dir()
     assert (workspace / "logs/campaign.log").is_file()
     assert not list(hot_mount.iterdir())
