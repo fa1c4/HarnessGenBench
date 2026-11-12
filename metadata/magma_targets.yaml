@@ -1,0 +1,89 @@
+# MAGMA target registry for the HarnessGenBench MAGMA baseline evaluation.
+#
+# ``harness`` is the file the original MAGMA build compiles as the fuzz target.
+# ``harness_base`` says whether it lives in the fetched repository (repo) or in
+# the MAGMA target directory (target_src, copied/compiled from there).
+# ``corpus`` is the MAGMA seed corpus directory inside the image.
+# ``first_api`` / ``entry_api`` come from scripts/hgb_magma_harnesses.py.
+targets:
+  libpng:
+    project: libpng
+    program: libpng_read_fuzzer
+    harness: contrib/oss-fuzz/libpng_read_fuzzer.cc
+    harness_base: repo
+    corpus: /magma/targets/libpng/corpus/libpng_read_fuzzer
+    project_root: /magma/targets/libpng/repo
+    first_api: png_sig_cmp
+    entry_api: png_create_read_struct
+  libsndfile:
+    project: libsndfile
+    program: sndfile_fuzzer
+    harness: ossfuzz/sndfile_fuzzer.cc
+    harness_base: repo
+    corpus: /magma/targets/libsndfile/corpus/sndfile_fuzzer
+    project_root: /magma/targets/libsndfile/repo
+    first_api: sf_open_virtual
+    entry_api: sf_open_virtual
+  libtiff:
+    project: libtiff
+    program: tiff_read_rgba_fuzzer
+    harness: contrib/oss-fuzz/tiff_read_rgba_fuzzer.cc
+    harness_base: repo
+    corpus: /magma/targets/libtiff/corpus/tiff_read_rgba_fuzzer
+    project_root: /magma/targets/libtiff/repo
+    first_api: TIFFSetErrorHandler
+    entry_api: TIFFStreamOpen
+  libxml2:
+    project: libxml2
+    program: libxml2_xml_read_memory_fuzzer
+    harness: libxml2_xml_read_memory_fuzzer.cc
+    harness_base: target_src
+    corpus: /magma/targets/libxml2/corpus/libxml2_xml_read_memory_fuzzer
+    project_root: /magma/targets/libxml2/repo
+    first_api: xmlSetGenericErrorFunc
+    entry_api: xmlReadMemory
+  lua:
+    project: lua
+    program: fuzz_lua
+    harness: fuzz_lua.c
+    harness_base: target_src
+    corpus: /magma/targets/lua/corpus/fuzz_lua
+    project_root: /magma/targets/lua/repo
+    first_api: luaL_newstate
+    entry_api: luaL_loadbufferx
+  openssl:
+    project: openssl
+    program: x509
+    harness: fuzz/x509.c
+    harness_base: repo
+    corpus: /magma/targets/openssl/corpus/x509
+    project_root: /magma/targets/openssl/repo
+    first_api: d2i_X509
+    entry_api: d2i_X509
+  php:
+    project: php
+    program: parser
+    harness: sapi/fuzzer/fuzzer-parser.c
+    harness_base: repo
+    corpus: /magma/targets/php/corpus/parser
+    project_root: /magma/targets/php/repo
+    first_api: fuzzer_do_request_from_buffer
+    entry_api: zend_compile_file
+  poppler:
+    project: poppler
+    program: pdf_fuzzer
+    harness: pdf_fuzzer.cc
+    harness_base: target_src
+    corpus: /magma/targets/poppler/corpus/pdf_fuzzer
+    project_root: /magma/targets/poppler/repo
+    first_api: set_debug_error_function
+    entry_api: load_from_raw_data
+  sqlite3:
+    project: sqlite3
+    program: sqlite3_fuzz
+    harness: test/ossfuzz.c
+    harness_base: repo
+    corpus: /magma/targets/sqlite3/corpus/sqlite3_fuzz
+    project_root: /magma/targets/sqlite3/repo
+    first_api: sqlite3_initialize
+    entry_api: sqlite3_exec
