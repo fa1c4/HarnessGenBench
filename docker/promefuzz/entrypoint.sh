@@ -1151,12 +1151,22 @@ EOF_PROMEFUZZ_LIBS
   if [[ "$project" == "systemd" && "$fuzz_target" == "fuzz-link-parser" && -d "$project_source_dir/src/udev/net" ]]; then
     api_source_dir="$project_source_dir/src/udev/net"
   fi
+  # api-oracle protocol: use the committed entry API for MAGMA targets.
+  promefuzz_declared_api_args=()
+  if [[ -f "${HGB_DECLARED_API_FILE:-/target/declared_api.json}" ]]; then
+    HGB_DECLARED_API_FILE="${HGB_DECLARED_API_FILE:-/target/declared_api.json}"
+    HGB_API_SELECTION_MODE=declared
+    promefuzz_declared_api_args=(--declared-api-file "$HGB_DECLARED_API_FILE")
+    printf 'PromeFuzz declared entry API: %s\n' "$HGB_DECLARED_API_FILE" \
+      >>"$workspace/logs/promefuzz_api_extract.log"
+  fi
   api_extract_args=(
     /opt/hgb/bin/extract_api_list.py
     --source "$api_source_dir" --out "$selected_api_names_file"
     --max "${PROME_FUZZ_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}"
     --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}"
     --selection-mode "${HGB_API_SELECTION_MODE:-ranked}"
+    "${promefuzz_declared_api_args[@]}"
     --report-mode "${HGB_API_REPORT_MODE:-dynamic_only}"
     --project "$project" --target-name "$target_name" --fuzz-target "$fuzz_target"
     --selection-metadata "$api_selection_metadata"

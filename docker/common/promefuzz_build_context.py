@@ -259,7 +259,14 @@ def overlay_neutral_stubs(
     if native_rel.startswith("/src/"):
         native_rel = native_rel[len("/src/"):]
     if native_rel:
-        write_neutral_stub(template_root / native_rel, language)
+        # The harness is compiled by the project recipe; its suffix decides
+        # the linkage. libpng's manifest language is "c" but its harness is
+        # .cc, so a C-language stub would be C++-mangled and libFuzzer's main
+        # could not resolve LLVMFuzzerTestOneInput.
+        stub_language = language
+        if Path(native_rel).suffix.lower() in {".cc", ".cpp", ".cxx"}:
+            stub_language = "c++"
+        write_neutral_stub(template_root / native_rel, stub_language)
     rels = _evaluator_reference_harness_files(evaluator_manifest)
     evaluator_root = Path(os.environ.get("HGB_EVALUATOR_ROOT", "/evaluator"))
     reference_dir = evaluator_root / "reference_harnesses"
@@ -1260,6 +1267,12 @@ def verify_link_set(
     )
     compiler = "clang" if language == "c" else "clang++"
     link_args = _strip_fuzzer_engine_args(list(driver_build_args))
+    # A C consumer must not inherit -std=c++XX from a CMake compile database
+    # (clang rejects it). Keep the rest of the recovered flags.
+    if language == "c":
+        link_args = [a for a in link_args if not a.startswith("-std=c++")]
+    else:
+        link_args = [a for a in link_args if not a.startswith("-std=c99") and not a.startswith("-std=c11")]
     cmd = [compiler, str(consumer), *link_args, "-o", str(work_dir / "hgb_link_probe")]
     result = runner(cmd, timeout)
     if result.returncode == 0:

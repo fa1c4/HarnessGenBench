@@ -122,3 +122,66 @@ targets:
     build_timeout: 2400
     fuzz_timeout: 600
     preferred_apis: ["bloaty::ParseOptions"]
+
+  # -------------------------------------------------------------------------
+  # MAGMA phase targets.  Only integration facts: language, build timeout and
+  # the committed entry API from results/magma_harness_apis.md (a public API
+  # name, never a reference-harness excerpt).  candidate_destination is left
+  # empty on purpose: OSS-Fuzz-Gen resolves the native compile path from the
+  # pinned OSS-Fuzz project recipe, and the HGB evaluator uses the split
+  # package's evaluator manifest for the MAGMA-native overlay.
+  # -------------------------------------------------------------------------
+  magma_libpng:
+    candidate_destination: /src/libpng/contrib/oss-fuzz/libpng_read_fuzzer.cc
+    language: c
+    build_timeout: 1800
+    fuzz_timeout: 600
+    preferred_apis: [png_create_read_struct]
+  magma_libsndfile:
+    candidate_destination: /src/libsndfile/ossfuzz/sndfile_fuzzer.cc
+    language: c
+    build_timeout: 1800
+    fuzz_timeout: 600
+    preferred_apis: [sf_open_virtual]
+  magma_libtiff:
+    candidate_destination: /src/libtiff/contrib/oss-fuzz/tiff_read_rgba_fuzzer.cc
+    language: c
+    build_timeout: 2400
+    fuzz_timeout: 600
+    preferred_apis: [TIFFStreamOpen]
+  magma_libxml2:
+    candidate_destination: /src/libxml2/fuzz/libxml2_xml_read_memory_fuzzer.cc
+    language: c
+    build_timeout: 1800
+    fuzz_timeout: 600
+    preferred_apis: [xmlReadMemory]
+  magma_lua:
+    candidate_destination: /src/fuzz_lua.c
+    language: c
+    build_timeout: 1800
+    fuzz_timeout: 600
+    preferred_apis: [luaL_loadbufferx]
+  magma_openssl:
+    candidate_destination: /src/openssl/fuzz/x509.c
+    language: c
+    build_timeout: 3600
+    fuzz_timeout: 600
+    preferred_apis: [d2i_X509]
+  magma_php:
+    candidate_destination: /src/php-src/sapi/fuzzer/fuzzer-parser.c
+    language: c
+    build_timeout: 3600
+    fuzz_timeout: 600
+    preferred_apis: [zend_compile_file, zend_eval_string, php_json_decode_ex]
+  magma_poppler:
+    candidate_destination: /src/poppler/test/ossfuzz/pdf_fuzzer.cc
+    language: c++
+    build_timeout: 3600
+    fuzz_timeout: 600
+    preferred_apis: [load_from_raw_data]
+  magma_sqlite3:
+    candidate_destination: /src/sqlite3/test/ossfuzz.c
+    language: c
+    build_timeout: 1800
+    fuzz_timeout: 600
+    preferred_apis: [sqlite3_exec]

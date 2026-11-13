@@ -1407,7 +1407,7 @@ def run_smoke(
     seeds: list[Path],
     work_dir: Path,
     runner: Runner = _run,
-    timeout_seconds: int = 600,
+    timeout_seconds: int = 90,
 ) -> dict:
     """Run the built binary on empty input and available seeds (sanitizer smoke).
 
@@ -1443,7 +1443,8 @@ def run_smoke(
             runner=runner,
             timeout_seconds=timeout_seconds,
             command=["sh", "-lc", f"echo {HGB_TARGET_START_MARKER} >&2; "
-                     f"{php_asan_prefix}exec {binary_path} {container_input}"],
+                     f"{php_asan_prefix}exec {binary_path} -timeout=25 -rss_limit_mb=2560 "
+                     f"{container_input}"],
             phase=f"smoke_{label}",
             copy_in=[(host_input, container_input)],
             cleanup_timeout_seconds=timeout_seconds,
@@ -1567,7 +1568,7 @@ def run_campaign(
     max_total_time = '"$remaining"' if keep_going else str(budget)
     fuzzer_args = (
         f'{binary_path} {continuation_flags}-runs={run_count} '
-        f'-max_total_time={max_total_time} -print_final_stats=1 '
+        f'-max_total_time={max_total_time} -timeout=25 -print_final_stats=1 '
         '-artifact_prefix=/tmp/hgb-campaign/artifacts/ /tmp/hgb-campaign/corpus'
     )
     if keep_going:

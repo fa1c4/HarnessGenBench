@@ -649,12 +649,25 @@ EOF_CKG_USAGE
 
   api_selection_metadata="$workspace/api_selection.json"
   selected_reference_dir="/target/reference_harnesses/selected"
+  # api-oracle protocol: the MAGMA phase commits the parsed entry API and the
+  # generator must drive generation from that API only.  The file is
+  # generator-visible (generator_input/declared_api.json) and contains public
+  # signatures, never reference-harness source.
+  ckg_declared_api_args=()
+  if [[ -f "${HGB_DECLARED_API_FILE:-/target/declared_api.json}" ]]; then
+    HGB_DECLARED_API_FILE="${HGB_DECLARED_API_FILE:-/target/declared_api.json}"
+    HGB_API_SELECTION_MODE=declared
+    ckg_declared_api_args=(--declared-api-file "$HGB_DECLARED_API_FILE")
+    printf 'CKGFuzzer declared entry API: %s\n' "$HGB_DECLARED_API_FILE" \
+      >>"$workspace/logs/ckgfuzzer_preflight_summary.log"
+  fi
   ckg_api_extract_args=(
     --source /target/source_input
     --out "$ckg_db/api_list.json"
     --max "${CKGFUZZER_MAX_APIS:-${HGB_SELECTED_API_MAX:-8}}"
     --fallback-max "${HGB_SELECTED_API_FALLBACK_MAX:-4}"
     --selection-mode "${HGB_API_SELECTION_MODE:-ranked}"
+    "${ckg_declared_api_args[@]}"
     --project "$project"
     --target-name "$target_name"
     --fuzz-target "$fuzz_target"
@@ -2467,7 +2480,12 @@ HGB_BLOATY_BLOATYMAIN_FALLBACK
       # compatible aliases reproduction-zeta, reproduction-epsilon, and
       # reproduction-delta) build a separate coverage-instrumented image so an
       # address/libFuzzer image is never reused for source-based coverage.
-      [[ "$ckg_profile" == "reproduction-delta" || "$ckg_profile" == "reproduction-epsilon" || "$ckg_profile" == "reproduction-zeta" || "$ckg_profile" == "reproduction-eta" ]] && ckg_evaluator_args+=(--build-coverage-image)
+      # Every non-compat profile builds a separate coverage-instrumented image:
+      # the campaign image is SANITIZER=address and produces no profraw, so
+      # reusing it makes the coverage stage fail for every candidate.
+      if [[ "$ckg_profile" != "compat-smoke" ]]; then
+        ckg_evaluator_args+=(--build-coverage-image)
+      fi
       # reproduction-eta and reproduction-zeta additionally run the native
       # coverage control so the runtime coverage diff is reported (eta/zeta
       # plan §5/§6).

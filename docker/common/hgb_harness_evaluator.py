@@ -413,6 +413,37 @@ def _prepare_sealed_context(
     return ckgfuzzer_verifier_context.prepare_verification_context(target_root, work_dir)
 
 
+
+def _normalize_generated_candidate(candidate: Path, work_dir: Path, candidate_id: str) -> Path:
+    """Strip the OSS-Fuzz-Gen symbol namespace from a generated harness.
+
+    OSS-Fuzz-Gen emits calls such as ``OSS_FUZZ_png_create_read_struct`` (and a
+    matching ``*_PREFIX`` define) because the official libpng OSS-Fuzz recipe
+    builds the library with that namespace.  A MAGMA build links the plain
+    project API, so the namespace is adapted before the candidate is overlaid
+    and audited.  The original file is left untouched; the normalized copy is
+    what the evaluator builds and records.
+    """
+    if not candidate.is_file():
+        return candidate
+    try:
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return candidate
+    if "OSS_FUZZ_" not in text:
+        return candidate
+    import re
+    text = re.sub(r"\bOSS_FUZZ_([A-Za-z_])", r"\1", text)
+    text = "\n".join(
+        line for line in text.splitlines()
+        if not re.match(r"^\s*#define\s+[A-Za-z0-9_]*PREFIX\s*$", line)
+    ) + "\n"
+    destination = work_dir / "normalized_candidates" / candidate.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(text, encoding="utf-8")
+    return destination
+
+
 def evaluate_candidate(
     *,
     candidate: Path,
@@ -1286,6 +1317,7 @@ def evaluate(
     run_id = run_id or os.environ.get("HGB_RUN_ID", "run")
     for index, candidate in enumerate(candidates, start=1):
         candidate_id = f"cand_{index:03d}"
+        candidate = _normalize_generated_candidate(candidate, work_dir, candidate_id)
         image_tag = hgb_fuzzbench_builder.deterministic_image_tag(
             run_id, fuzz_target, candidate_id, generator=generator,
         )

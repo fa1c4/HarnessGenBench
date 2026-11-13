@@ -86,12 +86,77 @@ def rebuild(args: argparse.Namespace, spec: dict) -> int:
     work.mkdir(parents=True, exist_ok=True)
     harness = Path(args.harness).resolve() if args.harness else None
     mounts = [work] + ([harness.parent] if harness else [])
+    fuzzer_include = ROOT / "workspace/magma/builds/fuzzer_include"
+    if fuzzer_include.is_dir():
+        mounts.append(fuzzer_include)
     target_path = harness_path(args.target, spec)
     lines = ["set -e"]
     if harness:
-        lines.append(f"cp {harness} {target_path}")
+        # Generated harnesses may use the OSS-Fuzz-Gen symbol namespace
+        # (OSS_FUZZ_<project>_*), while the MAGMA build links the plain API.
+        # Normalize a copy on the host before overlaying it.
+        normalized = harness
+        text = harness.read_text(encoding="utf-8", errors="replace")
+        if "OSS_FUZZ_" in text:
+            import re as _re
+            text = _re.sub(r"\bOSS_FUZZ_([A-Za-z_])", r"\1", text)
+            text = "\n".join(
+                line for line in text.splitlines()
+                if not _re.match(r"^\s*#define\s+[A-Za-z0-9_]*PREFIX\s*$", line)
+            ) + "\n"
+            normalized = work / f"normalized_{harness.name}"
+            normalized.write_text(text, encoding="utf-8")
+        # Harnesses that declare project prototypes themselves (instead of
+        # including the project header) still need the MAGMA_ symbol prefix.
+        # Apply the exact function-name map generated from pnglibconf.h.
+        if args.target == "sqlite3" and '"sqlite3/work/sqlite3.h"' in text:
+            # PromeFuzz emits the build-workdir spelling of the generated
+            # header; the MAGMA sqlite recipe compiles from its work dir where
+            # the header is `sqlite3.h`.
+            text = text.replace('"sqlite3/work/sqlite3.h"', "<sqlite3.h>")
+            normalized = work / f"normalized_{harness.name}"
+            normalized.write_text(text, encoding="utf-8")
+        if args.target == "libtiff" and "tiffio.hxx" not in text:
+            # TIFFStreamOpen is declared in tiffio.hxx; generated harnesses
+            # often include only tiffio.h.
+            text = "#include <tiffio.hxx>\n" + text
+            normalized = work / f"normalized_{harness.name}"
+            normalized.write_text(text, encoding="utf-8")
+        if args.target == "libpng":
+            import re as _re
+            symbol_map = ROOT / "workspace/magma/benchmarks/libpng/source_input/libpng/png_magma_symbols.h"
+            if symbol_map.is_file():
+                for line in symbol_map.read_text(encoding="utf-8").splitlines():
+                    match = _re.match(r"#define\s+(png_\w+)\s+(MAGMA_png_\w+)", line)
+                    if match:
+                        text = _re.sub(rf"\b{_re.escape(match.group(1))}\b", match.group(2), text)
+                normalized = work / f"normalized_{harness.name}"
+                normalized.write_text(text, encoding="utf-8")
+        lines.append(f"cp {normalized} {target_path}")
     lines += [
         "cd /magma",
+        # libtiff's autogen.sh fetches config.guess/config.sub from the network
+        # when they are absent; seed them from the image's automake.
+        "if [ -x /magma/targets/libtiff/repo/configure ]; then "
+        "sed -i 's#^\\./autogen\\.sh$#true#' /magma/targets/libtiff/build.sh; fi",
+        f"if [ -f {fuzzer_include}/FuzzedDataProvider.h ]; then "
+        "mkdir -p /usr/local/include/fuzzer; "
+        f"cp {fuzzer_include}/FuzzedDataProvider.h /usr/local/include/fuzzer/; fi",
+        "if [ -f /magma/targets/php/build.sh ]; then "
+        "sed -i 's/--enable-intl/--disable-intl/' /magma/targets/php/build.sh; fi",
+        "if [ -d /magma/targets/libsndfile/repo/include ]; then "
+        "ln -sfn . /magma/targets/libsndfile/repo/libsndfile; fi",
+        "if [ -d /magma/targets/poppler/src ]; then "
+        "printf '#include <poppler-document.h>\\nusing poppler::document;\\n' > /magma/targets/poppler/src/document.h; fi",
+        "if [ -f /magma/targets/lua/repo/lua.h ]; then "
+        "mkdir -p /tmp/luainc/lua; "
+        "for h in lua.h lauxlib.h lualib.h luaconf.h; do "
+        "ln -sf /magma/targets/lua/repo/$h /tmp/luainc/$h; "
+        "ln -sf /magma/targets/lua/repo/$h /tmp/luainc/lua/$h; done; "
+        "sed -i 's#\\$CC \\$CFLAGS -c fuzz_lua.c#\\$CC \\$CFLAGS -I/tmp/luainc -c fuzz_lua.c#' /magma/targets/lua/build.sh; fi",
+        "if [ -f /magma/targets/libxml2/src/FuzzedDataProvider.h ]; then "
+        "mkdir -p /magma/targets/libxml2/src/fuzzer; "
+        "ln -sf ../FuzzedDataProvider.h /magma/targets/libxml2/src/fuzzer/FuzzedDataProvider.h; fi",
         f"/magma/fuzzers/{args.fuzzer}/instrument.sh > {work}/build.log 2>&1 || "
         f"{{ echo instrument failed; tail -40 {work}/build.log; exit 1; }}",
         f"cp /magma_out/{spec['program']} {work}/",
@@ -121,7 +186,7 @@ cp -a {source} /tmp/corpus/ 2>/dev/null || true
 cd /tmp
 ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1:abort_on_error=0 \\
 set +e
-timeout {args.seconds}s {binary} -rss_limit_mb=100 -fork=1 -ignore_timeouts=1 \\
+timeout {args.seconds}s {binary} -rss_limit_mb=100 -fork=1 -timeout=25 -len_control=0 -ignore_timeouts=1 \\
   -ignore_crashes=1 -ignore_ooms=1 -artifact_prefix={out}/crashes/ /tmp/corpus \\
   > {out}/campaign.log 2>&1
 code=$?
@@ -139,16 +204,24 @@ def coverage(args: argparse.Namespace, spec: dict) -> int:
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
     harness = Path(args.harness).resolve() if args.harness else None
+    prebuilt = Path(args.binary).resolve() if getattr(args, "binary", "") else None
     mounts = [corpus, out] + ([harness.parent] if harness else [])
+    if prebuilt is not None:
+        mounts.append(prebuilt.parent)
     target_path = harness_path(args.target, spec)
     lines = ["set -e"]
-    if harness:
+    if harness and prebuilt is None:
         lines.append(f"cp {harness} {target_path}")
+    if prebuilt is None:
+        lines += [
+            "cd /magma",
+            f"/magma/fuzzers/llvm_cov/instrument.sh > {out}/coverage_build.log 2>&1 || "
+            f"{{ tail -40 {out}/coverage_build.log; exit 1; }}",
+            f"binary=/magma_out/{spec['program']}",
+        ]
+    else:
+        lines += [f"binary={prebuilt}"]
     lines += [
-        "cd /magma",
-        f"/magma/fuzzers/llvm_cov/instrument.sh > {out}/coverage_build.log 2>&1 || "
-        f"{{ tail -40 {out}/coverage_build.log; exit 1; }}",
-        f"binary=/magma_out/{spec['program']}",
         "mkdir -p /tmp/prof",
         f"find {corpus} -maxdepth 1 -type f -print0 | xargs -0 -r -n 400 sh -c "
         f"'LLVM_PROFILE_FILE=/tmp/prof/%p.profraw $0 \"$@\"' $binary "
@@ -227,6 +300,8 @@ def main() -> int:
     cov.add_argument("--corpus", required=True)
     cov.add_argument("--out", required=True)
     cov.add_argument("--harness", default="")
+    cov.add_argument("--binary", default="",
+                     help="reuse a prebuilt llvm_cov-instrumented binary instead of rebuilding")
 
     args = parser.parse_args()
     spec = load_targets()[args.target]

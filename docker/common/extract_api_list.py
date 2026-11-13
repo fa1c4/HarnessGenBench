@@ -324,7 +324,64 @@ def select_records(
     allow_name_only_report_apis: bool = False,
     public_freetype_apis: bool = False,
     public_libxml_parser_apis: bool = False,
+    declared_apis: list[str] | None = None,
+    declared_records: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if declared_apis or declared_records:
+        # api-oracle protocol: the caller supplies the committed entry API
+        # (results/magma_harness_apis.md) and the generator must use exactly
+        # this list. Resolve signatures from the source extraction when
+        # possible, otherwise keep a name-only record that the generator's
+        # own analysis can enrich.
+        wanted = [name.strip() for name in (declared_apis or []) if name.strip()]
+        declared_by_name = {
+            str(record.get("name") or "").split("::")[-1]: record
+            for record in (declared_records or [])
+            if record.get("name")
+        }
+        if not wanted:
+            wanted = list(declared_by_name)
+        by_name: dict[str, dict[str, Any]] = {}
+        for record in raw:
+            short = str(record.get("name") or "").split("::")[-1]
+            by_name.setdefault(short, record)
+            by_name.setdefault(str(record.get("name") or ""), record)
+        selected: list[dict[str, Any]] = []
+        resolved: list[str] = []
+        unresolved: list[str] = []
+        for name in wanted:
+            record = declared_by_name.get(name) or by_name.get(name)
+            if record is None:
+                record = {
+                    "name": name,
+                    "return_type": "int",
+                    "params": [],
+                    "signature": f"int {name}()",
+                }
+                unresolved.append(name)
+            else:
+                resolved.append(name)
+            selected.append(record)
+        metadata = {
+            "selection_mode": "declared",
+            "report_mode": report_mode,
+            "api_selection_source": "declared_api",
+            "reference_dir": reference_dir,
+            "raw_candidate_count": len(raw),
+            "ranked_candidate_count": 0,
+            "reference_call_count": 0,
+            "direct_match_count": len(resolved),
+            "selected_count": len(selected),
+            "fallback_used": False,
+            "fallback_max": fallback_max,
+            "max_records": max_records,
+            "selected_api_names": [str(record.get("name") or "") for record in selected],
+            "direct_api_names": [str(record.get("name") or "") for record in selected],
+            "declared_api_names": wanted,
+            "declared_resolved_names": resolved,
+            "declared_unresolved_names": unresolved,
+        }
+        return selected[: max(1, max_records)], metadata
     if public_freetype_apis:
         # FreeType declares its callable APIs through FT_EXPORT in the main
         # public header. Its bundled gzip and internal headers contain many
@@ -488,13 +545,27 @@ def main() -> int:
     parser.add_argument(
         "--selection-mode",
         default=os.environ.get("HGB_API_SELECTION_MODE", "selected_harness_fallback"),
-        choices=("ranked", "selected_harness", "selected_harness_fallback"),
+        choices=("ranked", "selected_harness", "selected_harness_fallback", "declared"),
+    )
+    parser.add_argument(
+        "--declared-apis",
+        default=os.environ.get("HGB_DECLARED_APIS", ""),
+        help="comma-separated committed entry APIs (api-oracle protocol)",
+    )
+    parser.add_argument(
+        "--declared-api-file",
+        default=os.environ.get("HGB_DECLARED_API_FILE", ""),
+        help="JSON file with committed entry API records (name/signature)",
     )
     parser.add_argument("--selection-metadata", default="")
     parser.add_argument("--keep-rejected", action="store_true")
     args = parser.parse_args()
     max_records = max(0, args.max)
     fallback_max = max(0, args.fallback_max)
+    declared_file_records: list[dict[str, Any]] | None = None
+    if args.declared_api_file:
+        data = json.loads(Path(args.declared_api_file).read_text(encoding="utf-8"))
+        declared_file_records = data.get("apis") if isinstance(data, dict) else data
     raw_limit = max(max(max_records, fallback_max) * 20, max_records, fallback_max, 1000)
     source = Path(args.source)
     if args.public_freetype_apis:
@@ -519,6 +590,8 @@ def main() -> int:
         allow_name_only_report_apis=args.allow_name_only_report_apis,
         public_freetype_apis=args.public_freetype_apis,
         public_libxml_parser_apis=args.public_libxml_parser_apis,
+        declared_apis=[a.strip() for a in args.declared_apis.split(",") if a.strip()] or None,
+        declared_records=declared_file_records,
     )
     if args.details:
         data = selected

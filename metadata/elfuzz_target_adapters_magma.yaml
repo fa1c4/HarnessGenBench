@@ -1,0 +1,101 @@
+schema_version: 1
+generator: elfuzz
+task_family: input_generator
+target_set: magma
+# Parallel ELFuzz adapter contract for the nine MAGMA targets.  Kept separate
+# from metadata/elfuzz_target_adapters.yaml so the committed FuzzBench target
+# set and its validate_adapter_coverage invariant are unchanged.  ELFuzz
+# synthesizes text-input generator programs only; binary container formats are
+# contractually Invalid and are recorded as N/A instead of producing a corpus.
+targets:
+  - target: magma_libpng
+    applicability: Invalid
+    input_kind: non-text
+    reason_code: elfuzz_non_text_target
+    reason: PNG is a binary image container format; ELFuzz supports text-input targets only
+  - target: magma_libsndfile
+    applicability: Invalid
+    input_kind: non-text
+    reason_code: elfuzz_non_text_target
+    reason: audio containers (WAV/AIFF/FLAC/MP3) are binary formats; ELFuzz supports text-input targets only
+  - target: magma_libtiff
+    applicability: Invalid
+    input_kind: non-text
+    reason_code: elfuzz_non_text_target
+    reason: TIFF is a binary image container format; ELFuzz supports text-input targets only
+  - target: magma_openssl
+    applicability: Invalid
+    input_kind: non-text
+    reason_code: elfuzz_non_text_target
+    reason: DER X.509 certificates are binary; ELFuzz supports text-input targets only
+  - target: magma_poppler
+    applicability: Invalid
+    input_kind: non-text
+    reason_code: elfuzz_non_text_target
+    reason: PDF is a binary container format; ELFuzz supports text-input targets only
+  - target: magma_libxml2
+    applicability: applicable
+    input_kind: text
+    upstream_benchmark: libxml2
+    adapter_class: upstream-native
+    adapter_id: magma_libxml2
+    build_mode: corpus_only
+    input_mode: file
+    argv: ["@@"]
+    format: XML
+    format_spec: repro/elfuzz/magma/libxml2/format.md
+    adapter_dir: repro/elfuzz/magma/libxml2
+    seed_template: repro/elfuzz/magma/libxml2/seed_fuzzer.py
+    validity_check: xml
+    timeout_seconds: 5
+    corpus_produce: fallback
+  - target: magma_lua
+    applicability: applicable
+    input_kind: text
+    upstream_benchmark: lua
+    adapter_class: extension
+    hgb_adapter: true
+    adapter_id: magma_lua
+    build_mode: corpus_only
+    input_mode: file
+    argv: ["@@"]
+    format: Lua source
+    format_spec: repro/elfuzz/magma/lua/format.md
+    adapter_dir: repro/elfuzz/magma/lua
+    seed_template: repro/elfuzz/magma/lua/seed_fuzzer.py
+    validity_check: none
+    timeout_seconds: 5
+    corpus_produce: fallback
+  - target: magma_php
+    applicability: applicable
+    input_kind: text
+    upstream_benchmark: php
+    adapter_class: extension
+    hgb_adapter: true
+    adapter_id: magma_php
+    build_mode: corpus_only
+    input_mode: file
+    argv: ["@@"]
+    format: PHP source
+    format_spec: repro/elfuzz/magma/php/format.md
+    adapter_dir: repro/elfuzz/magma/php
+    seed_template: repro/elfuzz/magma/php/seed_fuzzer.py
+    validity_check: php
+    timeout_seconds: 5
+    corpus_produce: fallback
+  - target: magma_sqlite3
+    applicability: applicable
+    input_kind: text
+    upstream_benchmark: sqlite3
+    adapter_class: upstream-native
+    adapter_id: magma_sqlite3
+    build_mode: corpus_only
+    input_mode: file
+    argv: ["@@"]
+    format: SQL
+    format_spec: repro/elfuzz/magma/sqlite3/format.md
+    adapter_dir: repro/elfuzz/magma/sqlite3
+    seed_template: repro/elfuzz/magma/sqlite3/seed_fuzzer.py
+    validity_check: sql
+    timeout_seconds: 5
+    corpus_produce: fallback

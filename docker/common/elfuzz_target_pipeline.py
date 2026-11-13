@@ -74,6 +74,11 @@ INVALID_MESSAGE = "Invalid: ELFuzz supports text-input targets only"
 # so the HGB adapter layer invokes ELFuzz with the target's own command instead
 # of running the aliased benchmark and renaming outputs.
 UPSTREAM_NATIVE_BENCHMARKS = {"jsoncpp", "libxml2", "re2", "sqlite3"}
+# MAGMA-phase adapters live in a parallel manifest so the committed FuzzBench
+# adapter contract (metadata/elfuzz_target_adapters.yaml) and its coverage
+# validation keep their exact semantics.  The MAGMA set is only loaded when a
+# caller explicitly classifies/launches a MAGMA target.
+MAGMA_ADAPTER_MANIFEST = "elfuzz_target_adapters_magma.yaml"
 REQUIRED_APPLICABLE_KEYS = {
     "target",
     "applicability",
@@ -299,11 +304,11 @@ def default_workspace() -> Path:
     return Path(os.environ.get("HGB_WORKSPACE", "/workspace"))
 
 
-def load_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]]:
-    root = metadata_root or default_metadata_root()
-    path = root / "elfuzz_target_adapters.yaml"
+def _load_adapter_manifest(path: Path, *, require_manifest: bool = True) -> dict[str, dict[str, Any]]:
     if not path.exists():
-        raise PipelineError("adapter_manifest_missing", f"missing ELFuzz adapter manifest: {path}", 66)
+        if require_manifest:
+            raise PipelineError("adapter_manifest_missing", f"missing ELFuzz adapter manifest: {path}", 66)
+        return {}
     raw = parse_simple_yaml(path)
     adapters: dict[str, dict[str, Any]] = {}
     for entry in raw.get("targets", []):
@@ -338,6 +343,42 @@ def load_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]
     return adapters
 
 
+def load_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load the committed FuzzBench adapter set only.
+
+    Kept intentionally free of the MAGMA parallel manifest: the FuzzBench
+    matrix and ``validate_adapter_coverage`` must continue to see exactly the
+    20 valuable targets.
+    """
+    root = metadata_root or default_metadata_root()
+    return _load_adapter_manifest(root / "elfuzz_target_adapters.yaml")
+
+
+def load_magma_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Load the MAGMA-phase adapters from the parallel manifest."""
+    root = metadata_root or default_metadata_root()
+    return _load_adapter_manifest(root / MAGMA_ADAPTER_MANIFEST, require_manifest=False)
+
+
+def load_target_adapters(metadata_root: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Merge the FuzzBench and MAGMA adapter sets for target dispatch.
+
+    Collisions are rejected so a MAGMA adapter can never silently shadow a
+    FuzzBench target (or vice versa).
+    """
+    root = metadata_root or default_metadata_root()
+    adapters = load_adapters(root)
+    for target, entry in load_magma_adapters(root).items():
+        if target in adapters:
+            raise PipelineError(
+                "adapter_parse_failed",
+                f"duplicate adapter entry across FuzzBench and MAGMA manifests: {target}",
+                64,
+            )
+        adapters[target] = entry
+    return adapters
+
+
 def valuable_targets(metadata_root: Path | None = None) -> list[str]:
     root = metadata_root or default_metadata_root()
     data = read_json(root / "fuzzbench_targets.json")
@@ -364,11 +405,55 @@ def validate_adapter_coverage(metadata_root: Path | None = None) -> list[str]:
 def adapter_yaml_path(metadata_root: Path | None = None, target: str | None = None) -> Path:
     """Resolve the per-target adapter.yaml path under repro/elfuzz/targets."""
 
-    adapters = load_adapters(metadata_root)
+    adapters = load_target_adapters(metadata_root)
     entry = adapters.get(target or "")
     if not entry or entry.get("applicability") != "applicable":
         return Path("repro/elfuzz/targets") / (target or "") / "adapter.yaml"
     return repo_root_from(metadata_root or default_metadata_root()) / entry["adapter_dir"] / "adapter.yaml"
+
+
+def validate_magma_adapters(metadata_root: Path | None = None) -> list[str]:
+    """Validate the parallel MAGMA adapter set.
+
+    The MAGMA targets are a separate target set, so the FuzzBench coverage and
+    no-aliasing invariants above are intentionally not applied here.  Instead
+    require that every declared applicable MAGMA target ships its adapter
+    files and that its ``adapter.yaml`` names the exact target.
+    """
+
+    root = metadata_root or default_metadata_root()
+    adapters = load_magma_adapters(root)
+    repo = repo_root_from(root)
+    violations: list[str] = []
+    for target, entry in adapters.items():
+        if entry.get("applicability") != "applicable":
+            continue
+        for key in ("format_spec", "adapter_dir", "seed_template"):
+            rel = str(entry.get(key, ""))
+            if not rel:
+                violations.append(f"{target}: missing {key}")
+                continue
+            path = repo / rel
+            if not path.exists() and (Path("/opt/hgb") / rel).exists():
+                path = Path("/opt/hgb") / rel
+            if not path.exists():
+                violations.append(f"{target}: missing {rel}")
+        adapter_dir = str(entry.get("adapter_dir", ""))
+        if adapter_dir:
+            adapter_yaml = repo / adapter_dir / "adapter.yaml"
+            if not adapter_yaml.is_file() and (Path("/opt/hgb") / adapter_dir / "adapter.yaml").is_file():
+                adapter_yaml = Path("/opt/hgb") / adapter_dir / "adapter.yaml"
+            if not adapter_yaml.is_file():
+                violations.append(f"{target}: missing adapter.yaml under {adapter_dir}")
+            else:
+                parsed = parse_simple_yaml(adapter_yaml)
+                if str(parsed.get("target", "")) != target:
+                    violations.append(
+                        f"{target}: adapter.yaml target '{parsed.get('target')}' != declared target"
+                    )
+    if violations:
+        raise PipelineError("magma_adapter_validation_failed", "; ".join(violations), 64)
+    return list(adapters)
 
 
 def validate_no_aliasing(metadata_root: Path | None = None) -> list[str]:
@@ -474,7 +559,7 @@ def smoke_target_binary(path: Path, sample: bytes = b"", timeout: int = 10) -> d
 
 
 def classify_target(target: str, metadata_root: Path | None = None) -> dict[str, Any]:
-    adapters = load_adapters(metadata_root)
+    adapters = load_target_adapters(metadata_root)
     entry = adapters.get(target)
     if not entry:
         return {
@@ -964,6 +1049,7 @@ class ELFuzzPipeline:
         profile: str,
         protocol: str,
         dry_run: bool = False,
+        corpus_only: bool = False,
     ) -> None:
         self.workspace = workspace
         self.target = target
@@ -973,7 +1059,8 @@ class ELFuzzPipeline:
         self.profile = profile or "alpha"
         self.protocol = protocol or "paper-native"
         self.dry_run = dry_run
-        self.adapters = load_adapters(metadata_root)
+        self.corpus_only = corpus_only
+        self.adapters = load_target_adapters(metadata_root)
         self.classification = classify_target(target, metadata_root)
         self.adapter = self.adapters.get(target)
         self.budget = budget_for_profile(self.profile)
@@ -1588,6 +1675,10 @@ class ELFuzzPipeline:
         sources = []
         if self.project_root:
             sources.append(self.project_root / "evaluation" / "elmfuzzers")
+            if self.corpus_only:
+                # Corpus-only runs keep the synthesized variant programs so the
+                # provenance shows what actually produced the seed corpus.
+                sources.append(self.project_root / "preset" / str(self.adapter["upstream_benchmark"]))
         env_src = os.environ.get("ELFUZZ_FUZZER_PROGRAMS_DIR")
         if env_src:
             sources.append(Path(env_src))
@@ -1596,6 +1687,12 @@ class ELFuzzPipeline:
                 continue
             for archive in sorted(src.glob("*.fuzzers.tar.xz")):
                 safe_extract_tar(archive, dest)
+            if self.corpus_only and src.parent.name == "preset":
+                # Only the generated variant programs, never config/seed files.
+                for path in sorted(src.glob("gen*/variants/*/*.py")):
+                    shutil.copy2(path, unique_dest(dest / "evolved", path.name))
+                    copied += 1
+                continue
             for path in sorted(src.rglob("*")):
                 if is_fuzzer_program(path):
                     shutil.copy2(path, unique_dest(dest, path.name))
@@ -1624,6 +1721,11 @@ class ELFuzzPipeline:
         sources = []
         if self.project_root:
             sources.append(self.project_root / "extradata" / "seeds" / "raw" / benchmark / "elm")
+            if self.corpus_only:
+                # Inputs generated by the synthesized variant programs during
+                # the generation loop; do_gen.sh retains them only in
+                # corpus-only mode (ELFUZZ_KEEP_GENERATED_OUTPUTS=1).
+                sources.append(self.project_root / "preset" / benchmark / "hgb_generated")
         env_src = os.environ.get("ELFUZZ_PRODUCED_INPUTS_DIR")
         if env_src:
             sources.append(Path(env_src))
@@ -1701,7 +1803,11 @@ class ELFuzzPipeline:
         preset_dir.mkdir(parents=True, exist_ok=True)
         cfg = preset_dir / "config.yaml"
         if cfg.is_file():
-            # Upstream preset (jsoncpp/libxml2/re2/sqlite3/...): leave it as-is.
+            # Upstream preset (jsoncpp/libxml2/re2/sqlite3/...): leave it as-is
+            # for the evaluation profiles.  A corpus-only run may only tune the
+            # generation budget, never the seed program or target identity.
+            if self.corpus_only:
+                self._tune_elfuzz_corpus_preset(cfg)
             return
         (preset_dir / "initial" / "seeds").mkdir(parents=True, exist_ok=True)
         # Install the adapter seed template as the initial seed program. It
@@ -1761,6 +1867,30 @@ class ELFuzzPipeline:
             "genoutput_dir: '/home/appuser/fastdata/randompngs/{ELMFUZZ_RUN_NAME}/{GEN}/{MODEL}'",
             "genoutput_dir: '/tmp/elfuzz-genout/{ELMFUZZ_RUN_NAME}/{GEN}/{MODEL}'",
         )
+        cfg.write_text(text, encoding="utf-8")
+        if self.corpus_only:
+            self._tune_elfuzz_corpus_preset(cfg)
+
+    def _tune_elfuzz_corpus_preset(self, cfg: Path) -> None:
+        """Shrink the generation budget for a corpus-only MAGMA smoke.
+
+        A corpus-only run only needs the graph of generated variant programs
+        and their outputs; it does not run coverage selection, a campaign, or
+        the evaluation harness.  The upstream defaults (200 variants for the
+        first generation and 1000 outputs per variant) are sized for a full
+        paper run and would generate tens of thousands of files.  Every knob is
+        environment-overridable so the host driver can scale the smoke.
+        """
+
+        text = cfg.read_text(encoding="utf-8", errors="replace")
+        variants = os.environ.get("ELFUZZ_NUM_VARIANTS", "4")
+        outputs = os.environ.get("ELFUZZ_NUM_OUTPUTS_PER_VARIANT", "20")
+        jobs = os.environ.get("ELFUZZ_VARIANT_JOBS", "8")
+        text = re.sub(r"(?m)^    num_variants: .*$", f"    num_variants: {int(variants)}", text)
+        text = re.sub(r"(?m)^    jobs: .*$", f"    jobs: {int(jobs)}", text)
+        text = re.sub(r"(?m)^      num_iterations: .*$", f"      num_iterations: {int(outputs)}", text)
+        # Never emit more than the configured number of outputs per generation.
+        text = re.sub(r"(?m)^      size_limit: .*$", "      size_limit: 1048576", text)
         cfg.write_text(text, encoding="utf-8")
 
     def synthesis(self) -> None:
@@ -1839,6 +1969,34 @@ class ELFuzzPipeline:
         )
 
     def production(self) -> None:
+        produce_mode = str(self.adapter.get("corpus_produce", "upstream"))
+        if self.corpus_only and produce_mode == "fallback":
+            # MAGMA targets have no ELFuzz ``evaluation/binary/<benchmark>``
+            # registry entry, so upstream ``elfuzz produce`` cannot resolve a
+            # target.  The corpus is materialized from the outputs the
+            # synthesized variant programs already generated during synthesis;
+            # the direct generator fallback only covers an empty output set.
+            (self.workspace / "generated_inputs" / "command.txt").write_text(
+                "corpus-only: collect inputs generated by ELFuzz variant programs "
+                "(upstream `elfuzz produce` skipped: no evaluation binary registry entry)\n",
+                encoding="utf-8",
+            )
+            self.collect_produced_inputs()
+            if self.produced_input_count == 0:
+                self._generate_inputs_from_fuzzer_programs()
+                self.collect_produced_inputs()
+            self.write_input_provenance()
+            if self.produced_input_count == 0:
+                raise PipelineError("failed", "ELFuzz corpus-only production produced no input files", 65)
+            self.stages["production"] = stage_record(
+                "complete",
+                "none",
+                produce_seconds=0,
+                produced_input_count=self.produced_input_count,
+                timed_out=False,
+                mode="corpus_only_fallback",
+            )
+            return
         cmd = self.produce_command()
         (self.workspace / "generated_inputs" / "command.txt").write_text(" ".join(cmd) + "\n", encoding="utf-8")
         timeout = stage_timeout()
@@ -1879,47 +2037,67 @@ class ELFuzzPipeline:
         if not programs_dir.exists():
             return
         count = 0
-        for prog_path in sorted(programs_dir.rglob("*.py")):
-            if "__pycache__" in str(prog_path):
-                continue
-            try:
-                text = prog_path.read_text(encoding="utf-8", errors="replace")
-                text = text.replace("int(wrapped_rng.read(1))", "int.from_bytes(wrapped_rng.read(1), 'big') % 128")
-                text = text.replace("int(wrapped_rng.read(", "int.from_bytes(wrapped_rng.read(")
-                text = text.replace("int.from_bytes.from_bytes(", "int.from_bytes(")
-                fn_match = re.search(r"def (generate_\w+)\s*\(", text)
-                if not fn_match:
+        max_programs = int(os.environ.get("ELFUZZ_FALLBACK_MAX_PROGRAMS", "64") or "64")
+        call_timeout = float(os.environ.get("ELFUZZ_FALLBACK_CALL_TIMEOUT_SECONDS", "2") or "2")
+        import signal
+
+        def _alarm_handler(signum, frame):  # noqa: ANN001, ARG001
+            raise TimeoutError("fuzzer program call exceeded its time budget")
+
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        programs_seen = 0
+        try:
+            for prog_path in sorted(programs_dir.rglob("*.py")):
+                if "__pycache__" in str(prog_path):
                     continue
-                fn_name = fn_match.group(1)
-                with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir=str(dest.parent)) as tmp:
-                    tmp.write(text)
-                    tmp_path = tmp.name
+                if programs_seen >= max_programs:
+                    break
+                programs_seen += 1
                 try:
-                    spec = importlib.util.spec_from_file_location(f"fuzzer_{count}", tmp_path)
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                fn = getattr(module, fn_name, None)
-                if not fn:
-                    continue
-                for i in range(10):
-                    rng_data = bytes(random.randint(0, 255) for _ in range(256))
-                    out_buf = io.BytesIO()
-                    try:
-                        fn(io.BytesIO(rng_data), out_buf)
-                    except Exception:
+                    text = prog_path.read_text(encoding="utf-8", errors="replace")
+                    text = text.replace("int(wrapped_rng.read(1))", "int.from_bytes(wrapped_rng.read(1), 'big') % 128")
+                    text = text.replace("int(wrapped_rng.read(", "int.from_bytes(wrapped_rng.read(")
+                    text = text.replace("int.from_bytes.from_bytes(", "int.from_bytes(")
+                    fn_match = re.search(r"def (generate_\w+)\s*\(", text)
+                    if not fn_match:
                         continue
-                    data = out_buf.getvalue()
-                    if data:
-                        out_path = dest / f"input_{count:04d}"
-                        out_path.write_bytes(data)
-                        count += 1
-            except Exception:
-                pass
+                    fn_name = fn_match.group(1)
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, dir=str(dest.parent)) as tmp:
+                        tmp.write(text)
+                        tmp_path = tmp.name
+                    try:
+                        spec = importlib.util.spec_from_file_location(f"fuzzer_{count}", tmp_path)
+                        module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(module)
+                    finally:
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                    fn = getattr(module, fn_name, None)
+                    if not fn:
+                        continue
+                    per_program = int(os.environ.get("ELFUZZ_FALLBACK_INPUTS_PER_PROGRAM", "10") or "10")
+                    for i in range(max(0, per_program)):
+                        rng_data = bytes(random.randint(0, 255) for _ in range(256))
+                        out_buf = io.BytesIO()
+                        try:
+                            signal.setitimer(signal.ITIMER_REAL, max(0.1, call_timeout))
+                            fn(io.BytesIO(rng_data), out_buf)
+                        except Exception:
+                            continue
+                        finally:
+                            signal.setitimer(signal.ITIMER_REAL, 0)
+                        data = out_buf.getvalue()
+                        if data:
+                            out_path = dest / f"input_{count:04d}"
+                            out_path.write_bytes(data)
+                            count += 1
+                except Exception:
+                    pass
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_handler)
 
     def _invoke_target(self, sample: bytes, timeout: int | None = None) -> dict[str, Any]:
         """Run one sample through the native target via the adapter input contract.
@@ -2701,6 +2879,17 @@ class ELFuzzPipeline:
             if self.dry_run:
                 self.write_outputs("dry_run_ok", "dry run validated ELFuzz adapter and budget", 0)
                 return 0
+            if self.corpus_only:
+                # Corpus-only MAGMA runs need the evolved generator programs
+                # and their outputs, not a native SUT, campaign, or coverage
+                # replay.  Stage names are still recorded so the result is
+                # comparable with a full run.
+                self.model_ready()
+                self.synthesis()
+                self.evolution()
+                self.production()
+                self.write_outputs("corpus_ready", "corpus-only run produced an ELFuzz seed corpus", 0)
+                return 0
             self.build_target()
             self.create_adapter_benchmark_dir()
             self.elfuzz_setup()
@@ -2820,6 +3009,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--profile", default=os.environ.get("HGB_BASELINE_PROFILE", "alpha"))
     parser.add_argument("--protocol", default=os.environ.get("HGB_BASELINE_PROTOCOL", "paper-native"))
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("HGB_DRY_RUN", "0") == "1")
+    parser.add_argument(
+        "--corpus-only",
+        action="store_true",
+        default=os.environ.get("ELFUZZ_CORPUS_ONLY", "0") == "1",
+        help="Generate an ELFuzz seed corpus only (skip SUT build, validation, campaign and coverage)",
+    )
 
 
 def make_pipeline(args: argparse.Namespace) -> ELFuzzPipeline:
@@ -2835,6 +3030,7 @@ def make_pipeline(args: argparse.Namespace) -> ELFuzzPipeline:
         profile=args.profile,
         protocol=args.protocol,
         dry_run=bool(args.dry_run),
+        corpus_only=bool(getattr(args, "corpus_only", False)),
     )
 
 
@@ -2853,6 +3049,8 @@ def main(argv: list[str] | None = None) -> int:
     write_invalid.add_argument("--out", required=True)
     validate_parser = sub.add_parser("validate-adapters")
     validate_parser.add_argument("--metadata-root", default=str(default_metadata_root()))
+    validate_magma_parser = sub.add_parser("validate-magma-adapters")
+    validate_magma_parser.add_argument("--metadata-root", default=str(default_metadata_root()))
     dump_parser = sub.add_parser("dump-adapter")
     dump_parser.add_argument("target")
     dump_parser.add_argument("--metadata-root", default=str(default_metadata_root()))
@@ -2872,8 +3070,12 @@ def main(argv: list[str] | None = None) -> int:
             validate_adapter_coverage(Path(args.metadata_root))
             validate_no_aliasing(Path(args.metadata_root))
             return 0
+        if args.command == "validate-magma-adapters":
+            targets = validate_magma_adapters(Path(args.metadata_root))
+            print(json.dumps({"targets": targets}, indent=2, sort_keys=True))
+            return 0
         if args.command == "dump-adapter":
-            print(json.dumps(load_adapters(Path(args.metadata_root))[args.target], indent=2, sort_keys=True))
+            print(json.dumps(load_target_adapters(Path(args.metadata_root))[args.target], indent=2, sort_keys=True))
             return 0
         pipeline = make_pipeline(args)
         if args.command == "full":

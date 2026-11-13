@@ -190,6 +190,7 @@ case "$native_dest" in
     ;;
 esac
 project_include_flags="${project_include_args[*]}"
+export AR="${AR:-ar}" AS="${AS:-as}" RANLIB="${RANLIB:-ranlib}" LD="${LD:-ld}" NM="${NM:-nm}" STRIP="${STRIP:-strip}" OBJCOPY="${OBJCOPY:-objcopy}"
 export CFLAGS="${CFLAGS:-} -pthread ${project_include_flags} ${PROME_FUZZ_EXTRA_CFLAGS:-}"
 export CXXFLAGS="${CXXFLAGS:-} -pthread -Wno-register ${project_include_flags} ${PROME_FUZZ_EXTRA_CXXFLAGS:-}"
 export LIBS="${LIBS:-} ${PROME_FUZZ_EXTRA_LIBS:-}"
@@ -217,10 +218,10 @@ build_status=0
 # past a failed build step. Report the child shell's status ourselves instead.
 set +e
 if [[ -n "$build_log" ]]; then
-  (cd "$build_workdir" && timeout "$build_timeout" bash -eu "$run_source/build.sh") >"$build_log" 2>&1
+  (cd "$build_workdir" && timeout "$build_timeout" bash -e "$run_source/build.sh") >"$build_log" 2>&1
   build_status=$?
 else
-  (cd "$build_workdir" && timeout "$build_timeout" bash -eu "$run_source/build.sh")
+  (cd "$build_workdir" && timeout "$build_timeout" bash -e "$run_source/build.sh")
   build_status=$?
 fi
 set -e

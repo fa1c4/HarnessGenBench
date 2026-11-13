@@ -106,7 +106,7 @@ def _symbol_names(symbol: str) -> set[str]:
     # Some OSS-Fuzz builds rename public project symbols with a stable prefix
     # during sanitizer/link isolation, while coverage still reports the renamed
     # symbol. Preserve the original and add the public API spelling.
-    for prefix in ("OSS_FUZZ_",):
+    for prefix in ("OSS_FUZZ_", "MAGMA_"):
         if raw.startswith(prefix) and len(raw) > len(prefix):
             names.add(raw[len(prefix):])
     # Itanium C++ ABI mangling stores identifiers as length-prefixed

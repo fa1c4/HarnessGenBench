@@ -1,0 +1,99 @@
+schema_version: 1
+generator: g2fuzz
+task_family: input_generator
+target_set: magma
+# Parallel G2Fuzz adapter contract for the nine MAGMA targets.  The upstream
+# program_to_format.json is extended at run time by the host driver from this
+# file; metadata/g2fuzz_target_adapters.yaml (the FuzzBench valuable set) is
+# never modified.
+targets:
+  - target: magma_libpng
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: magma_libpng
+    upstream_program: libpng_read_fuzzer
+    formats: [PNG]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_libpng.md
+    corpus_source: workspace/magma/benchmarks/libpng/seeds
+  - target: magma_libsndfile
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: magma_libsndfile
+    upstream_program: sndfile_fuzzer
+    formats: [WAV, AIFF, AU, MP3, CAF]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_libsndfile.md
+    corpus_source: workspace/magma/benchmarks/libsndfile/seeds
+  - target: magma_libtiff
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: magma_libtiff
+    upstream_program: tiff_read_rgba_fuzzer
+    formats: [TIFF]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_libtiff.md
+    corpus_source: workspace/magma/benchmarks/libtiff/seeds
+  - target: magma_libxml2
+    applicability: applicable
+    method_profile: extension
+    program_id: magma_libxml2
+    upstream_program: libxml2_xml_read_memory_fuzzer
+    formats: [XML]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_libxml2.md
+    corpus_source: workspace/magma/benchmarks/libxml2/seeds
+  - target: magma_lua
+    applicability: applicable
+    method_profile: extension
+    program_id: magma_lua
+    upstream_program: fuzz_lua
+    formats: [Lua source]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_lua.md
+    corpus_source: workspace/magma/benchmarks/lua/seeds
+  - target: magma_openssl
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: magma_openssl
+    upstream_program: x509
+    formats: [binary_large_object_BLOB]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_openssl.md
+    corpus_source: workspace/magma/benchmarks/openssl/seeds
+  - target: magma_php
+    applicability: applicable
+    method_profile: extension
+    program_id: magma_php
+    upstream_program: parser
+    formats: [PHP source]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_php.md
+    corpus_source: workspace/magma/benchmarks/php/seeds
+  - target: magma_poppler
+    applicability: applicable
+    method_profile: paper-faithful
+    program_id: magma_poppler
+    upstream_program: pdf_fuzzer
+    formats: [PDF]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_poppler.md
+    corpus_source: workspace/magma/benchmarks/poppler/seeds
+  - target: magma_sqlite3
+    applicability: applicable
+    method_profile: extension
+    program_id: magma_sqlite3
+    upstream_program: sqlite3_fuzz
+    formats: [SQL]
+    input_mode: file
+    argv: ["@@"]
+    format_spec: repro/g2fuzz/magma_specs/magma_sqlite3.md
+    corpus_source: workspace/magma/benchmarks/sqlite3/seeds

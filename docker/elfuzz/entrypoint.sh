@@ -254,6 +254,94 @@ path.write_text(text)
 PY_ELFUZZ_HGB_FLAGS_PATCH
 }
 
+patch_elfuzz_corpus_guards() {
+  local root="$ELFUZZ_PROJECT_ROOT"
+  [[ -n "$root" ]] || return 0
+  local all_gen="$root/all_gen.sh"
+  local do_gen="$root/do_gen.sh"
+  local batchrun="$root/evaluation/workdir/batchrun.py"
+  python3 - "$all_gen" "$do_gen" "$batchrun" <<'PY_ELFUZZ_CORPUS_GUARDS'
+from pathlib import Path
+import sys
+
+all_gen = Path(sys.argv[1])
+do_gen = Path(sys.argv[2])
+batchrun = Path(sys.argv[3])
+
+if all_gen.is_file():
+    text = all_gen.read_text()
+    marker = "# HGB corpus-mode guards"
+    if marker not in text:
+        old = "    python prepare_fuzzbench.py\n"
+        new = (
+            '    if [ "${ELFUZZ_SKIP_FUZZBENCH_PREPARE:-0}" != "1" ]; then\n'
+            "        python prepare_fuzzbench.py\n"
+            "    else\n"
+            '        echo "[HGB] skipping prepare_fuzzbench (ELFUZZ_SKIP_FUZZBENCH_PREPARE=1)"\n'
+            "    fi\n"
+        )
+        if old in text:
+            text = text.replace(old, new, 1)
+        text = text.replace("#!/bin/bash\n", "#!/bin/bash\n" + marker + "\n", 1)
+        all_gen.write_text(text)
+
+if do_gen.is_file():
+    text = do_gen.read_text()
+    marker = "# HGB corpus-only coverage guard"
+    if marker not in text:
+        needle = 'echo "Collecting coverage of the generators"'
+        plot = "python analyze_cov.py -m $num_gens"
+        if needle in text and plot in text:
+            guard = (
+                'echo "Collecting coverage of the generators"\n'
+                'if [ "${ELFUZZ_SKIP_COVERAGE:-0}" == "1" ]; then\n'
+                '    echo "{}" > "${LOGDIR}/coverage.json"\n'
+                '    echo "[HGB] skipped generator coverage collection (ELFUZZ_SKIP_COVERAGE=1)"\n'
+                "else"
+            )
+            text = text.replace(needle, guard, 1)
+            # Retain a bounded sample of the generated inputs before do_gen.sh
+            # deletes the per-variant output tree.  These are exactly the
+            # inputs ELFuzz's synthesized variant programs produced.
+            old_rm = '    rm -rf "$GOOUT"\n'
+            new_rm = (
+                '    if [ "${ELFUZZ_KEEP_GENERATED_OUTPUTS:-0}" == "1" ]; then\n'
+                '        dest="${ELMFUZZ_RUNDIR}/hgb_generated/${next_gen}/${MODEL}"\n'
+                '        mkdir -p "$dest"\n'
+                '        find "$GOOUT" -type f -path "*/output/*" | sort | head -n "${ELFUZZ_CORPUS_MAX_OUTPUTS:-128}" | while IFS= read -r f; do\n'
+                '            rel="$(basename "$(dirname "$(dirname "$f")")")_$(basename "$f")"\n'
+                '            cp "$f" "$dest/$rel" 2>/dev/null || true\n'
+                "        done\n"
+                "    fi\n"
+                '    rm -rf "$GOOUT"\n'
+            )
+            if old_rm in text:
+                text = text.replace(old_rm, new_rm, 1)
+            # Close the coverage-skip guard *before* the retention loop, so
+            # generated outputs are retained in both coverage modes even when
+            # the harness has no coverage image.
+            retention_anchor = (
+                "for model_name in $MODELS ; do\n"
+                "    GOOUT=$(./elmconfig.py get run.genoutput_dir -s MODEL=${MODEL} -s GEN=${next_gen})\n"
+                '    if [ "${ELFUZZ_KEEP_GENERATED_OUTPUTS'
+            )
+            if retention_anchor in text:
+                text = text.replace(retention_anchor, "fi\n" + retention_anchor, 1)
+            else:
+                text = text.replace(plot, "fi\n" + plot, 1)
+            text = text.replace("#!/bin/bash\n", "#!/bin/bash\n" + marker + "\n", 1)
+            do_gen.write_text(text)
+
+if batchrun.is_file():
+    text = batchrun.read_text()
+    old = "PRESETS[method][benchmark]"
+    new = "PRESETS[method].get(benchmark, [])"
+    if old in text:
+        batchrun.write_text(text.replace(old, new))
+PY_ELFUZZ_CORPUS_GUARDS
+}
+
+
 ensure_elfuzz_deps() {
   if [[ -n "$ELFUZZ_PROJECT_ROOT" && -f "$ELFUZZ_PROJECT_ROOT/elmconfig.py" ]]; then
     local py310_dir="/home/appuser/miniconda3/envs/py310/bin"
@@ -469,6 +557,7 @@ if [[ "$mode" == "generate-target" ]]; then
   setup_elfuzz_tgi_proxy
   patch_elfuzz_hgb_flags
   ensure_elfuzz_deps
+  patch_elfuzz_corpus_guards
   python=/opt/hgb/venv/bin/python
   if [[ ! -x "$python" ]]; then
     python="$(command -v python3)"
@@ -476,6 +565,10 @@ if [[ "$mode" == "generate-target" ]]; then
   dry_run_arg=()
   if [[ "${HGB_DRY_RUN:-0}" == "1" ]]; then
     dry_run_arg=(--dry-run)
+  fi
+  corpus_only_arg=()
+  if [[ "${ELFUZZ_CORPUS_ONLY:-0}" == "1" ]]; then
+    corpus_only_arg=(--corpus-only)
   fi
   exec "$python" /opt/hgb/bin/elfuzz_target_pipeline.py full \
     --workspace "$workspace" \
@@ -485,7 +578,8 @@ if [[ "$mode" == "generate-target" ]]; then
     --metadata-root /opt/hgb/metadata \
     --profile "$HGB_BASELINE_PROFILE" \
     --protocol "$HGB_BASELINE_PROTOCOL" \
-    "${dry_run_arg[@]}"
+    "${dry_run_arg[@]}" \
+    "${corpus_only_arg[@]}"
 fi
 
 # Legacy smoke mode (compatibility only; not the alpha matrix path).

@@ -181,6 +181,11 @@ load_hgb_config() {
   export HGB_LLM_TRACE_DIR="${HGB_LLM_TRACE_DIR:-/workspace/api_traces}"
   export HGB_LLM_TRACE_SAMPLE_RATE="${HGB_LLM_TRACE_SAMPLE_RATE:-10}"
   export HGB_LLM_TRACE_FIRST="${HGB_LLM_TRACE_FIRST:-1}"
+  # Docker 28 defaults to BuildKit, whose daemon-side worker can wedge under
+  # heavy shared-host load; the legacy builder is deterministic and supports
+  # concurrent target builds.  Containers that build images (generators and
+  # the sealed evaluator) inherit this through -e DOCKER_BUILDKIT.
+  export DOCKER_BUILDKIT="${DOCKER_BUILDKIT:-0}"
 }
 
 load_env() {
@@ -500,6 +505,7 @@ run_hgb_container() {
     extra_docker_args+=(--label "hgb.eval_all_run=$HGB_EVAL_ALL_RUN_ID" -e HGB_EVAL_ALL_RUN_ID)
   fi
   docker run --rm --pull=never --init \
+    -e DOCKER_BUILDKIT \
     "${extra_docker_args[@]}" \
     -e API_KEY \
     -e USTC_API_KEY \
@@ -568,6 +574,15 @@ run_hgb_container() {
     -e ELFUZZ_EVOLUTION_SECONDS \
     -e ELFUZZ_PRODUCE_SECONDS \
     -e ELFUZZ_AFL_SECONDS \
+    -e ELFUZZ_CORPUS_ONLY \
+    -e ELFUZZ_SKIP_FUZZBENCH_PREPARE \
+    -e ELFUZZ_SKIP_COVERAGE \
+    -e ELFUZZ_KEEP_GENERATED_OUTPUTS \
+    -e ELFUZZ_NUM_VARIANTS \
+    -e ELFUZZ_NUM_OUTPUTS_PER_VARIANT \
+    -e ELFUZZ_VARIANT_JOBS \
+    -e ELFUZZ_CORPUS_MAX_OUTPUTS \
+    -e ELFUZZ_FALLBACK_INPUTS_PER_PROGRAM \
     -e DOCKER_NAME \
     -e ELFUZZ_STAGE_TIMEOUT_SECONDS \
     -e ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
@@ -633,6 +648,7 @@ run_hgb_container() {
     -e PROME_FUZZ_EVAL_MAX_CANDIDATES \
     -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
+    -e PROME_FUZZ_SEED_HARNESS \
     -e PROME_FUZZ_COMPREHEND_TASK \
     -e G2FUZZ_MAX_FORMATS \
     -e G2FUZZ_TRY_NUM \
@@ -703,6 +719,14 @@ run_hgb_target_container() {
   if [[ -n "${HGB_CODEQL_DIR:-}" ]]; then
     extra_docker_args+=(-v "${HGB_CODEQL_DIR}:/opt/hgb/codeql-host:ro" -e HGB_CODEQL_DIR=/opt/hgb/codeql-host)
   fi
+  # Evaluator runtime overlays: the shared smoke/campaign timeout and the
+  # MAGMA-prefix reachability fixes must also apply inside generator
+  # containers, whose images carry an older copy of these modules.
+  extra_docker_args+=(
+    -v "$root/docker/common/hgb_fuzzbench_builder.py:/opt/hgb/bin/hgb_fuzzbench_builder.py:ro"
+    -v "$root/docker/common/hgb_reachability.py:/opt/hgb/bin/hgb_reachability.py:ro"
+    -v "$root/docker/common/hgb_harness_evaluator.py:/opt/hgb/bin/hgb_harness_evaluator.py:ro"
+  )
   if [[ "$generator" == "ckgfuzzer" ]]; then
     ensure_dir "$workspace/docker_shared"
     ckg_codeql_cache_dir="$(hgb_workspace_dir "$root")/ckgfuzzer-codeql-cache"
@@ -720,6 +744,19 @@ run_hgb_target_container() {
     if [[ -S /var/run/docker.sock ]]; then
       extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
     fi
+  fi
+  if [[ "$generator" == "ckgfuzzer" ]]; then
+    # Runtime overlay for the MAGMA-phase coverage-image fix.
+    extra_docker_args+=(-v "$root/docker/ckgfuzzer/entrypoint.sh:/opt/hgb/entrypoint.sh:ro")
+  fi
+  if [[ "$generator" == "promefuzz" ]]; then
+    # Runtime overlay for the MAGMA-phase neutral-stub linkage fix.
+    extra_docker_args+=(-v "$root/docker/common/promefuzz_build_context.py:/opt/hgb/bin/promefuzz_build_context.py:ro")
+  fi
+  if [[ "$generator" == "oss-fuzz-gen" ]]; then
+    # Runtime overlay for the MAGMA-phase override parsing fix (the generator
+    # image rebuild is expensive and this file is the only changed entrypoint).
+    extra_docker_args+=(-v "$root/docker/oss-fuzz-gen/entrypoint.sh:/opt/hgb/entrypoint.sh:ro")
   fi
   if [[ "$generator" == "oss-fuzz-gen" && -S /var/run/docker.sock ]]; then
     extra_docker_args+=(-v /var/run/docker.sock:/var/run/docker.sock)
@@ -841,6 +878,7 @@ run_hgb_target_container() {
   timeout --kill-after=60 "$hgb_docker_run_timeout" docker run --rm --pull=never --init \
     --entrypoint /opt/hgb/entrypoint.sh \
     -e HGB_DOCKER_IMAGE_DIGEST="$hgb_docker_image_digest" \
+    -e DOCKER_BUILDKIT \
     -e API_KEY \
     -e USTC_API_KEY \
     -e USTC_BASE_URL \
@@ -911,6 +949,15 @@ run_hgb_target_container() {
     -e ELFUZZ_EVOLUTION_ITERATIONS \
     -e ELFUZZ_PRODUCE_SECONDS \
     -e ELFUZZ_AFL_SECONDS \
+    -e ELFUZZ_CORPUS_ONLY \
+    -e ELFUZZ_SKIP_FUZZBENCH_PREPARE \
+    -e ELFUZZ_SKIP_COVERAGE \
+    -e ELFUZZ_KEEP_GENERATED_OUTPUTS \
+    -e ELFUZZ_NUM_VARIANTS \
+    -e ELFUZZ_NUM_OUTPUTS_PER_VARIANT \
+    -e ELFUZZ_VARIANT_JOBS \
+    -e ELFUZZ_CORPUS_MAX_OUTPUTS \
+    -e ELFUZZ_FALLBACK_INPUTS_PER_PROGRAM \
     -e DOCKER_NAME \
     -e ELFUZZ_STAGE_TIMEOUT_SECONDS \
     -e ELFUZZ_LLM_REQUEST_TIMEOUT_SECONDS \
@@ -983,6 +1030,7 @@ run_hgb_target_container() {
     -e PROME_FUZZ_EVAL_MAX_CANDIDATES \
     -e PROME_FUZZ_FAIL_FAST_ON_PROVIDER_ERROR \
     -e PROME_FUZZ_MAX_APIS \
+    -e PROME_FUZZ_SEED_HARNESS \
     -e PROME_FUZZ_POOL_SIZE \
     -e PROME_FUZZ_COMPREHEND_TASK \
     -e PROME_FUZZ_ALL_COVER_CANDIDATES \

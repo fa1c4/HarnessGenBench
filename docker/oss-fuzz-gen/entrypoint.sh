@@ -283,6 +283,25 @@ PY_OFG_BLOATY_SOURCE
       printf 'ofg_project_patch: Bloaty image uses local split source and populated submodules\n' >>"$patch_log"
     fi
   fi
+  # lua: the OSS-Fuzz image clones the 389k-file lunapark-corpus only to build
+  # seed corpora. That clone dominates (and can exceed) the generation budget
+  # and is irrelevant to compilation or the Introspector; ship empty
+  # dict/options placeholders so the project build step still succeeds.
+  local lua_dockerfile="$oss_fuzz_dir/projects/lua/Dockerfile"
+  if [[ -f "$lua_dockerfile" ]] && ! grep -qF "HGB lua corpus placeholder" "$lua_dockerfile"; then
+    "$python" - "$lua_dockerfile" <<'PY_OFG_LUA_PATCH'
+import sys
+from pathlib import Path
+p = Path(sys.argv[1])
+text = p.read_text(encoding="utf-8", errors="replace")
+old = "RUN git clone --depth 1 --jobs $(nproc) https://github.com/ligurio/lunapark-corpus corpus_dir"
+new = "RUN mkdir -p corpus_dir && touch corpus_dir/lua.dict corpus_dir/lua.options  # HGB lua corpus placeholder"
+if old not in text:
+    raise SystemExit("lua corpus clone command changed unexpectedly")
+p.write_text(text.replace(old, new, 1), encoding="utf-8")
+PY_OFG_LUA_PATCH
+    printf 'ofg_project_patch: lua lunapark-corpus clone replaced with dict/options placeholders\n' >>"$patch_log"
+  fi
   # lcms: the upstream Dockerfile seeds the corpus with ``cd seeds`` relative
   # to WORKDIR lcms (the dir does not exist there) and copies testbed/*.icc
   # files that current lcms master no longer ships; the RUN always fails and
@@ -366,7 +385,7 @@ PY_OFG_PHP_CONFIGURE
   # builder image has 2.69. Use the public FuzzBench target revision for the
   # generation image as well as for the independent evaluator. This also
   # keeps the generated driver aligned with the requested PHP target.
-  if [[ "${HGB_TARGET_PROJECT:-}" == "php" ]]; then
+  if [[ "${HGB_TARGET_PROJECT:-}" == "php" ]] && [[ ",${OFG_INTROSPECTOR_UNPINNED:-}," != *",php,"* ]]; then
     local php_dockerfile="$oss_fuzz_dir/projects/php/Dockerfile"
     if [[ -f "$php_dockerfile" && -f /target/source_repos.json ]] &&
        ! grep -qF "HGB pinned php target revision" "$php_dockerfile"; then
@@ -1314,6 +1333,10 @@ PY_OFG_PIN
   # target, ...) cannot be built at the pinned commit; use the OSS-Fuzz
   # project.yaml clone for those instead (recorded deviation).
   local ofg_unpinned="${OFG_INTROSPECTOR_UNPINNED:-}"
+  if [[ "$project" == "php" || "$project" == "php-src" ]]; then
+    # The MAGMA/php HEAD is not fetchable from the shallow upstream clone.
+    clone_pinned="unpinned_by_override"
+  fi
   if [[ -n "$ofg_unpinned" ]] && [[ ",$ofg_unpinned," == *",$project,"* ]]; then
     clone_pinned="unpinned_by_override"
     printf 'ofg_introspector_note: project=%s uses the OSS-Fuzz unpinned clone (OFG_INTROSPECTOR_UNPINNED)\n' "$project" >>"$workspace/logs/introspector_build.log"
@@ -1394,6 +1417,12 @@ PY_OFG_PIN_CLONE
       (cd "$oss_fuzz_dir" && python3 infra/helper.py build_fuzzers --sanitizer introspector \
           --architecture x86_64 \
           "$project" "${helper_extra_args[@]}" >"$introspector_log" 2>&1) && break
+      # helper.py refuses a local checkout for projects whose Dockerfile sets
+      # WORKDIR=/src (lua). The fallback below rebuilds against the image
+      # clone; jump there instead of treating this as a hard failure.
+      if grep -q 'Cannot use local checkout' "$introspector_log"; then
+        break
+      fi
       if [[ "$ofg_introspector_attempt" -lt 3 ]] && grep -Eiq 'gnutls|TLS|non-properly terminated|Connection|temporary failure|Failed to fetch|Unable to fetch|SSL|timed out' "$introspector_log"; then
         printf 'ofg_introspector_retry: transient network failure (attempt %s); retrying\n' "$ofg_introspector_attempt" >>"$introspector_log"
         sleep $((ofg_introspector_attempt * 30))
@@ -1608,7 +1637,8 @@ synthesize_benchmark_from_introspector() {
   # the language, and the per-target build timeout. These are static build
   # facts, not reference-derived content.
   local target_path="" language="" build_timeout="" preferred_apis=""
-  read -r target_path language build_timeout preferred_apis <<<"$("$python" - /opt/hgb/metadata "$target_name" <<'PY_OFG_OVERRIDE' 2>/dev/null || true
+  local target_path_language_timeout_apis=""
+  target_path_language_timeout_apis="$("$python" - /opt/hgb/metadata "$target_name" <<'PY_OFG_OVERRIDE' 2>/dev/null || true
 import sys
 from pathlib import Path
 sys.path.insert(0, "/opt/hgb/bin")
@@ -1619,9 +1649,10 @@ tpath = str(entry.get("candidate_destination") or "")
 lang = str(entry.get("language") or "")
 btimeout = str(entry.get("build_timeout") or "")
 apis = ",".join(str(a) for a in (entry.get("preferred_apis") or []))
-print(tpath, lang, btimeout, apis)
+print("|".join((tpath, lang, btimeout, apis)))
 PY_OFG_OVERRIDE
   )"
+  IFS='|' read -r target_path language build_timeout preferred_apis <<<"$target_path_language_timeout_apis"
   # The upstream OSS-Fuzz-Gen build loop COPYs the generated harness to
   # benchmark.target_path inside the OSS-Fuzz project image, so target_path
   # must be the path the OSS-Fuzz build.sh compiles -- the project's own

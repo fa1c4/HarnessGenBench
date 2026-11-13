@@ -2,6 +2,8 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip python3-venv build-essential cmake ninja-build git curl wget ca-certificates pkg-config clang llvm llvm-dev libclang-dev libclang-rt-18-dev clang-format libomp-dev make jq rsync ripgrep universal-ctags bear file zip xz-utils zlib1g-dev libssl-dev libffi-dev libsqlite3-dev libbz2-dev liblzma-dev apt-transport-https gnupg \
+    autoconf automake libtool bison re2c gettext libicu-dev libreadline-dev \
+    libjpeg-dev libpng-dev libtiff-dev libopenjp2-7-dev liblcms2-dev libfreetype-dev libboost-dev \
   && rm -rf /var/lib/apt/lists/*
 COPY artifacts/promefuzz /opt/hgb/artifacts/promefuzz
 # Upstream bug: check_actual_targets_ast returns the APICollection.safe_iter
@@ -22,38 +24,13 @@ RUN python3 -m venv /opt/hgb/venv \
   && /opt/hgb/venv/bin/python -m pip install --upgrade pip setuptools wheel \
   && if [ -f /opt/hgb/artifacts/promefuzz/requirements.txt ]; then /opt/hgb/venv/bin/python -m pip install -r /opt/hgb/artifacts/promefuzz/requirements.txt; fi
 ENV NLTK_DATA=/opt/hgb/nltk_data
-RUN /opt/hgb/venv/bin/python -m pip install pdfminer.six nltk \
-  && mkdir -p /opt/hgb/nltk_data \
-  && /opt/hgb/venv/bin/python - <<'PY_NLTK_DOWNLOAD'
-import os
-import time
-
-import nltk
-
-download_dir = os.environ["NLTK_DATA"]
-packages = (
-    "punkt",
-    "punkt_tab",
-    "averaged_perceptron_tagger",
-    "averaged_perceptron_tagger_eng",
-)
-for package in packages:
-    ok = False
-    for _ in range(5):
-        try:
-            if nltk.download(package, download_dir=download_dir, quiet=True):
-                ok = True
-                break
-        except Exception:
-            ok = False
-        time.sleep(3)
-    # Fail the build rather than silently shipping an image without NLTK data.
-    if not ok:
-        raise SystemExit(f"failed to download NLTK package: {package}")
-PY_NLTK_DOWNLOAD
+# NLTK corpora are baked into the build context (extracted from the validated
+# PromeFuzz image). Downloading them during the image build depends on the
+# public NLTK server and made rebuilds non-reproducible.
+RUN /opt/hgb/venv/bin/python -m pip install pdfminer.six nltk
+COPY docker/promefuzz/nltk_data /opt/hgb/nltk_data
 RUN test -n "$(ls -A /opt/hgb/nltk_data/tokenizers 2>/dev/null)" \
   && test -n "$(ls -A /opt/hgb/nltk_data/taggers 2>/dev/null)"
-ENV NLTK_DATA=/opt/hgb/nltk_data
 RUN cd /opt/hgb/artifacts/promefuzz \
   && bash ./setup.sh \
   && test -x build/bin/preprocessor \
