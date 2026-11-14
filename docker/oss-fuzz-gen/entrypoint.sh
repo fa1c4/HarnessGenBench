@@ -385,6 +385,47 @@ PY_OFG_PHP_CONFIGURE
   # builder image has 2.69. Use the public FuzzBench target revision for the
   # generation image as well as for the independent evaluator. This also
   # keeps the generated driver aligned with the requested PHP target.
+  if [[ "${HGB_TARGET_PROJECT:-}" == "php" ]] && [[ ",${OFG_INTROSPECTOR_UNPINNED:-}," == *",php,"* ]]; then
+    local php_local_dockerfile="$oss_fuzz_dir/projects/php/Dockerfile"
+    if [[ -d /target/source_input/php-src && -f "$php_local_dockerfile" ]]; then
+      rm -rf "$oss_fuzz_dir/projects/php/php-src"
+      cp -a /target/source_input/php-src "$oss_fuzz_dir/projects/php/php-src"
+      find "$oss_fuzz_dir/projects/php/php-src" -name Makefile -delete 2>/dev/null || true
+      find "$oss_fuzz_dir/projects/php/php-src" \( -name '*.lo' -o -name '*.o' -o -name '*.la' \) -delete 2>/dev/null || true
+      rm -f "$oss_fuzz_dir/projects/php/php-src/config.status" "$oss_fuzz_dir/projects/php/php-src/config.cache" "$oss_fuzz_dir/projects/php/php-src/buildmk.stamp" "$oss_fuzz_dir/projects/php/php-src/Makefile.global"
+      rm -rf "$oss_fuzz_dir/projects/php/php-src/autom4te.cache"
+      find "$oss_fuzz_dir/projects/php/php-src" -name '*.dep' -delete 2>/dev/null || true
+      "$python" - "$php_local_dockerfile" <<'PY_OFG_PHP_LOCAL_COPY'
+from pathlib import Path
+import re
+import sys
+dockerfile = Path(sys.argv[1])
+text = dockerfile.read_text(encoding="utf-8")
+text = re.sub(r"(?m)^RUN git clone --depth 1 --branch master https://github\.com/php/php-src\.git php-src$",
+              "COPY php-src php-src", text)
+dockerfile.write_text(text, encoding="utf-8")
+PY_OFG_PHP_LOCAL_COPY
+      printf 'ofg_project_patch: php Dockerfile uses the local MAGMA source\n' >>"$patch_log"
+    fi
+  fi
+  if [[ "${HGB_TARGET_PROJECT:-}" == "poppler" ]] && [[ ",${OFG_INTROSPECTOR_UNPINNED:-}," == *",poppler,"* ]]; then
+    local poppler_local_dockerfile="$oss_fuzz_dir/projects/poppler/Dockerfile"
+    if [[ -d /target/source_input/poppler && -f "$poppler_local_dockerfile" ]]; then
+      rm -rf "$oss_fuzz_dir/projects/poppler/poppler"
+      cp -a /target/source_input/poppler "$oss_fuzz_dir/projects/poppler/poppler"
+      "$python" - "$poppler_local_dockerfile" <<'PY_OFG_POPPLER_LOCAL_COPY'
+from pathlib import Path
+import re
+import sys
+dockerfile = Path(sys.argv[1])
+text = dockerfile.read_text(encoding="utf-8")
+text = re.sub(r"(?m)^RUN git clone --depth 1 --single-branch https://gitlab\.freedesktop\.org/poppler/poppler\.git$",
+              "COPY poppler poppler", text)
+dockerfile.write_text(text, encoding="utf-8")
+PY_OFG_POPPLER_LOCAL_COPY
+      printf 'ofg_project_patch: poppler Dockerfile uses the local MAGMA source\n' >>"$patch_log"
+    fi
+  fi
   if [[ "${HGB_TARGET_PROJECT:-}" == "php" ]] && [[ ",${OFG_INTROSPECTOR_UNPINNED:-}," != *",php,"* ]]; then
     local php_dockerfile="$oss_fuzz_dir/projects/php/Dockerfile"
     if [[ -f "$php_dockerfile" && -f /target/source_repos.json ]] &&
@@ -1402,6 +1443,48 @@ else:
     print("no_clone")
 PY_OFG_PIN_CLONE
   )"
+  fi
+  if [[ "$project" == "php" ]]; then
+    for php_build_script in "$oss_fuzz_dir/projects/php/build.sh" "$oss_fuzz_dir/projects/php/replay_build.sh"; do
+      if [[ -f "$php_build_script" ]]; then
+        sed -i '/php-fuzz-function-jit/d' "$php_build_script"
+      fi
+    done
+  fi
+  if [[ "$project" == "php" ]]; then
+    for php_build_script in "$oss_fuzz_dir/projects/php/build.sh" "$oss_fuzz_dir/projects/php/replay_build.sh"; do
+      if [[ -f "$php_build_script" ]]; then
+        sed -i '/php-fuzz-function-jit/d' "$php_build_script"
+      fi
+    done
+  fi
+  if [[ ",${OFG_INTROSPECTOR_UNPINNED:-}," == *",$project,"* ]] && [[ "${OFG_PHP_UPSTREAM:-0}" != "1" || "$project" != "php" ]]; then
+    local local_project_src=""
+    case "$project" in
+      php) local_project_src="/target/source_input/php-src" ;;
+      poppler) local_project_src="/target/source_input/poppler" ;;
+    esac
+    if [[ -n "$local_project_src" && -d "$local_project_src" && -f "$oss_fuzz_dir/projects/$project/Dockerfile" ]]; then
+      rm -rf "$oss_fuzz_dir/projects/$project/$project"
+      cp -a "$local_project_src" "$oss_fuzz_dir/projects/$project/$project"
+      find "$oss_fuzz_dir/projects/$project/$project" -name Makefile -delete 2>/dev/null || true
+      find "$oss_fuzz_dir/projects/$project/$project" \( -name '*.lo' -o -name '*.o' -o -name '*.la' \) -delete 2>/dev/null || true
+      rm -f "$oss_fuzz_dir/projects/$project/$project/config.status" "$oss_fuzz_dir/projects/$project/$project/config.cache"
+      "$python" - "$oss_fuzz_dir/projects/$project/Dockerfile" "$project" <<'PY_OFG_LOCAL_COPY_FINAL'
+from pathlib import Path
+import re
+import sys
+dockerfile = Path(sys.argv[1])
+project = sys.argv[2]
+text = dockerfile.read_text(encoding="utf-8")
+text = re.sub(r"(?m)^RUN git clone .*?$", f"COPY {project} {project}", text, count=1)
+dockerfile.write_text(text, encoding="utf-8")
+PY_OFG_LOCAL_COPY_FINAL
+      printf 'ofg_project_patch: %s Dockerfile uses the local MAGMA source (final)\n' "$project" >>"$workspace/logs/oss_fuzz_project_patches.log"
+    fi
+  fi
+  if [[ "${OFG_REUSE_PROJECT_IMAGE:-0}" == "1" && -f "$oss_fuzz_dir/infra/helper.py" ]]; then
+    sed -i 's/if build_project_image and not common_utils.build_image_impl(/if build_project_image and os.environ.get("OFG_REUSE_PROJECT_IMAGE") != "1" and not common_utils.build_image_impl(/' "$oss_fuzz_dir/infra/helper.py"
   fi
   if [[ -x "$oss_fuzz_dir/infra/helper.py" ]]; then
     # introspector is a SANITIZER choice in helper.py (--sanitizer introspector),

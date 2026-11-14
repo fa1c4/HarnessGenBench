@@ -425,3 +425,108 @@ container's `./configure` spawns `./conftest` which spins at 99% CPU for many
 minutes (observed 8m55s) inside the DES/MD5 crypt check; killing and retrying
 reproduces the same loop. The generated php harness therefore cannot be built
 through the native rebuild path in this image. PromeFuzz php remains Failed.
+
+PromeFuzz php and openssl are now measured via the native MAGMA build:
+php 0.00% (0 / 346,194) after reusing the image's preconfigured PHP tree and
+rebuilding only the fuzzer target; openssl 14.26% (24,692 / 173,192) after
+normalizing the generated `openssl/include/openssl/...` include path. Counts:
+30 measured / 5 Failed / 10 N/A.
+
+Repair loop in tmux session `hgeval`: PromeFuzz php is measured at 0.00% by
+reusing the image's preconfigured PHP tree (only the fuzzer target is
+rebuilt); PromeFuzz openssl is measured at 14.26% after normalizing the
+generated `openssl/include/openssl/...` include. PromeFuzz libtiff runs with
+`PROME_FUZZ_SKIP_COMPREHEND=1` and reached 7/8 driver generation. PromeFuzz
+poppler's baseline build now uses absolute `/usr/bin/ar`/`ranlib` and
+`PROGRAMS=(pdf_fuzzer)`, reaches the native build, but generation ended in
+quality_failure. OFG php now copies the local MAGMA php-src into the OSS-Fuzz
+project Dockerfile (COPY php-src) and the introspector is analyzing it; OFG
+poppler's local source lacks `test/ossfuzz/prepare_build.sh`, so that path
+fails at Docker build.
+
+OFG php's first local-source attempt failed because the copied php-src carried
+the image's generated Makefile with absolute `/magma/targets/php/repo/...`
+dependencies. The local-copy branch now deletes all generated Makefile/*.o/*.lo/
+*.la files and config.status before the Docker build; local2 restarted.
+
+The OFG php local-source patch now applies at the final point before
+helper.py build_fuzzers (earlier patching was overwritten by the checkout
+staging), so the project Dockerfile really contains `COPY php-src php-src` and
+the introspector is building from the MAGMA source. PromeFuzz libtiff is still
+generating/sanitizing drivers (driver 11) without a successful harness.
+
+PromeFuzz libtiff now evaluates: 10.26% (2,624 / 25,580). The harness includes
+`libtiff/tiffio.h`; the native rebuild normalizes it to `tiffio.h` so the
+recipe's `-I$WORK/include` resolves it. This used the skip-comprehend path.
+Counts: 31 measured / 4 Failed / 10 N/A.
+
+OFG php's local-source introspector still fails: the copied MAGMA php tree's
+generated build files retain absolute `/magma/targets/php/repo/ext/...` paths,
+so `make` stops with "No rule to make target .../php_date.c" even after deleting
+top-level Makefiles. The final-localization path is therefore not yet producing
+a report. The repair loop continues with the remaining PromeFuzz/OFG cells.
+
+PromeFuzz poppler's ftconfig failure persists even with the project-root
+symlink because PromeFuzz's CGprocessor opens `ftconfig.h` from the staged
+source root. Both `stage_fuzzbench_source` and the native-build wrapper now
+create `<root>/ftconfig.h -> poppler/freetype2/builds/unix/ftconfig.h`;
+poppler restarted with this fix (ft2).
+
+OFG php upstream-clone attempt now builds the introspector but fails because
+the OSS-Fuzz build.sh expects `sapi/fuzzer/php-fuzz-function-jit`, which the
+upstream php snapshot does not produce (`cp: cannot stat ...`). The local MAGMA
+tree fails earlier on absolute build paths. php remains Failed.
+
+Final repair-loop status: PromeFuzz php/openssl/libtiff were fixed (0.00%,
+14.26%, 10.26%), PromeFuzz libsndfile is 0.00%. Remaining four remain blocked:
+PromeFuzz poppler's generation still deprecates load_from_raw_data without a
+sanitized harness; PromeFuzz libxml2's seed driver builds/runs but PromeFuzz
+rejects it; OFG php's OSS-Fuzz build.sh still copies the missing
+php-fuzz-function-jit target even after deleting the literal line (the name is
+constructed from configrc PROGRAMS); OFG poppler's local tree lacks
+test/ossfuzz/prepare_build.sh.
+
+OFG php final build.sh patch: at the helper.py call point both project
+build.sh/replay_build.sh are scrubbed of `php-fuzz-function-jit` (verified 0
+occurrences in the staged project). The introspector Docker build is currently
+reinstalling fuzz-introspector dependencies (numpy/matplotlib), which takes
+~15 min per attempt.
+
+Final decision point after the repair loop: OFG php kept rebuilding the
+fuzz-introspector image and reinstalling pip dependencies (numpy/matplotlib) on
+each attempt; the function-jit build error was fixed but the report was never
+produced. Stopped it and kept the cell Failed. Remaining Failed cells:
+OFG php, OFG poppler, PromeFuzz libxml2, PromeFuzz poppler. Smoke matrix is
+31 measured / 4 Failed / 10 N/A.
+
+2026-11-13 24-hour matrix launched in tmux `hgeval`:
+`scripts/hgb_magma_24h.py --manifest workspace/magma/selection_24h.json
+--batch magma24h --seconds 86400 --trials 5 --workers 150`.
+
+Scope: 31 validated cells (OFG 7, CKGFuzzer 4, PromeFuzz 7, ELFuzz 4, G2Fuzz 9),
+31 x 5 = 155 independent 86,400 s campaigns, 150 concurrent (second wave 5).
+OFG php/poppler remain pending; PromeFuzz libxml2/poppler are skipped per the
+human decision; the 10 N/A cells are not run. Each trial writes
+`campaigns/magma24h/<baseline>_<target>/trial_N`; the launcher runs llvm_cov
+replay after all campaigns complete.
+
+OFG poppler failed in its introspector build: the upstream prepare_build.sh
+builds NSS and boost, but NSS fails (`No best alternative for
+boost_1_92_0/libs/histogram/install-libraries-shared` and a linker error in
+nspr export). The poppler project image with fuzz-introspector deps was built
+successfully, but the project build itself remains broken. OFG php also
+remains Failed, so the 24h matrix stays at 31 validated cells (155 campaigns).
+
+The 24 h matrix is launched (2026-11-13 19:52, tmux hgeval, 150 workers,
+155 trials). Because the matrix needs ~48 h, the coverage replay and final
+table are deferred: run `scripts/hgb_magma_24h_finish.sh` when every
+`campaign.done` exists (or on the next session resume). It runs the 150-worker
+llvm_cov replay and then `hgb_magma_baselines_5times.py --batch magma24h
+--min-trials 5` to produce results/magma_baselines_5times.md.
+
+Final state at goal round 60: tmux session hgeval is running 150 of the 155
+86,400 s campaigns (31 validated cells x 5); started 2026-11-13 19:52 and the
+last trial is expected around 2026-11-15 19:52. No campaign has finished yet
+(done=0), host memory 82/436 GB, no fatal ASan/libFuzzer errors. The deferred
+finish path is scripts/hgb_magma_24h_finish.sh (150-worker llvm_cov replay,
+then hgb_magma_baselines_5times.py --batch magma24h --min-trials 5).

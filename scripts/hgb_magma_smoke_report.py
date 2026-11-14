@@ -25,8 +25,7 @@ LABELS = {"oss-fuzz-gen": "OSS-Fuzz-Gen", "ckgfuzzer": "CKGFuzzer",
 SHORT = {"oss-fuzz-gen": "ofg", "ckgfuzzer": "ckg", "promefuzz": "prome",
          "elfuzz": "elfuzz", "g2fuzz": "g2fuzz"}
 FAILED = {("oss-fuzz-gen", "php"), ("oss-fuzz-gen", "poppler"),
-          ("promefuzz", "libtiff"), ("promefuzz", "libxml2"),
-          ("promefuzz", "openssl"), ("promefuzz", "php"), ("promefuzz", "poppler")}
+          ("promefuzz", "libxml2"), ("promefuzz", "poppler")}
 
 
 def specs() -> dict[str, dict]:

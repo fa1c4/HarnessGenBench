@@ -56,6 +56,9 @@ if [[ ! -d "$run_source" ]]; then
   cp -a "$template_root/." "$run_source/"
 fi
 mkdir -p "$run_source" "$run_out" "$run_work"
+if [[ -f "$run_source/poppler/freetype2/builds/unix/ftconfig.h" ]]; then
+  ln -sfn poppler/freetype2/builds/unix/ftconfig.h "$run_source/ftconfig.h"
+fi
 touch "$template_marker"
 case "$container_src_root" in
   /*) ;;
@@ -190,7 +193,7 @@ case "$native_dest" in
     ;;
 esac
 project_include_flags="${project_include_args[*]}"
-export AR="${AR:-ar}" AS="${AS:-as}" RANLIB="${RANLIB:-ranlib}" LD="${LD:-ld}" NM="${NM:-nm}" STRIP="${STRIP:-strip}" OBJCOPY="${OBJCOPY:-objcopy}"
+export AR="${AR:-$(command -v ar || echo /usr/bin/ar)}" AS="${AS:-as}" RANLIB="${RANLIB:-$(command -v ranlib || echo /usr/bin/ranlib)}" LD="${LD:-ld}" NM="${NM:-nm}" STRIP="${STRIP:-strip}" OBJCOPY="${OBJCOPY:-objcopy}"
 export CFLAGS="${CFLAGS:-} -pthread ${project_include_flags} ${PROME_FUZZ_EXTRA_CFLAGS:-}"
 export CXXFLAGS="${CXXFLAGS:-} -pthread -Wno-register ${project_include_flags} ${PROME_FUZZ_EXTRA_CXXFLAGS:-}"
 export LIBS="${LIBS:-} ${PROME_FUZZ_EXTRA_LIBS:-}"

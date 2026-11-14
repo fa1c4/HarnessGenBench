@@ -137,6 +137,9 @@ stage_fuzzbench_source() {
     rm -rf "$destination/$name"
     cp -a "$child" "$destination/$name"
   done < <(find "$benchmark" -mindepth 1 -maxdepth 1 -print0)
+  if [[ -f "$destination/poppler/freetype2/builds/unix/ftconfig.h" ]]; then
+    ln -sfn poppler/freetype2/builds/unix/ftconfig.h "$destination/ftconfig.h"
+  fi
   # Some FuzzBench recipes have no top-level build.sh (the Dockerfile copies a
   # project OSS-Fuzz build script instead, e.g. libpng). Replace the soft-skip
   # stub with a wrapper that runs the discovered project build script.
@@ -1628,7 +1631,11 @@ PY_PROMEFUZZ_LLM_TRACE_PATCH
   if ! (cd "$runtime_artifact" && "$python" PromeFuzz.py --help 2>/dev/null | grep -q -- ' -c'); then
     cfg_flag=--config
   fi
-  stages=(preprocess comprehend generate stats)
+  if [[ "${PROME_FUZZ_SKIP_COMPREHEND:-0}" == "1" ]]; then
+    stages=(preprocess generate stats)
+  else
+    stages=(preprocess comprehend generate stats)
+  fi
   : >"$workspace/command.txt"
   code=0
   failed_stage=none

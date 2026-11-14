@@ -109,11 +109,19 @@ def rebuild(args: argparse.Namespace, spec: dict) -> int:
         # Harnesses that declare project prototypes themselves (instead of
         # including the project header) still need the MAGMA_ symbol prefix.
         # Apply the exact function-name map generated from pnglibconf.h.
+        if args.target == "openssl" and 'openssl/include/openssl/' in text:
+            text = text.replace('openssl/include/openssl/', 'openssl/')
+            normalized = work / f"normalized_{harness.name}"
+            normalized.write_text(text, encoding="utf-8")
         if args.target == "sqlite3" and '"sqlite3/work/sqlite3.h"' in text:
             # PromeFuzz emits the build-workdir spelling of the generated
             # header; the MAGMA sqlite recipe compiles from its work dir where
             # the header is `sqlite3.h`.
             text = text.replace('"sqlite3/work/sqlite3.h"', "<sqlite3.h>")
+            normalized = work / f"normalized_{harness.name}"
+            normalized.write_text(text, encoding="utf-8")
+        if args.target == "libtiff" and "libtiff/tiffio.h" in text:
+            text = text.replace("libtiff/tiffio.h", "tiffio.h")
             normalized = work / f"normalized_{harness.name}"
             normalized.write_text(text, encoding="utf-8")
         if args.target == "libtiff" and "tiffio.hxx" not in text:
@@ -142,8 +150,16 @@ def rebuild(args: argparse.Namespace, spec: dict) -> int:
         f"if [ -f {fuzzer_include}/FuzzedDataProvider.h ]; then "
         "mkdir -p /usr/local/include/fuzzer; "
         f"cp {fuzzer_include}/FuzzedDataProvider.h /usr/local/include/fuzzer/; fi",
-        "if [ -f /magma/targets/php/build.sh ]; then "
-        "sed -i 's/--enable-intl/--disable-intl/' /magma/targets/php/build.sh; fi",
+        "if [ -f /magma/targets/php/Makefile ] || [ -f /magma/targets/php/repo/Makefile ]; then "
+        "printf '#!/bin/bash\\nset -ex\\ncd /magma/targets/php/repo\\nmake -j\"$(nproc)\" sapi/fuzzer/php-fuzz-parser\\nmkdir -p \"$OUT\"\\ncp sapi/fuzzer/php-fuzz-parser \"$OUT/parser\"\\n' > /magma/targets/php/build.sh; "
+        "chmod +x /magma/targets/php/build.sh; fi",
+        "if [ -d /magma/targets/libtiff/repo/libtiff ]; then "
+        "ln -sfn repo/libtiff /magma/targets/libtiff/libtiff; "
+        "mkdir -p /magma/targets/libtiff/work/include; "
+        "ln -sfn /magma/targets/libtiff/repo/libtiff /magma/targets/libtiff/work/include/libtiff; fi",
+        "if [ -d /magma/targets/openssl/repo/include ]; then "
+        "ln -sfn . /magma/targets/openssl/repo/openssl; "
+        "ln -sfn repo /magma/targets/openssl/openssl; fi",
         "if [ -d /magma/targets/libsndfile/repo/include ]; then "
         "ln -sfn . /magma/targets/libsndfile/repo/libsndfile; fi",
         "if [ -d /magma/targets/poppler/src ]; then "
@@ -186,7 +202,7 @@ cp -a {source} /tmp/corpus/ 2>/dev/null || true
 cd /tmp
 ASAN_OPTIONS=detect_leaks=0:allocator_may_return_null=1:abort_on_error=0 \\
 set +e
-timeout {args.seconds}s {binary} -rss_limit_mb=100 -fork=1 -timeout=25 -len_control=0 -ignore_timeouts=1 \\
+timeout {args.seconds}s {binary} -rss_limit_mb={args.rss_limit_mb} -fork=1 -timeout=25 -len_control=0 -ignore_timeouts=1 \\
   -ignore_crashes=1 -ignore_ooms=1 -artifact_prefix={out}/crashes/ /tmp/corpus \\
   > {out}/campaign.log 2>&1
 code=$?
@@ -293,6 +309,7 @@ def main() -> int:
     camp = sub.add_parser("campaign")
     camp.add_argument("--out", required=True)
     camp.add_argument("--seconds", type=int, default=86400)
+    camp.add_argument("--rss-limit-mb", type=int, default=100)
     camp.add_argument("--seeds", default="")
     camp.add_argument("--binary", default="")
 
